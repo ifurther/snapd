@@ -25,7 +25,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"math"
 	"os"
 	"path/filepath"
@@ -108,11 +107,13 @@ var (
 )
 
 type KernelCmdline struct {
-	// TODO: add append and remove slices that will replace the cmdline*.txt
-	// files that can be included nowadays in the gadget.
 	// Allow is the list of allowed parameters for the system.kernel.cmdline-append
 	// system option
 	Allow []kcmdline.ArgumentPattern `yaml:"allow"`
+	// Append are kernel parameters added by the gadget
+	Append []kcmdline.Argument `yaml:"append"`
+	// Remove are patterns to be removed from default command line
+	Remove []kcmdline.ArgumentPattern `yaml:"remove"`
 }
 
 type Info struct {
@@ -124,6 +125,19 @@ type Info struct {
 	Connections []Connection `yaml:"connections"`
 
 	KernelCmdline KernelCmdline `yaml:"kernel-cmdline"`
+}
+
+// HasRole returns true if any of the volume structures in this Info has the
+// given role.
+func (i *Info) HasRole(role string) bool {
+	for _, v := range i.Volumes {
+		for _, s := range v.Structure {
+			if s.Role == role {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // PartialProperty is a gadget property that can be partially defined.
@@ -664,9 +678,15 @@ func LoadDiskVolumesDeviceTraits(dir string) (map[string]DiskVolumeDeviceTraits,
 		return nil, nil
 	}
 
-	b, err := ioutil.ReadFile(filename)
+	b, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, err
+	}
+
+	if len(b) == 0 {
+		// if the file is empty, it is safe to ignore it
+		logger.Noticef("WARNING: ignoring zero sized device traits file\n")
+		return nil, nil
 	}
 
 	if err := json.Unmarshal(b, &mapping); err != nil {
@@ -1188,7 +1208,7 @@ func readInfo(f func(string) ([]byte, error), gadgetYamlFn string, model Model) 
 // validation like Validate.
 func ReadInfo(gadgetSnapRootDir string, model Model) (*Info, error) {
 	gadgetYamlFn := filepath.Join(gadgetSnapRootDir, "meta", "gadget.yaml")
-	ginfo, err := readInfo(ioutil.ReadFile, gadgetYamlFn, model)
+	ginfo, err := readInfo(os.ReadFile, gadgetYamlFn, model)
 	if err != nil {
 		return nil, err
 	}
@@ -1684,18 +1704,10 @@ func checkCompatibleSchema(old, new *Volume) error {
 
 // LaidOutVolumesFromGadget takes gadget volumes, gadget and kernel rootdirs
 // and lays out the partitions on all volumes as specified. It returns the
-// specific volume on which system-* roles/partitions exist, as well as all
 // volumes mentioned in the gadget.yaml and their laid out representations.
-// Those volumes are assumed to already be flashed and managed separately at
-// image build/flash time, while the system volume with all the system-* roles
-// on it can be manipulated during install mode.
-func LaidOutVolumesFromGadget(vols map[string]*Volume, gadgetRoot, kernelRoot string, model Model, encType secboot.EncryptionType, volToGadgetToDiskStruct map[string]map[int]*OnDiskStructure) (system *LaidOutVolume, all map[string]*LaidOutVolume, err error) {
-	all = make(map[string]*LaidOutVolume)
-	// model should never be nil here
-	if model == nil {
-		return nil, nil, fmt.Errorf("internal error: must have model to lay out system volumes from a gadget")
-	}
+func LaidOutVolumesFromGadget(vols map[string]*Volume, gadgetRoot, kernelRoot string, encType secboot.EncryptionType, volToGadgetToDiskStruct map[string]map[int]*OnDiskStructure) (all map[string]*LaidOutVolume, err error) {
 
+	all = make(map[string]*LaidOutVolume)
 	// layout all volumes saving them
 	opts := &LayoutOptions{
 		GadgetRootDir: gadgetRoot,
@@ -1703,42 +1715,19 @@ func LaidOutVolumesFromGadget(vols map[string]*Volume, gadgetRoot, kernelRoot st
 		EncType:       encType,
 	}
 
-	// find the volume with the system-boot role on it, we already validated
-	// that the system-* roles are all on the same volume
 	for name, vol := range vols {
-		var gadgetToDiskStruct map[int]*OnDiskStructure
-		if volToGadgetToDiskStruct != nil {
-			var ok bool
-			if gadgetToDiskStruct, ok = volToGadgetToDiskStruct[name]; !ok {
-				return nil, nil, fmt.Errorf("internal error: volume %q does not have a map of gadget to disk partitions", name)
-			}
+		gadgetToDiskStruct, ok := volToGadgetToDiskStruct[name]
+		if !ok {
+			return nil, fmt.Errorf("internal error: volume %q does not have a map of gadget to disk partitions", name)
 		}
 		lvol, err := LayoutVolume(vol, gadgetToDiskStruct, opts)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		all[name] = lvol
-		// check if this volume is the boot volume using the system-boot volume
-		// to identify it
-		for _, structure := range vol.Structure {
-			if structure.Role == SystemBoot {
-				if system != nil {
-					// this should be impossible, the validation above should
-					// ensure there are not multiple volumes with the same role
-					// on them
-					return nil, nil, fmt.Errorf("internal error: gadget passed validation but duplicated system-* roles across multiple volumes")
-				}
-				system = lvol
-			}
-		}
 	}
 
-	if system == nil {
-		// this should be impossible, the validation above should ensure this
-		return nil, nil, fmt.Errorf("internal error: gadget passed validation but does not have system-* roles on any volume")
-	}
-
-	return system, all, nil
+	return all, nil
 }
 
 // FindBootVolume returns the volume that contains the system-boot partition.
@@ -1810,27 +1799,49 @@ func isKernelArgumentAllowed(arg string) bool {
 // KernelCommandLineFromGadget returns the desired kernel command line provided by the
 // gadget. The full flag indicates whether the gadget provides a full command
 // line or just the extra parameters that will be appended to the static ones.
-func KernelCommandLineFromGadget(gadgetDirOrSnapPath string) (cmdline string, full bool, err error) {
+// A model is neededed to know how to interpret the gadget yaml from the gadget.
+func KernelCommandLineFromGadget(gadgetDirOrSnapPath string, model Model) (cmdline string, full bool, removeArgs []kcmdline.ArgumentPattern, err error) {
 	sf, err := snapfile.Open(gadgetDirOrSnapPath)
 	if err != nil {
-		return "", false, fmt.Errorf("cannot open gadget snap: %v", err)
+		return "", false, []kcmdline.ArgumentPattern{}, fmt.Errorf("cannot open gadget snap: %v", err)
 	}
+
+	info, err := ReadInfoFromSnapFileNoValidate(sf, model)
+	if err != nil {
+		return "", false, []kcmdline.ArgumentPattern{}, fmt.Errorf("Cannot read snap info: %v", err)
+	}
+
+	if len(info.KernelCmdline.Append) > 0 || len(info.KernelCmdline.Remove) > 0 {
+		var asStr []string
+		for _, cmd := range info.KernelCmdline.Append {
+			value := cmd.String()
+			split := strings.SplitN(value, "=", 2)
+			if !isKernelArgumentAllowed(split[0]) {
+				return "", false, []kcmdline.ArgumentPattern{}, fmt.Errorf("kernel parameter '%s' is not allowed", value)
+			}
+			asStr = append(asStr, value)
+		}
+
+		return strutil.JoinNonEmpty(asStr, " "), false, info.KernelCmdline.Remove, nil
+	}
+
+	// Backward compatibility
 	contentExtra, err := sf.ReadFile("cmdline.extra")
 	if err != nil && !os.IsNotExist(err) {
-		return "", false, err
+		return "", false, []kcmdline.ArgumentPattern{}, err
 	}
 	// TODO: should we enforce the maximum kernel command line for cmdline.full?
 	contentFull, err := sf.ReadFile("cmdline.full")
 	if err != nil && !os.IsNotExist(err) {
-		return "", false, err
+		return "", false, []kcmdline.ArgumentPattern{}, err
 	}
 	content := contentExtra
 	whichFile := "cmdline.extra"
 	switch {
 	case contentExtra != nil && contentFull != nil:
-		return "", false, fmt.Errorf("cannot support both extra and full kernel command lines")
+		return "", false, []kcmdline.ArgumentPattern{}, fmt.Errorf("cannot support both extra and full kernel command lines")
 	case contentExtra == nil && contentFull == nil:
-		return "", false, nil
+		return "", false, []kcmdline.ArgumentPattern{}, nil
 	case contentFull != nil:
 		content = contentFull
 		whichFile = "cmdline.full"
@@ -1838,9 +1849,9 @@ func KernelCommandLineFromGadget(gadgetDirOrSnapPath string) (cmdline string, fu
 	}
 	parsed, err := parseCommandLineFromGadget(content)
 	if err != nil {
-		return "", full, fmt.Errorf("invalid kernel command line in %v: %v", whichFile, err)
+		return "", full, []kcmdline.ArgumentPattern{}, fmt.Errorf("invalid kernel command line in %v: %v", whichFile, err)
 	}
-	return parsed, full, nil
+	return parsed, full, []kcmdline.ArgumentPattern{}, nil
 }
 
 // parseCommandLineFromGadget parses the command line file and returns a
@@ -1897,7 +1908,7 @@ func parseCommandLineFromGadget(content []byte) (string, error) {
 // but could be used on any known to be properly installed gadget.
 func HasRole(gadgetSnapRootDir string, roles []string) (foundRole string, err error) {
 	gadgetYamlFn := filepath.Join(gadgetSnapRootDir, "meta", "gadget.yaml")
-	gadgetYaml, err := ioutil.ReadFile(gadgetYamlFn)
+	gadgetYaml, err := os.ReadFile(gadgetYamlFn)
 	if err != nil {
 		return "", err
 	}

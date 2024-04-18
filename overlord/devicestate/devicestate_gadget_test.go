@@ -274,7 +274,7 @@ func (s *deviceMgrGadgetSuite) setupGadgetUpdate(c *C, modelGrade, gadgetYamlCon
 
 	snapstate.Set(s.state, "foo-gadget", &snapstate.SnapState{
 		SnapType: "gadget",
-		Sequence: []*snap.SideInfo{siCurrent},
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{siCurrent}),
 		Current:  siCurrent.Revision,
 		Active:   true,
 	})
@@ -297,7 +297,7 @@ func (s *deviceMgrGadgetSuite) testUpdateGadgetSimple(c *C, grade string, encryp
 	if grade != "" {
 		bootDir := c.MkDir()
 		tbl := bootloadertest.Mock("trusted", bootDir).WithTrustedAssets()
-		tbl.TrustedAssetsList = []string{"trusted-asset"}
+		tbl.TrustedAssetsMap = map[string]string{"trusted-asset": "trusted-asset"}
 		tbl.ManagedAssetsList = []string{"managed-asset"}
 		bootloader.Force(tbl)
 		defer func() { bootloader.Force(nil) }()
@@ -385,6 +385,11 @@ func (s *deviceMgrGadgetSuite) testUpdateGadgetSimple(c *C, grade string, encryp
 
 	s.state.Lock()
 	defer s.state.Unlock()
+
+	// Ensure that "gadget-restart-required" was set
+	var restartRequired bool
+	c.Check(chg.Get("gadget-restart-required", &restartRequired), IsNil)
+	c.Check(restartRequired, Equals, true)
 
 	// Expect the change to be in wait status at this point, as a restart
 	// will have been requested
@@ -602,7 +607,7 @@ func (s *deviceMgrGadgetSuite) TestUpdateGadgetOnCoreBadGadgetYaml(c *C) {
 
 	snapstate.Set(s.state, "foo-gadget", &snapstate.SnapState{
 		SnapType: "gadget",
-		Sequence: []*snap.SideInfo{siCurrent},
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{siCurrent}),
 		Current:  siCurrent.Revision,
 		Active:   true,
 	})
@@ -653,7 +658,7 @@ func (s *deviceMgrGadgetSuite) TestUpdateGadgetOnCoreParanoidChecks(c *C) {
 
 	snapstate.Set(s.state, "foo-gadget", &snapstate.SnapState{
 		SnapType: "gadget",
-		Sequence: []*snap.SideInfo{siCurrent},
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{siCurrent}),
 		Current:  siCurrent.Revision,
 		Active:   true,
 	})
@@ -730,21 +735,23 @@ volumes:
 		{"content.img", "updated content"},
 	})
 
-	r := gadget.MockVolumeStructureToLocationMap(func(_ gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+	r := gadget.MockVolumeStructureToLocationMap(func(gd gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
 		return map[string]map[int]gadget.StructureLocation{
-			"pc": {
-				0: {
-					Device: "/dev/foo",
-					Offset: quantity.OffsetMiB,
+				"pc": {
+					0: {
+						Device: "/dev/foo",
+						Offset: quantity.OffsetMiB,
+					},
 				},
-			},
-		}, nil, nil
+			}, map[string]map[int]*gadget.OnDiskStructure{
+				"pc": gadget.OnDiskStructsFromGadget(gd.Info.Volumes["pc"]),
+			}, nil
 	})
 	defer r()
 
 	expectedRollbackDir := filepath.Join(dirs.SnapRollbackDir, "foo-gadget_34")
 	updaterForStructureCalls := 0
-	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, ps *gadget.LaidOutStructure, rootDir, rollbackDir string, _ gadget.ContentUpdateObserver) (gadget.Updater, error) {
+	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, rootDir, rollbackDir string, _ gadget.ContentUpdateObserver) (gadget.Updater, error) {
 		updaterForStructureCalls++
 
 		c.Assert(loc, Equals, gadget.StructureLocation{
@@ -769,7 +776,7 @@ volumes:
 
 	snapstate.Set(s.state, "foo-gadget", &snapstate.SnapState{
 		SnapType: "gadget",
-		Sequence: []*snap.SideInfo{siCurrent},
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{siCurrent}),
 		Current:  siCurrent.Revision,
 		Active:   true,
 	})
@@ -832,7 +839,7 @@ func (s *deviceMgrGadgetSuite) TestCurrentAndUpdateInfo(c *C) {
 
 	snapstate.Set(s.state, "foo-gadget", &snapstate.SnapState{
 		SnapType: "gadget",
-		Sequence: []*snap.SideInfo{siCurrent},
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{siCurrent}),
 		Current:  siCurrent.Revision,
 		Active:   true,
 	})
@@ -1034,7 +1041,7 @@ volumes:
 	s.setupModelWithGadget(c, "foo-gadget")
 	snapstate.Set(s.state, "foo-gadget", &snapstate.SnapState{
 		SnapType: "gadget",
-		Sequence: []*snap.SideInfo{siGadget},
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{siGadget}),
 		Current:  siGadget.Revision,
 		Active:   true,
 	})
@@ -1054,7 +1061,7 @@ volumes:
 	snaptest.MockSnapWithFiles(c, snapKernelYaml, siNext, nil)
 	snapstate.Set(s.state, "pc-kernel", &snapstate.SnapState{
 		SnapType: "kernel",
-		Sequence: []*snap.SideInfo{siNext, siCurrent},
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{siNext, siCurrent}),
 		Current:  siCurrent.Revision,
 		Active:   true,
 	})
@@ -1194,7 +1201,7 @@ func (s *deviceMgrGadgetSuite) testGadgetCommandlineUpdateRun(c *C, fromFiles, t
 	}
 	snapstate.Set(s.state, "pc", &snapstate.SnapState{
 		SnapType: "gadget",
-		Sequence: []*snap.SideInfo{currentSi},
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{currentSi}),
 		Current:  currentSi.Revision,
 		Active:   true,
 	})
@@ -1228,6 +1235,11 @@ func (s *deviceMgrGadgetSuite) testGadgetCommandlineUpdateRun(c *C, fromFiles, t
 
 	if errMatch == "" {
 		if opts.updated && !argsAppended {
+			// Ensure that "gadget-restart-required" was set
+			var restartRequired bool
+			c.Check(chg.Get("gadget-restart-required", &restartRequired), IsNil)
+			c.Check(restartRequired, Equals, true)
+
 			// Expect the change to be in wait status at this point, as a restart
 			// will have been requested
 			c.Check(tsk.Status(), Equals, state.WaitStatus)
@@ -1267,6 +1279,10 @@ func (s *deviceMgrGadgetSuite) testGadgetCommandlineUpdateRun(c *C, fromFiles, t
 		} else {
 			// update was not applied or failed
 			c.Check(s.restartRequests, HasLen, 0)
+
+			// Ensure that "gadget-restart-required" was not set
+			var restartRequired bool
+			c.Check(chg.Get("gadget-restart-required", &restartRequired), FitsTypeOf, &state.NoStateError{})
 		}
 	} else {
 		c.Assert(chg.IsReady(), Equals, true)
@@ -1324,11 +1340,12 @@ func (s *deviceMgrGadgetSuite) TestUpdateGadgetCommandlineWithExistingArgs(c *C)
 		"snapd_recovery_mode=run console=ttyS0 console=tty1 panic=-1 args from updated gadget",
 	})
 	c.Check(s.managedbl.SetBootVarsCalls, Equals, 1)
-	vars, err := s.managedbl.GetBootVars("snapd_extra_cmdline_args")
+	vars, err := s.managedbl.GetBootVars("snapd_extra_cmdline_args", "snapd_full_cmdline_args")
 	c.Assert(err, IsNil)
 	// bootenv was cleared
 	c.Assert(vars, DeepEquals, map[string]string{
-		"snapd_extra_cmdline_args": "args from updated gadget",
+		"snapd_extra_cmdline_args": "",
+		"snapd_full_cmdline_args":  "console=ttyS0 console=tty1 panic=-1 args from updated gadget",
 	})
 }
 
@@ -1381,11 +1398,12 @@ func (s *deviceMgrGadgetSuite) TestUpdateGadgetCommandlineClassicWithModesWithEx
 		"snapd_recovery_mode=run console=ttyS0 console=tty1 panic=-1 args from updated gadget",
 	})
 	c.Check(s.managedbl.SetBootVarsCalls, Equals, 1)
-	vars, err := s.managedbl.GetBootVars("snapd_extra_cmdline_args")
+	vars, err := s.managedbl.GetBootVars("snapd_extra_cmdline_args", "snapd_full_cmdline_args")
 	c.Assert(err, IsNil)
 	// bootenv was cleared
 	c.Assert(vars, DeepEquals, map[string]string{
-		"snapd_extra_cmdline_args": "args from updated gadget",
+		"snapd_extra_cmdline_args": "",
+		"snapd_full_cmdline_args":  "console=ttyS0 console=tty1 panic=-1 args from updated gadget",
 	})
 }
 
@@ -1437,11 +1455,12 @@ func (s *deviceMgrGadgetSuite) TestUpdateGadgetCommandlineWithNewArgs(c *C) {
 		"snapd_recovery_mode=run console=ttyS0 console=tty1 panic=-1 args from new gadget",
 	})
 	c.Check(s.managedbl.SetBootVarsCalls, Equals, 1)
-	vars, err := s.managedbl.GetBootVars("snapd_extra_cmdline_args")
+	vars, err := s.managedbl.GetBootVars("snapd_extra_cmdline_args", "snapd_full_cmdline_args")
 	c.Assert(err, IsNil)
 	// bootenv was cleared
 	c.Assert(vars, DeepEquals, map[string]string{
-		"snapd_extra_cmdline_args": "args from new gadget",
+		"snapd_extra_cmdline_args": "",
+		"snapd_full_cmdline_args":  "console=ttyS0 console=tty1 panic=-1 args from new gadget",
 	})
 }
 
@@ -1463,6 +1482,7 @@ func (s *deviceMgrGadgetSuite) testUpdateGadgetCommandlineWithNewAppendedArgs(c 
 	c.Assert(m.Write(), IsNil)
 	err = s.managedbl.SetBootVars(map[string]string{
 		"snapd_extra_cmdline_args": "",
+		"snapd_full_cmdline_args":  "console=ttyS0 console=tty1 panic=-1",
 	})
 	c.Assert(err, IsNil)
 	s.managedbl.SetBootVarsCalls = 0
@@ -1513,7 +1533,7 @@ kernel-cmdline:
 
 	c.Check([]string(m.CurrentKernelCommandLines), DeepEquals, expCmdlines)
 	c.Check(s.managedbl.SetBootVarsCalls, Equals, numSetBootVarsCalls)
-	vars, err := s.managedbl.GetBootVars("snapd_extra_cmdline_args")
+	vars, err := s.managedbl.GetBootVars("snapd_extra_cmdline_args", "snapd_full_cmdline_args")
 	c.Assert(err, IsNil)
 	// bootenv was cleared
 	extraArgs := opts.allowedCmdline
@@ -1521,7 +1541,8 @@ kernel-cmdline:
 		extraArgs = strutil.JoinNonEmpty([]string{extraArgs, opts.cmdlineAppendDanger}, " ")
 	}
 	c.Assert(vars, DeepEquals, map[string]string{
-		"snapd_extra_cmdline_args": extraArgs,
+		"snapd_extra_cmdline_args": "",
+		"snapd_full_cmdline_args":  strutil.JoinNonEmpty([]string{"console=ttyS0 console=tty1 panic=-1", extraArgs}, " "),
 	})
 }
 
@@ -1755,7 +1776,7 @@ func (s *deviceMgrGadgetSuite) TestGadgetCommandlineUpdateUndo(c *C) {
 	}
 	snapstate.Set(s.state, "pc", &snapstate.SnapState{
 		SnapType: "gadget",
-		Sequence: []*snap.SideInfo{currentSi},
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{currentSi}),
 		Current:  currentSi.Revision,
 		Active:   true,
 	})
@@ -1845,10 +1866,11 @@ func (s *deviceMgrGadgetSuite) TestGadgetCommandlineUpdateUndo(c *C) {
 	// update was applied and then undone
 	c.Check(s.restartRequests, DeepEquals, []restart.RestartType{restart.RestartSystemNow, restart.RestartSystemNow})
 	c.Check(restartCount, Equals, 2)
-	vars, err := s.managedbl.GetBootVars("snapd_extra_cmdline_args")
+	vars, err := s.managedbl.GetBootVars("snapd_extra_cmdline_args", "snapd_full_cmdline_args")
 	c.Assert(err, IsNil)
 	c.Assert(vars, DeepEquals, map[string]string{
-		"snapd_extra_cmdline_args": "args from old gadget",
+		"snapd_extra_cmdline_args": "",
+		"snapd_full_cmdline_args":  "console=ttyS0 console=tty1 panic=-1 args from old gadget",
 	})
 	// 2 calls, one to set the new arguments, and one to reset them back
 	c.Check(s.managedbl.SetBootVarsCalls, Equals, 2)
@@ -1886,7 +1908,7 @@ func (s *deviceMgrGadgetSuite) TestGadgetCommandlineClassicWithModesUpdateUndo(c
 	}
 	snapstate.Set(s.state, "pc", &snapstate.SnapState{
 		SnapType: "gadget",
-		Sequence: []*snap.SideInfo{currentSi},
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{currentSi}),
 		Current:  currentSi.Revision,
 		Active:   true,
 	})
@@ -1937,6 +1959,11 @@ func (s *deviceMgrGadgetSuite) TestGadgetCommandlineClassicWithModesUpdateUndo(c
 	s.state.Lock()
 	defer s.state.Unlock()
 
+	// Ensure that "gadget-restart-required" was set
+	var restartRequired bool
+	c.Check(chg.Get("gadget-restart-required", &restartRequired), IsNil)
+	c.Check(restartRequired, Equals, true)
+
 	// Expect the change to be in wait status at this point, as a restart
 	// will have been requested
 	c.Check(tsk.Status(), Equals, state.WaitStatus)
@@ -1958,10 +1985,11 @@ func (s *deviceMgrGadgetSuite) TestGadgetCommandlineClassicWithModesUpdateUndo(c
 	// update was applied and then undone, but no automatic restarts happened
 	c.Check(s.restartRequests, HasLen, 0)
 	c.Check(restartCount, Equals, 0)
-	vars, err := s.managedbl.GetBootVars("snapd_extra_cmdline_args")
+	vars, err := s.managedbl.GetBootVars("snapd_extra_cmdline_args", "snapd_full_cmdline_args")
 	c.Assert(err, IsNil)
 	c.Assert(vars, DeepEquals, map[string]string{
-		"snapd_extra_cmdline_args": "args from old gadget",
+		"snapd_extra_cmdline_args": "",
+		"snapd_full_cmdline_args":  "console=ttyS0 console=tty1 panic=-1 args from old gadget",
 	})
 	// 2 calls, one to set the new arguments, and one to reset them back
 	c.Check(s.managedbl.SetBootVarsCalls, Equals, 2)
@@ -1999,7 +2027,7 @@ func (s *deviceMgrGadgetSuite) TestGadgetCommandlineUpdateNoChangeNoRebootsUndo(
 	}
 	snapstate.Set(s.state, "pc", &snapstate.SnapState{
 		SnapType: "gadget",
-		Sequence: []*snap.SideInfo{currentSi},
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{currentSi}),
 		Current:  currentSi.Revision,
 		Active:   true,
 	})

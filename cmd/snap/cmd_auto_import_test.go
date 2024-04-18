@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2016 Canonical Ltd
+ * Copyright (C) 2016-2023 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -21,7 +21,7 @@ package main_test
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -50,7 +50,7 @@ func (s *SnapSuite) TestAutoImportAssertsHappy(c *C) {
 		case 0:
 			c.Check(r.Method, Equals, "POST")
 			c.Check(r.URL.Path, Equals, "/v2/assertions")
-			postData, err := ioutil.ReadAll(r.Body)
+			postData, err := io.ReadAll(r.Body)
 			c.Assert(err, IsNil)
 			c.Check(postData, DeepEquals, fakeAssertData)
 			fmt.Fprintln(w, `{"type": "sync", "result": {"ready": true, "status": "Done"}}`)
@@ -58,7 +58,7 @@ func (s *SnapSuite) TestAutoImportAssertsHappy(c *C) {
 		case 1:
 			c.Check(r.Method, Equals, "POST")
 			c.Check(r.URL.Path, Equals, "/v2/users")
-			postData, err := ioutil.ReadAll(r.Body)
+			postData, err := io.ReadAll(r.Body)
 			c.Assert(err, IsNil)
 			c.Check(string(postData), Equals, `{"action":"create","automatic":true}`)
 
@@ -176,7 +176,7 @@ func (s *SnapSuite) TestAutoImportIntoSpool(c *C) {
 	// in the output
 	c.Check(logbuf.String(), Matches, "(?ms).*queuing for later.*\n")
 
-	files, err := ioutil.ReadDir(dirs.SnapAssertsSpoolDir)
+	files, err := os.ReadDir(dirs.SnapAssertsSpoolDir)
 	c.Assert(err, IsNil)
 	c.Check(files, HasLen, 1)
 	c.Check(files[0].Name(), Equals, "iOkaeet50rajLvL-0Qsf2ELrTdn3XIXRIBlDewcK02zwRi3_TJlUOTl9AaiDXmDn.assert")
@@ -198,7 +198,7 @@ func (s *SnapSuite) TestAutoImportFromSpoolHappy(c *C) {
 		case 0:
 			c.Check(r.Method, Equals, "POST")
 			c.Check(r.URL.Path, Equals, "/v2/assertions")
-			postData, err := ioutil.ReadAll(r.Body)
+			postData, err := io.ReadAll(r.Body)
 			c.Assert(err, IsNil)
 			c.Check(postData, DeepEquals, fakeAssertData)
 			fmt.Fprintln(w, `{"type": "sync", "result": {"ready": true, "status": "Done"}}`)
@@ -206,7 +206,7 @@ func (s *SnapSuite) TestAutoImportFromSpoolHappy(c *C) {
 		case 1:
 			c.Check(r.Method, Equals, "POST")
 			c.Check(r.URL.Path, Equals, "/v2/users")
-			postData, err := ioutil.ReadAll(r.Body)
+			postData, err := io.ReadAll(r.Body)
 			c.Assert(err, IsNil)
 			c.Check(string(postData), Equals, `{"action":"create","automatic":true}`)
 
@@ -265,7 +265,7 @@ func (s *SnapSuite) TestAutoImportIntoSpoolUnhappyTooBig(c *C) {
 	c.Assert(err, ErrorMatches, "cannot queue .*, file size too big: 656384")
 }
 
-func (s *SnapSuite) TestAutoImportUnhappyInInstallMode(c *C) {
+func (s *SnapSuite) testAutoImportUnhappyInInstallMode(c *C, mode string) {
 	restoreRelease := release.MockOnClassic(false)
 	defer restoreRelease()
 
@@ -275,16 +275,24 @@ func (s *SnapSuite) TestAutoImportUnhappyInInstallMode(c *C) {
 	_, restoreLogger := logger.MockLogger()
 	defer restoreLogger()
 
-	modeenvContent := `mode=install
+	modeenvContent := fmt.Sprintf(`mode=%s
 recovery_system=20200202
-`
+`, mode)
 	c.Assert(os.MkdirAll(filepath.Dir(dirs.SnapModeenvFile), 0755), IsNil)
 	c.Assert(os.WriteFile(dirs.SnapModeenvFile, []byte(modeenvContent), 0644), IsNil)
 
 	_, err := snap.Parser(snap.Client()).ParseArgs([]string{"auto-import"})
 	c.Assert(err, IsNil)
 	c.Check(s.Stdout(), Equals, "")
-	c.Check(s.Stderr(), Equals, "auto-import is disabled in install-mode\n")
+	c.Check(s.Stderr(), Equals, "auto-import is disabled in install modes\n")
+}
+
+func (s *SnapSuite) TestAutoImportUnhappyInInstallMode(c *C) {
+	s.testAutoImportUnhappyInInstallMode(c, "install")
+}
+
+func (s *SnapSuite) TestAutoImportUnhappyInFactoryResetMode(c *C) {
+	s.testAutoImportUnhappyInInstallMode(c, "factory-reset")
 }
 
 func (s *SnapSuite) TestAutoImportUnhappyInInstallInInitrdMode(c *C) {
@@ -517,7 +525,7 @@ func (s *SnapSuite) TestAutoImportAssertsManagedEmptyReply(c *C) {
 		case 0:
 			c.Check(r.Method, Equals, "POST")
 			c.Check(r.URL.Path, Equals, "/v2/assertions")
-			postData, err := ioutil.ReadAll(r.Body)
+			postData, err := io.ReadAll(r.Body)
 			c.Assert(err, IsNil)
 			c.Check(postData, DeepEquals, fakeAssertData)
 			fmt.Fprintln(w, `{"type": "sync", "result": {"ready": true, "status": "Done"}}`)
@@ -525,7 +533,7 @@ func (s *SnapSuite) TestAutoImportAssertsManagedEmptyReply(c *C) {
 		case 1:
 			c.Check(r.Method, Equals, "POST")
 			c.Check(r.URL.Path, Equals, "/v2/users")
-			postData, err := ioutil.ReadAll(r.Body)
+			postData, err := io.ReadAll(r.Body)
 			c.Assert(err, IsNil)
 			c.Check(string(postData), Equals, `{"action":"create","automatic":true}`)
 

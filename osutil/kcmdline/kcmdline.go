@@ -23,7 +23,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"strings"
 
 	"github.com/snapcore/snapd/osutil"
@@ -349,7 +349,7 @@ func parseArgument(args []byte) (argument Argument, end int) {
 
 // KernelCommandLine returns the command line reported by the running kernel.
 func KernelCommandLine() (string, error) {
-	buf, err := ioutil.ReadFile(procCmdline)
+	buf, err := os.ReadFile(procCmdline)
 	if err != nil {
 		return "", err
 	}
@@ -472,4 +472,19 @@ func (kap *ArgumentPattern) UnmarshalYAML(unmarshal func(interface{}) error) err
 		return fmt.Errorf("cannot unmarshal kernel argument: %v", err)
 	}
 	return kap.unmarshalFromString(arg)
+}
+
+// RemoveMatchingFilter parses a kernel command line and remove arguments that
+// matches match patterns.
+func RemoveMatchingFilter(cmdline string, match []ArgumentPattern) []string {
+	parsedDefault := Parse(cmdline)
+	matcher := NewMatcher(match)
+	var keepArgs []string
+	for _, arg := range parsedDefault {
+		if !matcher.Match(arg) {
+			keepArgs = append(keepArgs, arg.String())
+		}
+	}
+
+	return keepArgs
 }

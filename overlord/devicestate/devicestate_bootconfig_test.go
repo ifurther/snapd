@@ -34,6 +34,7 @@ import (
 	"github.com/snapcore/snapd/overlord/devicestate/devicestatetest"
 	"github.com/snapcore/snapd/overlord/restart"
 	"github.com/snapcore/snapd/overlord/snapstate"
+	"github.com/snapcore/snapd/overlord/snapstate/snapstatetest"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/release"
 	"github.com/snapcore/snapd/snap"
@@ -61,7 +62,7 @@ func (s *deviceMgrBootconfigSuite) mockGadget(c *C, yaml string) {
 	}
 	snapstate.Set(s.state, "pc", &snapstate.SnapState{
 		SnapType: "gadget",
-		Sequence: []*snap.SideInfo{si},
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{si}),
 		Current:  si.Revision,
 		Active:   true,
 	})
@@ -514,6 +515,7 @@ func (s *deviceMgrBootconfigSuite) TestBootConfigUpdateRunButNotUpdated(c *C) {
 	s.setupUC20Model(c)
 	s.state.Unlock()
 
+	s.managedbl.CandidateStaticCommandLine = s.managedbl.StaticCommandLine
 	s.managedbl.Updated = false
 
 	opts := testBootConfigUpdateOpts{

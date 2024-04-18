@@ -699,11 +699,31 @@ func (u *updateTestSuite) TestUpdateApplyHappy(c *C) {
 	newData.Info.Volumes["foo"].Structure[0].Update.Edition = 1
 	newData.Info.Volumes["foo"].Structure[1].Update.Edition = 1
 
+	r := gadget.MockVolumeStructureToLocationMap(func(gd gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+		return map[string]map[int]gadget.StructureLocation{
+				"foo": {
+					0: {
+						Device: "/dev/foo",
+					},
+					1: {
+						RootMountPoint: "/foo",
+					},
+					2: {
+						RootMountPoint: "/foo",
+					},
+				},
+			}, map[string]map[int]*gadget.OnDiskStructure{
+				"foo": gadget.OnDiskStructsFromGadget(gd.Info.Volumes["foo"]),
+			},
+			nil
+	})
+	defer r()
+
 	muo := &mockUpdateProcessObserver{}
 	updaterForStructureCalls := 0
 	updateCalls := make(map[string]bool)
 	backupCalls := make(map[string]bool)
-	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
+	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
 		c.Assert(psRootDir, Equals, newData.RootDir)
 		c.Assert(psRollbackDir, Equals, rollbackDir)
 		c.Assert(observer, Equals, muo)
@@ -864,7 +884,7 @@ func (u *updateTestSuite) TestUpdateApplyUC16FullLogic(c *C) {
 	updaterForStructureCalls := 0
 	updateCalls := make(map[string]bool)
 	backupCalls := make(map[string]bool)
-	restore = gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
+	restore = gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
 		c.Assert(psRootDir, Equals, newData.RootDir)
 		c.Assert(psRollbackDir, Equals, rollbackDir)
 		c.Assert(observer, Equals, muo)
@@ -1058,11 +1078,42 @@ func (u *updateTestSuite) TestUpdateApplyUC20MissingInitialMapFullLogicOnlySyste
 		newData.Info.Volumes["pc"].Structure[i+2].Update.Edition = 1
 	}
 
+	r := gadget.MockVolumeStructureToLocationMap(func(gd gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+		return map[string]map[int]gadget.StructureLocation{
+				"pc": {
+					0: {
+						Device: "/dev/vda",
+					},
+					1: {
+						Device: "/dev/vda",
+						Offset: quantity.OffsetMiB,
+					},
+					2: {
+						RootMountPoint: "/run/mnt/ubuntu-seed",
+					},
+					3: {
+						RootMountPoint: "/run/mnt/ubuntu-boot",
+					},
+					4: {
+						RootMountPoint: "/run/mnt/ubuntu-save",
+					},
+					5: {
+						RootMountPoint: "/run/mnt/data",
+					},
+				},
+			}, map[string]map[int]*gadget.OnDiskStructure{
+				"pc":  gadget.OnDiskStructsFromGadget(gd.Info.Volumes["pc"]),
+				"foo": gadget.OnDiskStructsFromGadget(gd.Info.Volumes["foo"]),
+			},
+			nil
+	})
+	defer r()
+
 	muo := &mockUpdateProcessObserver{}
 	updaterForStructureCalls := 0
 	updateCalls := make(map[string]bool)
 	backupCalls := make(map[string]bool)
-	restore = gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
+	restore = gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
 		c.Assert(psRootDir, Equals, newData.RootDir)
 		c.Assert(psRollbackDir, Equals, rollbackDir)
 		c.Assert(observer, Equals, muo)
@@ -1095,7 +1146,7 @@ func (u *updateTestSuite) TestUpdateApplyUC20MissingInitialMapFullLogicOnlySyste
 				Device: "/dev/vda",
 				Offset: quantity.OffsetMiB,
 			})
-		case 2:
+		case 5:
 			// ubuntu-seed
 			c.Check(ps.Name(), Equals, "ubuntu-seed")
 			c.Check(ps.HasFilesystem(), Equals, true)
@@ -1107,9 +1158,9 @@ func (u *updateTestSuite) TestUpdateApplyUC20MissingInitialMapFullLogicOnlySyste
 			c.Assert(ps.ResolvedContent, HasLen, 1)
 			c.Assert(ps.VolumeStructure.Content, HasLen, 1)
 			c.Assert(loc, Equals, gadget.StructureLocation{
-				RootMountPoint: filepath.Join(dirs.GlobalRootDir, "/run/mnt/ubuntu-seed"),
+				RootMountPoint: "/run/mnt/ubuntu-seed",
 			})
-		case 3:
+		case 4:
 			// ubuntu-boot
 			c.Check(ps.Name(), Equals, "ubuntu-boot")
 			c.Check(ps.HasFilesystem(), Equals, true)
@@ -1121,9 +1172,9 @@ func (u *updateTestSuite) TestUpdateApplyUC20MissingInitialMapFullLogicOnlySyste
 			c.Assert(ps.ResolvedContent, HasLen, 1)
 			c.Assert(ps.VolumeStructure.Content, HasLen, 1)
 			c.Assert(loc, Equals, gadget.StructureLocation{
-				RootMountPoint: filepath.Join(dirs.GlobalRootDir, "/run/mnt/ubuntu-boot"),
+				RootMountPoint: "/run/mnt/ubuntu-boot",
 			})
-		case 4:
+		case 2:
 			// ubuntu-save
 			c.Check(ps.Name(), Equals, "ubuntu-save")
 			c.Check(ps.HasFilesystem(), Equals, true)
@@ -1135,9 +1186,9 @@ func (u *updateTestSuite) TestUpdateApplyUC20MissingInitialMapFullLogicOnlySyste
 			c.Assert(ps.ResolvedContent, HasLen, 1)
 			c.Assert(ps.VolumeStructure.Content, HasLen, 1)
 			c.Assert(loc, Equals, gadget.StructureLocation{
-				RootMountPoint: filepath.Join(dirs.GlobalRootDir, "/run/mnt/ubuntu-save"),
+				RootMountPoint: "/run/mnt/ubuntu-save",
 			})
-		case 5:
+		case 3:
 			// ubuntu-data
 			c.Check(ps.Name(), Equals, "ubuntu-data")
 			c.Check(ps.HasFilesystem(), Equals, true)
@@ -1152,7 +1203,7 @@ func (u *updateTestSuite) TestUpdateApplyUC20MissingInitialMapFullLogicOnlySyste
 			c.Assert(ps.ResolvedContent, HasLen, 1)
 			c.Assert(ps.VolumeStructure.Content, HasLen, 1)
 			c.Assert(loc, Equals, gadget.StructureLocation{
-				RootMountPoint: filepath.Join(dirs.GlobalRootDir, "/run/mnt/data"),
+				RootMountPoint: "/run/mnt/data",
 			})
 
 		default:
@@ -1312,11 +1363,38 @@ func (u *updateTestSuite) TestUpdateApplyUC20MissingInitialMapFullLogicOnlySyste
 	// content, to check that updates are ignored in this case.
 	newData.Info.Volumes["pc"].Structure[4].Update.Edition = 1
 
+	r := gadget.MockVolumeStructureToLocationMap(func(gd gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+		return map[string]map[int]gadget.StructureLocation{
+				"pc": {
+					0: {
+						Device: "/dev/vda",
+					},
+					1: {
+						RootMountPoint: "/run/mnt/ubuntu-seed",
+					},
+					2: {
+						RootMountPoint: "/run/mnt/ubuntu-boot",
+					},
+					3: {
+						RootMountPoint: "/run/mnt/ubuntu-save",
+					},
+					4: {
+						RootMountPoint: "/run/mnt/data",
+					},
+				},
+			}, map[string]map[int]*gadget.OnDiskStructure{
+				"pc":  gadget.OnDiskStructsFromGadget(newData.Info.Volumes["pc"]),
+				"foo": gadget.OnDiskStructsFromGadget(newData.Info.Volumes["foo"]),
+			},
+			nil
+	})
+	defer r()
+
 	muo := &mockUpdateProcessObserver{}
 	updaterForStructureCalls := 0
 	updateCalls := make(map[string]bool)
 	backupCalls := make(map[string]bool)
-	restore = gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
+	restore = gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
 		c.Assert(psRootDir, Equals, newData.RootDir)
 		c.Assert(psRollbackDir, Equals, rollbackDir)
 		c.Assert(observer, Equals, muo)
@@ -1336,7 +1414,7 @@ func (u *updateTestSuite) TestUpdateApplyUC20MissingInitialMapFullLogicOnlySyste
 				Device: "/dev/vda",
 				Offset: quantity.Offset(0),
 			})
-		case 1:
+		case 3:
 			// ubuntu-seed
 			c.Check(ps.Name(), Equals, "ubuntu-seed")
 			c.Check(ps.HasFilesystem(), Equals, true)
@@ -1347,7 +1425,7 @@ func (u *updateTestSuite) TestUpdateApplyUC20MissingInitialMapFullLogicOnlySyste
 			c.Assert(ps.LaidOutContent, HasLen, 0)
 			c.Assert(ps.VolumeStructure.Content, HasLen, 1)
 			c.Assert(loc, Equals, gadget.StructureLocation{
-				RootMountPoint: filepath.Join(dirs.GlobalRootDir, "/run/mnt/ubuntu-seed"),
+				RootMountPoint: "/run/mnt/ubuntu-seed",
 			})
 		case 2:
 			// ubuntu-boot
@@ -1360,9 +1438,9 @@ func (u *updateTestSuite) TestUpdateApplyUC20MissingInitialMapFullLogicOnlySyste
 			c.Assert(ps.LaidOutContent, HasLen, 0)
 			c.Assert(ps.VolumeStructure.Content, HasLen, 1)
 			c.Assert(loc, Equals, gadget.StructureLocation{
-				RootMountPoint: filepath.Join(dirs.GlobalRootDir, "/run/mnt/ubuntu-boot"),
+				RootMountPoint: "/run/mnt/ubuntu-boot",
 			})
-		case 3:
+		case 1:
 			// ubuntu-save
 			c.Check(ps.Name(), Equals, "ubuntu-save")
 			c.Check(ps.HasFilesystem(), Equals, true)
@@ -1373,7 +1451,7 @@ func (u *updateTestSuite) TestUpdateApplyUC20MissingInitialMapFullLogicOnlySyste
 			c.Assert(ps.LaidOutContent, HasLen, 0)
 			c.Assert(ps.VolumeStructure.Content, HasLen, 1)
 			c.Assert(loc, Equals, gadget.StructureLocation{
-				RootMountPoint: filepath.Join(dirs.GlobalRootDir, "/run/mnt/ubuntu-save"),
+				RootMountPoint: "/run/mnt/ubuntu-save",
 			})
 		default:
 			c.Fatalf("unexpected call")
@@ -1555,11 +1633,42 @@ func (u *updateTestSuite) TestUpdateApplyUC20MissingInitialMapFullLogicOnlySyste
 	newData.Info.Volumes["foo"].Structure[2].Content = []gadget.VolumeContent{{UnresolvedSource: fName}}
 	newData.Info.Volumes["foo"].Structure[2].Update.Edition = 1
 
+	r := gadget.MockVolumeStructureToLocationMap(func(gd gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+		return map[string]map[int]gadget.StructureLocation{
+				"pc": {
+					0: {
+						Device: "/dev/vda",
+					},
+					1: {
+						Device: "/dev/vda",
+						Offset: quantity.OffsetMiB,
+					},
+					2: {
+						RootMountPoint: "/run/mnt/ubuntu-seed",
+					},
+					3: {
+						RootMountPoint: "/run/mnt/ubuntu-boot",
+					},
+					4: {
+						RootMountPoint: "/run/mnt/ubuntu-save",
+					},
+					5: {
+						RootMountPoint: "/run/mnt/data",
+					},
+				},
+			}, map[string]map[int]*gadget.OnDiskStructure{
+				"pc":  gadget.OnDiskStructsFromGadget(gd.Info.Volumes["pc"]),
+				"foo": gadget.OnDiskStructsFromGadget(gd.Info.Volumes["foo"]),
+			},
+			nil
+	})
+	defer r()
+
 	muo := &mockUpdateProcessObserver{}
 	updaterForStructureCalls := 0
 	updateCalls := make(map[string]bool)
 	backupCalls := make(map[string]bool)
-	restore = gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
+	restore = gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
 		c.Assert(psRootDir, Equals, newData.RootDir)
 		c.Assert(psRollbackDir, Equals, rollbackDir)
 		c.Assert(observer, Equals, muo)
@@ -1592,7 +1701,7 @@ func (u *updateTestSuite) TestUpdateApplyUC20MissingInitialMapFullLogicOnlySyste
 				Device: "/dev/vda",
 				Offset: quantity.OffsetMiB,
 			})
-		case 2:
+		case 5:
 			// ubuntu-seed
 			c.Check(ps.Name(), Equals, "ubuntu-seed")
 			c.Check(ps.HasFilesystem(), Equals, true)
@@ -1603,9 +1712,9 @@ func (u *updateTestSuite) TestUpdateApplyUC20MissingInitialMapFullLogicOnlySyste
 			c.Assert(ps.LaidOutContent, HasLen, 0)
 			c.Assert(ps.VolumeStructure.Content, HasLen, 1)
 			c.Assert(loc, Equals, gadget.StructureLocation{
-				RootMountPoint: filepath.Join(dirs.GlobalRootDir, "/run/mnt/ubuntu-seed"),
+				RootMountPoint: "/run/mnt/ubuntu-seed",
 			})
-		case 3:
+		case 4:
 			// ubuntu-boot
 			c.Check(ps.Name(), Equals, "ubuntu-boot")
 			c.Check(ps.HasFilesystem(), Equals, true)
@@ -1616,9 +1725,9 @@ func (u *updateTestSuite) TestUpdateApplyUC20MissingInitialMapFullLogicOnlySyste
 			c.Assert(ps.LaidOutContent, HasLen, 0)
 			c.Assert(ps.VolumeStructure.Content, HasLen, 1)
 			c.Assert(loc, Equals, gadget.StructureLocation{
-				RootMountPoint: filepath.Join(dirs.GlobalRootDir, "/run/mnt/ubuntu-boot"),
+				RootMountPoint: "/run/mnt/ubuntu-boot",
 			})
-		case 4:
+		case 2:
 			// ubuntu-save
 			c.Check(ps.Name(), Equals, "ubuntu-save")
 			c.Check(ps.HasFilesystem(), Equals, true)
@@ -1629,9 +1738,9 @@ func (u *updateTestSuite) TestUpdateApplyUC20MissingInitialMapFullLogicOnlySyste
 			c.Assert(ps.LaidOutContent, HasLen, 0)
 			c.Assert(ps.VolumeStructure.Content, HasLen, 1)
 			c.Assert(loc, Equals, gadget.StructureLocation{
-				RootMountPoint: filepath.Join(dirs.GlobalRootDir, "/run/mnt/ubuntu-save"),
+				RootMountPoint: "/run/mnt/ubuntu-save",
 			})
-		case 5:
+		case 3:
 			// ubuntu-data
 			c.Check(ps.Name(), Equals, "ubuntu-data")
 			c.Check(ps.HasFilesystem(), Equals, true)
@@ -1645,7 +1754,7 @@ func (u *updateTestSuite) TestUpdateApplyUC20MissingInitialMapFullLogicOnlySyste
 			c.Assert(ps.LaidOutContent, HasLen, 0)
 			c.Assert(ps.VolumeStructure.Content, HasLen, 1)
 			c.Assert(loc, Equals, gadget.StructureLocation{
-				RootMountPoint: filepath.Join(dirs.GlobalRootDir, "/run/mnt/data"),
+				RootMountPoint: "/run/mnt/data",
 			})
 
 		default:
@@ -1837,7 +1946,7 @@ func (u *updateTestSuite) TestUpdateApplyUC20WithInitialMapAllVolumesUpdatedFull
 	pcBackupCalls := make(map[string]bool)
 	fooUpdateCalls := make(map[string]bool)
 	fooBackupCalls := make(map[string]bool)
-	restore = gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
+	restore = gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
 		c.Assert(psRootDir, Equals, newData.RootDir)
 		c.Assert(psRollbackDir, Equals, rollbackDir)
 		c.Assert(observer, Equals, muo)
@@ -1874,7 +1983,7 @@ func (u *updateTestSuite) TestUpdateApplyUC20WithInitialMapAllVolumesUpdatedFull
 					Device: "/dev/vda",
 					Offset: quantity.OffsetMiB,
 				})
-			case 2:
+			case 5:
 				// ubuntu-seed
 				c.Check(ps.Name(), Equals, "ubuntu-seed")
 				c.Check(ps.HasFilesystem(), Equals, true)
@@ -1887,7 +1996,7 @@ func (u *updateTestSuite) TestUpdateApplyUC20WithInitialMapAllVolumesUpdatedFull
 				c.Assert(loc, Equals, gadget.StructureLocation{
 					RootMountPoint: filepath.Join(dirs.GlobalRootDir, "/run/mnt/ubuntu-seed"),
 				})
-			case 3:
+			case 4:
 				// ubuntu-boot
 				c.Check(ps.Name(), Equals, "ubuntu-boot")
 				c.Check(ps.HasFilesystem(), Equals, true)
@@ -1900,7 +2009,7 @@ func (u *updateTestSuite) TestUpdateApplyUC20WithInitialMapAllVolumesUpdatedFull
 				c.Assert(loc, Equals, gadget.StructureLocation{
 					RootMountPoint: filepath.Join(dirs.GlobalRootDir, "/run/mnt/ubuntu-boot"),
 				})
-			case 4:
+			case 2:
 				// ubuntu-save
 				c.Check(ps.Name(), Equals, "ubuntu-save")
 				c.Check(ps.HasFilesystem(), Equals, true)
@@ -1913,7 +2022,7 @@ func (u *updateTestSuite) TestUpdateApplyUC20WithInitialMapAllVolumesUpdatedFull
 				c.Assert(loc, Equals, gadget.StructureLocation{
 					RootMountPoint: filepath.Join(dirs.GlobalRootDir, "/run/mnt/ubuntu-save"),
 				})
-			case 5:
+			case 3:
 				// ubuntu-data
 				c.Check(ps.Name(), Equals, "ubuntu-data")
 				c.Check(ps.HasFilesystem(), Equals, true)
@@ -2104,8 +2213,43 @@ func (u *updateTestSuite) TestUpdateApplyUC20WithInitialMapIncompatibleStructure
 		copy(oldData.Info.Volumes[volName].Structure, laidOutVol.Volume.Structure)
 	}
 
-	r := gadget.MockVolumeStructureToLocationMap(func(_ gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
-		return map[string]map[int]gadget.StructureLocation{"pc": {}, "foo": {}}, nil, nil
+	r := gadget.MockVolumeStructureToLocationMap(func(gd gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+		return map[string]map[int]gadget.StructureLocation{
+				"pc": {
+					0: {
+						Device: "/dev/vda",
+					},
+					1: {
+						Device: "/dev/vda",
+						Offset: quantity.OffsetMiB,
+					},
+					2: {
+						RootMountPoint: "/run/mnt/ubuntu-seed",
+					},
+					3: {
+						RootMountPoint: "/run/mnt/ubuntu-boot",
+					},
+					4: {
+						RootMountPoint: "/run/mnt/ubuntu-save",
+					},
+					5: {
+						RootMountPoint: "/run/mnt/data",
+					},
+				},
+				"foo": {
+					0: {},
+					1: {
+						Device: "/dev/vdb1",
+					},
+					2: {
+						Device: "/dev/vdb2",
+					},
+				},
+			},
+			map[string]map[int]*gadget.OnDiskStructure{
+				"pc":  gadget.OnDiskStructsFromGadget(gd.Info.Volumes["pc"]),
+				"foo": gadget.OnDiskStructsFromGadget(gd.Info.Volumes["foo"]),
+			}, nil
 	})
 	defer r()
 
@@ -2122,7 +2266,7 @@ func (u *updateTestSuite) TestUpdateApplyUC20WithInitialMapIncompatibleStructure
 	newData.Info.Volumes["foo"].Structure[1].Content = []gadget.VolumeContent{{Image: imgName}}
 
 	muo := &mockUpdateProcessObserver{}
-	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
+	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
 		c.Fatalf("unexpected call")
 		return nil, errors.New("not called")
 	})
@@ -2131,11 +2275,6 @@ func (u *updateTestSuite) TestUpdateApplyUC20WithInitialMapIncompatibleStructure
 	// go go go
 	err = gadget.Update(uc20Model, oldData, newData, rollbackDir, nil, muo)
 	c.Assert(err, ErrorMatches, `cannot update volume structure #1 \("nofspart"\) for volume foo: new valid structure size range \[1024, 1024\] is not compatible with current \(\[4096, 4096\]\)`)
-
-	// now with overlap
-	newData.Info.Volumes["foo"].Structure[1].Size = quantity.SizeMiB
-	err = gadget.Update(uc20Model, oldData, newData, rollbackDir, nil, muo)
-	c.Assert(err, ErrorMatches, `cannot lay out the new volume foo: cannot lay out volume, structure #2 \("some-filesystem"\) overlaps with preceding structure #1 \("nofspart"\)`)
 }
 
 func (u *updateTestSuite) TestUpdateApplyUC20KernelAssetsOnAllVolumesWithInitialMapAllVolumesUpdatedFullLogic(c *C) {
@@ -2321,6 +2460,49 @@ volumes:
 	// some filesystem
 	newData.Info.Volumes["foo"].Structure[2].Update.Edition = 1
 
+	r := gadget.MockVolumeStructureToLocationMap(func(gd gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+		return map[string]map[int]gadget.StructureLocation{
+				"pc": {
+					0: {
+						Device: "/dev/vda",
+					},
+					1: {
+						Device: "/dev/vda",
+						Offset: quantity.OffsetMiB,
+					},
+					2: {
+						RootMountPoint: "/run/mnt/ubuntu-seed",
+					},
+					3: {
+						RootMountPoint: "/run/mnt/ubuntu-boot",
+					},
+					4: {
+						RootMountPoint: "/run/mnt/ubuntu-save",
+					},
+					5: {
+						RootMountPoint: "/run/mnt/data",
+					},
+				},
+				"foo": {
+					0: {
+						Device: "/dev/vdb",
+					},
+					1: {
+						Device: "/dev/vdb",
+						Offset: quantity.OffsetMiB,
+					},
+					2: {
+						RootMountPoint: "/foo/some-filesystem",
+					},
+				},
+			}, map[string]map[int]*gadget.OnDiskStructure{
+				"pc":  gadget.OnDiskStructsFromGadget(gd.Info.Volumes["pc"]),
+				"foo": gadget.OnDiskStructsFromGadget(gd.Info.Volumes["foo"]),
+			},
+			nil
+	})
+	defer r()
+
 	muo := &mockUpdateProcessObserver{}
 	pcUpdaterForStructureCalls := 0
 	fooUpdaterForStructureCalls := 0
@@ -2328,7 +2510,7 @@ volumes:
 	pcBackupCalls := make(map[string]bool)
 	fooUpdateCalls := make(map[string]bool)
 	fooBackupCalls := make(map[string]bool)
-	restore = gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
+	restore = gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
 		c.Assert(psRootDir, Equals, newData.RootDir)
 		c.Assert(psRollbackDir, Equals, rollbackDir)
 		c.Assert(observer, Equals, muo)
@@ -2355,7 +2537,7 @@ volumes:
 					},
 				})
 				c.Assert(loc, Equals, gadget.StructureLocation{
-					RootMountPoint: filepath.Join(dirs.GlobalRootDir, "/run/mnt/ubuntu-seed"),
+					RootMountPoint: "/run/mnt/ubuntu-seed",
 				})
 			}
 			pcUpdaterForStructureCalls++
@@ -2391,7 +2573,7 @@ volumes:
 					},
 				})
 				c.Assert(loc, Equals, gadget.StructureLocation{
-					RootMountPoint: filepath.Join(dirs.GlobalRootDir, "/foo/some-filesystem"),
+					RootMountPoint: "/foo/some-filesystem",
 				})
 			default:
 				c.Fatalf("unexpected call")
@@ -2635,7 +2817,7 @@ volumes:
 	pcBackupCalls := make(map[string]bool)
 	fooUpdateCalls := make(map[string]bool)
 	fooBackupCalls := make(map[string]bool)
-	restore = gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
+	restore = gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
 		c.Assert(psRootDir, Equals, newData.RootDir)
 		c.Assert(psRollbackDir, Equals, rollbackDir)
 		c.Assert(observer, Equals, muo)
@@ -2755,9 +2937,30 @@ func (u *updateTestSuite) TestUpdateApplyOnlyWhenNeeded(c *C) {
 	oldData.Info.Volumes["foo"].Structure[2].Update.Edition = 3
 	newData.Info.Volumes["foo"].Structure[2].Update.Edition = 3
 
+	r := gadget.MockVolumeStructureToLocationMap(func(gd gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+		return map[string]map[int]gadget.StructureLocation{
+				"foo": {
+					0: {
+						Device: "/dev/foo",
+						Offset: quantity.OffsetMiB,
+					},
+					1: {
+						RootMountPoint: "/foo",
+					},
+					2: {
+						RootMountPoint: "/foo",
+					},
+				},
+			}, map[string]map[int]*gadget.OnDiskStructure{
+				"foo": gadget.OnDiskStructsFromGadget(gd.Info.Volumes["foo"]),
+			},
+			nil
+	})
+	defer r()
+
 	muo := &mockUpdateProcessObserver{}
 	updaterForStructureCalls := 0
-	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
+	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
 		c.Assert(psRootDir, Equals, newData.RootDir)
 		c.Assert(psRollbackDir, Equals, rollbackDir)
 
@@ -2816,8 +3019,12 @@ func (u *updateTestSuite) TestUpdateApplyErrorLayout(c *C) {
 			},
 		},
 	}
-	r := gadget.MockVolumeStructureToLocationMap(func(_ gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
-		return map[string]map[int]gadget.StructureLocation{"foo": {}}, nil, nil
+	r := gadget.MockVolumeStructureToLocationMap(func(gd gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+		return map[string]map[int]gadget.StructureLocation{"foo": {}},
+			map[string]map[int]*gadget.OnDiskStructure{
+				"foo": gadget.OnDiskStructsFromGadget(gd.Info.Volumes["foo"]),
+			},
+			nil
 	})
 	defer r()
 
@@ -2879,7 +3086,13 @@ func (u *updateTestSuite) TestUpdateApplyErrorIllegalVolumeUpdate(c *C) {
 		},
 	}
 	r := gadget.MockVolumeStructureToLocationMap(func(_ gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
-		return map[string]map[int]gadget.StructureLocation{"foo": {}}, nil, nil
+		return map[string]map[int]gadget.StructureLocation{"foo": {}},
+			map[string]map[int]*gadget.OnDiskStructure{
+				"foo": {
+					0: {},
+				},
+			},
+			nil
 	})
 	defer r()
 
@@ -2938,8 +3151,12 @@ func (u *updateTestSuite) TestUpdateApplyErrorIllegalStructureUpdate(c *C) {
 			},
 		},
 	}
-	r := gadget.MockVolumeStructureToLocationMap(func(_ gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
-		return map[string]map[int]gadget.StructureLocation{"foo": {}}, nil, nil
+	r := gadget.MockVolumeStructureToLocationMap(func(gd gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+		return map[string]map[int]gadget.StructureLocation{"foo": {}},
+			map[string]map[int]*gadget.OnDiskStructure{
+				"foo": gadget.OnDiskStructsFromGadget(gd.Info.Volumes["foo"]),
+			},
+			nil
 	})
 	defer r()
 
@@ -2989,7 +3206,7 @@ func (u *updateTestSuite) TestUpdateApplyErrorRenamedVolume(c *C) {
 	newData := gadget.GadgetData{Info: newInfo, RootDir: c.MkDir()}
 	rollbackDir := c.MkDir()
 
-	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
+	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
 		c.Fatalf("unexpected call")
 		return &mockUpdater{}, nil
 	})
@@ -3038,14 +3255,19 @@ func (u *updateTestSuite) TestUpdateApplyUpdatesAreOptInWithDefaultPolicy(c *C) 
 
 	muo := &mockUpdateProcessObserver{}
 
-	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
+	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
 		c.Fatalf("unexpected call")
 		return &mockUpdater{}, nil
 	})
 	defer restore()
 
 	r := gadget.MockVolumeStructureToLocationMap(func(_ gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
-		return map[string]map[int]gadget.StructureLocation{"foo": {}}, nil, nil
+		return map[string]map[int]gadget.StructureLocation{"foo": {}},
+			map[string]map[int]*gadget.OnDiskStructure{
+				"foo": {
+					0: {},
+				},
+			}, nil
 	})
 	defer r()
 
@@ -3138,8 +3360,41 @@ func (u *updateTestSuite) TestUpdateApplyUpdatesArePolicyControlled(c *C) {
 	newData.Info.Volumes["foo"].Structure[3].Update.Edition = 4
 	newData.Info.Volumes["foo"].Structure[4].Update.Edition = 5
 
+	r := gadget.MockVolumeStructureToLocationMap(func(_ gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+		return map[string]map[int]gadget.StructureLocation{
+				"foo": {
+					0: {
+						Device: "/dev/foo",
+						Offset: quantity.OffsetMiB,
+					},
+					1: {
+						RootMountPoint: "/foo",
+					},
+					2: {
+						RootMountPoint: "/foo",
+					},
+					3: {
+						RootMountPoint: "/foo",
+					},
+					4: {
+						RootMountPoint: "/foo",
+					},
+				},
+			}, map[string]map[int]*gadget.OnDiskStructure{
+				"foo": {
+					0: {},
+					1: {},
+					2: {},
+					3: {},
+					4: {},
+				},
+			},
+			nil
+	})
+	defer r()
+
 	toUpdate := map[string]int{}
-	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
+	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
 		toUpdate[ps.Name()]++
 		return &mockUpdater{}, nil
 	})
@@ -3179,6 +3434,66 @@ func (u *updateTestSuite) TestUpdateApplyUpdatesArePolicyControlled(c *C) {
 	})
 }
 
+func (u *updateTestSuite) TestUpdateApplyUpdatesDefaultPolicy(c *C) {
+	oldData, newData, rollbackDir := u.policyDataSet(c)
+	c.Assert(oldData.Info.Volumes["foo"].Structure, HasLen, 5)
+	c.Assert(newData.Info.Volumes["foo"].Structure, HasLen, 5)
+
+	c.Check(oldData.Info.Volumes["foo"].Structure[1].Name, Equals, "first")
+	// no previous edition specified in the structure, as if it was not
+	// specified in gadget.yaml
+	c.Assert(oldData.Info.Volumes["foo"].Structure[1].Update, DeepEquals, gadget.VolumeUpdate{})
+	// new one has edition set explicitly
+	newData.Info.Volumes["foo"].Structure[1].Update.Edition = 5
+
+	r := gadget.MockVolumeStructureToLocationMap(func(_ gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+		return map[string]map[int]gadget.StructureLocation{
+				"foo": {
+					0: {
+						Device: "/dev/foo",
+						Offset: quantity.OffsetMiB,
+					},
+					1: {
+						RootMountPoint: "/foo",
+					},
+					2: {
+						RootMountPoint: "/foo",
+					},
+					3: {
+						RootMountPoint: "/foo",
+					},
+					4: {
+						RootMountPoint: "/foo",
+					},
+				},
+			}, map[string]map[int]*gadget.OnDiskStructure{
+				"foo": {
+					0: {},
+					1: {},
+					2: {},
+					3: {},
+					4: {},
+				},
+			},
+			nil
+	})
+	defer r()
+
+	toUpdate := map[string]int{}
+	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
+		toUpdate[ps.Name()]++
+		return &mockUpdater{}, nil
+	})
+	defer restore()
+
+	err := gadget.Update(uc16Model, oldData, newData, rollbackDir, nil, nil)
+	c.Assert(err, IsNil)
+	c.Assert(toUpdate, DeepEquals, map[string]int{
+		// the structure was picked for update
+		"first": 1,
+	})
+}
+
 func (u *updateTestSuite) TestUpdateApplyUpdatesRemodelPolicy(c *C) {
 	oldData, newData, rollbackDir := u.policyDataSet(c)
 
@@ -3189,8 +3504,41 @@ func (u *updateTestSuite) TestUpdateApplyUpdatesRemodelPolicy(c *C) {
 	oldData.Info.Volumes["foo"].Structure[3].Update.Edition = 4
 	oldData.Info.Volumes["foo"].Structure[4].Update.Edition = 5
 
+	r := gadget.MockVolumeStructureToLocationMap(func(_ gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+		return map[string]map[int]gadget.StructureLocation{
+				"foo": {
+					0: {
+						Device: "/dev/foo",
+						Offset: quantity.OffsetMiB,
+					},
+					1: {
+						RootMountPoint: "/foo",
+					},
+					2: {
+						RootMountPoint: "/foo",
+					},
+					3: {
+						RootMountPoint: "/foo",
+					},
+					4: {
+						RootMountPoint: "/foo",
+					},
+				},
+			}, map[string]map[int]*gadget.OnDiskStructure{
+				"foo": {
+					0: {},
+					1: {},
+					2: {},
+					3: {},
+					4: {},
+				},
+			},
+			nil
+	})
+	defer r()
+
 	toUpdate := map[string]int{}
-	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
+	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
 		toUpdate[ps.Name()] = toUpdate[ps.Name()] + 1
 		return &mockUpdater{}, nil
 	})
@@ -3216,25 +3564,32 @@ func (u *updateTestSuite) TestUpdateApplyBackupFails(c *C) {
 
 	r := gadget.MockVolumeStructureToLocationMap(func(_ gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
 		return map[string]map[int]gadget.StructureLocation{
-			"foo": {
-				0: {
-					Device: "/dev/foo",
-					Offset: quantity.OffsetMiB,
+				"foo": {
+					0: {
+						Device: "/dev/foo",
+						Offset: quantity.OffsetMiB,
+					},
+					1: {
+						RootMountPoint: "/foo",
+					},
+					2: {
+						RootMountPoint: "/foo",
+					},
 				},
-				1: {
-					RootMountPoint: "/foo",
-				},
-				2: {
-					RootMountPoint: "/foo",
+			}, map[string]map[int]*gadget.OnDiskStructure{
+				"foo": {
+					0: {},
+					1: {},
+					2: {},
 				},
 			},
-		}, nil, nil
+			nil
 	})
 	defer r()
 
 	muo := &mockUpdateProcessObserver{}
 	updaterForStructureCalls := 0
-	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
+	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
 		updater := &mockUpdater{
 			updateCb: func() error {
 				c.Fatalf("unexpected update call")
@@ -3272,12 +3627,37 @@ func (u *updateTestSuite) TestUpdateApplyUpdateFailsThenRollback(c *C) {
 	newData.Info.Volumes["foo"].Structure[1].Update.Edition = 2
 	newData.Info.Volumes["foo"].Structure[2].Update.Edition = 3
 
+	r := gadget.MockVolumeStructureToLocationMap(func(_ gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+		return map[string]map[int]gadget.StructureLocation{
+				"foo": {
+					0: {
+						Device: "/dev/foo",
+						Offset: quantity.OffsetMiB,
+					},
+					1: {
+						RootMountPoint: "/foo",
+					},
+					2: {
+						RootMountPoint: "/foo",
+					},
+				},
+			}, map[string]map[int]*gadget.OnDiskStructure{
+				"foo": {
+					0: {},
+					1: {},
+					2: {},
+				},
+			},
+			nil
+	})
+	defer r()
+
 	muo := &mockUpdateProcessObserver{}
 	updateCalls := make(map[string]bool)
 	backupCalls := make(map[string]bool)
 	rollbackCalls := make(map[string]bool)
 	updaterForStructureCalls := 0
-	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
+	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
 		updater := &mockUpdater{
 			backupCb: func() error {
 				backupCalls[ps.Name()] = true
@@ -3340,11 +3720,32 @@ func (u *updateTestSuite) TestUpdateApplyUpdateErrorRollbackFail(c *C) {
 	newData.Info.Volumes["foo"].Structure[1].Update.Edition = 2
 	newData.Info.Volumes["foo"].Structure[2].Update.Edition = 3
 
+	r := gadget.MockVolumeStructureToLocationMap(func(gd gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+		return map[string]map[int]gadget.StructureLocation{
+				"foo": {
+					0: {
+						Device: "/dev/foo",
+						Offset: quantity.OffsetMiB,
+					},
+					1: {
+						RootMountPoint: "/foo",
+					},
+					2: {
+						RootMountPoint: "/foo",
+					},
+				},
+			}, map[string]map[int]*gadget.OnDiskStructure{
+				"foo": gadget.OnDiskStructsFromGadget(gd.Info.Volumes["foo"]),
+			},
+			nil
+	})
+	defer r()
+
 	updateCalls := make(map[string]bool)
 	backupCalls := make(map[string]bool)
 	rollbackCalls := make(map[string]bool)
 	updaterForStructureCalls := 0
-	restore = gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
+	restore = gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
 		updater := &mockUpdater{
 			backupCb: func() error {
 				backupCalls[ps.Name()] = true
@@ -3412,10 +3813,35 @@ func (u *updateTestSuite) TestUpdateApplyBadUpdater(c *C) {
 	newData.Info.Volumes["foo"].Structure[1].Update.Edition = 2
 	newData.Info.Volumes["foo"].Structure[2].Update.Edition = 3
 
-	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
+	r := gadget.MockVolumeStructureToLocationMap(func(_ gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+		return map[string]map[int]gadget.StructureLocation{
+				"foo": {
+					0: {
+						Device: "/dev/foo",
+						Offset: quantity.OffsetMiB,
+					},
+					1: {
+						RootMountPoint: "/foo",
+					},
+					2: {
+						RootMountPoint: "/foo",
+					},
+				},
+			}, map[string]map[int]*gadget.OnDiskStructure{
+				"foo": {
+					0: {},
+					1: {},
+					2: {},
+				},
+			},
+			nil
+	})
+	defer r()
+
+	r = gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
 		return nil, errors.New("bad updater for structure")
 	})
-	defer restore()
+	defer r()
 
 	// go go go
 	err := gadget.Update(uc16Model, oldData, newData, rollbackDir, nil, nil)
@@ -3453,7 +3879,7 @@ func (u *updateTestSuite) TestUpdaterForStructure(c *C) {
 			EnclosingVolume: &gadget.Volume{},
 		},
 	}
-	updater, err := gadget.UpdaterForStructure(gadget.StructureLocation{}, psBare, gadgetRootDir, rollbackDir, nil)
+	updater, err := gadget.UpdaterForStructure(gadget.StructureLocation{}, psBare, psBare, gadgetRootDir, rollbackDir, nil)
 	c.Assert(err, IsNil)
 	c.Assert(updater, FitsTypeOf, &gadget.RawStructureUpdater{})
 
@@ -3466,12 +3892,12 @@ func (u *updateTestSuite) TestUpdaterForStructure(c *C) {
 			EnclosingVolume: &gadget.Volume{},
 		},
 	}
-	updater, err = gadget.UpdaterForStructure(gadget.StructureLocation{RootMountPoint: "/"}, psFs, gadgetRootDir, rollbackDir, nil)
+	updater, err = gadget.UpdaterForStructure(gadget.StructureLocation{RootMountPoint: "/"}, psFs, psFs, gadgetRootDir, rollbackDir, nil)
 	c.Assert(err, IsNil)
 	c.Assert(updater, FitsTypeOf, &gadget.MountedFilesystemUpdater{})
 
 	// trigger errors
-	updater, err = gadget.UpdaterForStructure(gadget.StructureLocation{Device: "/dev/vda"}, psBare, gadgetRootDir, "", nil)
+	updater, err = gadget.UpdaterForStructure(gadget.StructureLocation{Device: "/dev/vda"}, psBare, psBare, gadgetRootDir, "", nil)
 	c.Assert(err, ErrorMatches, "internal error: backup directory cannot be unset")
 	c.Assert(updater, IsNil)
 }
@@ -3512,10 +3938,31 @@ func (u *updateTestSuite) TestUpdateApplyNoChangedContentInAll(c *C) {
 	oldData.Info.Volumes["foo"].Structure[1].Update.Edition = 1
 	newData.Info.Volumes["foo"].Structure[1].Update.Edition = 2
 
+	r := gadget.MockVolumeStructureToLocationMap(func(gd gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+		return map[string]map[int]gadget.StructureLocation{
+				"foo": {
+					0: {
+						Device: "/dev/foo",
+						Offset: quantity.OffsetMiB,
+					},
+					1: {
+						RootMountPoint: "/foo",
+					},
+					2: {
+						RootMountPoint: "/foo",
+					},
+				},
+			}, map[string]map[int]*gadget.OnDiskStructure{
+				"foo": gadget.OnDiskStructsFromGadget(gd.Info.Volumes["foo"]),
+			},
+			nil
+	})
+	defer r()
+
 	muo := &mockUpdateProcessObserver{}
 	expectedStructs := []string{"first", "second"}
 	updateCalls := 0
-	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
+	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
 		mu := &mockUpdater{
 			updateCb: func() error {
 				c.Assert(expectedStructs, testutil.Contains, ps.Name())
@@ -3550,10 +3997,31 @@ func (u *updateTestSuite) TestUpdateApplyNoChangedContentInSome(c *C) {
 	oldData.Info.Volumes["foo"].Structure[1].Update.Edition = 1
 	newData.Info.Volumes["foo"].Structure[1].Update.Edition = 2
 
+	r := gadget.MockVolumeStructureToLocationMap(func(gd gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+		return map[string]map[int]gadget.StructureLocation{
+				"foo": {
+					0: {
+						Device: "/dev/foo",
+						Offset: quantity.OffsetMiB,
+					},
+					1: {
+						RootMountPoint: "/foo",
+					},
+					2: {
+						RootMountPoint: "/foo",
+					},
+				},
+			}, map[string]map[int]*gadget.OnDiskStructure{
+				"foo": gadget.OnDiskStructsFromGadget(gd.Info.Volumes["foo"]),
+			},
+			nil
+	})
+	defer r()
+
 	muo := &mockUpdateProcessObserver{}
 	expectedStructs := []string{"first", "second"}
 	updateCalls := 0
-	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
+	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
 		mu := &mockUpdater{
 			updateCb: func() error {
 				c.Assert(expectedStructs, testutil.Contains, ps.Name())
@@ -3586,7 +4054,28 @@ func (u *updateTestSuite) TestUpdateApplyObserverBeforeWriteErrs(c *C) {
 	oldData, newData, rollbackDir := u.updateDataSet(c)
 	newData.Info.Volumes["foo"].Structure[0].Update.Edition = 1
 
-	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
+	r := gadget.MockVolumeStructureToLocationMap(func(gd gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+		return map[string]map[int]gadget.StructureLocation{
+				"foo": {
+					0: {
+						Device: "/dev/foo",
+						Offset: quantity.OffsetMiB,
+					},
+					1: {
+						RootMountPoint: "/foo",
+					},
+					2: {
+						RootMountPoint: "/foo",
+					},
+				},
+			}, map[string]map[int]*gadget.OnDiskStructure{
+				"foo": gadget.OnDiskStructsFromGadget(gd.Info.Volumes["foo"]),
+			},
+			nil
+	})
+	defer r()
+
+	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
 		updater := &mockUpdater{
 			updateCb: func() error {
 				c.Fatalf("unexpected call")
@@ -3615,9 +4104,30 @@ func (u *updateTestSuite) TestUpdateApplyObserverCanceledErrs(c *C) {
 	oldData, newData, rollbackDir := u.updateDataSet(c)
 	newData.Info.Volumes["foo"].Structure[0].Update.Edition = 1
 
+	r := gadget.MockVolumeStructureToLocationMap(func(gd gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
+		return map[string]map[int]gadget.StructureLocation{
+				"foo": {
+					0: {
+						Device: "/dev/foo",
+						Offset: quantity.OffsetMiB,
+					},
+					1: {
+						RootMountPoint: "/foo",
+					},
+					2: {
+						RootMountPoint: "/foo",
+					},
+				},
+			}, map[string]map[int]*gadget.OnDiskStructure{
+				"foo": gadget.OnDiskStructsFromGadget(gd.Info.Volumes["foo"]),
+			},
+			nil
+	})
+	defer r()
+
 	backupErr := errors.New("backup fails")
 	updateErr := errors.New("update fails")
-	restore = gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
+	restore = gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
 		updater := &mockUpdater{
 			backupCb: func() error { return backupErr },
 			updateCb: func() error { return updateErr },
@@ -3777,12 +4287,18 @@ func (u *updateTestSuite) TestUpdateApplyUpdatesWithKernelPolicy(c *C) {
 
 	r := gadget.MockVolumeStructureToLocationMap(func(_ gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
 		return map[string]map[int]gadget.StructureLocation{
-			"foo": {
-				0: {
-					RootMountPoint: "/foo",
+				"foo": {
+					0: {
+						RootMountPoint: "/foo",
+					},
 				},
 			},
-		}, nil, nil
+			map[string]map[int]*gadget.OnDiskStructure{
+				"foo": {
+					0: {},
+				},
+			},
+			nil
 	})
 	defer r()
 
@@ -3817,7 +4333,7 @@ assets:
 	// updater is only called with the kernel content, not with the
 	// gadget content.
 	mockUpdaterCalls := 0
-	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
+	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
 		mockUpdaterCalls++
 		c.Check(ps.ResolvedContent, DeepEquals, []gadget.ResolvedContent{
 			{
@@ -3887,13 +4403,19 @@ assets:
 	rollbackDir := c.MkDir()
 	muo := &mockUpdateProcessObserver{}
 
-	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
+	restore := gadget.MockUpdaterForStructure(func(loc gadget.StructureLocation, fromPs, ps *gadget.LaidOutStructure, psRootDir, psRollbackDir string, observer gadget.ContentUpdateObserver) (gadget.Updater, error) {
 		panic("should not get called")
 	})
 	defer restore()
 
 	r := gadget.MockVolumeStructureToLocationMap(func(_ gadget.GadgetData, _ gadget.Model, _ map[string]*gadget.Volume) (map[string]map[int]gadget.StructureLocation, map[string]map[int]*gadget.OnDiskStructure, error) {
-		return map[string]map[int]gadget.StructureLocation{"foo": {}}, nil, nil
+		return map[string]map[int]gadget.StructureLocation{"foo": {}},
+			map[string]map[int]*gadget.OnDiskStructure{
+				"foo": {
+					0: {},
+				},
+			},
+			nil
 	})
 	defer r()
 
@@ -4705,7 +5227,7 @@ func (u *updateTestSuite) TestBuildNewVolumeToDeviceMappingImplicitSystemBootMul
 
 	opts := &gadget.LayoutOptions{GadgetRootDir: gadgetRoot}
 	for volName, vol := range info.Volumes {
-		lvol, err := gadget.LayoutVolume(vol, nil, opts)
+		lvol, err := gadget.LayoutVolume(vol, gadget.OnDiskStructsFromGadget(vol), opts)
 		c.Assert(err, IsNil)
 		allLaidOutVolumes[volName] = lvol
 	}
@@ -4747,6 +5269,60 @@ func (u *updateTestSuite) TestBuildNewVolumeToDeviceMappingPreUC20NonFatalError(
 	}
 	_, err = gadget.BuildNewVolumeToDeviceMapping(uc16Model, old, vols)
 	c.Assert(err, Equals, gadget.ErrSkipUpdateProceedRefresh)
+
+	// it's a fatal error on UC20 though
+	_, err = gadget.BuildNewVolumeToDeviceMapping(uc20Model, old, vols)
+	c.Assert(err, Not(Equals), gadget.ErrSkipUpdateProceedRefresh)
+}
+
+func (u *updateTestSuite) TestBuildNewVolumeToDeviceMappingPreUC20CannotMap(c *C) {
+	mockLogBuf, restore := logger.MockLogger()
+	defer restore()
+
+	allLaidOutVolumes, err := gadgettest.LayoutMultiVolumeFromYaml(c.MkDir(), "", gadgettest.UC16YAMLImplicitSystemData, uc16Model)
+	c.Assert(err, IsNil)
+
+	old := gadget.GadgetData{
+		Info: &gadget.Info{
+			Volumes: make(map[string]*gadget.Volume),
+		},
+	}
+
+	for volName, laidOutVol := range allLaidOutVolumes {
+		old.Info.Volumes[volName] = laidOutVol.Volume
+	}
+
+	// setup symlink for the system-boot partition
+	err = os.MkdirAll(filepath.Join(dirs.GlobalRootDir, "/dev/disk/by-partlabel"), 0755)
+	c.Assert(err, IsNil)
+	fakedevicepart := filepath.Join(dirs.GlobalRootDir, "/dev/vda1")
+	err = os.Symlink(fakedevicepart, filepath.Join(dirs.GlobalRootDir, "/dev/disk/by-partlabel", disks.BlkIDEncodeLabel("EFI System")))
+	c.Assert(err, IsNil)
+	err = os.WriteFile(fakedevicepart, nil, 0644)
+	c.Assert(err, IsNil)
+
+	// mock the partition device node to mock disk
+	restore = disks.MockPartitionDeviceNodeToDiskMapping(map[string]*disks.MockDiskMapping{
+		filepath.Join(dirs.GlobalRootDir, "/dev/vda1"): gadgettest.VMSystemVolumeDiskMapping,
+	})
+	defer restore()
+
+	// and the device name to the disk itself
+	restore = disks.MockDeviceNameToDiskMapping(map[string]*disks.MockDiskMapping{
+		"/dev/vda": gadgettest.VMSystemVolumeDiskMapping,
+	})
+	defer restore()
+
+	vols := map[string]*gadget.Volume{}
+	for name, lov := range allLaidOutVolumes {
+		vols[name] = lov.Volume
+	}
+
+	// The call will fail as it won't find a match between /dev/vda2 and
+	// any partition defined in the gadget. But it is ok for UC16/18.
+	_, err = gadget.BuildNewVolumeToDeviceMapping(uc16Model, old, vols)
+	c.Assert(err, Equals, gadget.ErrSkipUpdateProceedRefresh)
+	c.Assert(mockLogBuf.String(), testutil.Contains, "WARNING: not applying gadget asset updates on main system-boot volume due to error while finding disk traits")
 
 	// it's a fatal error on UC20 though
 	_, err = gadget.BuildNewVolumeToDeviceMapping(uc20Model, old, vols)

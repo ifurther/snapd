@@ -2084,7 +2084,8 @@ volumes:
 
 		// also layout the volume and check that when laying out the MBR
 		// structure it retains the role of MBR, as validated by IsRoleMBR
-		ls, err := gadget.LayoutVolumePartially(giMeta.Volumes[volName], nil)
+		vol := giMeta.Volumes[volName]
+		ls, err := gadget.LayoutVolumePartially(vol, gadget.OnDiskStructsFromGadget(vol))
 		c.Assert(err, IsNil)
 		c.Check(ls.LaidOutStructure[0].VolumeStructure.IsRoleMBR(), Equals, true)
 	}
@@ -2352,45 +2353,38 @@ func (s *gadgetYamlTestSuite) TestLaidOutVolumesFromGadgetMultiVolume(c *C) {
 	err = os.WriteFile(filepath.Join(s.dir, "u-boot.imz"), nil, 0644)
 	c.Assert(err, IsNil)
 
-	systemLv, all, err := gadgettest.LaidOutVolumesFromGadget(s.dir, "", uc20Mod, secboot.EncryptionTypeNone, nil)
+	all, err := gadgettest.LaidOutVolumesFromGadget(s.dir, "", uc20Mod, secboot.EncryptionTypeNone, nil)
 	c.Assert(err, IsNil)
 
 	c.Assert(all, HasLen, 2)
-	c.Assert(all["frobinator-image"], DeepEquals, systemLv)
-	c.Assert(all["u-boot-frobinator"].LaidOutStructure, DeepEquals, []gadget.LaidOutStructure{
-		{
-			OnDiskStructure: gadget.OnDiskStructure{
-				Name:        "u-boot",
-				Type:        "bare",
-				Size:        quantity.Size(623000),
+	c.Assert(all["u-boot-frobinator"].LaidOutStructure[0], DeepEquals, gadget.LaidOutStructure{
+		OnDiskStructure: gadget.OnDiskStructure{
+			Name:        "u-boot",
+			Type:        "bare",
+			StartOffset: 24576,
+			Size:        623000,
+		},
+		VolumeStructure: &gadget.VolumeStructure{
+			VolumeName: "u-boot-frobinator",
+			Name:       "u-boot",
+			Offset:     asOffsetPtr(24576),
+			Size:       quantity.Size(623000),
+			MinSize:    quantity.Size(623000),
+			Type:       "bare",
+			Content: []gadget.VolumeContent{
+				{Image: "u-boot.imz"},
+			},
+			EnclosingVolume: all["u-boot-frobinator"].Volume,
+		},
+		LaidOutContent: []gadget.LaidOutContent{
+			{
+				VolumeContent: &gadget.VolumeContent{
+					Image: "u-boot.imz",
+				},
 				StartOffset: 24576,
-			},
-			VolumeStructure: &gadget.VolumeStructure{
-				VolumeName: "u-boot-frobinator",
-				Name:       "u-boot",
-				Offset:     asOffsetPtr(24576),
-				Size:       quantity.Size(623000),
-				MinSize:    quantity.Size(623000),
-				Type:       "bare",
-				Content: []gadget.VolumeContent{
-					{Image: "u-boot.imz"},
-				},
-				EnclosingVolume: all["u-boot-frobinator"].Volume,
-			},
-			LaidOutContent: []gadget.LaidOutContent{
-				{
-					VolumeContent: &gadget.VolumeContent{
-						Image: "u-boot.imz",
-					},
-					StartOffset: 24576,
-				},
 			},
 		},
 	})
-
-	c.Assert(systemLv.Volume.Bootloader, Equals, "u-boot")
-	// ubuntu-seed, ubuntu-save, ubuntu-boot and ubuntu-data
-	c.Assert(systemLv.LaidOutStructure, HasLen, 4)
 }
 
 func (s *gadgetYamlTestSuite) TestLaidOutVolumesFromGadgetHappy(c *C) {
@@ -2401,13 +2395,12 @@ func (s *gadgetYamlTestSuite) TestLaidOutVolumesFromGadgetHappy(c *C) {
 		c.Assert(err, IsNil)
 	}
 
-	systemLv, all, err := gadgettest.LaidOutVolumesFromGadget(s.dir, "", coreMod, secboot.EncryptionTypeNone, nil)
+	all, err := gadgettest.LaidOutVolumesFromGadget(s.dir, "", coreMod, secboot.EncryptionTypeNone, nil)
 	c.Assert(err, IsNil)
 	c.Assert(all, HasLen, 1)
-	c.Assert(all["pc"], DeepEquals, systemLv)
-	c.Assert(systemLv.Volume.Bootloader, Equals, "grub")
+	c.Assert(all["pc"].Volume.Bootloader, Equals, "grub")
 	// mbr, bios-boot, efi-system
-	c.Assert(systemLv.LaidOutStructure, HasLen, 3)
+	c.Assert(all["pc"].LaidOutStructure, HasLen, 3)
 }
 
 func (s *gadgetYamlTestSuite) TestLaidOutVolumesFromGadgetAndDiskHappy(c *C) {
@@ -2426,17 +2419,13 @@ func (s *gadgetYamlTestSuite) TestLaidOutVolumesFromGadgetAndDiskHappy(c *C) {
 		4: {Name: "ubuntu-save"},
 		5: {Name: "ubuntu-data"},
 	}
-	volToGadgetToDiskStruct := map[string]map[int]*gadget.OnDiskStructure{
-		"pc": gadgetToDiskStruct,
-	}
-	systemLv, all, err := gadgettest.LaidOutVolumesFromGadget(s.dir, "", uc20Mod, secboot.EncryptionTypeNone, volToGadgetToDiskStruct)
+	all, err := gadgettest.LaidOutVolumesFromGadget(s.dir, "", uc20Mod, secboot.EncryptionTypeNone, nil)
 	c.Assert(err, IsNil)
 	c.Assert(all, HasLen, 1)
-	c.Assert(all["pc"], DeepEquals, systemLv)
-	c.Assert(systemLv.Volume.Bootloader, Equals, "grub")
+	c.Assert(all["pc"].Volume.Bootloader, Equals, "grub")
 	// mbr, bios-boot, seed, boot, save, data
-	c.Assert(systemLv.LaidOutStructure, HasLen, len(gadgetToDiskStruct))
-	for i, los := range systemLv.LaidOutStructure {
+	c.Assert(all["pc"].LaidOutStructure, HasLen, len(gadgetToDiskStruct))
+	for i, los := range all["pc"].LaidOutStructure {
 		c.Check(los.OnDiskStructure.Name, Equals, gadgetToDiskStruct[i].Name)
 		c.Check(los.VolumeStructure.Name, Equals, gadgetToDiskStruct[i].Name)
 	}
@@ -2457,24 +2446,9 @@ func (s *gadgetYamlTestSuite) TestLaidOutVolumesFromGadgetAndDiskFail(c *C) {
 	volToGadgetToDiskStruct := map[string]map[int]*gadget.OnDiskStructure{
 		"pc": gadgetToDiskStruct,
 	}
-	systemLv, all, err := gadgettest.LaidOutVolumesFromGadget(s.dir, "", uc20Mod, secboot.EncryptionTypeNone, volToGadgetToDiskStruct)
+	all, err := gadgettest.LaidOutVolumesFromGadget(s.dir, "", uc20Mod, secboot.EncryptionTypeNone, volToGadgetToDiskStruct)
 	c.Assert(err.Error(), Equals, `internal error: partition "ubuntu-seed" not in disk map`)
-	c.Assert(systemLv, IsNil)
 	c.Assert(all, IsNil)
-}
-
-func (s *gadgetYamlTestSuite) TestLaidOutVolumesFromGadgetNeedsModel(c *C) {
-	err := os.WriteFile(s.gadgetYamlPath, gadgetYamlPC, 0644)
-	c.Assert(err, IsNil)
-	for _, fn := range []string{"pc-boot.img", "pc-core.img"} {
-		err = os.WriteFile(filepath.Join(s.dir, fn), nil, 0644)
-		c.Assert(err, IsNil)
-	}
-
-	// need the model in order to lay out system volumes due to the verification
-	// and other metadata we use with the gadget
-	_, _, err = gadgettest.LaidOutVolumesFromGadget(s.dir, "", nil, secboot.EncryptionTypeNone, nil)
-	c.Assert(err, ErrorMatches, "internal error: must have model to lay out system volumes from a gadget")
 }
 
 func (s *gadgetYamlTestSuite) testLaidOutVolumesFromGadgetUCHappy(c *C, gadgetYaml []byte) {
@@ -2485,13 +2459,12 @@ func (s *gadgetYamlTestSuite) testLaidOutVolumesFromGadgetUCHappy(c *C, gadgetYa
 		c.Assert(err, IsNil)
 	}
 
-	systemLv, all, err := gadgettest.LaidOutVolumesFromGadget(s.dir, "", uc20Mod, secboot.EncryptionTypeNone, nil)
+	all, err := gadgettest.LaidOutVolumesFromGadget(s.dir, "", uc20Mod, secboot.EncryptionTypeNone, nil)
 	c.Assert(err, IsNil)
 	c.Assert(all, HasLen, 1)
-	c.Assert(all["pc"], DeepEquals, systemLv)
-	c.Assert(systemLv.Volume.Bootloader, Equals, "grub")
+	c.Assert(all["pc"].Volume.Bootloader, Equals, "grub")
 	// mbr, bios-boot, ubuntu-seed, ubuntu-save, ubuntu-boot, and ubuntu-data
-	c.Assert(systemLv.LaidOutStructure, HasLen, 6)
+	c.Assert(all["pc"].LaidOutStructure, HasLen, 6)
 }
 
 func (s *gadgetYamlTestSuite) TestLaidOutVolumesFromGadgetUCHappy(c *C) {
@@ -2811,6 +2784,15 @@ memmap=100M@2G,100M#3G,1G!1024G
 `
 
 func (s *gadgetYamlTestSuite) TestKernelCommandLineBasic(c *C) {
+	model := &gadgettest.ModelCharacteristics{}
+
+	mockGadgetYaml := `
+volumes:
+  volumename:
+    schema: gpt
+    bootloader: grub
+`
+
 	for _, tc := range []struct {
 		files [][]string
 
@@ -2820,63 +2802,79 @@ func (s *gadgetYamlTestSuite) TestKernelCommandLineBasic(c *C) {
 	}{{
 		files: [][]string{
 			{"cmdline.extra", "   foo bar baz just-extra\n"},
+			{"meta/gadget.yaml", mockGadgetYaml},
 		},
 		cmdline: "foo bar baz just-extra", full: false,
 	}, {
 		files: [][]string{
 			{"cmdline.full", "    foo bar baz full\n"},
+			{"meta/gadget.yaml", mockGadgetYaml},
 		},
 		cmdline: "foo bar baz full", full: true,
 	}, {
 		files: [][]string{
 			{"cmdline.full", cmdlineMultiLineWithComments},
+			{"meta/gadget.yaml", mockGadgetYaml},
 		},
 		cmdline: "panic=5 reserve=0x300,32 foo=bar baz=baz random=op debug snapd.debug=1 memmap=100M@2G,100M#3G,1G!1024G",
 		full:    true,
 	}, {
 		files: [][]string{
 			{"cmdline.full", ""},
+			{"meta/gadget.yaml", mockGadgetYaml},
 		},
 		cmdline: "",
 		full:    true,
 	}, {
 		// no cmdline
-		files:   nil,
+		files: [][]string{
+			{"meta/gadget.yaml", mockGadgetYaml},
+		},
 		full:    false,
 		cmdline: "",
 	}, {
 		// not what we are looking for
 		files: [][]string{
 			{"cmdline.other", `ignored`},
+			{"meta/gadget.yaml", mockGadgetYaml},
 		},
 		full:    false,
 		cmdline: "",
 	}, {
-		files: [][]string{{"cmdline.full", " # error"}},
-		full:  true, err: `invalid kernel command line in cmdline\.full: unexpected or invalid use of # in argument "#"`,
+		files: [][]string{
+			{"cmdline.full", " # error"},
+			{"meta/gadget.yaml", mockGadgetYaml},
+		},
+		full: true, err: `invalid kernel command line in cmdline\.full: unexpected or invalid use of # in argument "#"`,
 	}, {
-		files: [][]string{{"cmdline.full", "foo bar baz #error"}},
-		full:  true, err: `invalid kernel command line in cmdline\.full: unexpected or invalid use of # in argument "#error"`,
+		files: [][]string{
+			{"cmdline.full", "foo bar baz #error"},
+			{"meta/gadget.yaml", mockGadgetYaml},
+		},
+		full: true, err: `invalid kernel command line in cmdline\.full: unexpected or invalid use of # in argument "#error"`,
 	}, {
 		files: [][]string{
 			{"cmdline.full", "foo bad =\n"},
+			{"meta/gadget.yaml", mockGadgetYaml},
 		},
 		full: true, err: `invalid kernel command line in cmdline\.full: unexpected assignment`,
 	}, {
 		files: [][]string{
 			{"cmdline.extra", "foo bad ="},
+			{"meta/gadget.yaml", mockGadgetYaml},
 		},
 		full: false, err: `invalid kernel command line in cmdline\.extra: unexpected assignment`,
 	}, {
 		files: [][]string{
 			{"cmdline.extra", `extra`},
 			{"cmdline.full", `full`},
+			{"meta/gadget.yaml", mockGadgetYaml},
 		},
 		err: "cannot support both extra and full kernel command lines",
 	}} {
 		c.Logf("files: %q", tc.files)
 		snapPath := snaptest.MakeTestSnapWithFiles(c, string(mockSnapYaml), tc.files)
-		cmdline, full, err := gadget.KernelCommandLineFromGadget(snapPath)
+		cmdline, full, _, err := gadget.KernelCommandLineFromGadget(snapPath, model)
 		if tc.err != "" {
 			c.Assert(err, ErrorMatches, tc.err)
 			c.Check(cmdline, Equals, "")
@@ -2890,6 +2888,8 @@ func (s *gadgetYamlTestSuite) TestKernelCommandLineBasic(c *C) {
 }
 
 func (s *gadgetYamlTestSuite) testKernelCommandLineArgs(c *C, whichCmdline string) {
+	model := &gadgettest.ModelCharacteristics{}
+
 	c.Logf("checking %v", whichCmdline)
 	// mock test snap creates a snap directory
 	info := snaptest.MockSnapWithFiles(c, string(mockSnapYaml),
@@ -2905,12 +2905,15 @@ func (s *gadgetYamlTestSuite) testKernelCommandLineArgs(c *C, whichCmdline strin
 		"snapd_system_disk=somedisk",
 	}
 
+	err := os.WriteFile(filepath.Join(info.MountDir(), "meta", "gadget.yaml"), mockGadgetYaml, 0644)
+	c.Assert(err, IsNil)
+
 	for _, arg := range allowedArgs {
 		c.Logf("trying allowed arg: %q", arg)
 		err := os.WriteFile(filepath.Join(info.MountDir(), whichCmdline), []byte(arg), 0644)
 		c.Assert(err, IsNil)
 
-		cmdline, _, err := gadget.KernelCommandLineFromGadget(info.MountDir())
+		cmdline, _, _, err := gadget.KernelCommandLineFromGadget(info.MountDir(), model)
 		c.Assert(err, IsNil)
 		c.Check(cmdline, Equals, arg)
 	}
@@ -2929,7 +2932,7 @@ func (s *gadgetYamlTestSuite) testKernelCommandLineArgs(c *C, whichCmdline strin
 		err := os.WriteFile(filepath.Join(info.MountDir(), whichCmdline), []byte(arg), 0644)
 		c.Assert(err, IsNil)
 
-		cmdline, _, err := gadget.KernelCommandLineFromGadget(info.MountDir())
+		cmdline, _, _, err := gadget.KernelCommandLineFromGadget(info.MountDir(), model)
 		c.Assert(err, ErrorMatches, fmt.Sprintf(`invalid kernel command line in %v: disallowed kernel argument ".*"`, whichCmdline))
 		c.Check(cmdline, Equals, "")
 	}
@@ -3917,6 +3920,15 @@ func (s *gadgetYamlTestSuite) TestSaveLoadDiskVolumeDeviceTraits(c *C) {
 	c.Assert(err, IsNil)
 
 	c.Assert(m4, DeepEquals, expPiLUKSMap)
+
+	// if disk-mapping.jso is empty file (zero size), we should handle this as device traits are not
+	// available
+	f, err := os.Create(filepath.Join(dirs.SnapDeviceDir, "disk-mapping.json"))
+	c.Assert(err, IsNil)
+	f.Close()
+	mAbsent, err = gadget.LoadDiskVolumesDeviceTraits(dirs.SnapDeviceDir)
+	c.Assert(err, IsNil)
+	c.Assert(mAbsent, HasLen, 0)
 }
 
 func (s *gadgetYamlTestSuite) TestOnDiskStructureIsLikelyImplicitSystemDataRoleUC16Implicit(c *C) {
@@ -4130,6 +4142,7 @@ func (s *gadgetYamlTestSuite) TestAllDiskVolumeDeviceTraitsMultipleGPTVolumes(c 
 	mod := &gadgettest.ModelCharacteristics{
 		HasModes: true,
 	}
+
 	laidOutVols, err := gadgettest.LayoutMultiVolumeFromYaml(
 		c.MkDir(),
 		"",
@@ -4324,14 +4337,13 @@ func (s *gadgetYamlTestSuite) TestLaidOutVolumesFromClassicWithModesGadgetHappy(
 		c.Assert(err, IsNil)
 	}
 
-	systemLv, all, err := gadgettest.LaidOutVolumesFromGadget(s.dir, "", classicWithModesMod, secboot.EncryptionTypeNone, nil)
+	all, err := gadgettest.LaidOutVolumesFromGadget(s.dir, "", classicWithModesMod, secboot.EncryptionTypeNone, nil)
 	c.Assert(err, IsNil)
 	c.Assert(all, HasLen, 1)
-	c.Assert(all["pc"], DeepEquals, systemLv)
-	c.Assert(systemLv.Volume.Bootloader, Equals, "grub")
-	c.Assert(systemLv.LaidOutStructure, HasLen, 6)
-	c.Assert(systemLv.Structure[2].Role, Equals, gadget.SystemSeedNull)
-	c.Assert(systemLv.Structure[2].Label, Equals, "ubuntu-seed")
+	c.Assert(all["pc"].Volume.Bootloader, Equals, "grub")
+	c.Assert(all["pc"].LaidOutStructure, HasLen, 6)
+	c.Assert(all["pc"].Structure[2].Role, Equals, gadget.SystemSeedNull)
+	c.Assert(all["pc"].Structure[2].Label, Equals, "ubuntu-seed")
 }
 
 func (s *gadgetYamlTestSuite) TestHasRole(c *C) {
@@ -5213,4 +5225,25 @@ func (s *gadgetYamlTestSuite) TestGadgetToLinuxFilesystem(c *C) {
 		c.Logf("case %d: %s", i, tc.linFs)
 		c.Check(tc.vs.LinuxFilesystem(), Equals, tc.linFs)
 	}
+}
+
+func (s *gadgetYamlTestSuite) TestGadgetInfoHasRole(c *C) {
+	info := gadget.Info{
+		Volumes: map[string]*gadget.Volume{
+			"name": {
+				Structure: []gadget.VolumeStructure{
+					{Role: gadget.SystemSeed},
+				},
+			},
+			"other-name": {
+				Structure: []gadget.VolumeStructure{
+					{Role: gadget.SystemBoot},
+				},
+			},
+		},
+	}
+
+	c.Check(info.HasRole(gadget.SystemSeed), Equals, true)
+	c.Check(info.HasRole(gadget.SystemBoot), Equals, true)
+	c.Check(info.HasRole(gadget.SystemSeedNull), Equals, false)
 }
