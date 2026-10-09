@@ -21,6 +21,7 @@ package ctlcmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"text/tabwriter"
@@ -80,7 +81,7 @@ func (c *servicesCommand) showGlobalEnablement() bool {
 func (c *servicesCommand) validateArguments() error {
 	// can't use --global and --user together
 	if c.Global && c.User {
-		return fmt.Errorf(i18n.G("cannot combine --global and --user switches."))
+		return errors.New(i18n.G("cannot combine --global and --user switches."))
 	}
 	return nil
 }
@@ -97,8 +98,15 @@ func (c *servicesCommand) Execute([]string) error {
 		return err
 	}
 
+	serviceNames := c.Positional.ServiceNames
+
+	serviceNames, patched, err := maybePatchServiceNames(ctx.InstanceName().String(), serviceNames)
+	if err != nil {
+		return err
+	}
+
 	st := ctx.State()
-	svcInfos, err := getServiceInfos(st, ctx.InstanceName(), c.Positional.ServiceNames)
+	svcInfos, err := getServiceInfos(st, ctx.InstanceName().String(), serviceNames)
 	if err != nil {
 		return err
 	}
@@ -114,9 +122,15 @@ func (c *servicesCommand) Execute([]string) error {
 	w := tabwriter.NewWriter(c.stdout, 5, 3, 2, ' ', 0)
 	defer w.Flush()
 
-	fmt.Fprintln(w, i18n.G("Service\tStartup\tCurrent\tNotes"))
+	fmt.Fprintln(w, "Service\tStartup\tCurrent\tNotes")
 	for _, svc := range services {
-		fmt.Fprintln(w, clientutil.FmtServiceStatus(&svc, isGlobal))
+		fmt.Fprintln(w, clientutil.FmtServiceStatus(&svc, clientutil.FmtServiceStatusOptions{
+			IsUserGlobal: isGlobal,
+			// snap name in services may be subject to patching if the calling
+			// snap has an instance key but the query used $SNAP_NAME
+			DropSnapInstanceKey: patched,
+			FromSnapCtl:         true,
+		}))
 	}
 
 	return nil

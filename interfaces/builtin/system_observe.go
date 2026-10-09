@@ -63,10 +63,13 @@ ptrace (read),
 
 # Other miscellaneous accesses for observing the system
 @{PROC}/cgroups r,
+@{PROC}/buddyinfo r,
 @{PROC}/locks r,
 @{PROC}/modules r,
 @{PROC}/mdstat r,
 @{PROC}/schedstat r,
+@{PROC}/slabinfo r,
+@{PROC}/softirqs r,
 @{PROC}/stat r,
 @{PROC}/vmstat r,
 @{PROC}/zoneinfo r,
@@ -78,7 +81,11 @@ ptrace (read),
 @{PROC}/pressure/memory r,
 @{PROC}/sys/kernel/panic r,
 @{PROC}/sys/kernel/panic_on_oops r,
+@{PROC}/sys/kernel/random/poolsize r,
+@{PROC}/sys/kernel/random/urandom_min_reseed_secs r,
+@{PROC}/sys/kernel/random/write_wakeup_threshold r,
 @{PROC}/sys/kernel/sched_autogroup_enabled r,
+@{PROC}/sys/kernel/threads-max r,
 @{PROC}/sys/vm/max_map_count r,
 @{PROC}/sys/vm/panic_on_oom r,
 @{PROC}/sys/vm/swappiness r,
@@ -104,6 +111,10 @@ ptrace (read),
 @{PROC}/*/{,task/*/}status r,
 @{PROC}/*/{,task/*/}wchan r,
 
+# Allow listing of existing file descriptors, which is needed for tools like nvtop
+# and resources that monitor per-process GPU usage.
+@{PROC}/*/fdinfo/ r,
+
 # Allow reading processes security label
 @{PROC}/*/{,task/*/}attr/{,apparmor/}current r,
 
@@ -122,6 +133,15 @@ ptrace (read),
 /sys/fs/cgroup/cpu,cpuacct/cpu.shares r,
 /sys/fs/cgroup/cpu,cpuacct/cpu.stat r,
 /sys/fs/cgroup/memory/memory.stat r,
+
+# Allow reading the system max CPU resource constraints
+/sys/fs/cgroup/system.slice/cpu.max r,
+
+# Allow reading ext4 and btrfs filesystems information
+/sys/fs/{btrfs,ext4}/{,**} r,
+
+# Allow reading zfs filesystem information
+@{PROC}/spl/kstat/zfs/{,**} r,
 
 #include <abstractions/dbus-strict>
 
@@ -143,7 +163,7 @@ dbus (send)
 # Allow clients to enumerate DBus connection names on common buses
 dbus (send)
     bus={session,system}
-    path=/org/freedesktop/DBus
+    path={/,/org/freedesktop/DBus}
     interface=org.freedesktop.DBus
     member={ListNames,ListActivatableNames}
     peer=(label=unconfined),
@@ -188,11 +208,13 @@ const systemObserveConnectedPlugSecComp = `
 # it gives privileged read access to all processes on the system and should
 # only be used with trusted apps.
 
+lsm_get_self_attr
+
 # ptrace can be used to break out of the seccomp sandbox, but ps requests
 # 'ptrace (trace)' from apparmor. 'ps' does not need the ptrace syscall though,
-# so we deny the ptrace here to make sure we are always safe.
-# Note: may uncomment once ubuntu-core-launcher understands @deny rules and
-# if/when we conditionally deny this in the future.
+# so we deny the ptrace here to make sure we are always safe. Note: may
+# uncomment once snap-confine understands @deny rules and if/when we
+# conditionally deny this in the future.
 #@deny ptrace
 `
 
@@ -237,12 +259,13 @@ func (iface *systemObserveInterface) MountPermanentPlug(spec *mount.Specificatio
 func init() {
 	registerIface(&systemObserveInterface{
 		commonInterface: commonInterface{
-			name:                 "system-observe",
-			summary:              systemObserveSummary,
-			implicitOnCore:       true,
-			implicitOnClassic:    true,
-			baseDeclarationSlots: systemObserveBaseDeclarationSlots,
-			connectedPlugSecComp: systemObserveConnectedPlugSecComp,
+			name:                     "system-observe",
+			summary:                  systemObserveSummary,
+			implicitOnCore:           true,
+			implicitOnClassic:        true,
+			baseDeclarationSlots:     systemObserveBaseDeclarationSlots,
+			connectedPlugSecComp:     systemObserveConnectedPlugSecComp,
+			parallelInstancesSlotErr: errParallelInstancesSystemSlot,
 		},
 	})
 }

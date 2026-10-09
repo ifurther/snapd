@@ -20,6 +20,9 @@ remap_one() {
         test-snapd-pkg-2)
             echo "texlive-base"
             ;;
+        gdbserver)
+            echo "gdb-gdbserver"
+            ;;
         *)
             echo "$1"
             ;;
@@ -62,7 +65,9 @@ cmd_query() {
 }
 
 cmd_list_installed() {
-    rpm -qa | sort
+    # Keep only the stable package identity (name.arch), excluding version data,
+    # so restore diffs do not treat package upgrades during a test as new installs.
+    rpm -qa --qf '%{NAME}.%{ARCH}\n' | sort -u
 }
 
 cmd_remove() {
@@ -71,5 +76,13 @@ cmd_remove() {
         dnf remove -y $@
     else
         yum remove -y $@
+    fi
+}
+
+cmd_download() {
+    if [ "$(command -v dnf)" != "" ]; then
+        dnf download -q "$@"
+    else
+        yum reinstall --downloadonly -q -y --downloaddir "${PWD:-.}" "$@"
     fi
 }

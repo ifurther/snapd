@@ -55,8 +55,8 @@ func mockSnap(c *check.C, instanceName, yamlText string, sideInfo *snap.SideInfo
 		snapInfo.InstanceKey = instanceKey
 
 		// Make sure snap name/instance name checks out
-		c.Assert(snapInfo.InstanceName(), check.Equals, instanceName)
-		c.Assert(snapInfo.SnapName(), check.Equals, snapName)
+		c.Assert(snapInfo.InstanceName().String(), check.Equals, instanceName)
+		c.Assert(snapInfo.SnapName().String(), check.Equals, snapName)
 	}
 
 	// Put the YAML on disk, in the right spot.
@@ -85,19 +85,28 @@ func MockSnap(c *check.C, yamlText string, sideInfo *snap.SideInfo) *snap.Info {
 	return mockSnap(c, "", yamlText, sideInfo)
 }
 
+// MockComponentInfo creates a snap.ComponentInfo from yaml and includes csi if
+// provided. Disk is not touched, if that is needed use MockComponent instead.
+func MockComponentInfo(c *check.C, yamlText string, csi snap.ComponentSideInfo) *snap.ComponentInfo {
+	compInfo, err := snap.InfoFromComponentYaml([]byte(yamlText))
+	c.Assert(err, check.IsNil)
+	compInfo.ComponentSideInfo = csi
+
+	return compInfo
+}
+
 // MockComponent puts a component.yaml file on disk so to mock an installed
 // component, based on the provided arguments.
 //
 // The caller is responsible for mocking root directory with dirs.SetRootDir()
 // and for altering the overlord state if required.
-func MockComponent(c *check.C, yamlText string, info *snap.Info) *snap.ComponentInfo {
+func MockComponent(c *check.C, yamlText string, info *snap.Info, csi snap.ComponentSideInfo) *snap.ComponentInfo {
 	infoForName, err := snap.InfoFromComponentYaml([]byte(yamlText))
 	c.Assert(err, check.IsNil)
 
-	componentName := infoForName.Component.ComponentName
-
-	// Put the YAML on disk, in the right spot.
-	metaDir := filepath.Join(snap.BaseDir(info.InstanceName()), "components", info.Revision.String(), componentName, "meta")
+	// Put the component.yaml on disk, in the right spot.
+	mountDir := snap.ComponentMountDir(infoForName.Component.ComponentName, csi.Revision, info.InstanceName())
+	metaDir := filepath.Join(mountDir, "meta")
 	err = os.MkdirAll(metaDir, 0755)
 	c.Assert(err, check.IsNil)
 
@@ -108,11 +117,17 @@ func MockComponent(c *check.C, yamlText string, info *snap.Info) *snap.Component
 	err = os.MkdirAll(filepath.Dir(info.MountFile()), 0755)
 	c.Assert(err, check.IsNil)
 
-	// TODO: write something to disk for the component snap file, like in
-	// MockSnap
+	compPath := MakeTestComponent(c, yamlText)
+	cpi := snap.MinimalComponentContainerPlaceInfo(
+		csi.Component.ComponentName,
+		csi.Revision,
+		info.InstanceName(),
+	)
+	err = os.Rename(compPath, cpi.MountFile())
+	c.Assert(err, check.IsNil)
 
 	container := snapdir.New(filepath.Dir(metaDir))
-	component, err := snap.ReadComponentInfoFromContainer(container, info)
+	component, err := snap.ReadComponentInfoFromContainer(container, info, &csi)
 	c.Assert(err, check.IsNil)
 
 	return component
@@ -139,6 +154,23 @@ func MockSnapCurrent(c *check.C, yamlText string, sideInfo *snap.SideInfo) *snap
 	return si
 }
 
+func MockComponentCurrent(c *check.C, yamlText string, info *snap.Info, csi snap.ComponentSideInfo) *snap.ComponentInfo {
+	ci := MockComponent(c, yamlText, info, csi)
+
+	mountDir := snap.ComponentMountDir(ci.Component.ComponentName, ci.Revision, info.InstanceName())
+	link := filepath.Join(snap.ComponentsBaseDir(info.InstanceName()), info.Revision.String(), ci.Component.ComponentName)
+	err := os.MkdirAll(filepath.Dir(link), 0755)
+	c.Assert(err, check.IsNil)
+
+	linkDest, err := filepath.Rel(filepath.Dir(link), mountDir)
+	c.Assert(err, check.IsNil)
+
+	err = os.Symlink(linkDest, link)
+	c.Assert(err, check.IsNil)
+
+	return ci
+}
+
 // MockSnapInstanceCurrent does the same as MockSnapInstance but additionally
 // creates the 'current' symlink.
 //
@@ -146,7 +178,7 @@ func MockSnapCurrent(c *check.C, yamlText string, sideInfo *snap.SideInfo) *snap
 // and for altering the overlord state if required.
 func MockSnapInstanceCurrent(c *check.C, instanceName, yamlText string, sideInfo *snap.SideInfo) *snap.Info {
 	si := MockSnapInstance(c, instanceName, yamlText, sideInfo)
-	err := os.Symlink(si.MountDir(), filepath.Join(si.MountDir(), "../current"))
+	err := os.Symlink(filepath.Base(si.MountDir()), filepath.Join(si.MountDir(), "../current"))
 	c.Assert(err, check.IsNil)
 	return si
 }
@@ -209,19 +241,36 @@ func MockSnapWithFiles(c *check.C, yamlText string, si *snap.SideInfo, files [][
 	return info
 }
 
-// PopulateDir populates the directory with files specified as pairs of relative file path and its content. Useful to add extra files to a snap.
+// PopulateDir populates the directory with files specified as pairs of relative
+// file path and its content. Useful to add extra files to a snap. A path entry
+// ending with "/" indicates a directory, in which case there should be no
+// associated content element or it should be empty.
 func PopulateDir(dir string, files [][]string) {
+	// TODO: tweak the API to take a list of interfaces, each one with its
+	// own creation method
 	for _, filenameAndContent := range files {
 		filename := filenameAndContent[0]
-		content := filenameAndContent[1]
 		fpath := filepath.Join(dir, filename)
-		err := os.MkdirAll(filepath.Dir(fpath), 0755)
-		if err != nil {
-			panic(err)
-		}
-		err = os.WriteFile(fpath, []byte(content), 0755)
-		if err != nil {
-			panic(err)
+		if strings.HasSuffix(filename, "/") {
+			if len(filenameAndContent) > 1 && filenameAndContent[1] != "" {
+				panic(fmt.Sprintf("unexpected content for directory entry %q", filename))
+			}
+			// actually it's a directory
+			err := os.MkdirAll(fpath, 0755)
+			if err != nil {
+				panic(err)
+			}
+		} else {
+			content := filenameAndContent[1]
+			fpath := filepath.Join(dir, filename)
+			err := os.MkdirAll(filepath.Dir(fpath), 0755)
+			if err != nil {
+				panic(err)
+			}
+			err = os.WriteFile(fpath, []byte(content), 0755)
+			if err != nil {
+				panic(err)
+			}
 		}
 	}
 }
@@ -244,19 +293,21 @@ func MakeTestSnapWithFiles(c *check.C, snapYamlContent string, files [][]string)
 // the squashfs with files if required.
 func MakeTestComponentWithFiles(c *check.C, componentName, componentYaml string, files [][]string) (snapFilePath string) {
 	compSource := populateContainer(c, "component.yaml", componentYaml, files)
+
+	componentFileName := fmt.Sprintf("%s.comp", componentName)
 	err := osutil.ChDir(compSource, func() error {
-		d := squashfs.New(componentName)
+		d := squashfs.New(componentFileName)
 		err := d.Build(compSource, nil)
 		return err
 	})
 	c.Assert(err, check.IsNil)
-	return filepath.Join(compSource, componentName)
+	return filepath.Join(compSource, componentFileName)
 }
 
 func MakeTestComponent(c *check.C, compYaml string) string {
 	compInfo, err := snap.InfoFromComponentYaml([]byte(compYaml))
 	c.Assert(err, check.IsNil)
-	return MakeTestComponentWithFiles(c, compInfo.FullName()+".comp", compYaml, nil)
+	return MakeTestComponentWithFiles(c, compInfo.FullName(), compYaml, nil)
 }
 
 func populateContainer(c *check.C, yamlFile, yamlContent string, files [][]string) string {

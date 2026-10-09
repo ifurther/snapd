@@ -32,6 +32,7 @@ import (
 	"github.com/snapcore/snapd/overlord/devicestate"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
+	"github.com/snapcore/snapd/overlord/swfeats"
 )
 
 const (
@@ -40,6 +41,8 @@ const (
 	coreOptionKernelCmdlineAppend          = "core." + optionKernelCmdlineAppend
 	coreOptionKernelDangerousCmdlineAppend = "core." + optionKernelDangerousCmdlineAppend
 )
+
+var applyCmdlineChangeKind = swfeats.RegisterChangeKind("apply-cmdline-append")
 
 func init() {
 	supportedConfigurations[coreOptionKernelCmdlineAppend] = true
@@ -60,6 +63,10 @@ func changedKernelConfigs(c RunTransaction) []string {
 }
 
 func validateCmdlineParamsAreAllowed(st *state.State, devCtx snapstate.DeviceContext, cmdline string) error {
+	if devCtx.IsClassicBoot() {
+		return fmt.Errorf("changing the kernel command line is not supported on a classic system")
+	}
+
 	gd, err := devicestate.CurrentGadgetData(st, devCtx)
 	if err != nil {
 		return err
@@ -117,8 +124,8 @@ func createApplyCmdlineChange(c RunTransaction, kernelOpts []string) (*state.Cha
 	st.Lock()
 	defer st.Unlock()
 
-	// error out if some other change is touching the kernel command line
-	if err := snapstate.CheckUpdateKernelCommandLineConflict(st, ""); err != nil {
+	// check whether there are other changes that need to run exclusively
+	if err := snapstate.CheckChangeConflictExclusiveKinds(st, ""); err != nil {
 		return nil, err
 	}
 
@@ -148,7 +155,7 @@ func createApplyCmdlineChange(c RunTransaction, kernelOpts []string) (*state.Cha
 	// command line and wait for it to finish, otherwise we cannot
 	// wait on the changes to happen.
 	// TODO fix this in the future.
-	cmdlineChg := st.NewChange("apply-cmdline-append",
+	cmdlineChg := st.NewChange(applyCmdlineChangeKind,
 		i18n.G("Update kernel command line due to change in system configuration"))
 	// Add task to the new change to set the new kernel command line
 	t := st.NewTask("update-gadget-cmdline",
@@ -185,6 +192,23 @@ func handleCmdlineAppend(c RunTransaction, opts *fsOnlyContext) error {
 	logger.Debugf("handling %v", kernelOpts)
 
 	st := c.State()
+	// If not seeded yet, this is coming from the gadget defaults and it is
+	// already applied to the kernel command line, do not create another
+	// change for this.
+	// TODO we should introduce better checking as there is a possibility
+	// that the change is happening from a service that has already started
+	// while seeding has not finished yet. We need information about the
+	// task that is doing this. This could happen for other optons that
+	// check seeding state too (netplan).
+	seeded, err := alreadySeeded(c)
+	if err != nil {
+		return err
+	}
+	if !seeded {
+		logger.Debugf("kernel command line defaults already applied, no cmdline change needed")
+		return nil
+	}
+
 	isDangModel, err := isDangerousModel(st)
 	if err != nil {
 		return err

@@ -40,7 +40,13 @@ import (
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 )
+
+// IsConfdbHookname is a hook set by confdbstate (see confdbstate.go).
+var IsConfdbHookname = func(string) bool {
+	panic("internal error: hookstate.IsConfdbHookname is unset")
+}
 
 type hijackFunc func(ctx *Context) error
 type hijackKey struct{ hook, snap string }
@@ -61,7 +67,7 @@ type HookManager struct {
 	runner       *state.TaskRunner
 }
 
-// Handler is the interface a client must satify to handle hooks.
+// Handler is the interface a client must satisfy to handle hooks.
 type Handler interface {
 	// Before is called right before the hook is to be run.
 	Before() error
@@ -80,40 +86,37 @@ type HandlerGenerator func(*Context) Handler
 
 // HookSetup is a reference to a hook within a specific snap.
 type HookSetup struct {
-	Snap        string        `json:"snap"`
-	Revision    snap.Revision `json:"revision"`
-	Hook        string        `json:"hook"`
-	Timeout     time.Duration `json:"timeout,omitempty"`
-	Optional    bool          `json:"optional,omitempty"`     // do not error if script is missing
-	Always      bool          `json:"always,omitempty"`       // run handler even if script is missing
-	IgnoreError bool          `json:"ignore-error,omitempty"` // do not run handler's Error() on error
+	Snap     string        `json:"snap"`
+	Revision snap.Revision `json:"revision"`
+	Hook     string        `json:"hook"`
+	Timeout  time.Duration `json:"timeout,omitempty"`
+
+	// Optional is true if we should not error if the script is missing.
+	Optional bool `json:"optional,omitempty"`
+
+	// Always is true if we should run the handler even if the script is
+	// missing.
+	Always bool `json:"always,omitempty"`
+
+	// IgnoreError is true if we should not run the handler's Error() on error.
+	IgnoreError bool `json:"ignore-error,omitempty"`
+
+	// Component is the component name that the hook is associated with. If the
+	// hook is not associated with a component, the string will be empty.
+	Component string `json:"component,omitempty"`
+
+	// ComponentRevision is the revision of the component that the hook is
+	// associated with. Only valid if Component is not empty.
+	ComponentRevision snap.Revision `json:"component-revision"`
 }
 
 // Manager returns a new HookManager.
 func Manager(s *state.State, runner *state.TaskRunner) (*HookManager, error) {
 	// Make sure we only run 1 hook task for given snap at a time
-	runner.AddBlocked(func(thisTask *state.Task, running []*state.Task) bool {
-		// check if we're a hook task
-		if thisTask.Kind() != "run-hook" {
-			return false
-		}
-		var hooksup HookSetup
-		if thisTask.Get("hook-setup", &hooksup) != nil {
-			return false
-		}
-		thisSnapName := hooksup.Snap
-		// examine all hook tasks, block thisTask if we find any other hook task affecting same snap
-		for _, t := range running {
-			if t.Kind() != "run-hook" || t.Get("hook-setup", &hooksup) != nil {
-				continue // ignore errors and continue checking remaining tasks
-			}
-			if hooksup.Snap == thisSnapName {
-				// found hook task affecting same snap, block thisTask.
-				return true
-			}
-		}
-		return false
-	})
+	runner.AddBlocked(snapIsRunningHook)
+	// ensure hooks can't run concurrently with snap or base unlinking (can
+	// happen during confdb operations that trigger hooks)
+	runner.AddBlocked(snapOrBaseAreInactive)
 
 	manager := &HookManager{
 		state:      s,
@@ -138,6 +141,81 @@ func Manager(s *state.State, runner *state.TaskRunner) (*HookManager, error) {
 	return manager, nil
 }
 
+// snapIsRunningHook returns true if hook's snap already has other running hooks.
+func snapIsRunningHook(cand *state.Task, running []*state.Task) bool {
+	if cand.Kind() != "run-hook" {
+		return false
+	}
+	var hooksup HookSetup
+	if cand.Get("hook-setup", &hooksup) != nil {
+		return false
+	}
+
+	candSnapName := hooksup.Snap
+	// block cand if we find any other hook task affecting same snap
+	for _, t := range running {
+		if t.Kind() != "run-hook" || t.Get("hook-setup", &hooksup) != nil {
+			continue // ignore errors and continue checking remaining tasks
+		}
+		if hooksup.Snap == candSnapName {
+			// found hook task affecting same snap, block candidate task
+			return true
+		}
+	}
+
+	return false
+}
+
+// snapOrBaseAreInactive returns true if the hook should be prevented from
+// running due to the snap it belongs to or its base being inactive.
+func snapOrBaseAreInactive(cand *state.Task, running []*state.Task) bool {
+	if cand.Kind() != "run-hook" {
+		return false
+	}
+
+	// run-hook tasks only run something on undo if they have an undo-hook-setup.
+	// The pre-refresh hook has none, so its undo just returns nil.
+	// Blocking it gains nothing and can deadlock the whole rollback.
+	setupKey := "hook-setup"
+	if status := cand.Status(); status == state.UndoStatus || status == state.UndoingStatus {
+		if !cand.Has("undo-hook-setup") {
+			// undo is a no-op, nothing can be affected by the snap being inactive
+			return false
+		}
+
+		// ensure we select the right hook
+		setupKey = "undo-hook-setup"
+	}
+
+	hooksup, snapst, err := hookSetup(cand, setupKey)
+	if err != nil || !snapst.IsInstalled() {
+		return false
+	}
+
+	// XXX: this prevents the confdb hooks from running while the snap is disabled
+	// (e.g,. refresh). While in theory we shouldn't run any hooks if the snap is
+	// disabled, we've always allowed removals of disabled snaps. Those hooks runs
+	// fail silently which we should eventually prevent (at least require the user
+	// to acknowledge that any removal hooks won't run by --force'ing or similar).
+	if !snapst.Active && IsConfdbHookname(hooksup.Hook) {
+		return true
+	}
+
+	if snapst.Base == "" {
+		// snaps installed before "Base" was added won't have this set
+		return false
+	}
+
+	var baseSnapst snapstate.SnapState
+	err = snapstate.Get(cand.State(), snapst.Base, &baseSnapst)
+	if err != nil {
+		return false
+	}
+
+	// no hooks (confdb or otherwise) can run if the snap's base is currently unlinked
+	return !baseSnapst.Active
+}
+
 // Register registers a function to create Handler values whenever hooks
 // matching the provided pattern are run.
 func (m *HookManager) Register(pattern *regexp.Regexp, generator HandlerGenerator) {
@@ -147,6 +225,15 @@ func (m *HookManager) Register(pattern *regexp.Regexp, generator HandlerGenerato
 // Ensure implements StateManager.Ensure.
 func (m *HookManager) Ensure() error {
 	return nil
+}
+
+// ShutDown implements the ShutDowner interface for the HookManager.
+func (m *HookManager) ShutDown() {
+	// stop hooks gracefully
+	logger.Noticef("gracefully waiting for running hooks")
+	m.GracefullyWaitRunningHooks()
+	logger.Noticef("done waiting for running hooks")
+	m.StopHooks()
 }
 
 // StopHooks kills all currently running hooks and returns after
@@ -236,7 +323,8 @@ func (m *HookManager) NumRunningHooks() int {
 	return int(atomic.LoadInt32(&m.runningHooks))
 }
 
-// GracefullyWaitRunningHooks waits for currently running hooks to finish up to the default hook timeout. Returns true if there are no more running hooks on exit.
+// GracefullyWaitRunningHooks waits for currently running hooks to finish up to
+// the default hook timeout. Returns true if there are no more running hooks on exit.
 func (m *HookManager) GracefullyWaitRunningHooks() bool {
 	toutC := time.After(defaultHookTimeout)
 	doWait := true
@@ -284,7 +372,7 @@ func (m *HookManager) undoRunHook(task *state.Task, tomb *tomb.Tomb) error {
 	return m.runHookForTask(task, tomb, snapst, hooksup)
 }
 
-func (m *HookManager) EphemeralRunHook(ctx context.Context, hooksup *HookSetup, contextData map[string]interface{}) (*Context, error) {
+func (m *HookManager) EphemeralRunHook(ctx context.Context, hooksup *HookSetup, contextData map[string]any) (*Context, error) {
 	var snapst snapstate.SnapState
 	m.state.Lock()
 	err := snapstate.Get(m.state, hooksup.Snap, &snapst)
@@ -318,7 +406,7 @@ func (m *HookManager) runHookForTask(task *state.Task, tomb *tomb.Tomb, snapst *
 func (m *HookManager) runHookGuardForRestarting(context *Context) error {
 	context.Lock()
 	defer context.Unlock()
-	if ok, _ := restart.Pending(m.state); ok {
+	if restart.Pending(m.state) != restart.RestartUnset {
 		return &state.Retry{}
 	}
 
@@ -328,8 +416,12 @@ func (m *HookManager) runHookGuardForRestarting(context *Context) error {
 }
 
 func (m *HookManager) runHook(context *Context, snapst *snapstate.SnapState, hooksup *HookSetup, tomb *tomb.Tomb) error {
-	mustHijack := m.hijacked(hooksup.Hook, hooksup.Snap) != nil
+	// for now, we will only support hijacking snap hooks, not component hooks.
+	// if we ever add components to the snapd snap, we might need to handle
+	// hijacking component hooks as well.
+	mustHijack := context.IsSnapHook() && m.hijacked(hooksup.Hook, hooksup.Snap) != nil
 	hookExists := false
+
 	if !mustHijack {
 		// not hijacked, snap must be installed
 		if !snapst.IsInstalled() {
@@ -341,9 +433,24 @@ func (m *HookManager) runHook(context *Context, snapst *snapstate.SnapState, hoo
 			return fmt.Errorf("cannot read %q snap details: %v", hooksup.Snap, err)
 		}
 
-		hookExists = info.Hooks[hooksup.Hook] != nil
-		if !hookExists && !hooksup.Optional {
-			return fmt.Errorf("snap %q has no %q hook", hooksup.Snap, hooksup.Hook)
+		if context.IsSnapHook() {
+			hookExists = info.Hooks[hooksup.Hook] != nil
+			if !hookExists && !hooksup.Optional {
+				return fmt.Errorf("snap %q has no %q hook", hooksup.Snap, hooksup.Hook)
+			}
+		} else {
+			comp, err := snapst.CurrentComponentInfo(naming.ComponentRef{
+				SnapName:      info.SnapName(),
+				ComponentName: hooksup.Component,
+			})
+			if err != nil {
+				return fmt.Errorf(`cannot read "%s+%s" component details: %v`, info.SnapName(), hooksup.Component, err)
+			}
+
+			hookExists = comp.Hooks[hooksup.Hook] != nil
+			if !hookExists && !hooksup.Optional {
+				return fmt.Errorf(`component "%s+%s" has no %q hook`, info.SnapName(), hooksup.Component, hooksup.Hook)
+			}
 		}
 	}
 
@@ -434,7 +541,7 @@ func (m *HookManager) runHook(context *Context, snapst *snapstate.SnapState, hoo
 }
 
 func runHookImpl(c *Context, tomb *tomb.Tomb) ([]byte, error) {
-	return runHookAndWait(c.InstanceName(), c.SnapRevision(), c.HookName(), c.ID(), c.Timeout(), tomb)
+	return runHookAndWait(c.HookSource(), c.SnapRevision(), c.HookName(), c.ID(), c.Timeout(), tomb)
 }
 
 var runHook = runHookImpl
@@ -473,8 +580,8 @@ func snapCmd() string {
 
 var defaultHookTimeout = 10 * time.Minute
 
-func runHookAndWait(snapName string, revision snap.Revision, hookName, hookContext string, timeout time.Duration, tomb *tomb.Tomb) ([]byte, error) {
-	argv := []string{snapCmd(), "run", "--hook", hookName, "-r", revision.String(), snapName}
+func runHookAndWait(hookSource string, revision snap.Revision, hookName, hookContext string, timeout time.Duration, tomb *tomb.Tomb) ([]byte, error) {
+	argv := []string{snapCmd(), "run", "--hook", hookName, "-r", revision.String(), hookSource}
 	if timeout == 0 {
 		timeout = defaultHookTimeout
 	}

@@ -7,8 +7,6 @@ if ! command -v snap; then
     apt install -y snapd
 fi
 
-# TODO: Remove the refresh once the issue https://github.com/lxc/lxd/issues/10079 is release to 4.0/candidate
-# Make sure the lxd snap is updated before removing it
 for _ in $(seq 30); do
     if snap changes | grep -qE "Done.*Initialize device"; then
         break
@@ -17,7 +15,6 @@ for _ in $(seq 30); do
 done
 snap wait system seed.loaded
 if snap list lxd; then
-    snap refresh lxd --channel=latest/stable
     snap remove lxd
 fi
 
@@ -28,19 +25,12 @@ if [ -e /var/lib/dpkg/info/snapd.postrm ]; then
     sed -i 's#echo "Final directory cleanup"#umount /snap || true#' /var/lib/dpkg/info/snapd.postrm
 fi
 
-# wait for cloud-init to finish before doing any apt operations, since it will
-# re-write the apt sources.list file and we will be racing with the re-write 
-# trying to do apt operations before cloud-init is done
-# TODO: we should eventually use `cloud-init status --wait`, but that doesn't work
-# in nested containers, see https://bugs.launchpad.net/cloud-init/+bug/1905493
-for _ in $(seq 1 60); do
-    if python3 -c "import apt;apt.apt_pkg.SourceList().read_main_list()"; then
-        break
-    fi
-    sleep 1
-done
+# wait for cloud-init to finish before doing any apt operations
+cloud-init status --wait
 
-apt autoremove --purge -y snapd ubuntu-core-launcher
+apt autoremove --purge -y snapd
+# ubuntu-core-launcher is a transitional package and removed in recent distros
+apt autoremove --purge -y ubuntu-core-launcher || true
 apt update
 
 # requires the snapd deb to already have been "lxd file push"d into the 

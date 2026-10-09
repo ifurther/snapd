@@ -55,6 +55,15 @@ set_tls
 usr26
 usr32
 
+# Requires input fd and so should not pose more security 
+# issues than access to the file in the first place
+# Flags are currently unused and should be 0
+cachestat - - - 0
+
+# Flags are currently unused and should be 0
+mseal - - 0
+map_shadow_stack
+
 capget
 # AppArmor mediates capabilities, so allow capset (useful for apps that for
 # example want to drop capabilities)
@@ -63,11 +72,30 @@ capset
 chdir
 fchdir
 
-# We can't effectively block file perms due to open() with O_CREAT, so allow
-# chmod until we have syscall arg filtering (LP: #1446748)
+# We can't effectively block file perms due to open() with O_CREAT. Allow
+# chmod in general but deny specific patterns with ~ and | (bit mask) entries
+# below.
 chmod
 fchmod
 fchmodat
+fchmodat2
+# Deny setuid bit (S_ISUID = 0o4000) from being used.
+#
+# The signature is:
+#
+# chmod <path> <mode>
+# fchmod <fd> <mode>
+# fchmodat <fd> <path> <mode>
+# fchmodat2 <fd> <path> <mode> <flags>
+~chmod - |S_ISUID
+~fchmod - |S_ISUID
+~fchmodat - - |S_ISUID
+~fchmodat2 - - |S_ISUID -
+# Deny setgid bit (S_ISGID = 0o2000) from being used.
+~chmod - |S_ISGID
+~fchmod - |S_ISGID
+~fchmodat - - |S_ISGID
+~fchmodat2 - - |S_ISGID -
 
 # Daemons typically run as 'root' so allow chown to 'root'. DAC will prevent
 # non-root from chowning to root.
@@ -116,7 +144,15 @@ copy_file_range - - - - - 0
 
 chroot
 
+# creat <path> <mode>
 creat
+
+# Deny setuid bit (S_ISUID = 0o4000) from being used.
+~creat - |S_ISUID
+
+# Deny setgid bit (S_ISGID = 0o2000) from being used.
+~creat - |S_ISGID
+
 dup
 dup2
 dup3
@@ -125,6 +161,7 @@ epoll_create1
 epoll_ctl
 epoll_ctl_old
 epoll_pwait
+epoll_pwait2
 epoll_wait
 epoll_wait_old
 eventfd
@@ -146,8 +183,11 @@ flock
 fork
 ftime
 futex
+futex_requeue
 futex_time64
+futex_wait
 futex_waitv
+futex_wake
 get_mempolicy
 get_robust_list
 get_thread_area
@@ -168,6 +208,13 @@ getpgid
 getpgrp
 getpid
 getppid
+# Note that pidfd_open semantics differs from the traditional pid handling.
+# Any process can open the pid of any other process in its pid namespace. What
+# is further controlled depends on the relationship between the two processes
+# and the capabilities of the calling process. Because of this, we allow
+# pidfd_open unconditionally here and rely on the kernel to enforce proper
+# access control.
+pidfd_open
 getpriority
 getrandom
 getresgid
@@ -188,6 +235,7 @@ getuid32
 getxattr
 fgetxattr
 lgetxattr
+getxattrat
 
 inotify_add_watch
 inotify_init
@@ -205,6 +253,9 @@ inotify_rm_watch
 # TODO: this should be scaled back even more
 ~ioctl - TIOCSTI
 ~ioctl - TIOCLINUX
+# see CVE-2019-7303
+~ioctl - 4294967295|TIOCSTI
+~ioctl - 4294967295|TIOCLINUX
 ioctl
 
 io_cancel
@@ -231,6 +282,7 @@ linkat
 listxattr
 llistxattr
 flistxattr
+listxattrat
 
 lseek
 llseek
@@ -246,6 +298,7 @@ arm_fadvise64_64
 mbind
 membarrier
 memfd_create
+memfd_secret
 mincore
 mkdir
 mkdirat
@@ -257,12 +310,22 @@ mmap2
 
 # Allow mknod for regular files, pipes and sockets (and not block or char
 # devices)
+# mknod <path> <mode> <dev>
+# mknodat <dirfd> <path> <mode> <dev>
 mknod - |S_IFREG -
 mknodat - - |S_IFREG -
 mknod - |S_IFIFO -
 mknodat - - |S_IFIFO -
 mknod - |S_IFSOCK -
 mknodat - - |S_IFSOCK -
+
+# Deny setuid bit (S_ISUID = 0o4000) from being used.
+~mknod - |S_ISUID
+~mknodat - - |S_ISUID
+
+# Deny setgid bit (S_ISGID = 0o2000) from being used.
+~mknod - |S_ISGID
+~mknodat - - |S_ISGID
 
 modify_ldt
 mprotect
@@ -295,12 +358,37 @@ nice <=19
 setpriority PRIO_PROCESS 0 <=19
 
 # LP: #1446748 - support syscall arg filtering for mode_t with O_CREAT
+# open <path> <flags> <mode>
 open
 
+# openat <dirfd> <path> <flags> <mode>
 openat
+
+# Deny openat2 from being used as struct open_how is behind a pointer and it
+# may be used to pass suid/sgid mode.
+# openat2 <dirfd> <path> <how> <size>
+~openat2
+
+# Deny setuid bit (S_ISUID = 0o4000) from being used together with O_CREAT.
+~open - |O_CREAT |S_ISUID
+~openat - - |O_CREAT |S_ISUID
+
+# Deny setgid bit (S_ISGID = 0o2000) from being used together with O_CREAT.
+~open - |O_CREAT |S_ISGID
+~openat - - |O_CREAT |S_ISGID
+
+# Deny setuid bit from being used together with O_TMPFILE.
+~open - |O_TMPFILE |S_ISUID
+~openat - - |O_TMPFILE |S_ISUID
+
+# Deny setgid bit from being used together with O_TMPFILE.
+~open - |O_TMPFILE |S_ISGID
+~openat - - |O_TMPFILE |S_ISGID
+
 pause
 personality
 pipe
+~pipe2 - |O_NOTIFICATION_PIPE
 pipe2
 poll
 ppoll
@@ -333,6 +421,7 @@ remap_file_pages
 removexattr
 fremovexattr
 lremovexattr
+removexattrat
 
 rename
 renameat
@@ -346,6 +435,7 @@ rmdir
 
 # glibc 2.35 unconditionally calls rseq for all threads
 rseq
+rseq_slice_yield
 
 rt_sigaction
 rt_sigpending
@@ -380,6 +470,13 @@ sched_yield
 # the new filter is a subset of the current filter (ie, no widening
 # permissions)
 seccomp
+
+# Allow restricting access with Landlock. This is OK because the kernel
+# enforces that each new restriction only drops accesses for the calling
+# process (i.e., no widening permissions).
+landlock_create_ruleset
+landlock_add_rule
+landlock_restrict_self
 
 select
 _newselect
@@ -425,6 +522,7 @@ set_tid_address
 setxattr
 fsetxattr
 lsetxattr
+setxattrat
 
 shmat
 shmctl
@@ -592,6 +690,7 @@ writev
 pwrite
 pwrite64
 pwritev
+pwritev2
 `)
 
 // Go's net package attempts to bind early to check whether IPv6 is available or not.

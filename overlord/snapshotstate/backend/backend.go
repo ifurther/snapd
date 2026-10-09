@@ -301,15 +301,37 @@ func EstimateSnapshotSize(si *snap.Info, usernames []string, dirOpts *dirs.SnapD
 	return total, nil
 }
 
+// MapSnapDataDirToSnapVar returns a map from absolute path of a snap's data
+// directories to snap variable name. The global directories
+// {$SNAP_DATA, $SNAP_COMMON} are always included and the user directories
+// {$SNAP_USER_DATA, $SNAP_USER_COMMON} are included only for the given
+// usernames (if non-empty). If usernames is empty all users are considered.
+// On user lookup error, the error is returned with nil mappings.
+func MapSnapDataDirToSnapVar(si *snap.Info, opts *dirs.SnapDirOptions, usernames []string) (map[string]string, error) {
+	users, err := usersForUsernames(usernames, opts)
+	if err != nil {
+		return nil, err
+	}
+	mappings := map[string]string{
+		si.DataDir():       "$SNAP_DATA",
+		si.CommonDataDir(): "$SNAP_COMMON",
+	}
+	for _, usr := range users {
+		mappings[si.UserDataDir(usr.HomeDir, opts)] = "$SNAP_USER_DATA"
+		mappings[si.UserCommonDataDir(usr.HomeDir, opts)] = "$SNAP_USER_COMMON"
+	}
+	return mappings, nil
+}
+
 // Save a snapshot
-func Save(ctx context.Context, id uint64, si *snap.Info, cfg map[string]interface{}, usernames []string, dynSnapshotOpts *snap.SnapshotOptions, dirOpts *dirs.SnapDirOptions) (*client.Snapshot, error) {
+func Save(ctx context.Context, id uint64, si *snap.Info, cfg map[string]any, usernames []string, dynSnapshotOpts *snap.SnapshotOptions, dirOpts *dirs.SnapDirOptions) (*client.Snapshot, error) {
 	if err := os.MkdirAll(dirs.SnapshotsDir, 0700); err != nil {
 		return nil, err
 	}
 
 	snapshot := &client.Snapshot{
 		SetID:    id,
-		Snap:     si.InstanceName(),
+		Snap:     si.InstanceName().String(),
 		SnapID:   si.SnapID,
 		Revision: si.Revision,
 		Version:  si.Version,
@@ -345,7 +367,7 @@ func Save(ctx context.Context, id uint64, si *snap.Info, cfg map[string]interfac
 	w := zip.NewWriter(aw)
 	defer w.Close() // note this does not close the file descriptor (that's done by hand on the atomic writer, above)
 	savingUserData := false
-	baseDataDir := snap.BaseDataDir(si.InstanceName())
+	baseDataDir := snap.BaseDataDir(si.InstanceName().String())
 	if err := addSnapDirToZip(ctx, snapshot, w, "root", archiveName, baseDataDir, savingUserData, snapshotOptions.Exclude); err != nil {
 		return nil, err
 	}
@@ -474,7 +496,7 @@ func addToZip(ctx context.Context, snapshot *client.Snapshot, w *zip.Writer, use
 	var sz osutil.Sizer
 	hasher := crypto.SHA3_384.New()
 
-	cmd := tarAsUser(username, tarArgs...)
+	cmd := tarAsUser(ctx, username, tarArgs...)
 	cmd.Stdout = io.MultiWriter(archiveWriter, hasher, &sz)
 
 	// keep (at most) the last 5 non-empty lines of what 'tar' writes to stderr
@@ -490,7 +512,8 @@ func addToZip(ctx context.Context, snapshot *client.Snapshot, w *zip.Writer, use
 		cmd.Stderr = io.MultiWriter(os.Stderr, matchCounter)
 	}
 
-	if err := osutil.RunWithContext(ctx, cmd); err != nil {
+	// cmd is cancellable if ctx in a cancellable context
+	if err := cmd.Run(); err != nil {
 		matches, count := matchCounter.Matches()
 		if count > 0 {
 			note := ""
@@ -566,7 +589,7 @@ func (me *multiError) Error() string {
 	return me.nestedError(0)
 }
 
-// helper to ensure formating of nested multiErrors works.
+// helper to ensure formatting of nested multiErrors works.
 func (me *multiError) nestedError(level int) string {
 	indent := strings.Repeat(" ", level)
 	buf := bytes.NewBufferString(fmt.Sprintf("%s:\n", me.header))
@@ -694,14 +717,14 @@ func (t *importTransaction) unlock() error {
 
 var filepathGlob = filepath.Glob
 
-// CleanupAbandondedImports will clean any import that is in progress.
+// CleanupAbandonedImports will clean any import that is in progress.
 // This is meant to be called at startup of snapd before any real imports
 // happen. It is not safe to run this concurrently with any other snapshot
 // operation.
 //
 // The amount of snapshots cleaned is returned and an error if one or
 // more cleanups did not succeed.
-func CleanupAbandondedImports() (cleaned int, err error) {
+func CleanupAbandonedImports() (cleaned int, err error) {
 	inProgressSnapshots, err := filepathGlob(filepath.Join(dirs.SnapshotsDir, importingFnGlob))
 	if err != nil {
 		return 0, err
@@ -1008,7 +1031,7 @@ func (se *SnapshotExport) Init() error {
 	// but a known issue with this approach here.
 	var sz osutil.Sizer
 	if err := se.StreamTo(&sz); err != nil {
-		return fmt.Errorf("cannot calculcate the size for %v: %s", se.setID, err)
+		return fmt.Errorf("cannot calculate the size for %v: %s", se.setID, err)
 	}
 	se.size = sz.Size()
 	return nil

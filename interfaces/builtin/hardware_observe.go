@@ -98,8 +98,8 @@ network netlink raw,
 @{PROC}/tty/driver/{,*} r,
 @{PROC}/sys/dev/cdrom/info r,
 
-# status of hugepages and transparent_hugepage, but not the pages themselves
-/sys/kernel/mm/{hugepages,transparent_hugepage}/{,**} r,
+# status of ksm (Kernel Samepage Merging), hugepages and transparent_hugepage, but not the pages themselves
+/sys/kernel/mm/{ksm,hugepages,transparent_hugepage}/{,**} r,
 
 # systemd-detect-virt
 /{,usr/}bin/systemd-detect-virt ixr,
@@ -145,6 +145,8 @@ const hardwareObserveConnectedPlugSecComp = `
 # used by 'lspci -A intel-conf1/intel-conf2'
 iopl
 
+riscv_hwprobe
+
 # multicast statistics
 socket AF_NETLINK - NETLINK_GENERIC
 
@@ -155,12 +157,13 @@ bind
 
 func init() {
 	registerIface(&commonInterface{
-		name:                  "hardware-observe",
-		summary:               hardwareObserveSummary,
-		implicitOnCore:        true,
-		implicitOnClassic:     true,
-		baseDeclarationSlots:  hardwareObserveBaseDeclarationSlots,
-		connectedPlugAppArmor: hardwareObserveConnectedPlugAppArmor,
-		connectedPlugSecComp:  hardwareObserveConnectedPlugSecComp,
+		name:                     "hardware-observe",
+		summary:                  hardwareObserveSummary,
+		implicitOnCore:           true,
+		implicitOnClassic:        true,
+		baseDeclarationSlots:     hardwareObserveBaseDeclarationSlots,
+		connectedPlugAppArmor:    hardwareObserveConnectedPlugAppArmor,
+		connectedPlugSecComp:     hardwareObserveConnectedPlugSecComp,
+		parallelInstancesSlotErr: errParallelInstancesSystemSlot,
 	})
 }

@@ -8,8 +8,7 @@ systems:
   # bpftool is not available on core22+ and tests.device-cgroup needs it for cgroups v2
   - -ubuntu-core-22-*
   - -ubuntu-core-24-*
-  # no i386 build of core24
-  - -ubuntu-18.04-32
+  - -ubuntu-core-26-*
   # because udev is a mess there
   - -ubuntu-14.04-*
 
@@ -33,6 +32,11 @@ execute: |
     if os.query is-fedora || os.query is-centos || os.query is-amazon-linux ; then
         has_apparmor=0
     fi
+    case "$SPREAD_SYSTEM" in
+        opensuse-*-selinux-*)
+            has_apparmor=0
+            ;;
+    esac
 
     echo "No devices are assigned to the snap"
     udevadm info "/dev/null" | NOMATCH "E: (CURRENT_)?TAGS=.*container-mgr-snap.*"

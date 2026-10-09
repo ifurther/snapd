@@ -30,6 +30,7 @@ import (
 	"github.com/snapcore/snapd/overlord/snapstate/snapstatetest"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/testutil"
 )
 
@@ -56,6 +57,7 @@ func (s *baseHandlerSuite) SetUpTest(c *C) {
 	var err error
 	s.snapmgr, err = snapstate.Manager(s.state, s.runner)
 	c.Assert(err, IsNil)
+	snapstate.SetStoreCacheCleanNext(s.snapmgr, time.Now().Add(time.Hour))
 
 	s.se = overlord.NewStateEngine(s.state)
 	s.se.AddManager(s.snapmgr)
@@ -77,7 +79,7 @@ func (s *baseHandlerSuite) SetUpTest(c *C) {
 	restoreCheckFreeSpace := snapstate.MockOsutilCheckFreeSpace(func(string, uint64) error { return nil })
 	s.AddCleanup(restoreCheckFreeSpace)
 
-	restoreSecurityProfilesDiscardLate := snapstate.MockSecurityProfilesDiscardLate(func(snapName string, rev snap.Revision, typ snap.Type) error {
+	restoreSecurityProfilesDiscardLate := snapstate.MockSecurityProfilesDiscardLate(func(instanceName naming.InstanceName, rev snap.Revision, typ snap.Type) error {
 		return nil
 	})
 	s.AddCleanup(restoreSecurityProfilesDiscardLate)

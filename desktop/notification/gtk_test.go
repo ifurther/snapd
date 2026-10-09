@@ -20,7 +20,7 @@
 package notification_test
 
 import (
-	"github.com/godbus/dbus"
+	"github.com/godbus/dbus/v5"
 	. "gopkg.in/check.v1"
 
 	"github.com/snapcore/snapd/desktop/notification"
@@ -75,7 +75,7 @@ func (s *gtkSuite) TestSendNotificationSuccess(c *C) {
 		Info: map[string]dbus.Variant{
 			"title":    dbus.MakeVariant("some title"),
 			"body":     dbus.MakeVariant("a body"),
-			"icon":     dbus.MakeVariant([]interface{}{"file", dbus.MakeVariant("an icon")}),
+			"icon":     dbus.MakeVariant([]any{"file", dbus.MakeVariant("an icon")}),
 			"priority": dbus.MakeVariant("urgent"),
 		},
 	})

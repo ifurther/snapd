@@ -24,12 +24,14 @@
 #include <limits.h>
 #include <linux/magic.h>
 #include <stdio.h>
+#include <sys/capability.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/vfs.h>
 #include <unistd.h>
 
+#include "../libsnap-confine-private/cleanup-funcs.h"
 #include "../libsnap-confine-private/error.h"
 #include "../libsnap-confine-private/locking.h"
 #include "../libsnap-confine-private/snap.h"
@@ -40,31 +42,67 @@
 #define NSFS_MAGIC 0x6e736673
 #endif
 
-int main(int argc, char** argv) {
+// Asserts the proces has sufficient capabilities being either run directly by root user or
+// through snap-confine.
+static void assert_caps(void) {
+    cap_t current SC_CLEANUP(cap_free) = cap_get_proc();
+
+    cap_value_t expected_caps[] = {
+        CAP_SYS_ADMIN,    /* umount */
+        CAP_DAC_OVERRIDE, /* for poking around /run/snapd */
+        CAP_CHOWN,        /* for lock file and directory */
+    };
+
+    for (size_t i = 0; i < SC_ARRAY_SIZE(expected_caps); i++) {
+        cap_value_t cap = expected_caps[i];
+        const char *cap_name SC_CLEANUP(cap_free) = cap_to_name(cap);
+
+        cap_flag_value_t set = CAP_CLEAR;
+        if (cap_get_flag(current, cap, CAP_EFFECTIVE, &set) != 0) {
+            die("cannot assert %s state", cap_name);
+        }
+
+        if (set != CAP_SET) {
+            die("missing capability %s", cap_name);
+        }
+    }
+}
+
+int main(int argc, char **argv) {
     if (argc != 2 && argc != 3) {
-        printf("Usage: snap-discard-ns [--from-snap-confine] <SNAP-INSTANCE-NAME>\n");
+        printf("Usage: snap-discard-ns [--snap-already-locked|--from-snap-confine] <SNAP-INSTANCE-NAME>\n");
         return 0;
     }
-    const char* snap_instance_name;
-    bool from_snap_confine;
+    const char *snap_instance_name;
+    bool snap_already_locked;
 
     if (argc == 3) {
-        if (!sc_streq(argv[1], "--from-snap-confine")) {
+        /*
+         * --from-snap-confine and --snap-already-locked mean the same thing,
+         * but are invoked from different places, where depending on the
+         * context, the name makes more or less sense.
+         */
+        if (!sc_streq(argv[1], "--from-snap-confine") && !sc_streq(argv[1], "--snap-already-locked")) {
             die("unexpected argument %s", argv[1]);
         }
-        from_snap_confine = true;
+        snap_already_locked = true;
         snap_instance_name = argv[2];
     } else {
-        from_snap_confine = false;
+        snap_already_locked = false;
         snap_instance_name = argv[1];
     }
 
-    sc_error* err = NULL;
+    sc_error *err = NULL;
     sc_instance_name_validate(snap_instance_name, &err);
     sc_die_on_error(err);
 
+    /* time to assert we have the right capabilities to perform the job */
+    assert_caps();
+    /* TODO: drop superfluous capabilities and keep only the ones that are
+     * explicitly needed */
+
     int snap_lock_fd = -1;
-    if (from_snap_confine) {
+    if (snap_already_locked) {
         sc_verify_snap_lock(snap_instance_name);
     } else {
         /* Grab the lock holding the snap instance. This prevents races from
@@ -76,7 +114,7 @@ int main(int argc, char** argv) {
     }
     debug("discarding mount namespaces of snap %s", snap_instance_name);
 
-    const char* ns_dir_path = "/run/snapd/ns";
+    const char *ns_dir_path = "/run/snapd/ns";
     int ns_dir_fd = open(ns_dir_path, O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (ns_dir_fd < 0) {
         /* The directory may legitimately not exist if no snap has started to
@@ -119,7 +157,7 @@ int main(int argc, char** argv) {
     sc_must_snprintf(usr_mnt_pattern, sizeof usr_mnt_pattern, "%s\\.*\\.mnt", snap_instance_name);
     sc_must_snprintf(sys_info_pattern, sizeof sys_info_pattern, "snap\\.%s\\.info", snap_instance_name);
 
-    DIR* ns_dir = fdopendir(ns_dir_fd);
+    DIR *ns_dir = fdopendir(ns_dir_fd);
     if (ns_dir == NULL) {
         die("cannot fdopendir");
     }
@@ -129,7 +167,7 @@ int main(int argc, char** argv) {
         /* Reset errno ahead of any call to readdir to differentiate errors
          * from legitimate end of directory. */
         errno = 0;
-        struct dirent* dent = readdir(ns_dir);
+        struct dirent *dent = readdir(ns_dir);
         if (dent == NULL) {
             if (errno != 0) {
                 die("cannot read next directory entry");
@@ -139,7 +177,7 @@ int main(int argc, char** argv) {
         }
 
         /* We use dnet->d_name a lot so let's shorten it. */
-        const char* dname = dent->d_name;
+        const char *dname = dent->d_name;
 
         /* Check the four patterns that we have against the name and set the
          * two should flags to decide further actions. Note that we always
@@ -147,7 +185,7 @@ int main(int argc, char** argv) {
         bool should_unmount = false;
         bool should_unlink = false;
         struct variant {
-            const char* pattern;
+            const char *pattern;
             bool unmount;
         };
         struct variant variants[] = {
@@ -157,8 +195,8 @@ int main(int argc, char** argv) {
             {.pattern = usr_fstab_pattern},
             {.pattern = sys_info_pattern},
         };
-        for (size_t i = 0; i < sizeof variants / sizeof *variants; ++i) {
-            struct variant* v = &variants[i];
+        for (size_t i = 0; i < SC_ARRAY_SIZE(variants); ++i) {
+            struct variant *v = &variants[i];
             debug("checking if %s matches %s", dname, v->pattern);
             int match_result = fnmatch(v->pattern, dname, 0);
             if (match_result == FNM_NOMATCH) {

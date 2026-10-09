@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2016-2023 Canonical Ltd
+ * Copyright (C) 2016-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -26,12 +26,14 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/snapcore/snapd/asserts"
 	"github.com/snapcore/snapd/asserts/sysdb"
 	"github.com/snapcore/snapd/boot"
+	"github.com/snapcore/snapd/bootloader"
 	"github.com/snapcore/snapd/client"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/gadget"
@@ -40,20 +42,24 @@ import (
 	"github.com/snapcore/snapd/kernel/fde"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
+	"github.com/snapcore/snapd/osutil/keyboard"
 	"github.com/snapcore/snapd/overlord/assertstate"
 	"github.com/snapcore/snapd/overlord/auth"
 	"github.com/snapcore/snapd/overlord/configstate/config"
 	"github.com/snapcore/snapd/overlord/devicestate/internal"
+	"github.com/snapcore/snapd/overlord/fdestate"
 	"github.com/snapcore/snapd/overlord/hookstate"
 	"github.com/snapcore/snapd/overlord/install"
 	"github.com/snapcore/snapd/overlord/restart"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/overlord/storecontext"
+	"github.com/snapcore/snapd/overlord/swfeats"
 	"github.com/snapcore/snapd/progress"
 	"github.com/snapcore/snapd/release"
 	"github.com/snapcore/snapd/secboot"
 	"github.com/snapcore/snapd/secboot/keys"
+	"github.com/snapcore/snapd/seclog"
 	"github.com/snapcore/snapd/seed"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/snap/snapfile"
@@ -69,12 +75,80 @@ var (
 	cloudInitStatus   = sysconfig.CloudInitStatus
 	restrictCloudInit = sysconfig.RestrictCloudInit
 
-	secbootMarkSuccessful = secboot.MarkSuccessful
+	secbootMarkSuccessful        = secboot.MarkSuccessful
+	secbootPreinstallCheckAction = (*secboot.PreinstallCheckContext).PreinstallCheckAction
+
+	osutilBootID = osutil.BootID
+
+	fdestateAttemptAutoRepairIfNeeded = fdestate.AttemptAutoRepairIfNeeded
+
+	bootGetRunBootChain = boot.GetRunBootChain
+	bootReadModeenv     = boot.ReadModeenv
 )
+
+var (
+	becomeOperationalChangeKind = swfeats.RegisterChangeKind("become-operational")
+	seedChangeKind              = swfeats.RegisterChangeKind("seed")
+	installSystemChangeKind     = swfeats.RegisterChangeKind("install-system")
+	factoryResetChangeKind      = swfeats.RegisterChangeKind("factory-reset")
+)
+
+func init() {
+	swfeats.RegisterEnsure("DeviceManager", "ensureOperationalAfterSeed")
+	swfeats.RegisterEnsure("DeviceManager", "ensureClassicModelAfterSeed")
+	swfeats.RegisterEnsure("DeviceManager", "ensureSeeded")
+	swfeats.RegisterEnsure("DeviceManager", "ensureAutoImportAssertionsWithEarlySeed")
+	swfeats.RegisterEnsure("DeviceManager", "ensureSerialBoundSystemUserAssertionsProcessedAfterSeed")
+	swfeats.RegisterEnsure("DeviceManager", "ensureFDE")
+	swfeats.RegisterEnsure("DeviceManager", "ensureBootOk")
+	swfeats.RegisterEnsure("DeviceManager", "ensureCloudInitRestrictedAfterSeed")
+	swfeats.RegisterEnsure("DeviceManager", "ensureInstalledAfterSeed")
+	swfeats.RegisterEnsure("DeviceManager", "ensureFactoryResetAfterSeed")
+	swfeats.RegisterEnsure("DeviceManager", "ensureSeedInConfigAfterSeed")
+	swfeats.RegisterEnsure("DeviceManager", "ensureTriedRecoverySystemAfterSeed")
+	swfeats.RegisterEnsure("DeviceManager", "ensurePostFactoryResetAfterSeed")
+	swfeats.RegisterEnsure("DeviceManager", "ensureExpiredUsersRemovedAfterSeed")
+	swfeats.RegisterEnsure("DeviceManager", "ensureEarlyBootXKBConfigUpdatedAfterSeed")
+	swfeats.RegisterEnsure("DeviceManager", "ensureExtraSnapdKernelCommandLineFragmentsApplied")
+
+	snapstate.RegisterResealingTaskKind("set-model")
+	snapstate.RegisterResealingTaskKind("create-recovery-system")
+	snapstate.RegisterResealingTaskKind("remove-recovery-system")
+	snapstate.RegisterResealingTaskKind("finalize-recovery-system")
+	snapstate.RegisterResealingTaskKind("fde-reprovision")
+	snapstate.RegisterResealingTaskKind("update-managed-boot-config")
+	snapstate.RegisterResealingTaskKind("update-gadget-cmdline")
+	snapstate.RegisterResealingTaskKind("update-gadget-assets")
+}
 
 // EarlyConfig is a hook set by configstate that can process early configuration
 // during managers' startup.
 var EarlyConfig func(st *state.State, preloadGadget func() (sysconfig.Device, *gadget.Info, error)) error
+
+// ErrNoDeviceIdentityYet is returned when the device doesn't have a serial assertion.
+// It's a special case of ErrNoState.
+var ErrNoDeviceIdentityYet = &noDeviceIdentityYetError{}
+
+// noDeviceIdentityYetError is returned when the device doesn't have a serial assertion.
+type noDeviceIdentityYetError struct{}
+
+func (e *noDeviceIdentityYetError) Error() string {
+	return "device has no identity yet"
+}
+
+func (e *noDeviceIdentityYetError) Is(err error) bool {
+	_, ok := err.(*noDeviceIdentityYetError)
+	return ok || errors.Is(err, state.ErrNoState)
+}
+
+// StateDeviceInitialized represents another manager that can be
+// notified when the device manager has been started.
+type StateDeviceInitialized interface {
+	// DeviceInitialized is called when StartUp has finished on
+	// DeviceManager. There are no use case for returning an error
+	// so far.
+	DeviceInitialized()
+}
 
 // DeviceManager is responsible for managing the device identity and device
 // policies.
@@ -95,12 +169,15 @@ type DeviceManager struct {
 	// newStore can make new stores for remodeling
 	newStore func(storecontext.DeviceBackend) snapstate.StoreService
 
-	bootOkRan            bool
 	bootRevisionsUpdated bool
+	fdeRan               bool
 
 	seedTimings *timings.Timings
 	// this is used during early phases until seeding is under way
-	earlyDeviceSeed     seed.Seed
+	earlyDeviceSeed seed.Seed
+	// these are details about the chosen seed we will be seeding from,
+	// set and valid only before seeding has happened. Should not be
+	// used by tasks that are not explicitly happening prior to system being marked seeded.
 	seedLabel, seedMode string
 	seedChosen          bool
 
@@ -108,11 +185,14 @@ type DeviceManager struct {
 
 	ensureSeedInConfigRan bool
 
+	ensureBootOkRan           bool
 	ensureInstalledRan        bool
 	ensureFactoryResetRan     bool
 	ensurePostFactoryResetRan bool
 
 	ensureTriedRecoverySystemRan bool
+
+	ensureEarlyBootLocaleConfigUpdatedRan bool
 
 	cloudInitAlreadyRestricted           bool
 	cloudInitErrorAttemptStart           *time.Time
@@ -125,9 +205,14 @@ type DeviceManager struct {
 	noRegister                   bool
 
 	preseed            bool
+	preseedHybrid      bool
 	preseedSystemLabel string
 
 	ntpSyncedOrTimedOut bool
+
+	onInit []StateDeviceInitialized
+
+	xkbConfigListener *keyboard.XKBConfigListener
 }
 
 // Manager returns a new device manager.
@@ -135,28 +220,30 @@ func Manager(s *state.State, hookManager *hookstate.HookManager, runner *state.T
 	delayedCrossMgrInit()
 
 	m := &DeviceManager{
-		state:    s,
-		hookMgr:  hookManager,
-		newStore: newStore,
-		reg:      make(chan struct{}),
-		preseed:  snapdenv.Preseeding(),
+		state:         s,
+		hookMgr:       hookManager,
+		newStore:      newStore,
+		reg:           make(chan struct{}),
+		preseed:       snapdenv.Preseeding(),
+		preseedHybrid: snapdenv.PreseedingHybrid(),
 	}
 	m.populateStateFromSeed = m.populateStateFromSeedImpl
 
 	if !m.preseed {
-		modeenv, err := maybeReadModeenv()
+		mode, explicit, err := boot.SystemMode("")
 		if err != nil {
 			return nil, err
 		}
-		if modeenv != nil {
-			logger.Debugf("modeenv for model %q found", modeenv.Model)
-			m.sysMode = modeenv.Mode
+
+		if explicit {
+			logger.Debugf("explicitly set system mode")
+			m.sysMode = mode
 		}
 	} else {
 		// cache system label for preseeding of core20; note, this will fail on
 		// core16/core18 (they are not supported by preseeding) as core20 system
 		// label is expected.
-		if !release.OnClassic {
+		if !release.OnClassic || m.preseedHybrid {
 			var err error
 			m.preseedSystemLabel, err = systemForPreseeding()
 			if err != nil {
@@ -176,9 +263,12 @@ func Manager(s *state.State, hookManager *hookstate.HookManager, runner *state.T
 
 	hookManager.Register(regexp.MustCompile("^prepare-device$"), newBasicHookStateHandler)
 	hookManager.Register(regexp.MustCompile("^install-device$"), newBasicHookStateHandler)
+	hookManager.Register(regexp.MustCompile("^prepare-serial-request$"), newBasicHookStateHandler)
 
 	runner.AddHandler("generate-device-key", m.doGenerateDeviceKey, nil)
 	runner.AddHandler("request-serial", m.doRequestSerial, nil)
+	// Mark-preseeded touches and records the system-key, ensure that it does
+	// not run in parallel with other tasks touching the system-key
 	runner.AddHandler("mark-preseeded", m.doMarkPreseeded, nil)
 	runner.AddHandler("mark-seeded", m.doMarkSeeded, nil)
 	runner.AddHandler("setup-ubuntu-save", m.doSetupUbuntuSave, nil)
@@ -213,12 +303,15 @@ func Manager(s *state.State, hookManager *hookstate.HookManager, runner *state.T
 	// TODO: use better task names that are close to our usual pattern
 	runner.AddHandler("install-finish", m.doInstallFinish, nil)
 	runner.AddHandler("install-setup-storage-encryption", m.doInstallSetupStorageEncryption, nil)
+	runner.AddHandler("install-preseed", m.doInstallPreseed, nil)
 
 	runner.AddBlocked(gadgetUpdateBlocked)
+	runner.AddBlocked(removeRecoverySystemBlocked)
+
+	runner.AddHandler("fde-reprovision", m.doReprovision, nil)
 
 	// wire FDE kernel hook support into boot
-	boot.HasFDESetupHook = m.hasFDESetupHook
-	boot.RunFDESetupHook = m.runFDESetupHook
+	boot.HookKeyProtectorFactory = m.hookKeyProtectorFactory
 	hookManager.Register(regexp.MustCompile("^fde-setup$"), newFdeSetupHandler)
 
 	return m, nil
@@ -248,24 +341,19 @@ func newBasicHookStateHandler(context *hookstate.Context) hookstate.Handler {
 	return genericHook{}
 }
 
-func maybeReadModeenv() (*boot.Modeenv, error) {
-	modeenv, err := boot.ReadModeenv("")
-	if err != nil && !os.IsNotExist(err) {
-		return nil, fmt.Errorf("cannot read modeenv: %v", err)
-	}
-	return modeenv, nil
-}
-
 // ReloadModeenv is only useful for integration testing
 func (m *DeviceManager) ReloadModeenv() error {
 	osutil.MustBeTestBinary("ReloadModeenv can only be called from tests")
-	modeenv, err := maybeReadModeenv()
+
+	mode, explicit, err := boot.SystemMode("")
 	if err != nil {
 		return err
 	}
-	if modeenv != nil {
-		m.sysMode = modeenv.Mode
+
+	if explicit {
+		m.sysMode = mode
 	}
+
 	return nil
 }
 
@@ -277,6 +365,10 @@ const (
 	// SysHasModeenv indicates only systems with modeenv are appropriate.
 	SysHasModeenv
 )
+
+func (m *DeviceManager) AddOnInit(onInit StateDeviceInitialized) {
+	m.onInit = append(m.onInit, onInit)
+}
 
 // SystemMode returns the current mode of the system.
 // An expectation about the system controls the returned mode when
@@ -297,30 +389,52 @@ func (m *DeviceManager) SystemMode(sysExpect SysExpectation) string {
 
 // StartUp implements StateStarterUp.Startup.
 func (m *DeviceManager) StartUp() error {
-	m.state.Lock()
-	defer m.state.Unlock()
+	err := func() error {
+		m.state.Lock()
+		defer m.state.Unlock()
 
-	dev, err := m.earlyDeviceContext()
-	if err != nil && !errors.Is(err, state.ErrNoState) {
+		dev, err := m.earlyDeviceContext(false)
+		if err != nil && !errors.Is(err, state.ErrNoState) {
+			return err
+		}
+
+		// if ErrNoState then dev is nil, we assume a classic system here,
+		// any error will re-surface again in the main first boot code
+		if dev != nil && m.shouldMountUbuntuSave(dev) {
+			if err := m.setupUbuntuSave(dev); err != nil {
+				return fmt.Errorf("cannot set up ubuntu-save: %v", err)
+			}
+		}
+
+		// ensure install-time kernel cmdline fragments are seeded into state.
+		if err := initExtraSnapdFragmentsFromInstallTime(m.state); err != nil {
+			logger.Noticef("cannot initialize install-time kernel cmdline fragments: %v", err)
+		}
+
+		// ensure /var/lib/snapd/void permissions are ok
+		if err := ensureFileDirPermissions(); err != nil {
+			logger.Noticef("cannot ensure device file/dir permissions: %v", err)
+		}
+
+		// TODO: setup proper timings measurements for this
+		return EarlyConfig(m.state, m.earlyPreloadGadget)
+	}()
+
+	if err != nil {
 		return err
 	}
 
-	// if ErrNoState then dev is nil, we assume a classic system here,
-	// any error will re-surface again in the main first boot code
-	if dev != nil && m.shouldMountUbuntuSave(dev) {
-		if err := m.setupUbuntuSave(dev); err != nil {
-			return fmt.Errorf("cannot set up ubuntu-save: %v", err)
-		}
+	for _, onInit := range m.onInit {
+		onInit.DeviceInitialized()
 	}
 
-	// ensure /var/lib/snapd/void permissions are ok
-	if err := ensureFileDirPermissions(); err != nil {
-		logger.Noticef("%v", fmt.Errorf("cannot ensure device file/dir permissions: %v", err))
+	return nil
+}
+
+func (m *DeviceManager) Stop() {
+	if m.xkbConfigListener != nil {
+		m.xkbConfigListener.Close()
 	}
-
-	// TODO: setup proper timings measurements for this
-
-	return EarlyConfig(m.state, m.earlyPreloadGadget)
 }
 
 func (m *DeviceManager) shouldMountUbuntuSave(dev snap.Device) bool {
@@ -395,7 +509,7 @@ func (m *DeviceManager) ensureUbuntuSaveSnapFolders() error {
 	}
 
 	for _, s := range snaps {
-		saveDir := snap.CommonDataSaveDir(s.InstanceName())
+		saveDir := snap.CommonDataSaveDir(s.InstanceName().String())
 		if err := os.MkdirAll(saveDir, 0755); err != nil {
 			return err
 		}
@@ -481,6 +595,23 @@ func gadgetUpdateBlocked(cand *state.Task, running []*state.Task) bool {
 	return false
 }
 
+func removeRecoverySystemBlocked(cand *state.Task, running []*state.Task) bool {
+	// remove-recovery-system computes task-local cleanup state that depends on
+	// the current set of recovery systems before dropping the state lock, so
+	// always keep these tasks serialized
+	if cand.Kind() != "remove-recovery-system" {
+		return false
+	}
+
+	for _, other := range running {
+		if other.Kind() == "remove-recovery-system" {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (m *DeviceManager) changeInFlight(kind string) bool {
 	for _, chg := range m.state.Changes() {
 		if chg.Kind() == kind && !chg.IsReady() {
@@ -539,7 +670,28 @@ func setClassicFallbackModel(st *state.State, device *auth.DeviceState) error {
 	return nil
 }
 
-func (m *DeviceManager) ensureOperational() error {
+func (m *DeviceManager) ensureClassicModelAfterSeed() error {
+	m.state.Lock()
+	defer m.state.Unlock()
+
+	if m.SystemMode(SysAny) != "run" {
+		return nil
+	}
+
+	device, err := m.device()
+	if err != nil {
+		return err
+	}
+	if device.Serial != "" || device.Brand != "" && device.Model != "" {
+		return nil
+	}
+
+	logger.Trace("ensure", "manager", "DeviceManager", "func", "ensureClassicModelAfterSeed")
+
+	return setClassicFallbackModel(m.state, device)
+}
+
+func (m *DeviceManager) ensureOperationalAfterSeed(deviceCtx snapstate.DeviceContext) error {
 	m.state.Lock()
 	defer m.state.Unlock()
 
@@ -559,6 +711,8 @@ func (m *DeviceManager) ensureOperational() error {
 		return nil
 	}
 
+	logger.Trace("ensure", "manager", "DeviceManager", "func", "ensureOperationalAfterSeed")
+
 	perfTimings := timings.New(map[string]string{"ensure": "become-operational"})
 
 	// conditions to trigger device registration
@@ -574,22 +728,8 @@ func (m *DeviceManager) ensureOperational() error {
 	//   or no model): we wait to have some snaps installed or be
 	//   in the process to install some
 
-	var seeded bool
-	err = m.state.Get("seeded", &seeded)
-	if err != nil && !errors.Is(err, state.ErrNoState) {
-		return err
-	}
-
 	if device.Brand == "" || device.Model == "" {
-		if !release.OnClassic || !seeded {
-			return nil
-		}
-		// we are on classic and seeded but there is no model:
-		// use a fallback model!
-		err := setClassicFallbackModel(m.state, device)
-		if err != nil {
-			return err
-		}
+		return fmt.Errorf("internal error: device brand or model are unset after seeding")
 	}
 
 	if m.noRegister {
@@ -601,17 +741,9 @@ func (m *DeviceManager) ensureOperational() error {
 		return nil
 	}
 
-	var storeID, gadget string
-	model, err := m.Model()
-	if err != nil && !errors.Is(err, state.ErrNoState) {
-		return err
-	}
-	if err == nil {
-		gadget = model.Gadget()
-		storeID = model.Store()
-	} else {
-		return fmt.Errorf("internal error: core device brand and model are set but there is no model assertion")
-	}
+	model := deviceCtx.Model()
+	gadget := model.Gadget()
+	storeID := model.Store()
 
 	willRequestSerial, err := shouldRequestSerial(m.state, gadget)
 	if err != nil {
@@ -648,14 +780,6 @@ func (m *DeviceManager) ensureOperational() error {
 	var hasPrepareDeviceHook bool
 	// if there's a gadget specified wait for it
 	if gadget != "" {
-		// if have a gadget wait until seeded to proceed
-		if !seeded {
-			// this will be run again, so eventually when the system is
-			// seeded the code below runs
-			return nil
-
-		}
-
 		gadgetInfo, err := snapstate.CurrentInfo(m.state, gadget)
 		if err != nil {
 			return err
@@ -717,7 +841,7 @@ func (m *DeviceManager) ensureOperational() error {
 		tasks = append(tasks, requestSerial)
 	}
 
-	chg := m.state.NewChange("become-operational", i18n.G("Initialize device"))
+	chg := m.state.NewChange(becomeOperationalChangeKind, i18n.G("Initialize device"))
 	chg.AddAll(state.NewTaskSet(tasks...))
 
 	state.TagTimingsWithChange(perfTimings, chg)
@@ -821,13 +945,15 @@ func (m *DeviceManager) systemForPreseeding() string {
 	return m.preseedSystemLabel
 }
 
-func (m *DeviceManager) earlyDeviceContext() (snapstate.DeviceContext, error) {
-	mod, err := findModel(m.state)
-	if err == nil {
-		return newModelDeviceContext(m, mod), nil
-	}
-	if !errors.Is(err, state.ErrNoState) {
-		return nil, err
+func (m *DeviceManager) earlyDeviceContext(noModel bool) (snapstate.DeviceContext, error) {
+	if !noModel {
+		mod, err := findModel(m.state)
+		if err == nil {
+			return newModelDeviceContext(m, mod), nil
+		}
+		if !errors.Is(err, state.ErrNoState) {
+			return nil, err
+		}
 	}
 	dev, _, err := m.earlyLoadDeviceSeed(state.ErrNoState)
 	return dev, err
@@ -841,12 +967,12 @@ func (m *DeviceManager) seedLabelAndMode() (seedLabel, seedMode string, err erro
 		return m.seedLabel, m.seedMode, nil
 	}
 	if m.preseed {
-		if !release.OnClassic {
+		if !release.OnClassic || m.preseedHybrid {
 			seedMode = "run"
 			seedLabel = m.systemForPreseeding()
 		}
 	} else {
-		modeenv, err := maybeReadModeenv()
+		modeenv, err := boot.MaybeReadModeenv()
 		if err != nil {
 			return "", "", err
 		}
@@ -909,6 +1035,26 @@ func (m *DeviceManager) earlyLoadDeviceSeed(seedLoadErr error) (snapstate.Device
 	// cache
 	m.earlyDeviceSeed = deviceSeed
 	return dev, deviceSeed, nil
+}
+
+// retireEarlyDeviceSeed clears the cached early seed after an acknowledged
+// device context becomes available, returning that context to the caller.
+func (m *DeviceManager) retireEarlyDeviceSeed() (snapstate.DeviceContext, error) {
+	m.state.Lock()
+	defer m.state.Unlock()
+
+	if m.earlyDeviceSeed == nil {
+		return nil, nil
+	}
+	deviceCtx, err := DeviceCtx(m.state, nil, nil)
+	if err == nil {
+		m.earlyDeviceSeed = nil
+		return deviceCtx, nil
+	}
+	if errors.Is(err, state.ErrNoState) {
+		return nil, nil
+	}
+	return nil, err
 }
 
 func (m *DeviceManager) earlyPreloadGadget() (sysconfig.Device, *gadget.Info, error) {
@@ -997,7 +1143,9 @@ func (m *DeviceManager) ensureSeeded() error {
 		return nil
 	}
 
-	chg := m.state.NewChange("seed", "Initialize system state")
+	logger.Trace("ensure", "manager", "DeviceManager", "func", "ensureSeeded")
+
+	chg := m.state.NewChange(seedChangeKind, "Initialize system state")
 	for _, ts := range tsAll {
 		chg.AddAll(ts)
 	}
@@ -1010,9 +1158,10 @@ func (m *DeviceManager) ensureSeeded() error {
 
 var processAutoImportAssertionsImpl = processAutoImportAssertions
 
-// ensureAutoImportAssertions makes sure that auto import assertions
-// get processed. Assertion should be processed while seeding is in progress.
-func (m *DeviceManager) ensureAutoImportAssertions() error {
+// ensureAutoImportAssertionsWithEarlySeed makes sure that auto import
+// assertions get processed. Assertion should be processed while seeding is in
+// progress.
+func (m *DeviceManager) ensureAutoImportAssertionsWithEarlySeed(deviceSeed seed.Seed) error {
 	if release.OnClassic {
 		return nil
 	}
@@ -1020,7 +1169,7 @@ func (m *DeviceManager) ensureAutoImportAssertions() error {
 	m.state.Lock()
 	defer m.state.Unlock()
 
-	if m.earlyDeviceSeed == nil {
+	if deviceSeed == nil {
 		// we have no seed cached yet, no point to check further
 		return nil
 	}
@@ -1029,15 +1178,6 @@ func (m *DeviceManager) ensureAutoImportAssertions() error {
 	if mode == "install" || mode == "factory-reset" {
 		// we do not auto-import assertions during install modes
 		// snap auto-import also does not
-		return nil
-	}
-
-	var seeded bool
-	if err := m.state.Get("seeded", &seeded); err != nil && !errors.Is(err, state.ErrNoState) {
-		return err
-	}
-	// if system is seeded, stop trying
-	if seeded {
 		return nil
 	}
 
@@ -1050,6 +1190,8 @@ func (m *DeviceManager) ensureAutoImportAssertions() error {
 		return nil
 	}
 
+	logger.Trace("ensure", "manager", "DeviceManager", "func", "ensureAutoImportAssertionsWithEarlySeed")
+
 	commitTo := func(batch *asserts.Batch) error {
 		return assertstate.AddBatch(m.state, batch, nil)
 	}
@@ -1058,7 +1200,7 @@ func (m *DeviceManager) ensureAutoImportAssertions() error {
 	// it should not be re-run. State should not be altered once
 	// processAutoImportAssertionsImpl is called.
 	m.state.Set("asserts-early-auto-imported", true)
-	err := processAutoImportAssertionsImpl(m.state, m.earlyDeviceSeed, db, commitTo)
+	err := processAutoImportAssertionsImpl(m.state, deviceSeed, db, commitTo)
 	if err != nil {
 		// best effort
 		logger.Noticef("cannot process auto import assertion: %v", err)
@@ -1066,7 +1208,107 @@ func (m *DeviceManager) ensureAutoImportAssertions() error {
 	return nil
 }
 
-func (m *DeviceManager) ensureBootOk() error {
+func (m *DeviceManager) ensureSerialBoundSystemUserAssertionsProcessedAfterSeed(deviceCtx snapstate.DeviceContext) error {
+	// in situations where a device serial can be anticipated, it is
+	// possible to create a serial-bound system-user assertion beforehand,
+	// this Ensure logic takes care of creating the corresponding user even
+	// if system-user gets presented to the device before the actual serial
+	// assertion is acquired, see the corresponding code setting the
+	// system-user-waiting-on-serial flag in createAllKnownSystemUsers
+	// (users.go).
+	if release.OnClassic {
+		return nil
+	}
+
+	m.state.Lock()
+	defer m.state.Unlock()
+
+	var waitingOnSerial bool
+	err := m.state.Get("system-user-waiting-on-serial", &waitingOnSerial)
+	if err != nil && !errors.Is(err, state.ErrNoState) {
+		return err
+	}
+	if !waitingOnSerial {
+		return nil
+	}
+
+	serial, err := m.Serial()
+	if err != nil {
+		if errors.Is(err, state.ErrNoState) {
+			return nil
+		}
+		return err
+	}
+	logger.Trace("ensure", "manager", "DeviceManager", "func", "ensureSerialBoundSystemUserAssertionsProcessedAfterSeed")
+
+	db := assertstate.DB(m.state)
+
+	const sudoer = true
+	_, err = createAllKnownSystemUsers(m.state, db, deviceCtx.Model(), serial, sudoer, seclog.AddReasonEnsureSerialBoundAssertion)
+	if err != nil {
+		return err
+	}
+
+	m.state.Set("system-user-waiting-on-serial", false)
+
+	return nil
+}
+
+func (m *DeviceManager) ensureFDE(deviceCtx snapstate.DeviceContext) error {
+	m.state.Lock()
+	defer m.state.Unlock()
+
+	if m.SystemMode(SysAny) != "run" {
+		return nil
+	}
+
+	if m.fdeRan {
+		return nil
+	}
+
+	logger.Trace("ensure", "manager", "DeviceManager", "func", "ensureFDE")
+
+	runPostInstallChecks, err := install.CheckHybridQuestingRelease(deviceCtx.Model())
+	if err != nil {
+		return err
+	}
+
+	// Auto-repair should be attempted only once.
+	m.fdeRan = true
+
+	// FIXME: we should rename to something like "reset lockout"
+	lockoutResetErr := secbootMarkSuccessful()
+
+	// TODO:FDEM: with new APIs of lockout reset we will get so
+	// more statuses that we will need to react to and
+	// provide to the status API.
+
+	// FIXME: we need to check that a try kernel was attempted here and not attempt
+	// repair in that case.
+
+	if err := fdestateAttemptAutoRepairIfNeeded(m.state, lockoutResetErr, runPostInstallChecks); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+var bootOkRanForBootID = bootOkRanForBootIDImpl
+
+func bootOkRanForBootIDImpl(st *state.State, currentBootID string) (bool, error) {
+	var lastBootID string
+	if err := st.Get("ensure-boot-ok-boot-id", &lastBootID); err != nil && !errors.Is(err, state.ErrNoState) {
+		return false, err
+	}
+
+	return currentBootID == lastBootID, nil
+}
+
+func markBootOkRanForBootID(st *state.State, currentBootID string) {
+	st.Set("ensure-boot-ok-boot-id", currentBootID)
+}
+
+func (m *DeviceManager) ensureBootOk(deviceCtx snapstate.DeviceContext) error {
 	m.state.Lock()
 	defer m.state.Unlock()
 
@@ -1075,22 +1317,37 @@ func (m *DeviceManager) ensureBootOk() error {
 		return nil
 	}
 
-	if !m.bootOkRan {
-		deviceCtx, err := DeviceCtx(m.state, nil, nil)
-		if err != nil && !errors.Is(err, state.ErrNoState) {
+	if !m.ensureBootOkRan {
+		currentBootID, err := osutilBootID()
+		if err != nil {
 			return err
 		}
-		if err == nil && deviceCtx.Model().KernelSnap() != nil {
-			if err := boot.MarkBootSuccessful(deviceCtx); err != nil {
-				return err
-			}
-			if err := secbootMarkSuccessful(); err != nil {
-				return err
-			}
+
+		bootOkRanForCurrentBootID, err := bootOkRanForBootID(m.state, currentBootID)
+		if err != nil {
+			return err
 		}
 
-		m.bootOkRan = true
+		if !bootOkRanForCurrentBootID {
+			markBootOkRanForBootID(m.state, currentBootID)
+
+			if deviceCtx != nil && deviceCtx.Model().KernelSnap() != nil {
+				// FIXME: we should check if recovery keys
+				// were used and in that case do not mark the
+				// boot successful.
+				if err := boot.MarkBootSuccessful(deviceCtx); err != nil {
+					return err
+				}
+			}
+		} else {
+			// a reseal already ran, nothing to do
+			logger.Noticef("skipping boot ok check since it already ran for boot-id %q", currentBootID)
+		}
+
+		m.ensureBootOkRan = true
 	}
+
+	logger.Trace("ensure", "manager", "DeviceManager", "func", "ensureBootOk")
 
 	if !m.bootRevisionsUpdated {
 		if err := snapstate.UpdateBootRevisions(m.state); err != nil {
@@ -1102,22 +1359,11 @@ func (m *DeviceManager) ensureBootOk() error {
 	return nil
 }
 
-func (m *DeviceManager) ensureCloudInitRestricted() error {
+func (m *DeviceManager) ensureCloudInitRestrictedAfterSeed(deviceCtx snapstate.DeviceContext) error {
 	m.state.Lock()
 	defer m.state.Unlock()
 
 	if m.cloudInitAlreadyRestricted {
-		return nil
-	}
-
-	var seeded bool
-	err := m.state.Get("seeded", &seeded)
-	if err != nil && !errors.Is(err, state.ErrNoState) {
-		return err
-	}
-
-	if !seeded {
-		// we need to wait until we are seeded
 		return nil
 	}
 
@@ -1145,6 +1391,7 @@ func (m *DeviceManager) ensureCloudInitRestricted() error {
 	if err != nil {
 		return err
 	}
+	logger.Trace("ensure", "manager", "DeviceManager", "func", "ensureCloudInitRestrictedAfterSeed")
 	statusMsg := ""
 
 	switch cloudInitStatus {
@@ -1224,11 +1471,7 @@ func (m *DeviceManager) ensureCloudInitRestricted() error {
 		statusMsg = "failed to transition to done or error state after 5 minutes"
 	}
 
-	// we should always have a model if we are seeded and are not on classic
-	model, err := m.Model()
-	if err != nil {
-		return err
-	}
+	model := deviceCtx.Model()
 
 	// For UC20, we want to always disable cloud-init after it has run on
 	// first boot unless we are in a "real cloud", i.e. not using NoCloud,
@@ -1292,7 +1535,7 @@ func (m *DeviceManager) installDeviceHookTask(model *asserts.Model) *state.Task 
 	return hookstate.HookTask(m.state, summary, hooksup, nil)
 }
 
-func (m *DeviceManager) ensureInstalled() error {
+func (m *DeviceManager) ensureInstalledAfterSeed(deviceCtx snapstate.DeviceContext) error {
 	m.state.Lock()
 	defer m.state.Unlock()
 
@@ -1308,24 +1551,9 @@ func (m *DeviceManager) ensureInstalled() error {
 		return nil
 	}
 
-	var seeded bool
-	err := m.state.Get("seeded", &seeded)
-	if err != nil && !errors.Is(err, state.ErrNoState) {
-		return err
-	}
-	if !seeded {
-		return nil
-	}
-
 	perfTimings := timings.New(map[string]string{"ensure": "install-system"})
 
-	model, err := m.Model()
-	if err != nil {
-		if errors.Is(err, state.ErrNoState) {
-			return fmt.Errorf("internal error: core device brand and model are set but there is no model assertion")
-		}
-		return err
-	}
+	model := deviceCtx.Model()
 
 	// check if the gadget has an install-device hook, do this before
 	// we mark ensureInstalledRan as true, as this can fail if no gadget
@@ -1334,6 +1562,8 @@ func (m *DeviceManager) ensureInstalled() error {
 	if err != nil {
 		return fmt.Errorf("internal error: %v", err)
 	}
+
+	logger.Trace("ensure", "manager", "DeviceManager", "func", "ensureInstalledAfterSeed")
 
 	m.ensureInstalledRan = true
 
@@ -1367,7 +1597,7 @@ func (m *DeviceManager) ensureInstalled() error {
 
 	addTask(restartSystem)
 
-	chg := m.state.NewChange("install-system", i18n.G("Install the system"))
+	chg := m.state.NewChange(installSystemChangeKind, i18n.G("Install the system"))
 	chg.AddAll(state.NewTaskSet(tasks...))
 
 	state.TagTimingsWithChange(perfTimings, chg)
@@ -1376,7 +1606,7 @@ func (m *DeviceManager) ensureInstalled() error {
 	return nil
 }
 
-func (m *DeviceManager) ensureFactoryReset() error {
+func (m *DeviceManager) ensureFactoryResetAfterSeed(deviceCtx snapstate.DeviceContext) error {
 	m.state.Lock()
 	defer m.state.Unlock()
 
@@ -1392,24 +1622,11 @@ func (m *DeviceManager) ensureFactoryReset() error {
 		return nil
 	}
 
-	var seeded bool
-	err := m.state.Get("seeded", &seeded)
-	if err != nil && !errors.Is(err, state.ErrNoState) {
-		return err
-	}
-	if !seeded {
-		return nil
-	}
+	logger.Trace("ensure", "manager", "DeviceManager", "func", "ensureFactoryResetAfterSeed")
 
 	perfTimings := timings.New(map[string]string{"ensure": "factory-reset"})
 
-	model, err := m.Model()
-	if err != nil {
-		if errors.Is(err, state.ErrNoState) {
-			return fmt.Errorf("internal error: core device brand and model are set but there is no model assertion")
-		}
-		return err
-	}
+	model := deviceCtx.Model()
 
 	// We perform this check before setting ensureFactoryResetRan in
 	// case this should fail. This should in theory not be possible as
@@ -1445,7 +1662,7 @@ func (m *DeviceManager) ensureFactoryReset() error {
 
 	addTask(restartSystem)
 
-	chg := m.state.NewChange("factory-reset", i18n.G("Perform factory reset"))
+	chg := m.state.NewChange(factoryResetChangeKind, i18n.G("Perform factory reset"))
 	chg.AddAll(state.NewTaskSet(tasks...))
 
 	state.TagTimingsWithChange(perfTimings, chg)
@@ -1503,21 +1720,12 @@ func markSeededInConfig(st *state.State) error {
 	return nil
 }
 
-func (m *DeviceManager) ensureSeedInConfig() error {
+func (m *DeviceManager) ensureSeedInConfigAfterSeed() error {
 	m.state.Lock()
 	defer m.state.Unlock()
 
 	if !m.ensureSeedInConfigRan {
-		// get global seeded option
-		var seeded bool
-		if err := m.state.Get("seeded", &seeded); err != nil && !errors.Is(err, state.ErrNoState) {
-			return err
-		}
-		if !seeded {
-			// wait for ensure again, this is fine because
-			// doMarkSeeded will run "EnsureBefore(0)"
-			return nil
-		}
+		logger.Trace("ensure", "manager", "DeviceManager", "func", "ensureSeedInConfigAfterSeed")
 
 		// Sync seeding with the configuration state. We need to
 		// do this here to ensure that old systems which did not
@@ -1527,6 +1735,8 @@ func (m *DeviceManager) ensureSeedInConfig() error {
 			return err
 		}
 		m.ensureSeedInConfigRan = true
+	} else {
+		logger.Trace("ensure", "manager", "DeviceManager", "func", "ensureSeedInConfigAfterSeed")
 	}
 
 	return nil
@@ -1549,25 +1759,36 @@ func (m *DeviceManager) appendTriedRecoverySystem(label string) error {
 	return nil
 }
 
-func (m *DeviceManager) ensureTriedRecoverySystem() error {
-	if release.OnClassic {
-		return nil
-	}
+func (m *DeviceManager) ensureTriedRecoverySystemAfterSeed(deviceCtx snapstate.DeviceContext) error {
 	// nothing to do if not UC20 and run mode
 	if m.SystemMode(SysHasModeenv) != "run" {
 		return nil
 	}
+
 	if m.ensureTriedRecoverySystemRan {
 		return nil
 	}
 
+	// has to be core boot to have a recovery system that was tried
+	if !deviceCtx.IsCoreBoot() {
+		return nil
+	}
+
+	logger.Trace("ensure", "manager", "DeviceManager", "func", "ensureTriedRecoverySystemAfterSeed")
+
 	m.state.Lock()
 	defer m.state.Unlock()
 
-	deviceCtx, err := DeviceCtx(m.state, nil, nil)
-	if err != nil && !errors.Is(err, state.ErrNoState) {
-		return err
+	hasSystemSeed, err := checkForSystemSeed(m.state, deviceCtx)
+	if err != nil {
+		return fmt.Errorf("cannot find ubuntu seed role: %w", err)
 	}
+
+	// has to have a system seed to have a recovery system that was tried
+	if !hasSystemSeed {
+		return nil
+	}
+
 	outcome, label, err := boot.InspectTryRecoverySystemOutcome(deviceCtx)
 	if err != nil {
 		if !boot.IsInconsistentRecoverySystemState(err) {
@@ -1600,9 +1821,7 @@ func (m *DeviceManager) ensureTriedRecoverySystem() error {
 	return nil
 }
 
-var bootMarkFactoryResetComplete = boot.MarkFactoryResetComplete
-
-func (m *DeviceManager) ensurePostFactoryReset() error {
+func (m *DeviceManager) ensurePostFactoryResetAfterSeed() error {
 	m.state.Lock()
 	defer m.state.Unlock()
 
@@ -1619,14 +1838,7 @@ func (m *DeviceManager) ensurePostFactoryReset() error {
 		return nil
 	}
 
-	var seeded bool
-	err := m.state.Get("seeded", &seeded)
-	if err != nil && !errors.Is(err, state.ErrNoState) {
-		return err
-	}
-	if !seeded {
-		return nil
-	}
+	logger.Trace("ensure", "manager", "DeviceManager", "func", "ensurePostFactoryResetAfterSeed")
 
 	m.ensurePostFactoryResetRan = true
 
@@ -1647,14 +1859,9 @@ func (m *DeviceManager) ensurePostFactoryReset() error {
 		return fmt.Errorf("cannot verify factory reset marker: %v", err)
 	}
 
-	// if encrypted, rotates the fallback keys on disk
-	if err := bootMarkFactoryResetComplete(encrypted); err != nil {
-		return fmt.Errorf("cannot complete factory reset: %v", err)
-	}
-
 	if encrypted {
-		if err := rotateEncryptionKeys(); err != nil {
-			return fmt.Errorf("cannot transition encryption keys: %v", err)
+		if err := rotateSaveKeyAndDeleteOldKeys(boot.InitramfsUbuntuSaveDir); err != nil {
+			return fmt.Errorf("cannot remove old encryption keys: %v", err)
 		}
 	}
 
@@ -1663,7 +1870,7 @@ func (m *DeviceManager) ensurePostFactoryReset() error {
 
 // ensureExpiredUsersRemoved is periodically called as a part of Ensure()
 // to remove expired users from the system.
-func (m *DeviceManager) ensureExpiredUsersRemoved() error {
+func (m *DeviceManager) ensureExpiredUsersRemovedAfterSeed() error {
 	st := m.state
 	st.Lock()
 	defer st.Unlock()
@@ -1675,19 +1882,12 @@ func (m *DeviceManager) ensureExpiredUsersRemoved() error {
 		return nil
 	}
 
-	// Expect the system to be seeded, otherwise we ignore this.
-	var seeded bool
-	if err := st.Get("seeded", &seeded); err != nil && !errors.Is(err, state.ErrNoState) {
-		return err
-	}
-	if !seeded {
-		return nil
-	}
-
 	users, err := auth.Users(st)
 	if err != nil {
 		return err
 	}
+
+	logger.Trace("ensure", "manager", "DeviceManager", "func", "ensureExpiredUsersRemovedAfterSeed")
 
 	for _, user := range users {
 		if !user.HasExpired() {
@@ -1695,10 +1895,136 @@ func (m *DeviceManager) ensureExpiredUsersRemoved() error {
 		}
 		// Force the removal of the user as it's possible to block this expiration
 		// otherwise by the user having left a process or service running.
-		if _, err := RemoveUser(st, user.Username, &RemoveUserOptions{Force: true}); err != nil {
+		if _, err := RemoveUser(st, user.Username, &RemoveUserOptions{
+			Force:        true,
+			RemoveReason: seclog.RemoveReasonEnsureExpired,
+		}); err != nil {
 			return err
 		}
 	}
+	return nil
+}
+
+var (
+	keyboardCurrentXKBConfig     = keyboard.CurrentXKBConfig
+	keyboardNewXKBConfigListener = keyboard.NewXKBConfigListener
+)
+
+func (m *DeviceManager) ensureEarlyBootXKBConfigUpdatedAfterSeed(deviceCtx snapstate.DeviceContext) error {
+	m.state.Lock()
+	defer m.state.Unlock()
+
+	if m.ensureEarlyBootLocaleConfigUpdatedRan {
+		return nil
+	}
+
+	mode := m.SystemMode(SysHasModeenv)
+	if mode != "run" {
+		return nil
+	}
+
+	logger.Trace("ensure", "manager", "DeviceManager", "func", "ensureEarlyBootXKBConfigUpdatedAfterSeed")
+
+	m.ensureEarlyBootLocaleConfigUpdatedRan = true
+
+	// Only setup early boot XKB configs for hybrid systems
+	// with versions 25.10 or higher for FDE.
+	supported, err := install.CheckHybridQuestingRelease(deviceCtx.Model())
+	if err != nil {
+		return err
+	}
+	if !supported {
+		return nil
+	}
+
+	// Initialize config, It is fine to run this even if the config
+	// was initilized in a previous snapd startup because no change
+	// will be triggered unless the kernel command line arguments are
+	// updated, otherwise it is a no-op.
+	config, err := keyboardCurrentXKBConfig()
+	if err != nil {
+		return err
+	}
+	if err := m.updateEarlyBootXKBConfig(config); err != nil {
+		return fmt.Errorf("cannot update early boot locale config: %w", err)
+	}
+
+	// Setup XKB config listener to detect system keyboard layout
+	// changes and reflect it into the XKB early boot configs.
+	cb := func(config *keyboard.XKBConfig) {
+		m.state.Lock()
+		defer m.state.Unlock()
+		if err := m.updateEarlyBootXKBConfig(config); err != nil {
+			m.state.Warnf("cannot update early boot locale config: %v", err)
+			return
+		}
+	}
+	listener, err := keyboardNewXKBConfigListener(context.Background(), cb)
+	if err != nil {
+		return err
+	}
+	m.xkbConfigListener = listener
+	return nil
+}
+
+// updateEarlyBootXKBConfig adds an extra snapd kernel cmdline
+// fragment with a simplified XKB configuration embedded into it
+// based on the current system XKB config.
+//
+// This kernel cmdline argument would then be consumed by
+// plymouth-set-keymap.service very early in boot to construct
+// a temporary XKB configuration that can be consumed by plymouth
+// before disks are unlocked so the the correct keyboard layout
+// can be detected when entring a recovery-key, passphrase or PIN
+// in a FDE system.
+//
+// This workaround is needed because we cannot update the initrd
+// to set the updated XKB configs for plymouth because it is
+// embedded in the signed UKI.
+func (m *DeviceManager) updateEarlyBootXKBConfig(config *keyboard.XKBConfig) error {
+	fragment := config.KernelCommandLineFragment()
+	return setExtraSnapdKernelCommandLineFragment(m.state, extraSnapdKernelCommandLineFragmentXKB, fragment)
+}
+
+func (m *DeviceManager) ensureExtraSnapdKernelCommandLineFragmentsApplied() error {
+	m.state.Lock()
+	defer m.state.Unlock()
+
+	var pending bool
+	if err := m.state.Get(kcmdlinePendingExtraSnapdFragmentsKey, &pending); err != nil && !errors.Is(err, state.ErrNoState) {
+		return err
+	}
+
+	if !pending {
+		// nothing to do
+		return nil
+	}
+
+	// check whether there are other changes that need to run exclusively
+	if err := snapstate.CheckChangeConflictExclusiveKinds(m.state, ""); err != nil {
+		logger.Noticef("cannot apply extra snapd kernel command line fragments: %v", err)
+		return nil
+	}
+
+	if m.changeInFlight("apply-extra-snapd-kcmdline-fragments") {
+		// avoid creating a change if one is already in-progress
+		return nil
+	}
+
+	logger.Noticef("applying pending extra snapd kernel cmdline fragments")
+
+	summary := "Apply extra snapd kernel command line fragments"
+	t := m.state.NewTask("update-gadget-cmdline", summary)
+	// make sure the change does not trigger a system restart to avoid
+	// confusion and bad UX of implicit internal updates to fragment
+	// causing a restart (e.g. a keyboard layout update causing a
+	// sudden restart).
+	t.Set("from-extra-snapd-fragments", true)
+	chg := m.state.NewChange("apply-extra-snapd-kcmdline-fragments", summary)
+	chg.AddTask(t)
+
+	logger.Trace("ensure", "manager", "DeviceManager", "func", "ensureExtraSnapdKernelCommandLineFragmentsApplied")
+
 	return nil
 }
 
@@ -1724,57 +2050,152 @@ var seedFailureFmt = `seeding failed with: %v. This indicates an error in your d
 func (m *DeviceManager) Ensure() error {
 	var errs []error
 
-	if err := m.ensureSeeded(); err != nil {
+	seedingErr := m.ensureSeeded()
+	if seedingErr != nil {
 		m.state.Lock()
-		m.state.Warnf(seedFailureFmt, err)
+		m.state.Warnf(seedFailureFmt, seedingErr)
 		m.state.Unlock()
-		errs = append(errs, fmt.Errorf("cannot seed: %v", err))
+		errs = append(errs, fmt.Errorf("cannot seed: %v", seedingErr))
 	}
 
 	if !m.preseed {
-		if err := m.ensureAutoImportAssertions(); err != nil {
+		m.state.Lock()
+		seeded, seededErr := snapstate.SystemSeeded(m.state)
+		var deviceCtx snapstate.DeviceContext
+		var deviceCtxErr error
+		if seededErr == nil {
+			deviceCtx, deviceCtxErr = snapstate.DeviceCtxForEnsure(m.state)
+		}
+		deviceSeed := m.earlyDeviceSeed
+		m.state.Unlock()
+		var classicModelErr error
+		// Seeded classic systems may still need the generic-classic fallback
+		// before an acknowledged device context can be resolved.
+		if seeded && release.OnClassic && errors.Is(deviceCtxErr, state.ErrNoState) {
+			classicModelErr = m.ensureClassicModelAfterSeed()
+			if classicModelErr != nil {
+				errs = append(errs, classicModelErr)
+				deviceCtxErr = nil
+			} else {
+				m.state.Lock()
+				deviceCtx, deviceCtxErr = snapstate.DeviceCtxForEnsure(m.state)
+				m.state.Unlock()
+			}
+		}
+		if seededErr != nil {
+			// ensureSeeded reads the same state entry before doing any work.
+			if seedingErr == nil {
+				errs = append(errs, seededErr)
+			}
+		} else if deviceCtxErr != nil && (!errors.Is(deviceCtxErr, state.ErrNoState) || seeded) {
+			errs = append(errs, deviceCtxErr)
+		}
+
+		if !seeded && seededErr == nil {
+			if err := m.ensureAutoImportAssertionsWithEarlySeed(deviceSeed); err != nil {
+				errs = append(errs, err)
+			}
+		}
+
+		// Code below should not need the full early loaded device seed.
+		// Retire it once an acknowledged device context is available to free
+		// the corresponding memory usage.
+		if acknowledgedDeviceCtx, err := m.retireEarlyDeviceSeed(); err != nil {
+			errs = append(errs, err)
+		} else if acknowledgedDeviceCtx != nil {
+			deviceCtx = acknowledgedDeviceCtx
+		}
+		if seeded && deviceCtx == nil {
+			errs = append(errs, fmt.Errorf("internal error: device context is nil after seeding"))
+		}
+
+		if seeded && deviceCtx != nil {
+			if err := m.ensureCloudInitRestrictedAfterSeed(deviceCtx); err != nil {
+				errs = append(errs, err)
+			}
+		}
+
+		if seeded && deviceCtx != nil {
+			if err := m.ensureOperationalAfterSeed(deviceCtx); err != nil {
+				errs = append(errs, err)
+			}
+		}
+
+		// XXX: This might trigger a reseal (auto-repair) but
+		// it should not affect resealing tasks since it is
+		// run at most once during startup before
+		// TaskRunner.Ensure() is called.
+		if deviceCtx != nil {
+			if err := m.ensureFDE(deviceCtx); err != nil {
+				errs = append(errs, err)
+			}
+		}
+
+		// XXX: This might trigger a reseal (removal of "try"
+		// entries in modeenv) but it should not affect
+		// resealing tasks since it is run at most once during
+		// startup before TaskRunner.Ensure() is called.
+		if err := m.ensureBootOk(deviceCtx); err != nil {
 			errs = append(errs, err)
 		}
 
-		// code below should not need the early loaded device seed
-		// optimistically forget the earlyDeviceSeed here
-		// to free the corresponding memory usage
-		m.earlyDeviceSeed = nil
-
-		if err := m.ensureCloudInitRestricted(); err != nil {
-			errs = append(errs, err)
+		if seeded {
+			if err := m.ensureSeedInConfigAfterSeed(); err != nil {
+				errs = append(errs, err)
+			}
 		}
 
-		if err := m.ensureOperational(); err != nil {
-			errs = append(errs, err)
+		if seeded && deviceCtx != nil {
+			if err := m.ensureInstalledAfterSeed(deviceCtx); err != nil {
+				errs = append(errs, err)
+			}
 		}
 
-		if err := m.ensureBootOk(); err != nil {
-			errs = append(errs, err)
+		// XXX: This might trigger a reseal but it should not affect
+		// resealing tasks since it is run at most once during startup
+		// before TaskRunner.Ensure() is called.
+		if seeded && deviceCtx != nil {
+			if err := m.ensureTriedRecoverySystemAfterSeed(deviceCtx); err != nil {
+				errs = append(errs, err)
+			}
 		}
 
-		if err := m.ensureSeedInConfig(); err != nil {
-			errs = append(errs, err)
+		if seeded && deviceCtx != nil {
+			if err := m.ensureFactoryResetAfterSeed(deviceCtx); err != nil {
+				errs = append(errs, err)
+			}
 		}
 
-		if err := m.ensureInstalled(); err != nil {
-			errs = append(errs, err)
+		if seeded {
+			if err := m.ensurePostFactoryResetAfterSeed(); err != nil {
+				errs = append(errs, err)
+			}
 		}
 
-		if err := m.ensureTriedRecoverySystem(); err != nil {
-			errs = append(errs, err)
+		if seeded && deviceCtx != nil {
+			if err := m.ensureSerialBoundSystemUserAssertionsProcessedAfterSeed(deviceCtx); err != nil {
+				errs = append(errs, err)
+			}
 		}
 
-		if err := m.ensureFactoryReset(); err != nil {
-			errs = append(errs, err)
+		if seeded {
+			if err := m.ensureExpiredUsersRemovedAfterSeed(); err != nil {
+				errs = append(errs, err)
+			}
 		}
 
-		if err := m.ensurePostFactoryReset(); err != nil {
-			errs = append(errs, err)
+		if seeded && deviceCtx != nil {
+			if err := m.ensureEarlyBootXKBConfigUpdatedAfterSeed(deviceCtx); err != nil {
+				errs = append(errs, err)
+			}
 		}
 
-		if err := m.ensureExpiredUsersRemoved(); err != nil {
-			errs = append(errs, err)
+		// This must come after all ensures that might update extra snapd
+		// kernel command line fragments.
+		if seeded {
+			if err := m.ensureExtraSnapdKernelCommandLineFragmentsApplied(); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
 
@@ -1788,7 +2209,8 @@ func (m *DeviceManager) Ensure() error {
 // ResetToPostBootState is only useful for integration testing.
 func (m *DeviceManager) ResetToPostBootState() {
 	osutil.MustBeTestBinary("ResetToPostBootState can only be called from tests")
-	m.bootOkRan = false
+	m.state.Set("ensure-boot-ok-boot-id", "")
+	m.ensureBootOkRan = false
 	m.bootRevisionsUpdated = false
 	m.ensureTriedRecoverySystemRan = false
 }
@@ -1900,6 +2322,59 @@ func (m *DeviceManager) keyPair() (asserts.PrivateKey, error) {
 	return privKey, nil
 }
 
+// SignConfdbControl signs a confdb-control assertion using the device's key as
+// it needs to be attested by the device.
+func (m *DeviceManager) SignConfdbControl(groups []any, revision int) (*asserts.ConfdbControl, error) {
+	serial, err := m.Serial()
+	if err != nil {
+		return nil, fmt.Errorf("cannot sign confdb-control without a serial")
+	}
+
+	privKey, err := m.keyPair()
+	if err != nil {
+		return nil, fmt.Errorf("cannot sign confdb-control without device key")
+	}
+
+	a, err := asserts.SignWithoutAuthority(asserts.ConfdbControlType, map[string]any{
+		"brand-id": serial.BrandID(),
+		"model":    serial.Model(),
+		"serial":   serial.Serial(),
+		"revision": strconv.Itoa(revision),
+		"groups":   groups,
+	}, nil, privKey)
+	if err != nil {
+		return nil, err
+	}
+
+	return a.(*asserts.ConfdbControl), nil
+}
+
+// SignResponseMessage signs a response-message assertion using the device's key.
+func (m *DeviceManager) SignResponseMessage(accountID, messageID string, status asserts.MessageStatus, body []byte) (*asserts.ResponseMessage, error) {
+	serial, err := m.Serial()
+	if err != nil {
+		return nil, fmt.Errorf("cannot sign response-message without a serial")
+	}
+
+	privKey, err := m.keyPair()
+	if err != nil {
+		return nil, fmt.Errorf("cannot sign response-message without device key")
+	}
+
+	a, err := asserts.SignWithoutAuthority(asserts.ResponseMessageType, map[string]any{
+		"account-id": accountID,
+		"message-id": messageID,
+		"device":     serial.DeviceID().String(),
+		"status":     string(status),
+		"timestamp":  time.Now().UTC().Format(time.RFC3339),
+	}, body, privKey)
+	if err != nil {
+		return nil, err
+	}
+
+	return a.(*asserts.ResponseMessage), nil
+}
+
 // Registered returns a channel that is closed when the device is known to have been registered.
 func (m *DeviceManager) Registered() <-chan struct{} {
 	return m.reg
@@ -1975,6 +2450,35 @@ func (m *DeviceManager) Serial() (*asserts.Serial, error) {
 	return findSerial(m.state, nil)
 }
 
+// ConfdbControl returns the device's confdb-control assertion.
+func (m *DeviceManager) ConfdbControl() (*asserts.ConfdbControl, error) {
+	serial, err := m.Serial()
+	if err != nil {
+		return nil, ErrNoDeviceIdentityYet
+	}
+
+	db := assertstate.DB(m.state)
+	a, err := db.Find(asserts.ConfdbControlType, map[string]string{
+		"brand-id": serial.BrandID(),
+		"model":    serial.Model(),
+		"serial":   serial.Serial(),
+	})
+	if errors.Is(err, &asserts.NotFoundError{}) {
+		return nil, state.ErrNoState
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	cc := a.(*asserts.ConfdbControl)
+	key := serial.DeviceKey()
+	if key.ID() != cc.SignKeyID() {
+		return nil, errors.New("confdb-control's signing key doesn't match the device key")
+	}
+
+	return cc, nil
+}
+
 type SystemModeInfo struct {
 	Mode              string
 	HasModeenv        bool
@@ -2041,6 +2545,10 @@ type System struct {
 	// DefaultRecoverySystem is true when the system is the default recovery
 	// system.
 	DefaultRecoverySystem bool
+	// OptionalContainers is a set of snaps and components that are optional in
+	// the system's model, but are available to be installed when installing this
+	// system.
+	OptionalContainers OptionalContainers
 }
 
 var defaultSystemActions = []SystemAction{
@@ -2110,15 +2618,109 @@ func (m *DeviceManager) systems() ([]*System, error) {
 	return systems, nil
 }
 
-// SystemAndGadgetAndEncryptionInfo return the system details
-// including the model assertion, gadget details and encryption info
-// for the given system label.
-func (m *DeviceManager) SystemAndGadgetAndEncryptionInfo(wantedSystemLabel string) (*System, *gadget.Info, *install.EncryptionSupportInfo, error) {
+// SystemAndGadgetAndEncryptionInfo resolves the target system by
+// label and returns the system details (including its model assertion), the
+// gadget details and encryption support information.
+//
+// This is a wrapper around systemAndGadgetAndEncryptionInfoWithAction that
+// performs an encryption availability check without any action.
+//
+// Cache semantics:
+//   - With encInfoFromCache set to true: returns cached EncryptionSupportInfo when
+//     available, skipping the expensive availability check.
+//   - Otherwise: computes fresh EncryptionSupportInfo and refreshes the cache on
+//     success.
+//
+// Errors are returned if the system cannot be resolved, gadget info cannot be
+// read/validated, or encryption support evaluation fails.
+func (m *DeviceManager) SystemAndGadgetAndEncryptionInfo(
+	wantedSystemLabel string,
+	encInfoFromCache bool,
+) (*System, *gadget.Info, *install.EncryptionSupportInfo, error) {
+	var checkAction *secboot.PreinstallAction = nil
+	return m.systemAndGadgetAndEncryptionInfoWithAction(wantedSystemLabel, checkAction, encInfoFromCache)
+}
+
+// RunningSystemAndGadgetAndEncryptionInfo resolves the currently running system
+// and returns the system details (including its model assertion), the
+// currently installed gadget details and encryption support information.
+//
+// Since the system is running, the encryption support information
+// will reflect the result of post install checks, rather than pre
+// install ones.
+func (m *DeviceManager) RunningSystemAndGadgetAndEncryptionInfo() (*System, *gadget.Info, *install.EncryptionSupportInfo, error) {
+	var checkAction *secboot.PreinstallAction = nil
+	return m.runningSystemAndGadgetAndEncryptionInfoWithAction(checkAction)
+}
+
+// ApplyActionOnSystemAndGadgetAndEncryptionInfo resolves the target system by
+// label and evaluates encryption support after applying the provided action. It
+// returns the system details (including its model assertion), the gadget
+// details and encryption support information.
+//
+// Action and cache semantics:
+//   - Always computes fresh EncryptionSupportInfo (encInfoFromCache is false).
+//   - Requires EncryptionSupportInfo containing a CheckContext to exist in
+//     cache for the provided label.
+//
+// Errors are returned if the system cannot be resolved, gadget info cannot be
+// read/validated, or encryption support evaluation fails.
+func (m *DeviceManager) ApplyActionOnSystemAndGadgetAndEncryptionInfo(
+	wantedSystemLabel string,
+	checkAction *secboot.PreinstallAction,
+) (*System, *gadget.Info, *install.EncryptionSupportInfo, error) {
+	if checkAction == nil {
+		return nil, nil, nil, errors.New("cannot apply empty action")
+	}
+	const encInfoFromCache = false
+	return m.systemAndGadgetAndEncryptionInfoWithAction(wantedSystemLabel, checkAction, encInfoFromCache)
+}
+
+// ApplyActionOnRunningSystemAndGadgetAndEncryptionInfo resolves the
+// currently running system and evaluates encryption support after
+// applying the provided action. It returns the system details
+// (including its model assertion), the currently installed gadget
+// details and encryption support information.
+//
+// Since the system is running, the encryption support information
+// will reflect the result of post install checks, rather than pre
+// install ones.
+func (m *DeviceManager) ApplyActionOnRunningSystemAndGadgetAndEncryptionInfo(
+	checkAction *secboot.PreinstallAction,
+) (*System, *gadget.Info, *install.EncryptionSupportInfo, error) {
+	if checkAction == nil {
+		return nil, nil, nil, errors.New("cannot apply empty action")
+	}
+	return m.runningSystemAndGadgetAndEncryptionInfoWithAction(checkAction)
+}
+
+// systemAndGadgetAndEncryptionInfoWithAction resolves the target system by
+// label and returns the system details (including its model assertion), the
+// gadget details and encryption support information.
+//
+// Action and cache semantics:
+//   - With a checkAction: Computes fresh EncryptionSupportInfo. Requires
+//     EncryptionSupportInfo containing a CheckContext to exist in cache for the
+//     provided label. It is incompatible with encInfoFromCache set to true.
+//   - Without a checkAction and encInfoFromCache set to true: return the cached
+//     EncryptionSupportInfo when available, skipping the expensive availability
+//     check.
+//   - Otherwise: computes fresh EncryptionSupportInfo and refreshes the cache on
+//     success.
+//
+// Errors are returned if the system cannot be resolved, gadget info cannot be
+// read/validated, or encryption support evaluation fails. See
+// encryptionSupportInfoUnlocked for the exact cache/CheckContext behavior.
+func (m *DeviceManager) systemAndGadgetAndEncryptionInfoWithAction(
+	wantedSystemLabel string,
+	checkAction *secboot.PreinstallAction,
+	encInfoFromCache bool,
+) (*System, *gadget.Info, *install.EncryptionSupportInfo, error) {
 	// TODO check that the system is not a classic boot one when the
 	// installer is not anymore.
 
 	// System information
-	systemAndSnaps, err := m.loadSystemAndEssentialSnaps(wantedSystemLabel, []snap.Type{snap.TypeKernel, snap.TypeGadget})
+	systemAndSnaps, err := m.loadSystemAndEssentialSnaps(wantedSystemLabel, []snap.Type{snap.TypeSnapd, snap.TypeKernel, snap.TypeGadget}, seed.AllModes)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -2134,7 +2736,14 @@ func (m *DeviceManager) SystemAndGadgetAndEncryptionInfo(wantedSystemLabel strin
 	}
 
 	// Encryption details
-	encInfo, err := m.encryptionSupportInfo(systemAndSnaps.Model, secboot.TPMProvisionFull, systemAndSnaps.InfosByType[snap.TypeKernel], gadgetInfo)
+	encInfo, err := m.encryptionSupportInfoUnlocked(wantedSystemLabel, install.EncryptionConstraints{
+		Model:         systemAndSnaps.Model,
+		Kernel:        systemAndSnaps.InfosByType[snap.TypeKernel],
+		Gadget:        gadgetInfo,
+		TPMMode:       secboot.TPMProvisionFull,
+		SnapdVersions: systemAndSnaps.SystemSnapdVersions,
+		CheckAction:   checkAction,
+	}, encInfoFromCache)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -2147,14 +2756,146 @@ func (m *DeviceManager) SystemAndGadgetAndEncryptionInfo(wantedSystemLabel strin
 		return nil, nil, nil, fmt.Errorf("cannot validate gadget.yaml: %v", err)
 	}
 
-	return systemAndSnaps.System, gadgetInfo, &encInfo, err
+	return systemAndSnaps.System, gadgetInfo, encInfo, err
+}
+
+type reprovisionSetupData struct {
+	recoveryKeyID string
+	checkContext  *secboot.PreinstallCheckContext
+}
+
+type reprovisionSetupDataKey struct {
+}
+
+// GenerateReprovisionRecoveryKey generates a recovery key that is
+// stored in the reprovision setup cache. It returns the generated
+// recovery key. Subsequent call to reprovision will use this key.
+func GenerateReprovisionRecoveryKey(st *state.State) (rkey keys.RecoveryKey, err error) {
+	rkey, keyID, err := fdestateGenerateRecoveryKey(st)
+	if err != nil {
+		return keys.RecoveryKey{}, err
+	}
+
+	var data *reprovisionSetupData
+	cached := st.Cached(reprovisionSetupDataKey{})
+	if cached == nil {
+		data = &reprovisionSetupData{recoveryKeyID: keyID}
+	} else {
+		var ok bool
+		data, ok = cached.(*reprovisionSetupData)
+		if !ok {
+			return keys.RecoveryKey{}, fmt.Errorf("internal error: wrong data type for reprovisionSetupDataKey")
+		}
+		data.recoveryKeyID = keyID
+	}
+
+	st.Cache(reprovisionSetupDataKey{}, data)
+
+	return rkey, err
+}
+
+func (m *DeviceManager) runningSystemAndGadgetAndEncryptionInfoWithAction(
+	checkAction *secboot.PreinstallAction,
+) (*System, *gadget.Info, *install.EncryptionSupportInfo, error) {
+	systemMode := m.SystemMode(SysAny)
+
+	defaultRecoverySystem, err := m.DefaultRecoverySystem()
+	if err != nil && !errors.Is(err, state.ErrNoState) {
+		return nil, nil, nil, err
+	}
+
+	m.state.Lock()
+	defer m.state.Unlock()
+
+	var currentSys *currentSystem
+	currentSys, _ = currentSystemForMode(m.state, systemMode)
+	if currentSys == nil {
+		return nil, nil, nil, fmt.Errorf("no current system for mode %s", systemMode)
+	}
+
+	sys, err := systemFromSeed(currentSys.System, currentSys, defaultRecoverySystem)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	deviceCtx, err := DeviceCtx(m.state, nil, nil)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("cannot get device context: %v", err)
+	}
+
+	gadgetSnapInfo, err := snapstateGadgetInfo(m.state, deviceCtx)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("reading gadget information: %v", err)
+	}
+
+	gadgetInfo, err := gadget.ReadInfo(gadgetSnapInfo.MountDir(), nil)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	var data *reprovisionSetupData
+
+	cached := m.state.Cached(reprovisionSetupDataKey{})
+	if cached == nil {
+		data = &reprovisionSetupData{}
+	} else {
+		var ok bool
+		data, ok = cached.(*reprovisionSetupData)
+		if !ok {
+			return nil, nil, nil, fmt.Errorf("internal error: wrong data type for reprovisionSetupDataKey")
+		}
+	}
+
+	var checkContext *secboot.PreinstallCheckContext
+	var errorDetails []secboot.PreinstallErrorDetails
+	var checkErr error
+
+	if checkAction == nil {
+		modeenv, err := bootReadModeenv(dirs.GlobalRootDir)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		bootChain, err := bootGetRunBootChain(modeenv)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		checkContext, errorDetails, checkErr = secbootPostinstallCheck(context.Background(), bootChain)
+	} else {
+		checkContext = data.checkContext
+		if checkContext == nil {
+			return nil, nil, nil, fmt.Errorf("cannot run check action without prior check")
+		}
+		errorDetails, checkErr = secbootPreinstallCheckAction(checkContext, context.Background(), checkAction)
+	}
+
+	encInfo := &install.EncryptionSupportInfo{
+		Disabled:      false,
+		StorageSafety: sys.Model.StorageSafety(),
+		Available:     checkErr == nil && len(errorDetails) == 0,
+		// FIXME: deal with hooks
+		Type:                    device.EncryptionTypeLUKS,
+		UnavailableErr:          checkErr,
+		UnavailableWarning:      "",
+		AvailabilityCheckErrors: errorDetails,
+		PassphraseAuthAvailable: true,
+		PINAuthAvailable:        true,
+	}
+
+	if checkErr == nil {
+		data.checkContext = checkContext
+		m.state.Cache(reprovisionSetupDataKey{}, data)
+	}
+
+	return sys, gadgetInfo, encInfo, nil
 }
 
 type systemAndEssentialSnaps struct {
 	*System
-	Seed            seed.Seed
-	InfosByType     map[snap.Type]*snap.Info
-	SeedSnapsByType map[snap.Type]*seed.Snap
+	Seed                seed.Seed
+	SystemSnapdVersions install.SystemSnapdVersions
+	InfosByType         map[snap.Type]*snap.Info
+	CompsByType         map[snap.Type][]install.ComponentSeedInfo
+	SeedSnapsByType     map[snap.Type]*seed.Snap
 }
 
 // DefaultRecoverySystem returns the default recovery system, if there is one.
@@ -2175,16 +2916,20 @@ func (m *DeviceManager) defaultRecoverySystem() (*DefaultRecoverySystem, error) 
 }
 
 // loadSystemAndEssentialSnaps loads information for the given label, which
-// includes system, gadget information, gadget and kernel snaps info,
-// and gadget and kernel seed snap info.
+// includes system, gadget information, gadget and kernel snaps info, and
+// gadget and kernel seed snap info. In some cases we only want the components
+// of the essential snaps for a given mode.
 // TODO: make this method optionally return the system seed, since it might not
 // always be needed, and it is quite large.
-func (m *DeviceManager) loadSystemAndEssentialSnaps(wantedSystemLabel string, types []snap.Type) (*systemAndEssentialSnaps, error) {
+func (m *DeviceManager) loadSystemAndEssentialSnaps(wantedSystemLabel string, types []snap.Type, modeForComps string) (*systemAndEssentialSnaps, error) {
 	// get current system as input for loadSeedAndSystem()
 	systemMode := m.SystemMode(SysAny)
-	m.state.Lock()
-	currentSys, _ := currentSystemForMode(m.state, systemMode)
-	m.state.Unlock()
+	var currentSys *currentSystem
+	func() {
+		m.state.Lock()
+		defer m.state.Unlock()
+		currentSys, _ = currentSystemForMode(m.state, systemMode)
+	}()
 
 	defaultRecoverySystem, err := m.DefaultRecoverySystem()
 	if err != nil && !errors.Is(err, state.ErrNoState) {
@@ -2206,7 +2951,9 @@ func (m *DeviceManager) loadSystemAndEssentialSnaps(wantedSystemLabel string, ty
 	// like "snapd" will be skipped and not part of the EssentialSnaps list
 	//
 	snapInfos := make(map[snap.Type]*snap.Info)
+	compInfos := make(map[snap.Type][]install.ComponentSeedInfo)
 	seedSnaps := make(map[snap.Type]*seed.Snap)
+	systemSnapdVersions := install.SystemSnapdVersions{}
 	for _, seedSnap := range s.EssentialSnaps() {
 		typ := seedSnap.EssentialType
 		if seedSnap.Path == "" {
@@ -2223,18 +2970,59 @@ func (m *DeviceManager) loadSystemAndEssentialSnaps(wantedSystemLabel string, ty
 		if snapInfo.SnapType != typ {
 			return nil, fmt.Errorf("cannot use snap info, expected %s but got %s", typ, snapInfo.SnapType)
 		}
-		seedSnaps[typ] = seedSnap
+		// Read components in the seed too, for the mode we are interested in
+		snapForMode, err := s.ModeSnap(seedSnap.SnapName().String(), modeForComps)
+		if err != nil {
+			return nil, fmt.Errorf("internal error while retrieving %s for %s mode: %v",
+				seedSnap.SnapName(), modeForComps, err)
+		}
+		var compInfosForType []install.ComponentSeedInfo
+		if len(snapForMode.Components) > 0 {
+			compInfosForType = make([]install.ComponentSeedInfo, 0, len(snapForMode.Components))
+			for _, sc := range snapForMode.Components {
+				seedComp := sc
+				compf, err := snapfile.Open(seedComp.Path)
+				if err != nil {
+					return nil, fmt.Errorf("cannot open snap from %q: %v", snapForMode.Path, err)
+				}
+				compInfo, err := snap.ReadComponentInfoFromContainer(
+					compf, snapInfo, &seedComp.CompSideInfo)
+				if err != nil {
+					return nil, err
+				}
+				compInfosForType = append(compInfosForType, install.ComponentSeedInfo{
+					Info: compInfo,
+					Seed: &seedComp,
+				})
+			}
+		}
+		if typ == snap.TypeSnapd || typ == snap.TypeKernel {
+			snapdVersion, _, err := snap.SnapdInfoFromSnapFile(snapf, typ)
+			if err != nil {
+				return nil, err
+			}
+			switch typ {
+			case snap.TypeSnapd:
+				systemSnapdVersions.SnapdVersion = snapdVersion
+			case snap.TypeKernel:
+				systemSnapdVersions.SnapdInitramfsVersion = snapdVersion
+			}
+		}
+		seedSnaps[typ] = snapForMode
 		snapInfos[typ] = snapInfo
+		compInfos[typ] = compInfosForType
 	}
 	if len(snapInfos) != len(types) {
 		return nil, fmt.Errorf("internal error: retrieved snap infos (%d) does not match number of types (%d)", len(snapInfos), len(types))
 	}
 
 	return &systemAndEssentialSnaps{
-		System:          sys,
-		Seed:            s,
-		InfosByType:     snapInfos,
-		SeedSnapsByType: seedSnaps,
+		System:              sys,
+		Seed:                s,
+		SystemSnapdVersions: systemSnapdVersions,
+		InfosByType:         snapInfos,
+		CompsByType:         compInfos,
+		SeedSnapsByType:     seedSnaps,
 	}, nil
 }
 
@@ -2253,7 +3041,7 @@ var ErrUnsupportedAction = errors.New("unsupported action")
 func (m *DeviceManager) Reboot(systemLabel, mode string) error {
 	rebootCurrent := func() {
 		logger.Noticef("rebooting system")
-		restart.Request(m.state, restart.RestartSystemNow, nil)
+		restart.Request(m.state, restart.RestartSystemNow, nil, "")
 	}
 
 	// most simple case: just reboot
@@ -2278,7 +3066,7 @@ func (m *DeviceManager) Reboot(systemLabel, mode string) error {
 
 	switched := func(systemLabel string, sysAction *SystemAction) {
 		logger.Noticef("rebooting into system %q in %q mode", systemLabel, sysAction.Mode)
-		restart.Request(m.state, restart.RestartSystemNow, nil)
+		restart.Request(m.state, restart.RestartSystemNow, nil, "")
 	}
 	// even if we are already in the right mode we restart here by
 	// passing rebootCurrent as this is what the user requested
@@ -2329,7 +3117,7 @@ func (m *DeviceManager) RequestSystemAction(systemLabel string, action SystemAct
 	nop := func() {}
 	switched := func(systemLabel string, sysAction *SystemAction) {
 		logger.Noticef("restarting into system %q for action %q", systemLabel, sysAction.Title)
-		restart.Request(m.state, restart.RestartSystemNow, nil)
+		restart.Request(m.state, restart.RestartSystemNow, nil, "")
 	}
 	// we do nothing (nop) if the mode and system are the same
 	return m.switchToSystemAndMode(systemLabel, action.Mode, nop, switched)
@@ -2471,7 +3259,7 @@ func (scb storeContextBackend) SignDeviceSessionRequest(serial *asserts.Serial, 
 		return nil, err
 	}
 
-	a, err := asserts.SignWithoutAuthority(asserts.DeviceSessionRequestType, map[string]interface{}{
+	a, err := asserts.SignWithoutAuthority(asserts.DeviceSessionRequestType, map[string]any{
 		"brand-id":  serial.BrandID(),
 		"model":     serial.Model(),
 		"serial":    serial.Serial(),
@@ -2515,24 +3303,32 @@ func (m *DeviceManager) ntpSyncedOrWaitedLongerThan(maxWait time.Duration) bool 
 	return m.ntpSyncedOrTimedOut
 }
 
-func (m *DeviceManager) hasFDESetupHook(kernelInfo *snap.Info) (bool, error) {
+func (m *DeviceManager) hookKeyProtectorFactory(kernelInfo *snap.Info) (secboot.KeyProtectorFactory, error) {
 	// state must be locked
 	st := m.state
 
 	deviceCtx, err := DeviceCtx(st, nil, nil)
 	if err != nil {
-		return false, fmt.Errorf("cannot get device context: %v", err)
+		return nil, fmt.Errorf("cannot get device context: %v", err)
 	}
 
 	if kernelInfo == nil {
 		var err error
 		kernelInfo, err = snapstate.KernelInfo(st, deviceCtx)
 		if err != nil {
-			return false, fmt.Errorf("cannot get kernel info: %v", err)
+			return nil, fmt.Errorf("cannot get kernel info: %v", err)
 		}
 	}
-	_, ok := kernelInfo.Hooks["fde-setup"]
-	return ok, nil
+
+	if _, ok := kernelInfo.Hooks["fde-setup"]; ok {
+		return secboot.FDESetupHookKeyProtectorFactory(m.runFDESetupHook), nil
+	}
+
+	if secboot.FDEOpteeTAPresent() {
+		return secboot.OPTEEKeyProtectorFactory(), nil
+	}
+
+	return nil, secboot.ErrNoKeyProtector
 }
 
 func (m *DeviceManager) runFDESetupHook(req *fde.SetupRequest) ([]byte, error) {
@@ -2552,13 +3348,13 @@ func (m *DeviceManager) runFDESetupHook(req *fde.SetupRequest) ([]byte, error) {
 		return nil, fmt.Errorf("cannot get kernel info to run fde-setup hook: %v", err)
 	}
 	hooksup := &hookstate.HookSetup{
-		Snap:     kernelInfo.InstanceName(),
+		Snap:     kernelInfo.InstanceName().String(),
 		Revision: kernelInfo.Revision,
 		Hook:     "fde-setup",
 		// XXX: should this be configurable somehow?
 		Timeout: 5 * time.Minute,
 	}
-	contextData := map[string]interface{}{
+	contextData := map[string]any{
 		"fde-setup-request": req,
 	}
 	st.Unlock()
@@ -2716,10 +3512,10 @@ func (m *DeviceManager) RemoveRecoveryKeys() error {
 	return secbootRemoveRecoveryKeys(recoveryKeyDevices)
 }
 
-// checkEncryption verifies whether encryption should be used based on the
-// model grade and the availability of a TPM device or a fde-setup hook
-// in the kernel.
-func (m *DeviceManager) checkEncryption(st *state.State, deviceCtx snapstate.DeviceContext, tpmMode secboot.TPMProvisionMode) (secboot.EncryptionType, error) {
+// checkEncryption verifies whether encryption should be used based on the model
+// grade and the availability of a TPM device, fde-setup hook in the kernel, or
+// the OPTEE trusted application.
+func (m *DeviceManager) checkEncryption(st *state.State, deviceCtx snapstate.DeviceContext, tpmMode secboot.TPMProvisionMode) (device.EncryptionType, error) {
 	model := deviceCtx.Model()
 
 	kernelInfo, err := snapstate.KernelInfo(st, deviceCtx)
@@ -2735,9 +3531,134 @@ func (m *DeviceManager) checkEncryption(st *state.State, deviceCtx snapstate.Dev
 		return "", err
 	}
 
-	return install.CheckEncryptionSupport(model, tpmMode, kernelInfo, gadgetInfo, m.runFDESetupHook)
+	return install.CheckEncryptionSupport(install.EncryptionConstraints{
+		Model:   model,
+		TPMMode: tpmMode,
+		Kernel:  kernelInfo,
+		Gadget:  gadgetInfo,
+	}, m.runFDESetupHook)
 }
 
-func (m *DeviceManager) encryptionSupportInfo(model *asserts.Model, tpmMode secboot.TPMProvisionMode, kernelInfo *snap.Info, gadgetInfo *gadget.Info) (install.EncryptionSupportInfo, error) {
-	return install.GetEncryptionSupportInfo(model, tpmMode, kernelInfo, gadgetInfo, m.runFDESetupHook)
+// encryptionSupportInfoUnlocked is the encryptionSupportInfo variant to use when the state is not locked.
+func (m *DeviceManager) encryptionSupportInfoUnlocked(systemLabel string, constraints install.EncryptionConstraints, encInfoFromCache bool) (*install.EncryptionSupportInfo, error) {
+	return m.encryptionSupportInfo(
+		systemLabel,
+		constraints,
+		encInfoFromCache,
+		m.readCacheEncryptionSupportInfoUnlocked,
+		m.refreshCacheEncryptionSupportInfoUnlocked,
+	)
+}
+
+// encryptionSupportInfoLocked is the encryptionSupportInfo variant to use when the state is locked.
+func (m *DeviceManager) encryptionSupportInfoLocked(systemLabel string, constraints install.EncryptionConstraints, encInfoFromCache bool) (*install.EncryptionSupportInfo, error) {
+	return m.encryptionSupportInfo(
+		systemLabel,
+		constraints, encInfoFromCache,
+		m.readCacheEncryptionSupportInfoLocked,
+		m.refreshCacheEncryptionSupportInfoLocked,
+	)
+}
+
+// encryptionSupportInfo returns encryption support information, optionally
+// consulting and refreshing a cache.
+//
+// Cache behavior is implicit and depends on the combination of arguments:
+//   - With a CheckAction: the cache must provide a valid CheckContext. In this
+//     mode, the cached CheckContext and the set of internally accumulated errors
+//     are implicitly used by GetEncryptionSupportInfo. This implies that any call
+//     with CheckAction must be preceded by a call without that populates the cache.
+//   - Without a CheckAction and encInfoFromCache set to true: the function
+//     returns the cached EncryptionSupportInfo directly, if available. This
+//     provides a way to skip the expensive encryption availability check in
+//     cases where it is not relevant.
+//   - Otherwise: the function computes fresh information via
+//     GetEncryptionSupportInfo and refreshes the cache on success.
+//
+// Errors are returned if inconsistent or impossible cache usage is requested
+//   - CheckAction requires a cache but none is available
+//   - CheckAction is combined with encInfoFromCache set to true
+func (m *DeviceManager) encryptionSupportInfo(
+	systemLabel string,
+	constraints install.EncryptionConstraints,
+	encInfoFromCache bool,
+	readCache func(systemLabel string) *install.EncryptionSupportInfo,
+	refreshCache func(systemLabel string, info *install.EncryptionSupportInfo),
+) (*install.EncryptionSupportInfo, error) {
+
+	if constraints.CheckAction != nil && encInfoFromCache {
+		return nil, errors.New("internal error: cannot apply check action and use cached encryption information")
+	}
+
+	cachedEncryptionSupportInfo := readCache(systemLabel)
+
+	if constraints.CheckAction != nil {
+		// a check action requires only the check context from the cache
+		// and need to run the check
+		if cachedEncryptionSupportInfo == nil {
+			return nil, errors.New("cannot use check action without cached encryption information")
+		}
+		checkContext := cachedEncryptionSupportInfo.CheckContext()
+		if checkContext == nil {
+			return nil, errors.New("cannot use check action without cached check context")
+		}
+		constraints.PrevInfo = cachedEncryptionSupportInfo
+	} else if encInfoFromCache && cachedEncryptionSupportInfo != nil {
+		// in case of no check action use encryption support info from the
+		// cache when requested and available
+		return cachedEncryptionSupportInfo, nil
+	}
+
+	// GetEncryptionSupportInfo expects and uses constraints.PrevInfo.CheckContext when
+	// constraints.CheckAction != nil, otherwise it is ignored (check install.encryptionAvailabilityCheck).
+	// It also accumulates seen errors given constraints.PrevInfo even if some error was
+	// cleared by a "proceed" action.
+	encInfo, err := install.GetEncryptionSupportInfo(constraints, m.runFDESetupHook)
+	if err == nil {
+		refreshCache(systemLabel, &encInfo)
+	}
+	return &encInfo, err
+}
+
+type encryptionSupportInfoKey struct{ systemLabel string }
+
+// SetEncryptionSupportInfoInCacheUnlocked is a test only helper for populating EncryptionSupportInfo in cache.
+func (m *DeviceManager) SetEncryptionSupportInfoInCacheUnlocked(systemLabel string, encryptionInfo *install.EncryptionSupportInfo) {
+	osutil.MustBeTestBinary("SetEncryptionSupportInfoInCacheUnlocked can only be used tests")
+	m.refreshCacheEncryptionSupportInfoUnlocked(systemLabel, encryptionInfo)
+}
+
+// refreshCacheEncryptionSupportUnlocked is the refreshCacheEncryptionSupport variant to use when the state is not locked.
+func (m *DeviceManager) refreshCacheEncryptionSupportInfoUnlocked(systemLabel string, encryptionInfo *install.EncryptionSupportInfo) {
+	m.state.Lock()
+	defer m.state.Unlock()
+	m.refreshCacheEncryptionSupportInfoLocked(systemLabel, encryptionInfo)
+}
+
+// refreshCacheEncryptionSupportLocked is the refreshCacheEncryptionSupport variant to use when the state is locked.
+func (m *DeviceManager) refreshCacheEncryptionSupportInfoLocked(systemLabel string, encryptionInfo *install.EncryptionSupportInfo) {
+	m.state.Cache(encryptionSupportInfoKey{systemLabel}, encryptionInfo)
+}
+
+// readCacheEncryptionSupportInfoStateUnlocked is the readCacheEncryptionSupportInfoState variant that does not lock state.
+func (m *DeviceManager) readCacheEncryptionSupportInfoUnlocked(systemLabel string) *install.EncryptionSupportInfo {
+	m.state.Lock()
+	defer m.state.Unlock()
+	return m.readCacheEncryptionSupportInfoLocked(systemLabel)
+}
+
+// readCacheEncryptionSupportInfoStateLocked is the readCacheEncryptionSupportInfoState variant that locks state.
+func (m *DeviceManager) readCacheEncryptionSupportInfoLocked(systemLabel string) *install.EncryptionSupportInfo {
+	cached := m.state.Cached(encryptionSupportInfoKey{systemLabel})
+	if cached != nil {
+		encryptionSupportInfo, ok := cached.(*install.EncryptionSupportInfo)
+		if ok {
+			return encryptionSupportInfo
+		}
+	}
+	return nil
+}
+
+var secbootPostinstallCheck = func(ctx context.Context, bootChain []bootloader.BootFile) (*secboot.PreinstallCheckContext, []secboot.PreinstallErrorDetails, error) {
+	return secboot.PostinstallCheck(ctx, bootChain)
 }

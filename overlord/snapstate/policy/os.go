@@ -31,7 +31,7 @@ type osPolicy struct {
 	modelBase string
 }
 
-func (p *osPolicy) CanRemove(st *state.State, snapst *snapstate.SnapState, rev snap.Revision, dev snap.Device) error {
+func (p *osPolicy) CanRemove(st *state.State, snapst *snapstate.SnapState, rev snap.Revision, dev snap.Device, removals map[string]bool) error {
 	name := snapst.InstanceName()
 	if name == "" {
 		// not installed, or something. What are you even trying to do.
@@ -53,7 +53,7 @@ func (p *osPolicy) CanRemove(st *state.State, snapst *snapstate.SnapState, rev s
 		if !rev.Unset() {
 			// TODO: tweak boot.InUse so that it DTRT when rev.Unset, call
 			// it unconditionally as an extra precaution
-			if err := inUse(name, rev, snap.TypeOS, dev); err != nil {
+			if err := inUse(name.String(), rev, snap.TypeOS, dev); err != nil {
 				return err
 			}
 			return nil
@@ -89,9 +89,5 @@ func (p *osPolicy) CanRemove(st *state.State, snapst *snapstate.SnapState, rev s
 		return errRequired
 	}
 
-	usedBy, err := baseUsedBy(st, "")
-	if len(usedBy) == 0 || err != nil {
-		return err
-	}
-	return inUseByErr(usedBy)
+	return validateBaseOnlyUsedByRemoved(st, "", removals)
 }

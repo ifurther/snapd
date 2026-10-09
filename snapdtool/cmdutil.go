@@ -22,6 +22,7 @@ package snapdtool
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"debug/elf"
 	"fmt"
 	"io"
@@ -34,7 +35,7 @@ import (
 	"github.com/snapcore/snapd/osutil"
 )
 
-func elfInterp(cmd string) (string, error) {
+var elfInterp = func(cmd string) (string, error) {
 	el, err := elf.Open(cmd)
 	if err != nil {
 		return "", err
@@ -94,11 +95,28 @@ func parseLdSoConf(root string, confPath string) []string {
 }
 
 // CommandFromSystemSnap runs a command from the snapd/core snap
-// using the proper interpreter and library paths.
+// using the proper interpreter and library paths if needed.
+//
+// Files from core need this hack. Files from snapd are executed normally unless
+// the snapd snap is not mounted under /snap.
 //
 // At the moment it can only run ELF files, expects a standard ld.so
 // interpreter, and can't handle RPATH.
 func CommandFromSystemSnap(name string, cmdArgs ...string) (*exec.Cmd, error) {
+	return CommandFromSystemSnapWithCmdBuilder(exec.Command, name, cmdArgs...)
+}
+
+// CommandFromSystemSnapWithContext does the same as CommandFromSystemSnap, but
+// accepts a context for command cancellation.
+func CommandFromSystemSnapWithContext(ctx context.Context, name string, cmdArgs ...string) (*exec.Cmd, error) {
+	return CommandFromSystemSnapWithCmdBuilder(
+		func(name string, args ...string) *exec.Cmd {
+			return exec.CommandContext(ctx, name, args...)
+		},
+		name, cmdArgs...)
+}
+
+func CommandFromSystemSnapWithCmdBuilder(createCmd func(name string, arg ...string) *exec.Cmd, name string, cmdArgs ...string) (*exec.Cmd, error) {
 	from := "snapd"
 	root := filepath.Join(dirs.SnapMountDir, "/snapd/current")
 	if !osutil.FileExists(root) {
@@ -107,6 +125,34 @@ func CommandFromSystemSnap(name string, cmdArgs ...string) (*exec.Cmd, error) {
 	}
 
 	cmdPath := filepath.Join(root, name)
+
+	if from == "snapd" {
+		// the elf interpreter invoked by the binary will work if snaps are mounted at /snap
+		// or /snap/snapd/current resolves to <mount dir>/snapd/current so that the interpreter
+		// locations are correct, otherwise we need to set up a command to invoke it directly
+		snapdCurrentDir := filepath.Join(dirs.GlobalRootDir, "snap/snapd/current")
+		if match, err := osutil.ComparePathsByDeviceInode(root, snapdCurrentDir); err == nil && match {
+			return createCmd(cmdPath, cmdArgs...), nil
+		}
+
+		interp, err := elfInterp(cmdPath)
+		if err != nil {
+			return nil, err
+		}
+
+		slashSnapPrefix := filepath.Join(dirs.GlobalRootDir, "snap") + "/"
+		interp = filepath.Join(dirs.SnapMountDir, strings.TrimPrefix(interp, slashSnapPrefix))
+		// all libraries are at the same path as the interpreter
+		ldLibraryPathForSnapd := filepath.Dir(interp)
+
+		ldSoArgs := []string{"--library-path", ldLibraryPathForSnapd, cmdPath}
+		allArgs := append(ldSoArgs, cmdArgs...)
+		return createCmd(interp, allArgs...), nil
+	}
+
+	// We are trying to execute files from core snap. They need
+	// run with a their interpreter and library paths
+
 	interp, err := elfInterp(cmdPath)
 	if err != nil {
 		return nil, err
@@ -136,5 +182,5 @@ func CommandFromSystemSnap(name string, cmdArgs ...string) (*exec.Cmd, error) {
 
 	ldSoArgs := []string{"--library-path", strings.Join(ldLibraryPathForCore, ":"), cmdPath}
 	allArgs := append(ldSoArgs, cmdArgs...)
-	return exec.Command(coreLdSo, allArgs...), nil
+	return createCmd(coreLdSo, allArgs...), nil
 }

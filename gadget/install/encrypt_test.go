@@ -21,23 +21,39 @@
 package install_test
 
 import (
+	"context"
 	"errors"
-	"fmt"
 	"os"
 
 	. "gopkg.in/check.v1"
 
+	sb "github.com/snapcore/secboot"
+
 	"github.com/snapcore/snapd/dirs"
+	"github.com/snapcore/snapd/gadget/device"
 	"github.com/snapcore/snapd/gadget/install"
 	"github.com/snapcore/snapd/secboot"
 	"github.com/snapcore/snapd/secboot/keys"
 	"github.com/snapcore/snapd/testutil"
 )
 
+type simpleMockActivateContext struct {
+}
+
+func (m *simpleMockActivateContext) ActivateContainer(ctx context.Context, container sb.StorageContainer, opts ...sb.ActivateOption) error {
+	return nil
+}
+
+func (m *simpleMockActivateContext) DeactivateContainer(ctx context.Context, container sb.StorageContainer, reason sb.DeactivationReason) error {
+	return nil
+}
+
+func (m *simpleMockActivateContext) State() *secboot.ActivateState {
+	return nil
+}
+
 type encryptSuite struct {
 	testutil.BaseTest
-
-	mockCryptsetup *testutil.MockCmd
 
 	mockedEncryptionKey keys.EncryptionKey
 	mockedRecoveryKey   keys.RecoveryKey
@@ -79,25 +95,28 @@ func (s *encryptSuite) TestNewEncryptedDeviceLUKS(c *C) {
 			expectedErr:     "cannot open encrypted device on /dev/node1: open error",
 		},
 	} {
-		script := ""
-		if tc.mockedOpenErr != "" {
-			script = fmt.Sprintf("echo '%s'>&2; exit 1", tc.mockedOpenErr)
+		defer install.MockSecbootNewSimpleActivateContext(func(ctx context.Context) (secboot.ActivateContext, error) {
+			return &simpleMockActivateContext{}, nil
+		})()
 
-		}
-		s.mockCryptsetup = testutil.MockCommand(c, "cryptsetup", script)
-		s.AddCleanup(s.mockCryptsetup.Restore)
+		defer install.MockSecbootUnlockEncryptedVolumeUsingKey(func(activation secboot.ActivateContext, devNode string, name string, key []byte) (secboot.StorageContainer, error) {
+			if tc.mockedOpenErr != "" {
+				return nil, errors.New(tc.mockedOpenErr)
+			}
+			return nil, nil
+		})()
 
 		calls := 0
-		restore := install.MockSecbootFormatEncryptedDevice(func(key keys.EncryptionKey, encType secboot.EncryptionType, label, node string) error {
+		restore := install.MockSecbootFormatEncryptedDevice(func(key []byte, encType device.EncryptionType, label, node string) error {
 			calls++
-			c.Assert(key, DeepEquals, s.mockedEncryptionKey)
+			c.Assert(key, DeepEquals, []byte(s.mockedEncryptionKey))
 			c.Assert(label, Equals, "some-label-enc")
 			c.Assert(node, Equals, "/dev/node1")
 			return tc.mockedFormatErr
 		})
 		defer restore()
 
-		dev, err := install.NewEncryptedDeviceLUKS("/dev/node1", secboot.EncryptionTypeLUKS, s.mockedEncryptionKey, "some-label", "some-label")
+		dev, err := install.NewEncryptedDeviceLUKS("/dev/node1", device.EncryptionTypeLUKS, secboot.DiskUnlockKey(s.mockedEncryptionKey), "some-label", "some-label")
 		c.Assert(calls, Equals, 1)
 		if tc.expectedErr == "" {
 			c.Assert(err, IsNil)
@@ -109,10 +128,5 @@ func (s *encryptSuite) TestNewEncryptedDeviceLUKS(c *C) {
 
 		err = dev.Close()
 		c.Assert(err, IsNil)
-
-		c.Assert(s.mockCryptsetup.Calls(), DeepEquals, [][]string{
-			{"cryptsetup", "open", "--key-file", "-", "/dev/node1", "some-label"},
-			{"cryptsetup", "close", "some-label"},
-		})
 	}
 }

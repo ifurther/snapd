@@ -30,7 +30,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path"
 	"strconv"
 	"strings"
@@ -51,6 +50,7 @@ import (
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/snap/channel"
 	"github.com/snapcore/snapd/snap/naming"
+	"github.com/snapcore/snapd/snap/squashfs"
 	"github.com/snapcore/snapd/snapdenv"
 	"github.com/snapcore/snapd/strutil"
 )
@@ -86,6 +86,9 @@ var connCheckStrategy = retry.LimitCount(3, retry.LimitTime(38*time.Second,
 	},
 ))
 
+// For testing purposes
+var squashfsSupportedDeltaFormats = squashfs.SupportedDeltaFormats
+
 // Config represents the configuration to access the snap store
 type Config struct {
 	// Store API base URLs. The assertions url is only separate because it can
@@ -106,11 +109,10 @@ type Config struct {
 	DetailFields []string
 	InfoFields   []string
 	// search v2 fields
-	FindFields  []string
-	DeltaFormat string
+	FindFields []string
 
-	// CacheDownloads is the number of downloads that should be cached
-	CacheDownloads int
+	// CachePolicy defines the cache policy for downloaded snaps
+	CachePolicy CachePolicy
 
 	// Proxy returns the HTTP proxy to use when talking to the store
 	Proxy func(*http.Request) (*url.URL, error)
@@ -153,7 +155,6 @@ type Store struct {
 	detailFields []string
 	infoFields   []string
 	findFields   []string
-	deltaFormat  string
 
 	auth Authorizer
 	// reused http client
@@ -170,12 +171,6 @@ type Store struct {
 	proxyConnectHeader http.Header
 
 	userAgent string
-
-	xdeltaCheckLock sync.Mutex
-	// whether we should use deltas or not
-	shouldUseDeltas *bool
-	// which xdelta3 we picked when we checked the deltas
-	xdelta3CmdFunc func(args ...string) *exec.Cmd
 }
 
 var ErrTooManyRequests = errors.New("too many requests")
@@ -320,10 +315,10 @@ func init() {
 	if err != nil {
 		panic(err)
 	}
-	defaultConfig.DetailFields = jsonutil.StructFields((*snapDetails)(nil), "snap_yaml_raw")
-	defaultConfig.InfoFields = jsonutil.StructFields((*storeSnap)(nil), "snap-yaml")
+	defaultConfig.DetailFields = jsonutil.StructFields((*snapDetails)(nil), "snap_yaml_raw", "integrity")
+	defaultConfig.InfoFields = jsonutil.StructFields((*storeSnap)(nil), "snap-yaml", "integrity")
 	defaultConfig.FindFields = append(jsonutil.StructFields((*storeSnap)(nil),
-		"architectures", "created-at", "epoch", "name", "snap-id", "snap-yaml"),
+		"architectures", "created-at", "epoch", "name", "snap-id", "snap-yaml", "resources", "integrity"),
 		"channel")
 }
 
@@ -354,9 +349,6 @@ type CategoryDetails struct {
 type categoryResults struct {
 	Categories []CategoryDetails `json:"categories"`
 }
-
-// The default delta format if not configured.
-var defaultSupportedDeltaFormat = "xdelta3"
 
 // New creates a new Store with the given access configuration and for given the store id.
 func New(cfg *Config, dauthCtx DeviceAndAuthContext) *Store {
@@ -389,11 +381,6 @@ func New(cfg *Config, dauthCtx DeviceAndAuthContext) *Store {
 		series = release.Series
 	}
 
-	deltaFormat := cfg.DeltaFormat
-	if deltaFormat == "" {
-		deltaFormat = defaultSupportedDeltaFormat
-	}
-
 	userAgent := snapdenv.UserAgent()
 	proxyConnectHeader := http.Header{"User-Agent": []string{userAgent}}
 
@@ -407,7 +394,6 @@ func New(cfg *Config, dauthCtx DeviceAndAuthContext) *Store {
 		infoFields:         infoFields,
 		findFields:         findFields,
 		dauthCtx:           dauthCtx,
-		deltaFormat:        deltaFormat,
 		proxy:              cfg.Proxy,
 		proxyConnectHeader: proxyConnectHeader,
 		userAgent:          userAgent,
@@ -426,9 +412,19 @@ func New(cfg *Config, dauthCtx DeviceAndAuthContext) *Store {
 	}
 	store.auth = auth
 
-	store.SetCacheDownloads(cfg.CacheDownloads)
+	store.SetCachePolicy(cfg.CachePolicy)
 
 	return store
+}
+
+func (s *Store) supportedDeltaFormats() []string {
+	withSnapStoreDelta := false
+	if s.dauthCtx != nil {
+		withSnapStoreDelta = s.dauthCtx.WithSnapStoreDelta()
+	}
+
+	return squashfsSupportedDeltaFormats(
+		squashfs.DeltaFormatOpts{WithSnapDeltaFormat: withSnapStoreDelta})
 }
 
 // SetAssertionMaxFormats allows to change the assertion max formats to send
@@ -614,6 +610,13 @@ func (r *requestOptions) addHeader(k, v string) {
 	r.ExtraHeaders[k] = v
 }
 
+// iconRequestOptions specifies parameters for icon requests, which do not
+// require headers related to the store or snap. Just an ordinary GET request.
+type iconRequestOptions struct {
+	url  *url.URL
+	etag string
+}
+
 func cancelled(ctx context.Context) bool {
 	select {
 	case <-ctx.Done():
@@ -623,7 +626,7 @@ func cancelled(ctx context.Context) bool {
 	}
 }
 
-var expectedCatalogPreamble = []interface{}{
+var expectedCatalogPreamble = []any{
 	json.Delim('{'),
 	"_embedded",
 	json.Delim('{'),
@@ -693,7 +696,7 @@ func decodeCatalog(resp *http.Response, names io.Writer, db SnapAdder) error {
 	return nil
 }
 
-func decodeJSONBody(resp *http.Response, success interface{}, failure interface{}) error {
+func decodeJSONBody(resp *http.Response, success any, failure any) error {
 	ok := (resp.StatusCode == 200 || resp.StatusCode == 201)
 	// always decode on success; decode failures only if body is not empty
 	if !ok && resp.ContentLength == 0 {
@@ -710,7 +713,7 @@ func decodeJSONBody(resp *http.Response, success interface{}, failure interface{
 }
 
 // retryRequestDecodeJSON calls retryRequest and decodes the response into either success or failure.
-func (s *Store) retryRequestDecodeJSON(ctx context.Context, reqOptions *requestOptions, user *auth.UserState, success interface{}, failure interface{}) (resp *http.Response, err error) {
+func (s *Store) retryRequestDecodeJSON(ctx context.Context, reqOptions *requestOptions, user *auth.UserState, success any, failure any) (resp *http.Response, err error) {
 	return httputil.RetryRequest(reqOptions.URL.String(), func() (*http.Response, error) {
 		return s.doRequest(ctx, s.client, reqOptions, user)
 	}, func(resp *http.Response) error {
@@ -764,6 +767,26 @@ func (s *Store) doRequest(ctx context.Context, client *http.Client, reqOptions *
 
 		return resp, err
 	}
+}
+
+// doIconRequest does an unauthenticated GET request to the given URL.
+func doIconRequest(ctx context.Context, client *http.Client, reqOptions iconRequestOptions) (*http.Response, error) {
+	var body io.Reader // empty body
+	req, err := http.NewRequestWithContext(ctx, "GET", reqOptions.url.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	if reqOptions.etag != "" {
+		req.Header.Set("If-None-Match", reqOptions.etag)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	return resp, err
 }
 
 func (s *Store) buildLocationString() (string, error) {
@@ -1275,7 +1298,7 @@ func (s *Store) Sections(ctx context.Context, user *auth.UserState) ([]string, e
 	}
 
 	var sectionData sectionResults
-	resp, err := s.retryRequestDecodeJSON(context.TODO(), reqOptions, user, &sectionData, nil)
+	resp, err := s.retryRequestDecodeJSON(ctx, reqOptions, user, &sectionData, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1560,7 +1583,7 @@ func (s *Store) ReadyToBuy(user *auth.UserState) error {
 
 // abbreviated info structs just for the download info
 type storeInfoChannelAbbrev struct {
-	Download storeSnapDownload `json:"download"`
+	Download storeDownload `json:"download"`
 }
 
 type storeInfoAbbrev struct {
@@ -1572,9 +1595,7 @@ var errUnexpectedConnCheckResponse = errors.New("unexpected response during conn
 
 func (s *Store) snapConnCheck() ([]string, error) {
 	var hosts []string
-	// NOTE: "core" is possibly the only snap that's sure to be in all stores
-	//       when we drop "core" in the move to snapd/core18/etc, change this
-	infoURL, err := s.endpointURL(path.Join(snapInfoEndpPath, "core"), url.Values{
+	infoURL, err := s.endpointURL(path.Join(snapInfoEndpPath, "snapd"), url.Values{
 		// we only want the download URL
 		"fields": {"download"},
 		// we only need *one* (but can't filter by channel ... yet)

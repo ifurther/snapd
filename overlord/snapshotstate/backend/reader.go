@@ -30,6 +30,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"syscall"
 
 	"github.com/snapcore/snapd/client"
@@ -39,6 +40,7 @@ import (
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/osutil/sys"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/strutil"
 )
 
@@ -189,7 +191,7 @@ func (r *Reader) Check(ctx context.Context, usernames []string) error {
 }
 
 // Logf is the type implemented by logging functions.
-type Logf func(format string, args ...interface{})
+type Logf func(format string, args ...any)
 
 // Restore the data from the snapshot.
 //
@@ -197,7 +199,7 @@ type Logf func(format string, args ...interface{})
 // or the one in the snapshot) with that contained in the snapshot. It keeps
 // track of the old data in the task so it can be undone (or cleaned up).
 func (r *Reader) Restore(ctx context.Context, current snap.Revision, usernames []string, logf Logf, opts *dirs.SnapDirOptions) (rs *RestoreState, e error) {
-	rs = &RestoreState{}
+	rs = &RestoreState{Snap: r.Snap}
 	defer func() {
 		if e != nil {
 			logger.Noticef("Restore of snapshot %q failed (%v); undoing.", r.Name(), e)
@@ -208,7 +210,7 @@ func (r *Reader) Restore(ctx context.Context, current snap.Revision, usernames [
 
 	sort.Strings(usernames)
 	isRoot := sys.Geteuid() == 0
-	si := snap.MinimalPlaceInfo(r.Snap, r.Revision)
+	si := snap.MinimalPlaceInfo(naming.InstanceName(r.Snap), r.Revision)
 	hasher := crypto.SHA3_384.New()
 	var sz osutil.Sizer
 
@@ -322,7 +324,7 @@ func (r *Reader) Restore(ctx context.Context, current snap.Revision, usernames [
 		// resist the temptation of using archive/tar unless it's proven
 		// that calling out to tar has issues -- there are a lot of
 		// special cases we'd need to consider otherwise
-		cmd := tarAsUser(username,
+		cmd := tarAsUser(ctx, username,
 			"--extract",
 			"--preserve-permissions", "--preserve-order", "--gunzip",
 			"--directory", tempdir)
@@ -336,7 +338,8 @@ func (r *Reader) Restore(ctx context.Context, current snap.Revision, usernames [
 			cmd.Stderr = io.MultiWriter(os.Stderr, matchCounter)
 		}
 
-		if err = osutil.RunWithContext(ctx, cmd); err != nil {
+		// cmd is cancellable if ctx is a cancellable context
+		if err = cmd.Run(); err != nil {
 			matches, count := matchCounter.Matches()
 			if count > 0 {
 				return rs, fmt.Errorf("cannot unpack archive: %s (and %d more)", matches[0], count-1)
@@ -392,6 +395,33 @@ func moveFile(rs *RestoreState, file, sourceDir, targetDir string) error {
 		return err
 	}
 	if exists {
+		// Handle mounts under dst before renaming it.
+		// * snapctl mounts are stopped and restarted after moveFile returns
+		//   (i.e., once the src data has been moved).
+		// * non-snapctl mounts cannot be stopped and could lead to dangling
+		//   mounts on move, so return an error if any are present.
+		snapctlMPs, nonSnapctlMPs, err := listMountsAtOrUnder(rs.Snap, dst)
+		if err != nil {
+			return fmt.Errorf("cannot list mounts for snap %q under %q: %v",
+				rs.Snap, dst, err)
+		}
+		if len(nonSnapctlMPs) > 0 {
+			return fmt.Errorf("cannot move data with unknown mount(s) under %q: %s",
+				dst, strings.Join(nonSnapctlMPs, ", "))
+		}
+		stoppedUnits, err := stopMountUnits(snapctlMPs)
+		defer func() {
+			// best effort restart when we exit to restore the mounts in the newly
+			// restored directory, but also cover the error path
+			if startErr := startMountUnits(stoppedUnits); startErr != nil {
+				logger.Noticef("cannot restart mount unit(s) for snap %q under %q: %v",
+					rs.Snap, dst, startErr)
+			}
+		}()
+		if err != nil {
+			return fmt.Errorf("cannot stop mount unit(s) for snap %q under %q: %v",
+				rs.Snap, dst, err)
+		}
 		rsfn := restoreStateFilename(dst)
 		if err := os.Rename(dst, rsfn); err != nil {
 			return err

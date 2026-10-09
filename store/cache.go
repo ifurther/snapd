@@ -22,18 +22,45 @@ package store
 import (
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
+	"github.com/snapcore/snapd/strutil"
+	"github.com/snapcore/snapd/strutil/quantity"
 )
+
+// DefaultCachePolicyCore is a recommended default policy for Core systems.
+var DefaultCachePolicyCore = CachePolicy{
+	// at most this many unreferenced items
+	MaxItems: 5,
+	// unreferenced items older than 30 days are removed
+	MaxAge: 30 * 24 * time.Hour,
+	// try to keep cache < 1GB
+	MaxSizeBytes: 1 * 1024 * 1024 * 1024,
+}
+
+// DefaultCachePolicyClassic is a recommended default policy for classic
+// systems.
+var DefaultCachePolicyClassic = CachePolicy{
+	// at most this many unreferenced items
+	MaxItems: 5,
+	// unreferenced items older than 30 days are removed
+	MaxAge: 30 * 24 * time.Hour,
+	// policy for classic systems has no size limit
+}
 
 // overridden in the unit tests
 var osRemove = os.Remove
+
+var ErrCleanupBusy = errors.New("cannot perform cache cleanup: cache is busy")
 
 // downloadCache is the interface that a store download cache must provide
 type downloadCache interface {
@@ -44,6 +71,18 @@ type downloadCache interface {
 	Put(cacheKey, sourcePath string) error
 	// Get full path of the file in cache
 	GetPath(cacheKey string) string
+	// Drop an entry. Ignores errors when entry does not exist.
+	Drop(cacheKey string) error
+	// Open opens a cache entry for reading. The returned file handle
+	// remains valid even if the entry is subsequently removed by another
+	// operation (e.g. Drop or Cleanup), because on Linux an open file
+	// descriptor preserves access to the inode data until it is closed.
+	// Returns an io.ReadSeekCloser and the stream size.
+	Open(cacheKey string) (io.ReadSeekCloser, int64, error)
+	// Best effort cleanup of outstanding cache items. Returns ErrCleanupBusy
+	// when the cache is in use and cleanup should be retried at some later
+	// time.
+	Cleanup() error
 }
 
 // nullCache is cache that does not cache
@@ -57,52 +96,70 @@ func (cm *nullCache) GetPath(cacheKey string) string {
 }
 func (cm *nullCache) Put(cacheKey, sourcePath string) error { return nil }
 
-// changesByMtime sorts by the mtime of files
-type changesByMtime []os.FileInfo
+func (cm *nullCache) Drop(cacheKey string) error { return nil }
 
-func (s changesByMtime) Len() int           { return len(s) }
-func (s changesByMtime) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
-func (s changesByMtime) Less(i, j int) bool { return s[i].ModTime().Before(s[j].ModTime()) }
+func (cm *nullCache) Open(cacheKey string) (io.ReadSeekCloser, int64, error) {
+	return nil, 0, fs.ErrNotExist
+}
+
+func (cm *nullCache) Cleanup() error { return nil }
+
+// entriesByMtime sorts by the mtime of files
+type entriesByMtime []os.FileInfo
+
+func (s entriesByMtime) Len() int           { return len(s) }
+func (s entriesByMtime) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+func (s entriesByMtime) Less(i, j int) bool { return s[i].ModTime().Before(s[j].ModTime()) }
 
 // cacheManager implements a downloadCache via content based hard linking
 type CacheManager struct {
-	cacheDir string
-	maxItems int
+	// cleanupLock is used as a 'cleanup' synchronization point, where operations
+	// for putting, getting files from the cache take a read cleanupLock, while the
+	// actual cleanup operation takes the cleanupLock for writing
+	cleanupLock sync.RWMutex
+	cacheDir    string
+	cachePolicy CachePolicy
 }
 
-// NewCacheManager returns a new CacheManager with the given cacheDir
-// and the given maximum amount of items. The idea behind it is the
-// following algorithm:
+// NewCacheManager returns a new CacheManager with the given cacheDir and the
+// given cache policy. The idea behind it is the following algorithm:
 //
 //  1. When starting a download, check if it exists in $cacheDir
 //  2. If found, update its mtime, hardlink into target location, and
 //     return success
 //  3. If not found, download the snap
 //  4. On success, hardlink into $cacheDir/<digest>
-//  5. If cache dir has more than maxItems entries, remove oldest mtimes
-//     until it has maxItems
+//  5. Apply cache policy and remove items identified by the policy.
 //
 // The caching part is done here, the downloading happens in the store.go
 // code.
-func NewCacheManager(cacheDir string, maxItems int) *CacheManager {
+func NewCacheManager(cacheDir string, policy CachePolicy) *CacheManager {
 	return &CacheManager{
-		cacheDir: cacheDir,
-		maxItems: maxItems,
+		cacheDir:    cacheDir,
+		cachePolicy: policy,
 	}
 }
 
-// GetPath returns the full path of the given content in the cache
-// or empty string
+// GetPath returns the full path of the given content in the cache or empty
+// string. The path may be removed at any time. The caller needs to ensure that
+// they properly handle ErrNotExist when using returned path.
 func (cm *CacheManager) GetPath(cacheKey string) string {
+	cm.cleanupLock.RLock()
+	defer cm.cleanupLock.RUnlock()
+
 	if _, err := os.Stat(cm.path(cacheKey)); os.IsNotExist(err) {
 		return ""
 	}
+
 	return cm.path(cacheKey)
 }
 
 // Get retrieves the given cacheKey content and puts it into targetPath. Returns
 // true if a cached file was moved to targetPath or if one was already there.
 func (cm *CacheManager) Get(cacheKey, targetPath string) bool {
+	cm.cleanupLock.RLock()
+	defer cm.cleanupLock.RUnlock()
+
 	if err := os.Link(cm.path(cacheKey), targetPath); err != nil && !errors.Is(err, os.ErrExist) {
 		return false
 	}
@@ -125,22 +182,84 @@ func (cm *CacheManager) Put(cacheKey, sourcePath string) error {
 		return nil
 	}
 
-	err := os.Link(sourcePath, cm.path(cacheKey))
-	if os.IsExist(err) {
-		now := time.Now()
-		err := os.Chtimes(cm.path(cacheKey), now, now)
-		// this can happen if a cleanup happens in parallel, ie.
-		// the file was there but cleanup() removed it between
-		// the os.Link/os.Chtimes - no biggie, just link it again
-		if os.IsNotExist(err) {
-			return os.Link(sourcePath, cm.path(cacheKey))
+	err := func() error {
+		cm.cleanupLock.RLock()
+		defer cm.cleanupLock.RUnlock()
+
+		err := os.Link(sourcePath, cm.path(cacheKey))
+		if errors.Is(err, fs.ErrExist) {
+			now := time.Now()
+			return os.Chtimes(cm.path(cacheKey), now, now)
 		}
 		return err
-	}
+	}()
 	if err != nil {
 		return err
 	}
-	return cm.cleanup()
+
+	return cm.opportunisticCleanup()
+}
+
+// Drop drops an entry at given key.
+func (cm *CacheManager) Drop(cacheKey string) error {
+	if cacheKey == "" {
+		return nil
+	}
+
+	// always try to create the cache dir first or the following
+	// osutil.IsWritable will always fail if the dir is missing
+	_ = os.MkdirAll(cm.cacheDir, 0700)
+
+	// happens on e.g. `snap download` which runs as the user
+	if !osutil.IsWritable(cm.cacheDir) {
+		return nil
+	}
+
+	return func() error {
+		cm.cleanupLock.RLock()
+		defer cm.cleanupLock.RUnlock()
+
+		err := os.Remove(cm.path(cacheKey))
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		return nil
+	}()
+}
+
+// Open opens a cache entry for reading. The returned file handle remains
+// valid even if the entry is subsequently removed by another operation (e.g.
+// Drop or Cleanup), because on Linux an open file descriptor preserves access
+// to the inode data until it is closed. The returned int64 is the size of the
+// cached stream.
+func (cm *CacheManager) Open(cacheKey string) (f io.ReadSeekCloser, size int64, err error) {
+	if cacheKey == "" {
+		return nil, 0, fs.ErrNotExist
+	}
+
+	// always try to create the cache dir first or the following
+	// osutil.IsWritable will always fail if the dir is missing
+	_ = os.MkdirAll(cm.cacheDir, 0700)
+
+	cm.cleanupLock.RLock()
+	defer cm.cleanupLock.RUnlock()
+
+	fd, err := os.Open(cm.path(cacheKey))
+	if err != nil {
+		return nil, 0, err
+	}
+	defer func() {
+		if err != nil {
+			fd.Close()
+		}
+	}()
+	fi, err := fd.Stat()
+	if err != nil {
+		return nil, 0, err
+	}
+	f = fd
+
+	return f, fi.Size(), nil
 }
 
 // count returns the number of items in the cache
@@ -158,72 +277,50 @@ func (cm *CacheManager) path(cacheKey string) string {
 	return filepath.Join(cm.cacheDir, cacheKey)
 }
 
-// cleanup ensures that only maxItems are stored in the cache
-func (cm *CacheManager) cleanup() error {
+// invokes Cleanup(), but ignores ErrCleanupBusy errors.
+func (cm *CacheManager) opportunisticCleanup() error {
+	if err := cm.Cleanup(); err != ErrCleanupBusy {
+		return err
+	}
+	return nil
+}
+
+// Cleanup applies the cache policy to remove items. May return ErrCleanupBusy
+// if the cleanup lock cannot be taken in which case the cleanup is skipped.
+func (cm *CacheManager) Cleanup() error {
+	// try to obtain exclusive lock on the cache
+	if !cm.cleanupLock.TryLock() {
+		return ErrCleanupBusy
+	}
+	defer cm.cleanupLock.Unlock()
+
 	entries, err := os.ReadDir(cm.cacheDir)
 	if err != nil {
 		return err
 	}
 
-	// we need the modtime so convert to FileInfo
-	fil := make([]os.FileInfo, 0, len(entries))
-	for _, entry := range entries {
-		fi, err := entry.Info()
-		if err != nil {
-			return err
-		}
-
-		fil = append(fil, fi)
-	}
-
-	if len(fil) <= cm.maxItems {
-		return nil
-	}
-
-	numOwned := 0
-	for _, fi := range fil {
-		n, err := hardLinkCount(fi)
-		if err != nil {
-			logger.Noticef("cannot inspect cache: %s", err)
-		}
-		// Only count the file if it is not referenced elsewhere in the filesystem
-		if n <= 1 {
-			numOwned++
-		}
-	}
-
-	if numOwned <= cm.maxItems {
-		return nil
-	}
-
-	var lastErr error
-	sort.Sort(changesByMtime(fil))
-	deleted := 0
-	for _, fi := range fil {
+	removedCount, removedSize, err := cm.cachePolicy.Apply(entries, time.Now(), func(fi os.FileInfo) error {
 		path := cm.path(fi.Name())
-		n, err := hardLinkCount(fi)
+		logger.Debugf("removing %v", path)
+		err := osRemove(path)
 		if err != nil {
-			logger.Noticef("cannot inspect cache: %s", err)
-		}
-		// If the file is referenced in the filesystem somewhere
-		// else our copy is "free" so skip it. If there is any
-		// error we cleanup the file (it is just a cache afterall).
-		if n > 1 {
-			continue
-		}
-		if err := osRemove(path); err != nil {
 			if !os.IsNotExist(err) {
-				logger.Noticef("cannot cleanup cache: %s", err)
-				lastErr = err
+				// error here does not interrupt the cleanup, the cache policy
+				// still tries to meet the targets
+				logger.Noticef("cannot remove cache entry: %s", err)
+				return err
 			}
-			continue
 		}
-		deleted++
-		if numOwned-deleted <= cm.maxItems {
-			break
-		}
+		return nil
+	})
+	if err != nil {
+		logger.Noticef("cannot apply downloads cache policy: %v", err)
 	}
-	return lastErr
+
+	logger.Noticef("removed %v entries/%s from downloads cache",
+		removedCount, quantity.FormatAmount(removedSize, -1))
+
+	return err
 }
 
 // hardLinkCount returns the number of hardlinks for the given path
@@ -232,4 +329,153 @@ func hardLinkCount(fi os.FileInfo) (uint64, error) {
 		return uint64(stat.Nlink), nil
 	}
 	return 0, fmt.Errorf("internal error: cannot read hardlink count from %s", fi.Name())
+}
+
+type CacheEntry struct {
+	Info os.FileInfo
+	// Candidate is true if the entry is a candidate for removal
+	Candidate bool
+	// Remove is true when entry would be removed according to the cache policy
+	Remove bool
+}
+
+// StoreCacheStats contains some statistics about the store cache.
+type StoreCacheStats struct {
+	// TotalSize is a sum of sizes of all entries in the cache.
+	TotalSize uint64
+	// Entries in the cache, sorted by their modification time, starting from
+	// oldest.
+	Entries []CacheEntry
+}
+
+// Status returns statistics about the store cache.
+func (cm *CacheManager) Stats() (*StoreCacheStats, error) {
+	entries, err := os.ReadDir(cm.cacheDir)
+	if err != nil {
+		return nil, err
+	}
+
+	removeByName := map[string]bool{}
+	_, _, err = cm.cachePolicy.Apply(entries, time.Now(), func(info os.FileInfo) error {
+		removeByName[info.Name()] = true
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	stats := StoreCacheStats{}
+
+	for _, entry := range entries {
+		fi, err := entry.Info()
+		if err != nil {
+			return nil, err
+		}
+
+		stats.TotalSize += uint64(fi.Size())
+
+		stats.Entries = append(stats.Entries, CacheEntry{
+			Info:      fi,
+			Candidate: cm.cachePolicy.isCandidate(fi),
+			Remove:    removeByName[fi.Name()],
+		})
+	}
+
+	// TODO:GOVERSION: use slices.SortFunc
+	sort.Slice(stats.Entries, func(i, j int) bool {
+		return stats.Entries[i].Info.ModTime().Before(stats.Entries[j].Info.ModTime())
+	})
+	return &stats, nil
+}
+
+// CachePolicy defines the caching policy. Setting any of the limits to its zero
+// value effectively disables it. A zero value (all fields in their default
+// values) of CachePolicy means that no items would be dropped from cache,
+// however places where it is used, such as Store.SetCachePolicy() may choose to
+// disable all caching instead.
+type CachePolicy struct {
+	// MaxItems sets a target for maximum number of unique cache items.
+	MaxItems int
+	// MaxSizeBytes sets a target for maximum size of all unique items.
+	MaxSizeBytes uint64
+	// MaxAge sets a target for maximum age of unique cache items.
+	MaxAge time.Duration
+}
+
+func (cp *CachePolicy) isCandidate(fi os.FileInfo) bool {
+	n, err := hardLinkCount(fi)
+	if err != nil {
+		logger.Noticef("cannot inspect cache: %s", err)
+	}
+
+	// If the file is referenced in the filesystem somewhere else our copy
+	// is "free" so skip it.
+	return n <= 1
+}
+
+// Apply applies the cache policy for a given set of items and calls the
+// provided drop callback to remove items from the cache.
+//
+// Internally, attempts to meet all targets defined in the cache policy, by
+// processing unique cache items starting from oldest ones. Errors to drop items
+// are collected and returned, but processing continues until targets are met or
+// candidates list is exhausted.
+func (cp *CachePolicy) Apply(entries []os.DirEntry, now time.Time, remove func(info os.FileInfo) error) (removedCount int, removedSize uint64, err error) {
+	// most of the entries will have more than one hardlink, but a minority may
+	// be referenced only from the cache and thus be a candidate for pruning
+	candidates := make([]os.FileInfo, 0, len(entries)/5)
+	candidatesSize := uint64(0)
+
+	for _, entry := range entries {
+		fi, err := entry.Info()
+		if err != nil {
+			return 0, 0, err
+		}
+
+		if cp.isCandidate(fi) {
+			candidates = append(candidates, fi)
+			candidatesSize += uint64(fi.Size())
+		}
+	}
+
+	sort.Sort(entriesByMtime(candidates))
+
+	if len(candidates) > 0 {
+		logger.Debugf("store cache cleanup candidates %v total %v", len(candidates),
+			quantity.FormatAmount(uint64(candidatesSize), -1))
+		for _, c := range candidates {
+			logger.Debugf("%s, size: %v, mod %s", c.Name(), quantity.FormatAmount(uint64(c.Size()), -1), c.ModTime())
+		}
+	}
+
+	var lastErr error
+	for _, c := range candidates {
+		doRemove := false
+		if cp.MaxAge != 0 && c.ModTime().Add(cp.MaxAge).Before(now) {
+			doRemove = true
+		}
+
+		if !doRemove && cp.MaxItems != 0 && len(candidates)-removedCount > cp.MaxItems {
+			doRemove = true
+		}
+
+		if !doRemove && cp.MaxSizeBytes != 0 && candidatesSize-removedSize > cp.MaxSizeBytes {
+			doRemove = true
+		}
+
+		logger.Debugf("entry %v remove %v", c.Name(), doRemove)
+		if doRemove {
+			if err := remove(c); err != nil {
+				lastErr = strutil.JoinErrors(lastErr, err)
+			} else {
+				// managed to drop the items, update the counts
+				removedCount++
+				removedSize += uint64(c.Size())
+			}
+		}
+	}
+
+	logger.Debugf("cache candidates to remove %v/%s", removedCount, quantity.FormatAmount(removedSize, -1))
+
+	return removedCount, removedSize, lastErr
 }

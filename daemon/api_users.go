@@ -31,6 +31,7 @@ import (
 	"github.com/snapcore/snapd/overlord/devicestate"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/release"
+	"github.com/snapcore/snapd/seclog"
 	"github.com/snapcore/snapd/store"
 )
 
@@ -58,6 +59,7 @@ var (
 		Path:        "/v2/users",
 		GET:         getUsers,
 		POST:        postUsers,
+		Actions:     []string{"create", "remove"},
 		ReadAccess:  rootAccess{},
 		WriteAccess: rootAccess{},
 	}
@@ -82,6 +84,14 @@ type userResponseData struct {
 
 var isEmailish = regexp.MustCompile(`.@.*\..`).MatchString
 
+// apiLoginError logs a login failure via [seclog.LogLoginFailure] and returns resp
+// unchanged. It is a convenience wrapper so that each error return path in
+// loginUser can log with a single call.
+func apiLoginError(resp *apiError, snapdUser seclog.SnapdUser) *apiError {
+	seclog.LogLoginFailure(snapdUser, resp.seclogReason())
+	return resp
+}
+
 func loginUser(c *Command, r *http.Request, user *auth.UserState) Response {
 	var loginData struct {
 		Username string `json:"username"`
@@ -92,7 +102,7 @@ func loginUser(c *Command, r *http.Request, user *auth.UserState) Response {
 
 	decoder := json.NewDecoder(r.Body)
 	if err := decoder.Decode(&loginData); err != nil {
-		return BadRequest("cannot decode login data from request body: %v", err)
+		return apiLoginError(BadRequest("cannot decode login data from request body: %v", err), seclog.SnapdUser{})
 	}
 
 	if loginData.Email == "" && isEmailish(loginData.Username) {
@@ -107,12 +117,23 @@ func loginUser(c *Command, r *http.Request, user *auth.UserState) Response {
 
 	// the "username" needs to look a lot like an email address
 	if !isEmailish(loginData.Email) {
-		return &apiError{
+		return apiLoginError(&apiError{
 			Status:  400,
 			Message: "please use a valid email address.",
 			Kind:    client.ErrorKindInvalidAuthData,
 			Value:   map[string][]string{"email": {"invalid"}},
-		}
+		}, seclog.SnapdUser{
+			StoreUserName:  loginData.Username,
+			StoreUserEmail: loginData.Email,
+		})
+	}
+
+	// Build the user identity for security audit logging. At this point we know
+	// their claimed email and optional username; the numeric ID is only
+	// available after successful authentication.
+	snapdUser := seclog.SnapdUser{
+		StoreUserName:  loginData.Username,
+		StoreUserEmail: loginData.Email,
 	}
 
 	overlord := c.d.overlord
@@ -121,35 +142,35 @@ func loginUser(c *Command, r *http.Request, user *auth.UserState) Response {
 	macaroon, discharge, err := theStore.LoginUser(loginData.Email, loginData.Password, loginData.Otp)
 	switch err {
 	case store.ErrAuthenticationNeeds2fa:
-		return &apiError{
+		return apiLoginError(&apiError{
 			Status:  401,
 			Message: err.Error(),
 			Kind:    client.ErrorKindTwoFactorRequired,
-		}
+		}, snapdUser)
 	case store.Err2faFailed:
-		return &apiError{
+		return apiLoginError(&apiError{
 			Status:  401,
 			Message: err.Error(),
 			Kind:    client.ErrorKindTwoFactorFailed,
-		}
+		}, snapdUser)
 	default:
 		switch err := err.(type) {
 		case store.InvalidAuthDataError:
-			return &apiError{
+			return apiLoginError(&apiError{
 				Status:  400,
 				Message: err.Error(),
 				Kind:    client.ErrorKindInvalidAuthData,
 				Value:   err,
-			}
+			}, snapdUser)
 		case store.PasswordPolicyError:
-			return &apiError{
+			return apiLoginError(&apiError{
 				Status:  401,
 				Message: err.Error(),
 				Kind:    client.ErrorKindPasswordPolicy,
 				Value:   err,
-			}
+			}, snapdUser)
 		}
-		return Unauthorized(err.Error())
+		return apiLoginError(Unauthorized(err.Error()), snapdUser)
 	case nil:
 		// continue
 	}
@@ -171,8 +192,14 @@ func loginUser(c *Command, r *http.Request, user *auth.UserState) Response {
 	}
 	st.Unlock()
 	if err != nil {
-		return InternalError("cannot persist authentication details: %v", err)
+		return apiLoginError(InternalError("cannot persist authentication details: %v", err), snapdUser)
 	}
+
+	snapdUser.ID = int64(user.ID)
+	snapdUser.StoreUserName = user.Username
+	snapdUser.StoreUserEmail = user.Email
+	snapdUser.Expiration = user.Expiration
+	seclog.LogLoginSuccess(snapdUser)
 
 	result := userResponseData{
 		ID:         user.ID,
@@ -235,7 +262,9 @@ func removeUser(c *Command, username string, opts postUserDeleteData) Response {
 	st.Lock()
 	defer st.Unlock()
 
-	u, err := deviceStateRemoveUser(st, username, &devicestate.RemoveUserOptions{})
+	u, err := deviceStateRemoveUser(st, username, &devicestate.RemoveUserOptions{
+		RemoveReason: seclog.RemoveReasonAPI,
+	})
 	if err != nil {
 		if _, ok := err.(*devicestate.UserError); ok {
 			return BadRequest(err.Error())
@@ -243,7 +272,7 @@ func removeUser(c *Command, username string, opts postUserDeleteData) Response {
 		return InternalError(err.Error())
 	}
 
-	result := map[string]interface{}{
+	result := map[string]any{
 		"removed": []userResponseData{
 			{ID: u.ID, Username: u.Username, Email: u.Email},
 		},
@@ -362,10 +391,24 @@ func doCreateUser(st *state.State, createData postUserCreateData) ([]*devicestat
 	defer st.Unlock()
 
 	if createData.Known {
-		return deviceStateCreateKnownUsers(st, createData.Sudoer, createData.Email)
+		// add_reason records both dimensions of the request: whether one
+		// assertion was selected by email or all were used, and whether the
+		// caller was automation or an operator.
+		var addReason seclog.SystemUserAddReason
+		switch {
+		case createData.Email != "" && createData.Automatic:
+			addReason = seclog.AddReasonAPIAssertionAutomatic
+		case createData.Email != "":
+			addReason = seclog.AddReasonAPIAssertion
+		case createData.Automatic:
+			addReason = seclog.AddReasonAPIAssertionAllAutomatic
+		default:
+			addReason = seclog.AddReasonAPIAssertionAll
+		}
+		return deviceStateCreateKnownUsers(st, createData.Sudoer, createData.Email, addReason)
 	}
 
-	user, err := deviceStateCreateUser(st, createData.Sudoer, createData.Email, createData.Expiration)
+	user, err := deviceStateCreateUser(st, createData.Sudoer, createData.Email, createData.Expiration, seclog.AddReasonAPIStoreEmail)
 	return []*devicestate.CreatedUser{user}, err
 }
 

@@ -2,7 +2,6 @@ package snapstate
 
 import (
 	"github.com/snapcore/snapd/asserts"
-	"github.com/snapcore/snapd/boot"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/snap"
 )
@@ -18,20 +17,11 @@ type Policy interface {
 	// installed revisions will be removed, which is equally true when
 	// removing the last remaining revision of the snap, even if said
 	// revision was explicitly passed by the user.
-	CanRemove(st *state.State, snapst *SnapState, rev snap.Revision, dev snap.Device) error
+	CanRemove(st *state.State, snapst *SnapState, rev snap.Revision, dev snap.Device, removals map[string]bool) error
 }
 
 var PolicyFor func(snap.Type, *asserts.Model) Policy = policyForUnset
 
 func policyForUnset(snap.Type, *asserts.Model) Policy {
 	panic("PolicyFor unset!")
-}
-
-func inUseFor(deviceCtx DeviceContext) func(snap.Type) (boot.InUseFunc, error) {
-	if deviceCtx == nil {
-		return nil
-	}
-	return func(typ snap.Type) (boot.InUseFunc, error) {
-		return boot.InUse(typ, deviceCtx)
-	}
 }

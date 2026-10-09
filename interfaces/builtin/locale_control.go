@@ -19,6 +19,8 @@
 
 package builtin
 
+import "github.com/snapcore/snapd/release"
+
 const localeControlSummary = `allows control over system locale`
 
 const localeControlBaseDeclarationSlots = `
@@ -67,10 +69,12 @@ dbus (receive)
 
 func init() {
 	registerIface(&commonInterface{
-		name:                  "locale-control",
-		summary:               localeControlSummary,
-		implicitOnClassic:     true,
-		baseDeclarationSlots:  localeControlBaseDeclarationSlots,
-		connectedPlugAppArmor: localeControlConnectedPlugAppArmor,
+		name:                     "locale-control",
+		summary:                  localeControlSummary,
+		implicitOnClassic:        true,
+		implicitOnCore:           release.OnCoreDesktop,
+		baseDeclarationSlots:     localeControlBaseDeclarationSlots,
+		connectedPlugAppArmor:    localeControlConnectedPlugAppArmor,
+		parallelInstancesSlotErr: errParallelInstancesSystemSlot,
 	})
 }

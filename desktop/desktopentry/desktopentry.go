@@ -39,6 +39,10 @@ type DesktopEntry struct {
 	Icon     string
 	Exec     string
 
+	SnapInstanceName string
+	SnapAppName      string
+	SnapCommonID     string
+
 	Hidden                bool
 	OnlyShowIn            []string
 	NotShownIn            []string
@@ -52,6 +56,8 @@ type Action struct {
 	Name string
 	Icon string
 	Exec string
+
+	SnapAppName string
 }
 
 type groupState int
@@ -155,6 +161,12 @@ func parse(filename string, r io.Reader) (*DesktopEntry, error) {
 				de.GnomeAutostartEnabled = value == "true"
 			case "Actions":
 				actions = splitList(value)
+			case "X-SnapInstanceName":
+				de.SnapInstanceName = value
+			case "X-SnapAppName":
+				de.SnapAppName = value
+			case "X-SnapCommonID":
+				de.SnapCommonID = value
 			default:
 				// Ignore all other keys
 			}
@@ -166,6 +178,8 @@ func parse(filename string, r io.Reader) (*DesktopEntry, error) {
 				currentAction.Icon = value
 			case "Exec":
 				currentAction.Exec = value
+			case "X-SnapAppName":
+				currentAction.SnapAppName = value
 			default:
 				// Ignore all other keys
 			}

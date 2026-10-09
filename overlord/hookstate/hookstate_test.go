@@ -33,14 +33,19 @@ import (
 	"gopkg.in/tomb.v2"
 
 	"github.com/snapcore/snapd/dirs"
+	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/overlord"
+	"github.com/snapcore/snapd/overlord/confdbstate"
 	"github.com/snapcore/snapd/overlord/hookstate"
 	"github.com/snapcore/snapd/overlord/hookstate/hooktest"
 	"github.com/snapcore/snapd/overlord/restart"
 	"github.com/snapcore/snapd/overlord/snapstate"
+	"github.com/snapcore/snapd/overlord/snapstate/sequence"
 	"github.com/snapcore/snapd/overlord/snapstate/snapstatetest"
 	"github.com/snapcore/snapd/overlord/state"
+	"github.com/snapcore/snapd/overlord/swfeats/swfeatstest"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/snap/snaptest"
 	"github.com/snapcore/snapd/testutil"
 )
@@ -68,6 +73,7 @@ var (
 func (s *baseHookManagerSuite) commonSetUpTest(c *C) {
 	s.BaseTest.SetUpTest(c)
 
+	hookstate.IsConfdbHookname = confdbstate.IsConfdbHookname
 	hooktype1 := snap.NewHookType(regexp.MustCompile("^do-something$"))
 	hooktype2 := snap.NewHookType(regexp.MustCompile("^undo-something$"))
 	s.AddCleanup(snap.MockAppendSupportedHookTypes([]*snap.HookType{hooktype1, hooktype2}))
@@ -98,6 +104,11 @@ func (s *baseHookManagerSuite) commonSetUpTest(c *C) {
 		s.context = context
 		return s.mockHandler
 	})
+	s.manager.Register(regexp.MustCompile("change-view-"), func(context *hookstate.Context) hookstate.Handler {
+		s.context = context
+		return s.mockHandler
+	})
+
 }
 
 func (s *baseHookManagerSuite) commonTearDownTest(c *C) {
@@ -115,7 +126,7 @@ func (s *baseHookManagerSuite) setUpSnap(c *C, instanceName string, yaml string)
 		Revision: snap.R(1),
 	}
 
-	initialContext := map[string]interface{}{
+	initialContext := map[string]any{
 		"test-key": "test-value",
 	}
 
@@ -153,6 +164,7 @@ hooks:
     prepare-device:
     do-something:
     undo-something:
+    change-view-setup-wifi:
 `
 
 var snapYaml1 = `
@@ -193,7 +205,7 @@ func (s *hookManagerSuite) TestHookSetupJsonMarshal(c *C) {
 	hookSetup := &hookstate.HookSetup{Snap: "snap-name", Revision: snap.R(1), Hook: "hook-name"}
 	out, err := json.Marshal(hookSetup)
 	c.Assert(err, IsNil)
-	c.Check(string(out), Equals, "{\"snap\":\"snap-name\",\"revision\":\"1\",\"hook\":\"hook-name\"}")
+	c.Check(string(out), Equals, "{\"snap\":\"snap-name\",\"revision\":\"1\",\"hook\":\"hook-name\",\"component-revision\":\"unset\"}")
 }
 
 func (s *hookManagerSuite) TestHookSetupJsonUnmarshal(c *C) {
@@ -250,7 +262,7 @@ func (s *hookManagerSuite) TestHookTaskEnsure(c *C) {
 	defer s.state.Unlock()
 
 	c.Assert(s.context, NotNil, Commentf("Expected handler generator to be called with a valid context"))
-	c.Check(s.context.InstanceName(), Equals, "test-snap")
+	c.Check(s.context.InstanceName().String(), Equals, "test-snap")
 	c.Check(s.context.SnapRevision(), Equals, snap.R(1))
 	c.Check(s.context.HookName(), Equals, "configure")
 
@@ -331,7 +343,7 @@ func (s *hookManagerSuite) TestHookHijackingHappy(c *C) {
 	c.Check(s.command.Calls(), HasLen, 0)
 
 	c.Assert(s.context, NotNil)
-	c.Check(s.context.InstanceName(), Equals, "test-snap")
+	c.Check(s.context.InstanceName().String(), Equals, "test-snap")
 	c.Check(s.context.SnapRevision(), Equals, snap.R(1))
 	c.Check(s.context.HookName(), Equals, "configure")
 
@@ -358,7 +370,7 @@ func (s *hookManagerSuite) TestHookHijackingUnHappy(c *C) {
 	c.Check(s.command.Calls(), HasLen, 0)
 
 	c.Assert(s.context, NotNil)
-	c.Check(s.context.InstanceName(), Equals, "test-snap")
+	c.Check(s.context.InstanceName().String(), Equals, "test-snap")
 	c.Check(s.context.SnapRevision(), Equals, snap.R(1))
 	c.Check(s.context.HookName(), Equals, "configure")
 
@@ -469,6 +481,45 @@ func (s *hookManagerSuite) TestHookTaskHandlesHookErrorAndIgnoresIt(c *C) {
 	c.Check(s.change.Status(), Equals, state.DoneStatus)
 
 	c.Check(s.manager.NumRunningHooks(), Equals, 0)
+}
+
+func (s *hookManagerSuite) TestHookTaskShutDown(c *C) {
+	restore := hookstate.MockDefaultHookTimeout(100 * time.Millisecond)
+	defer restore()
+	logbuf, restoreLog := logger.MockLogger()
+	defer restoreLog()
+	cmd := testutil.MockCommand(c, "snap", "while true; do sleep 1; done")
+	defer cmd.Restore()
+
+	// Signal when the hook has started running
+	started := make(chan struct{})
+	s.mockHandler.BeforeCallback = func() {
+		close(started)
+	}
+	// Start the hook (no restart pending)
+	s.se.Ensure()
+	// Wait for the hook to actually start
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		c.Fatal("hook did not start")
+	}
+
+	s.se.ShutDown()
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	c.Check(s.mockHandler.BeforeCalled, Equals, true)
+	c.Check(s.mockHandler.DoneCalled, Equals, false)
+	c.Check(s.mockHandler.ErrorCalled, Equals, true)
+
+	c.Check(s.task.Kind(), Equals, "run-hook")
+	c.Check(s.task.Status(), Equals, state.ErrorStatus)
+	c.Check(s.change.Status(), Equals, state.ErrorStatus)
+	c.Check(s.manager.NumRunningHooks(), Equals, 0)
+
+	c.Check(logbuf.String(), testutil.Contains, "gracefully waiting for running hooks")
+	c.Check(logbuf.String(), testutil.Contains, "done waiting for running hooks")
 }
 
 func (s *hookManagerSuite) TestHookTaskEnforcesTimeout(c *C) {
@@ -701,7 +752,7 @@ func (s *hookManagerSuite) TestHookUndoRunsOnError(c *C) {
 		Revision: snap.R(1),
 	}
 
-	initialContext := map[string]interface{}{}
+	initialContext := map[string]any{}
 
 	s.state.Lock()
 	task := hookstate.HookTaskWithUndo(s.state, "test summary", hooksup, undohooksup, initialContext)
@@ -887,6 +938,29 @@ func (s *hookManagerSuite) TestOptionalHookWithMissingHandler(c *C) {
 	c.Logf("Task log:\n%s\n", s.task.Log())
 }
 
+func (s *hookManagerSuite) TestOptionalHookWithoutHandler(c *C) {
+	hooksup := &hookstate.HookSetup{
+		Snap:     "test-snap",
+		Hook:     "do-something",
+		Optional: true,
+	}
+	s.state.Lock()
+	s.task.Set("hook-setup", hooksup)
+	s.state.Unlock()
+
+	s.se.Ensure()
+	s.se.Wait()
+
+	// the hook exists, but without a handler it does not run
+	c.Check(s.command.Calls(), IsNil)
+
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	c.Check(s.task.Status(), Equals, state.DoneStatus)
+	c.Check(s.change.Status(), Equals, state.DoneStatus)
+}
+
 func checkTaskLogContains(c *C, task *state.Task, pattern string) {
 	exp := regexp.MustCompile(pattern)
 	found := false
@@ -975,6 +1049,182 @@ func (s *hookManagerSuite) TestHookTasksForSameSnapAreSerialized(c *C) {
 	}
 	c.Assert(atomic.LoadInt32(&TotalExecutions), Equals, int32(1+len(tasks)))
 	c.Assert(atomic.LoadInt32(&Executing), Equals, int32(0))
+}
+
+func (s *hookManagerSuite) TestConfdbHookTasksWaitForActiveSnap(c *C) {
+	s.testConfdbHookTasksWaitUntilActive(c, "test-snap")
+}
+
+func (s *hookManagerSuite) TestConfdbHookTasksWaitForActiveBase(c *C) {
+	func() {
+		s.state.Lock()
+		defer s.state.Unlock()
+
+		var snapst snapstate.SnapState
+		err := snapstate.Get(s.state, "test-snap", &snapst)
+		c.Assert(err, IsNil)
+		snapst.Active = true
+		snapst.Base = "test-base"
+		snapstate.Set(s.state, "test-snap", &snapst)
+
+		seq := snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{{
+			RealName: "test-base",
+			Revision: snap.R(123),
+		}})
+		snapstate.Set(s.state, "test-base", &snapstate.SnapState{
+			Active:   true,
+			Sequence: seq,
+		})
+	}()
+
+	s.testConfdbHookTasksWaitUntilActive(c, "test-base")
+}
+
+func (s *hookManagerSuite) testConfdbHookTasksWaitUntilActive(c *C, conflictSnap string) {
+	setActive := func(active bool) {
+		var snapst snapstate.SnapState
+		err := snapstate.Get(s.state, conflictSnap, &snapst)
+		c.Assert(err, IsNil)
+
+		snapst.Active = active
+		snapstate.Set(s.state, conflictSnap, &snapst)
+	}
+
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	hooksup := &hookstate.HookSetup{
+		Snap: "test-snap",
+		Hook: "change-view-setup-wifi",
+	}
+	confdbHook := hookstate.HookTask(s.state, "confdb hook task", hooksup, nil)
+	s.change.AddTask(confdbHook)
+
+	setActive(false)
+
+	s.state.Unlock()
+	err := s.o.TaskRunner().Ensure()
+	s.state.Lock()
+	c.Assert(err, IsNil)
+
+	// the confdb hook task didn't run
+	confdbHook = s.state.Task(confdbHook.ID())
+	c.Assert(confdbHook.Status(), Equals, state.DoStatus)
+
+	// the non-confdb hook task runs if the unlinked snap is the hook's snap but
+	// not if it's that snap's base (see XXX in snapOrBaseAreInactive)
+	task := s.state.Task(s.task.ID())
+	switch conflictSnap {
+	case "test-base":
+		c.Assert(task.Status(), Equals, state.DoStatus)
+	case "test-snap":
+		c.Assert(task.Status(), Equals, state.DoingStatus)
+	default:
+		c.Fatal("unknown snap")
+	}
+
+	setActive(true)
+
+	s.state.Unlock()
+	s.settle(c)
+	s.state.Lock()
+	c.Assert(err, IsNil)
+
+	// once the snap is enabled, the confdb hook runs
+	confdbHook = s.state.Task(confdbHook.ID())
+	c.Assert(confdbHook.Status(), Equals, state.DoneStatus)
+}
+
+func (s *hookManagerSuite) TestUndoHookTasksBlockedWhileInactive(c *C) {
+	for _, hook := range []string{"do-something", "undo-something"} {
+		s.manager.Register(regexp.MustCompile("^"+hook+"$"), func(context *hookstate.Context) hookstate.Handler {
+			return hooktest.NewMockHandler()
+		})
+	}
+
+	func() {
+		s.state.Lock()
+		defer s.state.Unlock()
+
+		// keep the suite's hook task from blocking ours via snapIsRunningHook
+		s.task.SetStatus(state.DoneStatus)
+
+		var snapst snapstate.SnapState
+		c.Assert(snapstate.Get(s.state, "test-snap", &snapst), IsNil)
+		snapst.Base = "test-base"
+		snapstate.Set(s.state, "test-snap", &snapst)
+
+		seq := snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{{
+			RealName: "test-base",
+			Revision: snap.R(123),
+		}})
+		snapstate.Set(s.state, "test-base", &snapstate.SnapState{
+			Active:   true,
+			Sequence: seq,
+		})
+	}()
+
+	const confdbHook = "change-view-setup-wifi"
+	for _, tc := range []struct {
+		inactiveSnap string
+		status       state.Status
+		hook         string
+		undoHook     string
+		blocked      bool
+	}{
+		// without an undo hook, undo is a no-op and is never blocked
+		{"test-snap", state.UndoStatus, confdbHook, "", false},
+		{"test-base", state.UndoStatus, "configure", "", false},
+		{"test-base", state.UndoingStatus, "configure", "", false},
+		// with an undo hook, the undo hook decides
+		{"test-snap", state.UndoStatus, confdbHook, "undo-something", false},
+		{"test-snap", state.UndoStatus, "do-something", confdbHook, true},
+		{"test-base", state.UndoStatus, "do-something", "undo-something", true},
+		{"test-base", state.UndoingStatus, "do-something", "undo-something", true},
+	} {
+		comment := Commentf("%+v", tc)
+
+		s.state.Lock()
+		hooksup := &hookstate.HookSetup{Snap: "test-snap", Hook: tc.hook, Revision: snap.R(1)}
+		var task *state.Task
+		if tc.undoHook == "" {
+			task = hookstate.HookTask(s.state, "hook", hooksup, nil)
+		} else {
+			undosup := &hookstate.HookSetup{Snap: "test-snap", Hook: tc.undoHook, Revision: snap.R(1)}
+			task = hookstate.HookTaskWithUndo(s.state, "hook", hooksup, undosup, nil)
+		}
+		chg := s.state.NewChange("undo", "...")
+		chg.AddTask(task)
+		task.SetStatus(tc.status)
+		s.setActive(c, tc.inactiveSnap, false)
+		s.state.Unlock()
+
+		c.Assert(s.o.TaskRunner().Ensure(), IsNil)
+		s.se.Wait()
+
+		s.state.Lock()
+		if tc.blocked {
+			c.Check(task.Status(), Equals, tc.status, comment)
+		} else {
+			c.Check(task.Status(), Equals, state.UndoneStatus, comment)
+		}
+		// let the blocked task finish so it doesn't affect other cases
+		s.setActive(c, tc.inactiveSnap, true)
+		s.state.Unlock()
+
+		s.settle(c)
+
+		s.state.Lock()
+		c.Check(task.Status(), Equals, state.UndoneStatus, comment)
+		s.state.Unlock()
+	}
+}
+
+func (s *hookManagerSuite) setActive(c *C, snapName string, active bool) {
+	var snapst snapstate.SnapState
+	c.Assert(snapstate.Get(s.state, snapName, &snapst), IsNil)
+	snapst.Active = active
+	snapstate.Set(s.state, snapName, &snapst)
 }
 
 type MockConcurrentHandler struct {
@@ -1150,7 +1400,7 @@ func (s *hookManagerSuite) TestHookHijackingNoConflict(c *C) {
 }
 
 func (s *hookManagerSuite) TestEphemeralRunHook(c *C) {
-	contextData := map[string]interface{}{
+	contextData := map[string]any{
 		"key":  "value",
 		"key2": "value2",
 	}
@@ -1158,11 +1408,11 @@ func (s *hookManagerSuite) TestEphemeralRunHook(c *C) {
 }
 
 func (s *hookManagerSuite) TestEphemeralRunHookNoContextData(c *C) {
-	var contextData map[string]interface{} = nil
+	var contextData map[string]any = nil
 	s.testEphemeralRunHook(c, contextData)
 }
 
-func (s *hookManagerSuite) testEphemeralRunHook(c *C, contextData map[string]interface{}) {
+func (s *hookManagerSuite) testEphemeralRunHook(c *C, contextData map[string]any) {
 	var hookInvokeCalled []string
 	hookInvoke := func(ctx *hookstate.Context, tomb *tomb.Tomb) ([]byte, error) {
 		c.Check(ctx.HookName(), Equals, "configure")
@@ -1212,7 +1462,7 @@ func (s *hookManagerSuite) TestEphemeralRunHookNoSnap(c *C) {
 		Revision: snap.R(1),
 		Hook:     "configure",
 	}
-	contextData := map[string]interface{}{
+	contextData := map[string]any{
 		"key": "value",
 	}
 	_, err := s.manager.EphemeralRunHook(context.Background(), hooksup, contextData)
@@ -1288,7 +1538,7 @@ func (s *parallelInstancesHookManagerSuite) TestHookTaskEnsureHookRan(c *C) {
 	s.state.Lock()
 	defer s.state.Unlock()
 
-	c.Check(s.context.InstanceName(), Equals, "test-snap_instance")
+	c.Check(s.context.InstanceName().String(), Equals, "test-snap_instance")
 	c.Check(s.context.SnapRevision(), Equals, snap.R(1))
 	c.Check(s.context.HookName(), Equals, "configure")
 
@@ -1305,4 +1555,151 @@ func (s *parallelInstancesHookManagerSuite) TestHookTaskEnsureHookRan(c *C) {
 	c.Check(s.change.Status(), Equals, state.DoneStatus)
 
 	c.Check(s.manager.NumRunningHooks(), Equals, 0)
+}
+
+type componentHookManagerSuite struct {
+	baseHookManagerSuite
+}
+
+var _ = Suite(&componentHookManagerSuite{})
+
+func (s *baseHookManagerSuite) setUpComponent(c *C, instanceName string, componentName string, hookName string) {
+	hooksup := &hookstate.HookSetup{
+		Snap:              instanceName,
+		Hook:              hookName,
+		Revision:          snap.R(1),
+		ComponentRevision: snap.R(1),
+		Component:         componentName,
+	}
+
+	s.state.Lock()
+	defer s.state.Unlock()
+	s.task = hookstate.HookTask(s.state, "test-hook-task", hooksup, nil)
+
+	s.change = s.state.NewChange("run-test-hook", "...")
+	s.change.AddTask(s.task)
+
+	snapName, instanceKey := snap.SplitInstanceName(instanceName)
+
+	sideInfo := &snap.SideInfo{
+		RealName: snapName,
+		SnapID:   "some-snap-id",
+		Revision: snap.R(1),
+	}
+
+	componentSideInfo := &snap.ComponentSideInfo{
+		Component: naming.ComponentRef{
+			SnapName:      naming.SnapName(snapName),
+			ComponentName: componentName,
+		},
+		Revision: snap.R(1),
+	}
+
+	const componentYaml = `
+component: %s+%s
+type: standard
+`
+
+	const snapYaml = `
+name: %s
+version: 1.0
+components:
+  %s:
+    type: standard
+    hooks:
+      %s:
+`
+
+	snapInfo := snaptest.MockSnapInstance(c, instanceName, fmt.Sprintf(snapYaml, snapName, componentName, hookName), sideInfo)
+	snaptest.MockComponent(c, fmt.Sprintf(componentYaml, snapName, componentName), snapInfo, snap.ComponentSideInfo{
+		Revision: snap.R(1),
+	})
+
+	snapstate.Set(s.state, instanceName, &snapstate.SnapState{
+		Active: true,
+		Sequence: snapstatetest.NewSequenceFromRevisionSideInfos([]*sequence.RevisionSideState{{
+			Snap: sideInfo,
+			Components: []*sequence.ComponentState{{
+				SideInfo: componentSideInfo,
+				CompType: snap.StandardComponent,
+			}},
+		}}),
+		Current:     snap.R(1),
+		InstanceKey: instanceKey,
+	})
+}
+
+func (s *componentHookManagerSuite) SetUpTest(c *C) {
+	s.commonSetUpTest(c)
+	s.mockHandler = hooktest.NewMockHandler()
+}
+
+func (s *componentHookManagerSuite) TestComponentHookTaskEnsure(c *C) {
+	s.setUpComponent(c, "test-snap", "standard-component", "install")
+
+	s.se.Ensure()
+	s.se.Wait()
+
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	c.Check(s.command.Calls(), DeepEquals, [][]string{{
+		"snap", "run", "--hook", "install", "-r", "1", "test-snap+standard-component",
+	}})
+
+	c.Check(s.task.Kind(), Equals, "run-hook")
+	c.Check(s.task.Status(), Equals, state.DoneStatus)
+	c.Check(s.change.Status(), Equals, state.DoneStatus)
+
+	c.Check(s.manager.NumRunningHooks(), Equals, 0)
+}
+
+func (s *componentHookManagerSuite) TestComponentHookTaskEnsureInstance(c *C) {
+	s.setUpComponent(c, "test-snap_instance", "standard-component", "install")
+
+	s.se.Ensure()
+	s.se.Wait()
+
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	c.Check(s.command.Calls(), DeepEquals, [][]string{{
+		"snap", "run", "--hook", "install", "-r", "1", "test-snap_instance+standard-component",
+	}})
+
+	c.Check(s.task.Kind(), Equals, "run-hook")
+	c.Check(s.task.Status(), Equals, state.DoneStatus)
+	c.Check(s.change.Status(), Equals, state.DoneStatus)
+
+	c.Check(s.manager.NumRunningHooks(), Equals, 0)
+}
+
+func (s *componentHookManagerSuite) TestComponentHookWithoutHookIsError(c *C) {
+	s.setUpComponent(c, "test-snap", "standard-component", "install")
+
+	s.state.Lock()
+
+	var hooksup hookstate.HookSetup
+	err := s.task.Get("hook-setup", &hooksup)
+	c.Assert(err, IsNil)
+
+	hooksup.Hook = "missing-hook"
+	s.task.Set("hook-setup", &hooksup)
+
+	s.state.Unlock()
+
+	s.se.Ensure()
+	s.se.Wait()
+
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	c.Check(s.task.Kind(), Equals, "run-hook")
+	c.Check(s.task.Status(), Equals, state.ErrorStatus)
+	c.Check(s.change.Status(), Equals, state.ErrorStatus)
+	checkTaskLogContains(c, s.task, `.*component "test-snap\+standard-component" has no "missing-hook" hook.*`)
+}
+
+func (s *componentHookManagerSuite) TestEnsureLoopLogging(c *C) {
+	swfeatstest.CheckEnsureLoopLogging("hookmgr.go", c, false)
 }

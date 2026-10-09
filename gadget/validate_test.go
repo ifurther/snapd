@@ -78,6 +78,7 @@ func (s *validateGadgetTestSuite) TestRuleValidateStructureReservedLabels(c *C) 
 				},
 			},
 		}
+		gadget.SetEnclosingVolumeInStructs(gi.Volumes)
 		err := gadget.Validate(gi, tc.model, nil)
 		if tc.err == "" {
 			c.Check(err, IsNil)
@@ -86,6 +87,35 @@ func (s *validateGadgetTestSuite) TestRuleValidateStructureReservedLabels(c *C) 
 		}
 	}
 
+}
+
+func (s *validateGadgetTestSuite) TestRuleValidateStructureEmmcNames(c *C) {
+	for _, tc := range []struct {
+		name, err string
+		model     gadget.Model
+	}{
+		{name: "some-name", err: `cannot use "some-name" as emmc name, only \["boot0" "boot1"\] is allowed`},
+		{name: "boot0", err: ""},
+		{name: "boot1", err: ""},
+	} {
+		gi := &gadget.Info{
+			Volumes: map[string]*gadget.Volume{
+				"emmc": {
+					Schema: "emmc",
+					Structure: []gadget.VolumeStructure{{
+						Name: tc.name,
+					}},
+				},
+			},
+		}
+		gadget.SetEnclosingVolumeInStructs(gi.Volumes)
+		err := gadget.Validate(gi, tc.model, nil)
+		if tc.err == "" {
+			c.Check(err, IsNil)
+		} else {
+			c.Check(err, ErrorMatches, ".*: "+tc.err)
+		}
+	}
 }
 
 // rolesYaml produces gadget metadata with volumes with structure withs the given
@@ -244,7 +274,7 @@ func (s *validateGadgetTestSuite) TestValidateConsistencyWithoutModelCharacteris
 		c.Logf("tc: %v %v %v", i, tc.role, tc.label)
 		b := &bytes.Buffer{}
 
-		fmt.Fprintf(b, `
+		fmt.Fprint(b, `
 volumes:
   pc:
     bootloader: grub
@@ -252,7 +282,7 @@ volumes:
     structure:`)
 
 		if tc.role == "system-seed" {
-			fmt.Fprintf(b, `
+			fmt.Fprint(b, `
       - name: Recovery
         size: 10M
         type: 83
@@ -328,16 +358,16 @@ volumes:
 		c.Logf("tc: %v %v %v %v", i, tc.addSeed, tc.dataLabel, tc.hasModes)
 		b := &bytes.Buffer{}
 
-		fmt.Fprintf(b, bloader)
+		fmt.Fprint(b, bloader)
 		if tc.addSeed {
-			fmt.Fprintf(b, `
+			fmt.Fprint(b, `
       - name: Recovery
         size: 10M
         type: 83
         role: system-seed`)
 		}
 		if tc.addBoot {
-			fmt.Fprintf(b, `
+			fmt.Fprint(b, `
       - name: Boot
         size: 10M
         type: 83
@@ -354,7 +384,7 @@ volumes:
 		}
 
 		if tc.addSave {
-			fmt.Fprintf(b, `
+			fmt.Fprint(b, `
       - name: Save
         size: 10M
         type: 83
@@ -1286,4 +1316,126 @@ func (s *validateGadgetTestSuite) TestValidateClassicWithModesEncryptHappy(c *C)
 	// Now validate without model
 	err = gadget.Validate(ginfo, nil, &gadget.ValidationConstraints{})
 	c.Assert(err, IsNil)
+}
+
+func (s *validateGadgetTestSuite) TestValidateSystemBootStateRoleHappy(c *C) {
+	// Valid system-boot-state partition
+	const gadgetYaml = `
+volumes:
+  vol0:
+    bootloader: u-boot
+    structure:
+      - name: ubuntu-boot-state
+        role: system-boot-state
+        type: 3DE21764-95BD-54BD-A5C3-4ABE786F38A8
+        size: 1M
+        offset: 1M
+`
+	gi, err := gadget.InfoFromGadgetYaml([]byte(gadgetYaml), nil)
+	c.Assert(err, IsNil)
+	err = gadget.Validate(gi, nil, nil)
+	c.Assert(err, IsNil)
+}
+
+func (s *validateGadgetTestSuite) TestValidateSystemBootStateRoleOffsetRequired(c *C) {
+	// system-boot-state without offset - error occurs during parsing
+	const gadgetYaml = `
+volumes:
+  vol0:
+    bootloader: u-boot
+    structure:
+      - name: ubuntu-boot-state
+        role: system-boot-state
+        type: 3DE21764-95BD-54BD-A5C3-4ABE786F38A8
+        size: 1M
+`
+	_, err := gadget.InfoFromGadgetYaml([]byte(gadgetYaml), nil)
+	c.Assert(err, ErrorMatches, `.*invalid structure #0 .* system-boot-state role requires explicit offset`)
+}
+
+func (s *validateGadgetTestSuite) TestValidateSystemBootStateRoleMinSizeNotAllowed(c *C) {
+	// system-boot-state with min-size - error occurs during parsing
+	const gadgetYaml = `
+volumes:
+  vol0:
+    bootloader: u-boot
+    structure:
+      - name: ubuntu-boot-state
+        role: system-boot-state
+        type: 3DE21764-95BD-54BD-A5C3-4ABE786F38A8
+        size: 2M
+        min-size: 1M
+        offset: 1M
+`
+	_, err := gadget.InfoFromGadgetYaml([]byte(gadgetYaml), nil)
+	c.Assert(err, ErrorMatches, `.*system-boot-state role does not support min-size`)
+}
+
+func (s *validateGadgetTestSuite) TestValidateSystemBootStateRoleMinSize1MiB(c *C) {
+	// system-boot-state with size less than 1MiB - error occurs during parsing
+	// Use raw bytes (524288 = 512 * 1024 = 512 KiB)
+	const gadgetYaml = `
+volumes:
+  vol0:
+    bootloader: u-boot
+    structure:
+      - name: ubuntu-boot-state
+        role: system-boot-state
+        type: 3DE21764-95BD-54BD-A5C3-4ABE786F38A8
+        size: 524288
+        offset: 1M
+`
+	_, err := gadget.InfoFromGadgetYaml([]byte(gadgetYaml), nil)
+	c.Assert(err, ErrorMatches, `.*system-boot-state partition must be at least 1 MiB, got 512 KiB`)
+}
+
+func (s *validateGadgetTestSuite) TestValidateSystemBootStateRoleNoFilesystem(c *C) {
+	// system-boot-state with a filesystem - error occurs during parsing
+	const gadgetYaml = `
+volumes:
+  vol0:
+    bootloader: u-boot
+    structure:
+      - name: ubuntu-boot-state
+        role: system-boot-state
+        type: 3DE21764-95BD-54BD-A5C3-4ABE786F38A8
+        size: 1M
+        offset: 1M
+        filesystem: ext4
+`
+	_, err := gadget.InfoFromGadgetYaml([]byte(gadgetYaml), nil)
+	c.Assert(err, ErrorMatches, `.*system-boot-state role must have no filesystem`)
+}
+
+func (s *validateGadgetTestSuite) TestValidateSystemBootStateRoleWrongGUID(c *C) {
+	// system-boot-state with wrong GUID - error occurs during parsing
+	const gadgetYaml = `
+volumes:
+  vol0:
+    bootloader: u-boot
+    structure:
+      - name: ubuntu-boot-state
+        role: system-boot-state
+        type: 21686148-6449-6E6F-744E-656564454649
+        size: 1M
+        offset: 1M
+`
+	_, err := gadget.InfoFromGadgetYaml([]byte(gadgetYaml), nil)
+	c.Assert(err, ErrorMatches, `.*system-boot-state role requires type 3DE21764-95BD-54BD-A5C3-4ABE786F38A8, got 21686148-6449-6E6F-744E-656564454649`)
+}
+
+func (s *validateGadgetTestSuite) TestValidateSystemBootStateRoleEmptyType(c *C) {
+	// system-boot-state with no type - error occurs during parsing
+	const gadgetYaml = `
+volumes:
+  vol0:
+    bootloader: u-boot
+    structure:
+      - name: ubuntu-boot-state
+        role: system-boot-state
+        size: 1M
+        offset: 1M
+`
+	_, err := gadget.InfoFromGadgetYaml([]byte(gadgetYaml), nil)
+	c.Assert(err, ErrorMatches, `.*type is not specified`)
 }

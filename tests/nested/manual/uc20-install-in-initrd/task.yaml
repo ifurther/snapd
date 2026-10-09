@@ -4,7 +4,11 @@ details: |
   This test checks that we are able to perform a single-boot installation in
   various scenarios.
 
-systems: [ubuntu-20.04-64]
+systems:
+  # FIXME: make it work on 26
+  - ubuntu-20*
+  - ubuntu-22*
+  - ubuntu-24*
 
 environment:
   # There are 4 modes:
@@ -32,9 +36,13 @@ environment:
   # TODO: single boot install currently requires the system to be preseeded
   NESTED_UBUNTU_IMAGE_PRESEED_KEY: "\" (test)\""
   NESTED_FAKESTORE_BLOB_DIR: $(pwd)/fake-store-blobdir
-  NESTED_CUSTOM_MODEL: $TESTSLIB/assertions/developer1-20-dangerous.model
+  NESTED_CUSTOM_MODEL: $TESTSLIB/assertions/developer1-{VERSION}-dangerous.model
   NESTED_UBUNTU_IMAGE_SNAPPY_FORCE_SAS_URL: http://localhost:11028
   NESTED_SNAPD_DEBUG_TO_SERIAL: true
+
+  # create a kernel-modules component for efi-pstore
+  NESTED_KERNEL_MODULES_COMP: efi-pstore
+  NESTED_COMP_KERNEL_MODULE_NAME: efi-pstore
 
 prepare: |
   "$TESTSTOOLS"/store-state setup-fake-store "$NESTED_FAKESTORE_BLOB_DIR"
@@ -61,6 +69,24 @@ prepare: |
 
   tests.nested build-image core
 
+  #shellcheck source=tests/lib/nested.sh
+  . "$TESTSLIB"/nested.sh
+
+  if os.query is-ubuntu-ge 24.04; then
+    # Let's repack the kernel with a new hash so we can force resealing
+    unsquashfs -d pc-kernel-new "${NESTED_ASSETS_DIR}"/pc-kernel.snap
+    objcopy -O binary -j .initrd pc-kernel-new/kernel.efi initrd.img
+    objcopy -O binary -j .linux pc-kernel-new/kernel.efi linux
+    /usr/lib/systemd/ukify build --linux=linux --initrd=initrd.img --section=.some:thing-new --output=pc-kernel-new/kernel.efi
+    rm linux initrd.img
+    KEY_NAME=$(tests.nested download snakeoil-key)
+    SNAKEOIL_KEY="${PWD}/${KEY_NAME}.key"
+    SNAKEOIL_CERT="${PWD}/${KEY_NAME}.pem"
+    tests.nested secboot-sign file "${PWD}/pc-kernel-new/kernel.efi" "${SNAKEOIL_KEY}" "${SNAKEOIL_CERT}"
+    snap pack pc-kernel-new --filename=pc-kernel-new.snap
+    rm -rf pc-kernel-new
+  fi
+
   "$TESTSTOOLS"/store-state teardown-fake-store "$NESTED_FAKESTORE_BLOB_DIR"
 
   tests.nested create-vm core
@@ -68,12 +94,62 @@ prepare: |
 restore: |
   "$TESTSTOOLS"/store-state teardown-fake-store "$NESTED_FAKESTORE_BLOB_DIR" || true
   rm -rf ~/.snap/gnupg
+  rm -rf pc-kernel-new
+  rm -f pc-kernel-new.snap
 
 execute: |
+  #shellcheck source=tests/lib/nested.sh
+  . "$TESTSLIB"/nested.sh
+
   remote.exec "cat /proc/cmdline" | MATCH "snapd_recovery_mode=install"
   remote.exec "cat /var/lib/snapd/modeenv" > modeenv
 
   MATCH "mode=run" <modeenv
+
+  check_efi_pstore() {
+      # Compare times to check that drivers tree was created on
+      # installation, not on seeding
+      # shellcheck disable=SC2016
+      tree_birth=$(remote.exec 'date -d"$(stat --printf="%w\n" /var/lib/snapd/kernel/pc-kernel)" +%s')
+      seeding_time=$(remote.exec 'systemctl show -P ExecMainStartTimestamp core.start-snapd.service')
+      seeding_time=$(date -d"${seeding_time}" +%s)
+      test "${seeding_time}" -gt "$tree_birth"
+
+      # check that the component is in place
+      kern_ver=$(remote.exec uname -r)
+      comp_install_dir=/var/lib/snapd/kernel/pc-kernel/x1/lib/modules/"$kern_ver"/updates/"$NESTED_KERNEL_MODULES_COMP"
+      comp_dir=/snap/pc-kernel/components/mnt/"$NESTED_KERNEL_MODULES_COMP"/x1/modules/"$kern_ver"
+      test "$(remote.exec readlink -f "$comp_install_dir")" = "$comp_dir"
+
+      # module comes from a component
+      remote.exec modinfo -F filename efi_pstore | MATCH updates/"$NESTED_KERNEL_MODULES_COMP"/kmod/efi-pstore.ko
+      # module should have been loaded (pulled by systemd-pstore.service)
+      remote.exec lsmod | MATCH efi_pstore
+      # Make sure it was loaded early
+      remote.exec systemctl show -p ExecMainStatus modprobe@efi_pstore.service | MATCH ExecMainStatus=0
+
+      # Check that the mount files were created
+      remote.exec stat /run/systemd/system/'sysroot-writable-system\\x2ddata-snap-pc\\x2dkernel-x1.mount'
+      remote.exec stat /run/systemd/system/'sysroot-writable-system\\x2ddata-snap-pc\\x2dkernel-components-mnt-efi\\x2dpstore-x1.mount'
+  }
+
+  # No unexpected mounts / directories
+  not remote.exec mountpoint /run/mnt/ubuntu-data
+  not remote.exec stat /run/mnt/ubuntu-data
+
+  if [ "$(nested_get_version)" -ge "24" ]; then
+      # check component from store has been early-installed
+      check_efi_pstore
+      # Additionally, check that modules loaded by systemd right after switch root could be loaded
+      lsmod | MATCH ip_tables
+      # No unexpected mounts / directories
+      not remote.exec mountpoint /run/mnt/kernel
+      not remote.exec stat /run/mnt/kernel
+      not remote.exec mountpoint /run/mnt/snap-content
+      not remote.exec stat /run/mnt/snap-content
+      # Can remove the kernel-modules component
+      remote.exec sudo snap remove pc-kernel+efi-pstore
+  fi
 
   if [ "${INSTALL_MODE}" != none ]; then
     # TODO: in a normal run, ubuntu-data-<someid> is used instead of
@@ -98,4 +174,18 @@ execute: |
     remote.exec test -f /var/lib/snapd/device/fde/boot-chains
   else
     remote.exec not test -f /var/lib/snapd/device/fde/boot-chains
+  fi
+
+  # Now we check we have access to the unlock key and primary key
+  if [ "${INSTALL_MODE}" != none ]; then
+    # To be able to enroll a key we access to the unlock keys of the devices
+    remote.exec "sudo snap recovery --show-keys"
+
+    if os.query is-ubuntu-ge 24.04; then
+      # To be able to reseal we need the primary key
+      remote.push pc-kernel-new.snap
+      boot_id="$(tests.nested boot-id)"
+      remote.exec sudo snap install --dangerous pc-kernel-new.snap || true
+      remote.wait-for reboot "${boot_id}"
+    fi
   fi

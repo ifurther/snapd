@@ -43,6 +43,9 @@ const networkSetupObserveConnectedPlugAppArmor = `
 /usr/share/netplan/ r,
 /usr/share/netplan/** r,
 
+# For UC26+
+/usr/lib/python/python* ixr,
+
 # Netplan uses busctl internally, so allow using that as well
 /usr/bin/busctl ixr,
 
@@ -74,11 +77,12 @@ dbus (send)
 
 func init() {
 	registerIface(&commonInterface{
-		name:                  "network-setup-observe",
-		summary:               networkSetupObserveSummary,
-		implicitOnCore:        true,
-		implicitOnClassic:     true,
-		baseDeclarationSlots:  networkSetupObserveBaseDeclarationSlots,
-		connectedPlugAppArmor: networkSetupObserveConnectedPlugAppArmor,
+		name:                     "network-setup-observe",
+		summary:                  networkSetupObserveSummary,
+		implicitOnCore:           true,
+		implicitOnClassic:        true,
+		baseDeclarationSlots:     networkSetupObserveBaseDeclarationSlots,
+		connectedPlugAppArmor:    networkSetupObserveConnectedPlugAppArmor,
+		parallelInstancesSlotErr: errParallelInstancesSystemSlot,
 	})
 }

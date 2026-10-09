@@ -12,15 +12,21 @@ details: |
 # memory cgroup is disabled
 systems:
   - -ubuntu-14.04-*
-  - -centos-7-*
-  - -amazon-linux-2-*
   - -ubuntu-16.04-*
   - -ubuntu-core-16-*
   - -ubuntu-core-*-arm-*
 
 prepare: |
-  snap install go-example-webserver jq remarshal hello-world
-  snap install test-snapd-curl --edge --devmode
+  snap install go-example-webserver hello-world
+
+restore: |
+  snap remove-quota group-five || true
+  snap remove-quota group-four || true
+  snap remove-quota group-three || true
+  snap remove-quota too-small || true
+  snap remove-quota group-one || true
+  # despite removing groups, in 18.04 and 20.04, the slices stay behind
+  find /sys/fs/cgroup/ -type d -name 'snap.*.slice' -prune -ls -exec rmdir \{\} \;
 
 execute: |
   echo "Create a group with a snap in it"
@@ -28,7 +34,7 @@ execute: |
 
   echo "The systemd slice should be active now"
   sliceName="snap.$(systemd-escape --path group-one).slice"
-  systemctl show --property=ActiveState "$sliceName" | MATCH "ActiveState=active"
+  systemctl show --property=ActiveState "$sliceName" | MATCH '^ActiveState=active$'
 
   echo "The service should also still be active"
   snap services go-example-webserver.webserver | MATCH "go-example-webserver.webserver\s+enabled\s+active"
@@ -81,21 +87,28 @@ execute: |
       echo "cannot detect cgroup memory file"
       exit 1
   fi
+  
+  # In systemd source code, systemd query this from property_get_current_memory() (which is sdbus),
+  # which is actually read from the exact same address as "$cgroupMemFile". So the delay we are seeing
+  # is most likely because systemd needs to start gathering information first from sdbus.
+  # So having the retries make sense.
+  total_iters=5
+  for iter in $(seq "$total_iters"); do
+      snapdSaysMemUsage="$(snap debug api /v2/quotas/group-one | gojq -r '.result.current.memory')"
+      kernelSaysMemUsage="$(cat "$cgroupMemFile")"
 
-  snapdSaysMemUsage="$(sudo snap run test-snapd-curl.curl --unix-socket /run/snapd.socket http://localhost/v2/quotas/group-one | jq -r '.result.current.memory')"
-  kernelSaysMemUsage="$(cat "$cgroupMemFile")"
+      pyCmd="import math; print(math.ceil(abs($snapdSaysMemUsage - $kernelSaysMemUsage) / $snapdSaysMemUsage * 100))"
+      percentChg="$(python3 -c "$pyCmd")"
 
-  pyCmd="import math; print(math.ceil(abs($snapdSaysMemUsage - $kernelSaysMemUsage) / $snapdSaysMemUsage * 100))"
-  if command -v python3 > /dev/null; then
-    percentChg="$(python3 -c "$pyCmd")"
-  else 
-    percentChg="$(python -c "$pyCmd")"
-  fi
-
-  if [ "$percentChg" -gt 10 ]; then
-    echo "memory usage reported by snapd differs from that of the kernel by more than 10%"
-    exit 1
-  fi
+      if [ "$percentChg" -le 10 ]; then
+          break
+      elif [ "$iter" = "$total_iters" ]; then
+          echo "memory usage reported by snapd differs from that of the kernel by more than 10%"
+          exit 1
+      else
+          sleep 3
+      fi
+  done
 
   echo "Removing the quota will stop the slice and the service will be restarted"
   snap remove-quota group-one
@@ -106,7 +119,7 @@ execute: |
   systemctl show --property=ControlGroup snap.go-example-webserver.webserver.service | NOMATCH "/$sliceName/snap.go-example-webserver.webserver.service"
 
   echo "And the slice is not active anymore"
-  systemctl show --property=ActiveState "$sliceName" | MATCH "ActiveState=inactive"
+  systemctl show --property=ActiveState "$sliceName" | MATCH '^ActiveState=inactive$'
 
   # snap.go-example-webserver.webserver.service is using about 540K and it is not killed
   if not os.query is-fedora; then
@@ -119,7 +132,7 @@ execute: |
     # the unit will jump between SubState=running and SubState=auto-restart while
     # trying to restart it in a loop, but after systemd has hit the limit it will
     # give up and mark the unit as failed
-    retry --wait 1 -n 30 sh -c "systemctl show --property=SubState snap.go-example-webserver.webserver.service | MATCH 'SubState=failed'"
+    retry --wait 1 -n 30 sh -c "systemctl show --property=SubState snap.go-example-webserver.webserver.service | MATCH '^SubState=failed$'"
 
     # clear "oom-killer" messages from dmesg or prepare-restore.sh will fail due
     # to the oom-killer messages from go-example-webserver
@@ -127,7 +140,7 @@ execute: |
 
     echo "The systemd slice should be active"
     sliceName="snap.$(systemd-escape --path too-small).slice"
-    systemctl show --property=ActiveState "$sliceName" | MATCH "ActiveState=active"
+    systemctl show --property=ActiveState "$sliceName" | MATCH '^ActiveState=active$'
 
     echo "But the service is not running after a short amount of time"
     retry --wait 1 -n 100 sh -c 'snap services go-example-webserver.webserver | MATCH "go-example-webserver.webserver\s+enabled\s+inactive"'
@@ -165,9 +178,9 @@ execute: |
 
   echo "Removing a snap ensures that the snap is not in the quota group anymore"
   snap set-quota group-three --memory=100MB go-example-webserver
-  snap quota group-three | yaml2json | jq -r '.snaps | .[]' | MATCH go-example-webserver
+  snap quota group-three | gojq --yaml-input -r '.snaps | .[]' | MATCH go-example-webserver
   snap remove go-example-webserver
-  snap quota group-three | yaml2json | jq -r '.snaps' | MATCH null
+  snap quota group-three | gojq --yaml-input -r '.snaps' | MATCH null
   snap remove-quota group-three
 
   echo "Creating a quota group with no actual services in it still has logical memory usage reported for it"
@@ -177,26 +190,26 @@ execute: |
   # in reporting it's memory usage on old systemd versions
   snap set-quota group-five --memory=10MB --parent=group-four hello-world
 
-  snapdSaysMemUsage="$(sudo snap run test-snapd-curl.curl --unix-socket /run/snapd.socket http://localhost/v2/quotas/group-five | jq -r '.result.current.memory')"
-  # both 0 and up to 12KiB values are expected here, 0 is for older systemd/kernels 
+  snapdSaysMemUsage="$(snap debug api /v2/quotas/group-five | gojq -r '.result.current.memory')"
+  # both 0 and up to 262KiB values are expected here, 0 is for older systemd/kernels 
   # where an empty cgroup has exactly 0, but on newer systems there is some 
   # minimum amount of accounting memory for an empty cgroup, which is observed
-  # to be up to 12KiB due to cached memory.
-  case "$snapdSaysMemUsage" in
-      null|0|4096|8192|12288)
-          # expected
-          ;; 
-      *)
-          echo "unexpected memory usage for empty quota group group-five, snapd says: $snapdSaysMemUsage"
-          exit 1
-  esac
+  # to be up to 262KiB due to cached memory.
+  if [ "$snapdSaysMemUsage" != null ] && [ "$snapdSaysMemUsage" -gt 262144 ]; then
+      echo "unexpected memory usage for empty quota group group-five, snapd says: $snapdSaysMemUsage"
+      exit 1
+  fi
 
-  snapdSaysMemUsage="$(sudo snap run test-snapd-curl.curl --unix-socket /run/snapd.socket http://localhost/v2/quotas/group-four | jq -r '.result.current.memory')"
-  case "$snapdSaysMemUsage" in
-      null|0|4096|8192|12288)
-          # expected
-          ;; 
-      *)
+  # Sporadically the system could take a while to adjust the memory usage like it happens in Arch-linux
+  for iter in $(seq 5); do
+      snapdSaysMemUsage="$(snap debug api /v2/quotas/group-four | gojq -r '.result.current.memory')"
+      if [ "$snapdSaysMemUsage" = null ] || [ "$snapdSaysMemUsage" -le 262144 ]; then
+          break
+      fi
+      sleep 5
+      if [ "$iter" = 5 ]; then
           echo "unexpected memory usage for empty quota group group-four, snapd says: $snapdSaysMemUsage"
           exit 1
-  esac
+      fi
+  done
+  

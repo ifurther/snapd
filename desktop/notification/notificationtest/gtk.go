@@ -24,7 +24,7 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/godbus/dbus"
+	"github.com/godbus/dbus/v5"
 
 	"github.com/snapcore/snapd/dbusutil"
 )
@@ -169,7 +169,7 @@ func (a gtkApi) RemoveNotification(desktopId, id string) *dbus.Error {
 	if err := a.server.Close(id); err != nil {
 		return &dbus.Error{
 			Name: "org.gtk.Notifications.Failed",
-			Body: []interface{}{err.Error()},
+			Body: []any{err.Error()},
 		}
 	}
 	return nil

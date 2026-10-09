@@ -26,8 +26,6 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/xerrors"
-
 	"github.com/snapcore/snapd/snap"
 )
 
@@ -55,6 +53,7 @@ type Snap struct {
 	IgnoreValidation bool          `json:"ignore-validation"`
 	Revision         snap.Revision `json:"revision"`
 	Confinement      string        `json:"confinement"`
+	Grade            string        `json:"grade"`
 	Private          bool          `json:"private"`
 	DevMode          bool          `json:"devmode"`
 	JailMode         bool          `json:"jailmode"`
@@ -66,7 +65,7 @@ type Snap struct {
 	MountedFrom      string        `json:"mounted-from,omitempty"`
 	CohortKey        string        `json:"cohort-key,omitempty"`
 
-	Links map[string][]string `json:"links,omitempy"`
+	Links map[string][]string `json:"links,omitempty"`
 
 	// legacy fields before we had links
 	Contact string `json:"contact"`
@@ -91,6 +90,11 @@ type Snap struct {
 	GatingHold *time.Time `json:"gating-hold,omitempty"`
 	// if RefreshInhibit is nil, then there is no pending refresh.
 	RefreshInhibit *SnapRefreshInhibit `json:"refresh-inhibit,omitempty"`
+	// RefreshFailures tracks information about snap failed refreshes.
+	RefreshFailures *snap.RefreshFailuresInfo `json:"refresh-failures,omitempty"`
+
+	// Components is a list of the snap components
+	Components []Component `json:"components,omitempty"`
 }
 
 type SnapHealth struct {
@@ -196,8 +200,7 @@ func (client *Client) Sections() ([]string, error) {
 	var sections []string
 	_, err := client.doSync("GET", "/v2/sections", nil, nil, nil, &sections)
 	if err != nil {
-		fmt := "cannot get snap sections: %w"
-		return nil, xerrors.Errorf(fmt, err)
+		return nil, fmt.Errorf("cannot get snap sections: %w", err)
 	}
 	return sections, nil
 }
@@ -258,8 +261,7 @@ func (client *Client) FindOne(name string) (*Snap, *ResultInfo, error) {
 
 	snaps, ri, err := client.snapsFromPath("/v2/find", q)
 	if err != nil {
-		fmt := "cannot find snap %q: %w"
-		return nil, nil, xerrors.Errorf(fmt, name, err)
+		return nil, nil, fmt.Errorf("cannot find snap %q: %w", name, err)
 	}
 
 	if len(snaps) == 0 {
@@ -276,8 +278,7 @@ func (client *Client) snapsFromPath(path string, query url.Values) ([]*Snap, *Re
 		return nil, nil, e
 	}
 	if err != nil {
-		fmt := "cannot list snaps: %w"
-		return nil, nil, xerrors.Errorf(fmt, err)
+		return nil, nil, fmt.Errorf("cannot list snaps: %w", err)
 	}
 	return snaps, ri, nil
 }
@@ -289,8 +290,7 @@ func (client *Client) Snap(name string) (*Snap, *ResultInfo, error) {
 	path := fmt.Sprintf("/v2/snaps/%s", name)
 	ri, err := client.doSync("GET", path, nil, nil, nil, &snap)
 	if err != nil {
-		fmt := "cannot retrieve snap %q: %w"
-		return nil, nil, xerrors.Errorf(fmt, name, err)
+		return nil, nil, fmt.Errorf("cannot retrieve snap %q: %w", name, err)
 	}
 	return snap, ri, nil
 }

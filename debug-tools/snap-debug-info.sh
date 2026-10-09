@@ -17,6 +17,7 @@ h1 "SNAP WHOAMI"; snap whoami
 h1 "SNAP MODEL"; snap model --verbose
 h1 "SNAP MODEL SERIAL"; snap model --serial --verbose
 h1 "SNAP LIST"; snap list --all
+h1 "SNAP COMPONENTS"; snap components
 h1 "SNAP SERVICES"; snap services
 h1 "SNAP CONNECTIONS"; snap connections
 
@@ -65,4 +66,4 @@ h1 "SNAPD.SERVICE STATUS"; sudo systemctl --no-pager status snapd
 h1 "UPTIME"; uptime
 h1 "DATE (IN UTC)"; date --utc
 h1 "DISK SPACE"; df -h
-h1 "DENIED MESSAGES"; sudo journalctl --no-pager | grep DENIED
+h1 "DENIED MESSAGES"; sudo journalctl --no-pager | grep DENIED || true

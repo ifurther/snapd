@@ -42,11 +42,13 @@ func (e *MissingContextError) Error() string {
 }
 
 type baseCommand struct {
-	stdout io.Writer
-	stderr io.Writer
-	c      *hookstate.Context
-	name   string
-	uid    string
+	stdout         io.Writer
+	stderr         io.Writer
+	c              *hookstate.Context
+	name           string
+	uid            string
+	changeID       *string
+	clientFeatures []string
 }
 
 func (c *baseCommand) setName(name string) {
@@ -61,9 +63,21 @@ func (c *baseCommand) setStdout(w io.Writer) {
 	c.stdout = w
 }
 
-func (c *baseCommand) printf(format string, a ...interface{}) {
+func (c *baseCommand) setChangeID(id *string) {
+	c.changeID = id
+}
+
+func (c *baseCommand) setClientFeatures(features []string) {
+	c.clientFeatures = features
+}
+
+func (c *baseCommand) printf(format string, a ...any) {
+	c.print(fmt.Sprintf(format, a...))
+}
+
+func (c *baseCommand) print(msg string) {
 	if c.stdout != nil {
-		fmt.Fprintf(c.stdout, format, a...)
+		fmt.Fprint(c.stdout, msg)
 	}
 }
 
@@ -71,9 +85,9 @@ func (c *baseCommand) setStderr(w io.Writer) {
 	c.stderr = w
 }
 
-func (c *baseCommand) errorf(format string, a ...interface{}) {
+func (c *baseCommand) error(msg string) {
 	if c.stderr != nil {
-		fmt.Fprintf(c.stderr, format, a...)
+		fmt.Fprint(c.stderr, msg)
 	}
 }
 
@@ -102,6 +116,9 @@ type command interface {
 	setContext(context *hookstate.Context)
 	context() *hookstate.Context
 
+	setChangeID(changeID *string)
+	setClientFeatures(features []string)
+
 	Execute(args []string) error
 }
 
@@ -112,7 +129,7 @@ type commandInfo struct {
 	hidden    bool
 }
 
-var commands = make(map[string]*commandInfo)
+var commands = make(map[string]*commandInfo, 32)
 
 func addCommand(name, shortHelp, longHelp string, generator func() command) *commandInfo {
 	cmd := &commandInfo{
@@ -144,16 +161,16 @@ func (f ForbiddenCommandError) Error() string {
 
 // nonRootAllowed lists the commands that can be performed even when snapctl
 // is invoked not by root.
-var nonRootAllowed = []string{"get", "services", "set-health", "is-connected", "system-mode", "model"}
+var nonRootAllowed = []string{"get", "services", "set-health", "is-connected", "system-mode", "refresh", "model", "version", "is-ready", "tasks", "change"}
 
 // Run runs the requested command.
-func Run(context *hookstate.Context, args []string, uid uint32) (stdout, stderr []byte, err error) {
+func Run(context *hookstate.Context, args []string, uid uint32, features []string) (stdout, stderr []byte, changeID string, err error) {
 	if len(args) == 0 {
-		return nil, nil, fmt.Errorf("internal error: snapctl cannot run without args")
+		return nil, nil, "", fmt.Errorf("internal error: snapctl cannot run without args")
 	}
 
 	if !isAllowedToRun(uid, args) {
-		return nil, nil, &ForbiddenCommandError{Message: fmt.Sprintf("cannot use %q with uid %d, try with sudo", args[0], uid)}
+		return nil, nil, "", &ForbiddenCommandError{Message: fmt.Sprintf("cannot use %q with uid %d, try with sudo", args[0], uid)}
 	}
 
 	parser := flags.NewNamedParser("snapctl", flags.PassDoubleDash|flags.HelpFlag)
@@ -168,6 +185,8 @@ func Run(context *hookstate.Context, args []string, uid uint32) (stdout, stderr 
 		cmd.setStdout(&stdoutBuffer)
 		cmd.setStderr(&stderrBuffer)
 		cmd.setContext(context)
+		cmd.setChangeID(&changeID)
+		cmd.setClientFeatures(features)
 
 		theCmd, err := parser.AddCommand(name, cmdInfo.shortHelp, cmdInfo.longHelp, cmd)
 		theCmd.Hidden = cmdInfo.hidden
@@ -177,17 +196,40 @@ func Run(context *hookstate.Context, args []string, uid uint32) (stdout, stderr 
 	}
 
 	_, err = parser.ParseArgs(args)
-	return stdoutBuffer.Bytes(), stderrBuffer.Bytes(), err
+
+	return stdoutBuffer.Bytes(), stderrBuffer.Bytes(), changeID, err
 }
 
+// isAllowedToRun returns true if the user with the given UID can run the given snapctl command vector.
+//
+// Commands still need valid context and snaps can only access own config.
 func isAllowedToRun(uid uint32, args []string) bool {
-	// A command can run if any of the following are true:
-	//	* It runs as root
-	//	* It's contained in nonRootAllowed
-	//	* It's used with the -h or --help flags
-	// note: commands still need valid context and snaps can only access own config.
-	return uid == 0 ||
-		strutil.ListContains(nonRootAllowed, args[0]) ||
-		strutil.ListContains(args, "-h") ||
-		strutil.ListContains(args, "--help")
+	// Root can run all snapctl commands.
+	if uid == 0 {
+		return true
+	}
+
+	for idx, arg := range args {
+		// A number of sub-commands are allowed to be executed by non-root users.
+		if idx == 0 && strutil.ListContains(nonRootAllowed, arg) {
+			return true
+		}
+
+		// Invoking help is always allowed.
+		if arg == "-h" || arg == "--help" {
+			return true
+		}
+
+		// Note that we are not interrupting parsing after the first non-option
+		// argument (POSIX style), because we want to cater to the use case of
+		// the user appending --help or -h at the end of the command and still
+		// getting something useful. The only exception is the condition below.
+
+		// The explicit termination argument terminates parsing.
+		if arg == "--" {
+			break
+		}
+	}
+
+	return false
 }

@@ -42,7 +42,7 @@ func newBootState20(typ snap.Type, dev snap.Device) bootState {
 			dev: dev,
 		}
 	case snap.TypeGadget:
-		return &bootState20Gadget{}
+		return &bootState20Gadget{dev: dev}
 	default:
 		panic(fmt.Sprintf("cannot make a bootState20 for snap type %q", typ))
 	}
@@ -50,7 +50,6 @@ func newBootState20(typ snap.Type, dev snap.Device) bootState {
 
 // modeenvMu is used to protect sections doing:
 //   - read moddeenv/modify it(/reseal from it)
-//   - write modeenv/seal from it
 //
 // while we might want to release the global state lock as seal/reseal are slow
 // (see Unlocker for that)
@@ -58,6 +57,10 @@ var (
 	modeenvMu     sync.Mutex
 	modeenvLocked int32
 )
+
+// TODO: we need to rethink the modeenv mutexes as naively releasing the state
+// lock while holding them can create deadlocks when we try to reacquire the
+// former
 
 func modeenvLock() {
 	modeenvMu.Lock()
@@ -69,12 +72,12 @@ func modeenvUnlock() {
 	modeenvMu.Unlock()
 }
 
-func isModeeenvLocked() bool {
+func isModeenvLocked() bool {
 	return atomic.LoadInt32(&modeenvLocked) == 1
 }
 
 func loadModeenv() (*Modeenv, error) {
-	if !isModeeenvLocked() {
+	if !isModeenvLocked() {
 		return nil, fmt.Errorf("internal error: cannot read modeenv without the lock")
 	}
 	modeenv, err := ReadModeenv("")
@@ -153,6 +156,8 @@ type bootStateUpdate20 struct {
 
 	// tasks to run after the modeenv has been written
 	postModeenvTasks []bootCommitTask
+
+	revokeOldKeys bool
 }
 
 func (u20 *bootStateUpdate20) preModeenv(task bootCommitTask) {
@@ -184,7 +189,7 @@ func newBootStateUpdate20(m *Modeenv) (*bootStateUpdate20, error) {
 
 // commit will write out boot state persistently to disk.
 func (u20 *bootStateUpdate20) commit() error {
-	if !isModeeenvLocked() {
+	if !isModeenvLocked() {
 		return fmt.Errorf("internal error: cannot commit modeenv without the lock")
 	}
 
@@ -207,13 +212,16 @@ func (u20 *bootStateUpdate20) commit() error {
 		}
 	}
 
-	expectReseal := false
+	// None of the implementation of successfulBootState is expected to modify the model.
+	// So we can safely ignore FDE hooks.
+	resealOpts := ResealKeyToModeenvOptions{IgnoreFDEHooks: true, RevokeOldKeys: u20.revokeOldKeys}
+
 	// next write the modeenv if it changed
 	if !u20.writeModeenv.deepEqual(u20.modeenv) {
 		if err := u20.writeModeenv.Write(); err != nil {
 			return err
 		}
-		expectReseal = resealExpectedByModeenvChange(u20.writeModeenv, u20.modeenv)
+		resealOpts.ExpectReseal = resealExpectedByModeenvChange(u20.writeModeenv, u20.modeenv)
 	}
 
 	// next reseal using the modeenv values, we do this before any
@@ -225,7 +233,7 @@ func (u20 *bootStateUpdate20) commit() error {
 	// changed because of unasserted kernels, then pass a
 	// flag as hint whether to reseal based on whether we
 	// wrote the modeenv
-	if err := resealKeyToModeenv(dirs.GlobalRootDir, u20.writeModeenv, expectReseal, nil); err != nil {
+	if err := resealKeyToModeenv(dirs.GlobalRootDir, u20.writeModeenv, resealOpts, nil); err != nil {
 		return err
 	}
 
@@ -463,7 +471,7 @@ func (ks20 *bootState20Kernel) selectAndCommitSnapInitramfsMount(modeenv *Modeen
 // snaps on UC20+. It is used for both setNext() and markSuccessful(),
 // with both of those methods returning bootStateUpdate20 to be used
 // with bootStateUpdate.
-type bootState20Gadget struct{}
+type bootState20Gadget struct{ dev snap.Device }
 
 func (bs20 *bootState20Gadget) revisions() (curSnap, trySnap snap.PlaceInfo, tryingStatus string, err error) {
 	return nil, nil, "", fmt.Errorf("internal error, revisions not implemented for gadget")
@@ -473,6 +481,13 @@ func (bs20 *bootState20Gadget) setNext(next snap.PlaceInfo, bootCtx NextBootCont
 	u20, err := newBootStateUpdate20(nil)
 	if err != nil {
 		return RebootInfo{RebootRequired: false}, nil, err
+	}
+
+	if u20.modeenv.Gadget != next.Filename() {
+		u20.postModeenv(func() error {
+			_, err := ReconfigureRecoveryBootConfig(bs20.dev)
+			return err
+		})
 	}
 
 	u20.writeModeenv.Gadget = next.Filename()
@@ -817,7 +832,10 @@ func (ba20 *bootState20BootAssets) markSuccessful(update bootStateUpdate) (bootS
 		return update, nil
 	}
 
-	newM, dropAssets, err := observeSuccessfulBootAssets(u20.writeModeenv)
+	newM, dropAssets, revokeOldKeys, err := observeSuccessfulBootAssets(u20.writeModeenv)
+	if revokeOldKeys {
+		u20.revokeOldKeys = true
+	}
 	if err != nil {
 		return nil, fmt.Errorf("cannot mark successful boot assets: %v", err)
 	}

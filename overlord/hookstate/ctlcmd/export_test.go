@@ -21,16 +21,23 @@ package ctlcmd
 
 import (
 	"context"
-	"fmt"
-	"os/user"
+	"errors"
+	"time"
 
 	"github.com/snapcore/snapd/asserts"
+	"github.com/snapcore/snapd/asserts/snapasserts"
+	"github.com/snapcore/snapd/client"
 	"github.com/snapcore/snapd/client/clientutil"
+	"github.com/snapcore/snapd/confdb"
+	"github.com/snapcore/snapd/osutil/user"
+	"github.com/snapcore/snapd/overlord/confdbstate"
 	"github.com/snapcore/snapd/overlord/devicestate"
 	"github.com/snapcore/snapd/overlord/hookstate"
 	"github.com/snapcore/snapd/overlord/servicestate"
+	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/testutil"
 )
 
@@ -42,11 +49,14 @@ const (
 var (
 	AttributesTask = attributesTask
 
-	KmodCheckConnection = kmodCheckConnection
-	KmodMatchConnection = kmodMatchConnection
+	KmodCheckConnection      = kmodCheckConnection
+	KmodMatchConnection      = kmodMatchConnection
+	ChangeInfoToClientChange = changeInfoToClientChange
 )
 
 type KmodCommand = kmodCommand
+type IsReadyCommand = isReadyCommand
+type ChangeRateLimitKey = changeRateLimitKey
 
 func MockKmodCheckConnection(f func(*hookstate.Context, string, []string) error) (restore func()) {
 	r := testutil.Backup(&kmodCheckConnection)
@@ -72,10 +82,28 @@ func MockServicestateControlFunc(f func(*state.State, []*snap.AppInfo, *services
 	return func() { servicestateControl = old }
 }
 
+func MockSnapstateInstallComponentsFunc(f func(ctx context.Context, st *state.State, names []string, info *snap.Info, vsets *snapasserts.ValidationSets, opts snapstate.Options) ([]*state.TaskSet, error)) (restore func()) {
+	old := snapstateInstallComponents
+	snapstateInstallComponents = f
+	return func() { snapstateInstallComponents = old }
+}
+
+func MockSnapstateRemoveComponentsFunc(f func(st *state.State, instanceName naming.InstanceName, compName []string, opts snapstate.RemoveComponentsOpts) ([]*state.TaskSet, error)) (restore func()) {
+	old := snapstateRemoveComponents
+	snapstateRemoveComponents = f
+	return func() { snapstateRemoveComponents = old }
+}
+
 func MockDevicestateSystemModeInfoFromState(f func(*state.State) (*devicestate.SystemModeInfo, error)) (restore func()) {
 	old := devicestateSystemModeInfoFromState
 	devicestateSystemModeInfoFromState = f
 	return func() { devicestateSystemModeInfoFromState = old }
+}
+
+func MockFdestateSystemEncryptedFromState(f func(*state.State) (bool, error)) (restore func()) {
+	old := fdestateSystemEncryptedFromState
+	fdestateSystemEncryptedFromState = f
+	return func() { fdestateSystemEncryptedFromState = old }
 }
 
 func AddMockCommand(name string) *MockCommand {
@@ -129,15 +157,15 @@ func (c *MockCommand) Execute(args []string) error {
 	c.Args = args
 
 	if c.FakeStdout != "" {
-		c.printf(c.FakeStdout)
+		c.print(c.FakeStdout)
 	}
 
 	if c.FakeStderr != "" {
-		c.errorf(c.FakeStderr)
+		c.error(c.FakeStderr)
 	}
 
 	if c.ExecuteError {
-		return fmt.Errorf("failed at user request")
+		return errors.New("failed at user request")
 	}
 
 	return nil
@@ -163,4 +191,35 @@ func MockNewStatusDecorator(f func(ctx context.Context, isGlobal bool, uid strin
 	restore = testutil.Backup(&newStatusDecorator)
 	newStatusDecorator = f
 	return restore
+}
+
+func MockConfdbstateWriteConfdb(f func(*hookstate.Context, *confdb.View, map[string]any, *client.ConfdbOptions) error) (restore func()) {
+	old := confdbstateWriteConfdb
+	confdbstateWriteConfdb = f
+	return func() {
+		confdbstateWriteConfdb = old
+	}
+}
+
+func MockConfdbstateGetView(f func(st *state.State, account, confdbName, viewName string) (*confdb.View, error)) (restore func()) {
+	old := confdbstateGetView
+	confdbstateGetView = f
+	return func() {
+		confdbstateGetView = old
+	}
+}
+
+func MockConfdbstateReadConfdb(f func(*hookstate.Context, *confdb.View, []string, map[string]any, *client.ConfdbOptions) (*confdbstate.Transaction, error)) (restore func()) {
+	old := confdbstateReadConfdb
+	confdbstateReadConfdb = f
+	return func() {
+		confdbstateReadConfdb = old
+	}
+}
+
+// TODO:GOVERSION: use time bubbles once project is updated to Go 1.26
+func MockTimeAfter(f func(time.Duration) <-chan time.Time) (restore func()) {
+	old := timeAfter
+	timeAfter = f
+	return func() { timeAfter = old }
 }

@@ -20,6 +20,7 @@
 package asserts
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -48,8 +49,8 @@ func presencesAsStrings(presences ...Presence) []string {
 
 var validValidationSetSnapPresences = presencesAsStrings(PresenceRequired, PresenceOptional, PresenceInvalid)
 
-func checkPresence(snap map[string]interface{}, which string, valid []string) (Presence, error) {
-	presence, err := checkOptionalStringWhat(snap, "presence", which)
+func checkOptionalPresence(headers map[string]any, which string, valid []string) (Presence, error) {
+	presence, err := checkOptionalStringWhat(headers, "presence", which)
 	if err != nil {
 		return Presence(""), err
 	}
@@ -59,18 +60,35 @@ func checkPresence(snap map[string]interface{}, which string, valid []string) (P
 	return Presence(presence), nil
 }
 
+func checkPresence(headers map[string]any, which string, valid []string) (Presence, error) {
+	presence, err := checkExistsStringWhat(headers, "presence", which)
+	if err != nil {
+		return "", err
+	}
+	if presence != "" && !strutil.ListContains(valid, presence) {
+		return "", fmt.Errorf("presence %s must be one of %s", which, strings.Join(valid, "|"))
+	}
+	return Presence(presence), nil
+}
+
 // ValidationSetSnap holds the details about a snap constrained by a validation-set assertion.
 type ValidationSetSnap struct {
-	Name   string
+	Name   naming.SnapName
 	SnapID string
 
 	Presence Presence
 
+	Revision   int
+	Components map[string]ValidationSetComponent
+}
+
+type ValidationSetComponent struct {
+	Presence Presence
 	Revision int
 }
 
 // SnapName implements naming.SnapRef.
-func (s *ValidationSetSnap) SnapName() string {
+func (s *ValidationSetSnap) SnapName() naming.SnapName {
 	return s.Name
 }
 
@@ -79,23 +97,23 @@ func (s *ValidationSetSnap) ID() string {
 	return s.SnapID
 }
 
-func checkValidationSetSnap(snap map[string]interface{}) (*ValidationSetSnap, error) {
-	name, err := checkNotEmptyStringWhat(snap, "name", "of snap")
+func checkValidationSetSnap(snap map[string]any) (*ValidationSetSnap, error) {
+	snapName, err := checkNotEmptyStringWhat(snap, "name", "of snap")
 	if err != nil {
 		return nil, err
 	}
-	if err := naming.ValidateSnap(name); err != nil {
-		return nil, fmt.Errorf("invalid snap name %q", name)
+	if err := naming.ValidateSnap(snapName); err != nil {
+		return nil, fmt.Errorf("invalid snap name %q", snapName)
 	}
 
-	what := fmt.Sprintf("of snap %q", name)
+	what := fmt.Sprintf("of snap %q", snapName)
 
 	snapID, err := checkStringMatchesWhat(snap, "id", what, naming.ValidSnapID)
 	if err != nil {
 		return nil, err
 	}
 
-	presence, err := checkPresence(snap, what, validValidationSetSnapPresences)
+	presence, err := checkOptionalPresence(snap, what, validValidationSetSnapPresences)
 	if err != nil {
 		return nil, err
 	}
@@ -112,44 +130,117 @@ func checkValidationSetSnap(snap map[string]interface{}) (*ValidationSetSnap, er
 		return nil, fmt.Errorf(`cannot specify revision %s at the same time as stating its presence is invalid`, what)
 	}
 
+	components, err := checkValidationSetComponents(naming.SnapName(snapName), snap, snapRevision)
+	if err != nil {
+		return nil, err
+	}
+
 	return &ValidationSetSnap{
-		Name:     name,
-		SnapID:   snapID,
-		Presence: presence,
-		Revision: snapRevision,
+		Name:       naming.SnapName(snapName),
+		SnapID:     snapID,
+		Presence:   presence,
+		Revision:   snapRevision,
+		Components: components,
 	}, nil
 }
 
-func checkValidationSetSnaps(snapList interface{}) ([]*ValidationSetSnap, error) {
+func checkValidationSetComponents(snapName naming.SnapName, snap map[string]any, snapRevision int) (map[string]ValidationSetComponent, error) {
+	mapping, err := checkMapWhat(snap, "components", fmt.Sprintf("of snap %q", snapName))
+	if err != nil {
+		return nil, errors.New(`"components" field in "snaps" header must be a map`)
+	}
+
+	if len(mapping) == 0 {
+		return nil, nil
+	}
+
+	components := make(map[string]ValidationSetComponent, len(mapping))
+	for name, comp := range mapping {
+		var parsed map[string]any
+		switch c := comp.(type) {
+		case map[string]any:
+			parsed = c
+		case string:
+			parsed = map[string]any{"presence": c}
+		default:
+			return nil, errors.New(`each field in "components" map must be either a map or a string`)
+		}
+
+		component, err := checkValidationSetComponent(name, parsed, snapName, snapRevision)
+		if err != nil {
+			return nil, err
+		}
+		components[name] = component
+	}
+
+	return components, nil
+}
+
+func checkValidationSetComponent(compName string, comp map[string]any, snapName naming.SnapName, snapRevision int) (ValidationSetComponent, error) {
+	if err := naming.ValidateSnap(compName); err != nil {
+		return ValidationSetComponent{}, fmt.Errorf("invalid component name %q", compName)
+	}
+
+	what := fmt.Sprintf("of component %q", naming.NewComponentRef(snapName, compName))
+
+	presence, err := checkPresence(comp, what, validValidationSetSnapPresences)
+	if err != nil {
+		return ValidationSetComponent{}, err
+	}
+
+	revision, err := checkOptionalSnapRevisionWhat(comp, "revision", what)
+	if err != nil {
+		return ValidationSetComponent{}, err
+	}
+
+	if revision != 0 && presence == PresenceInvalid {
+		return ValidationSetComponent{}, fmt.Errorf("cannot specify component revision %s at the same time as stating its presence is invalid", what)
+	}
+
+	if snapRevision != 0 && revision == 0 && presence != PresenceInvalid {
+		return ValidationSetComponent{}, fmt.Errorf("must specify revision %s since its associated snap specifies a revision", what)
+	}
+
+	if snapRevision == 0 && revision != 0 {
+		return ValidationSetComponent{}, fmt.Errorf("cannot specify revision %s if its associated snap does not specify a revision", what)
+	}
+
+	return ValidationSetComponent{
+		Presence: presence,
+		Revision: revision,
+	}, nil
+}
+
+func checkValidationSetSnaps(snapList any) ([]*ValidationSetSnap, error) {
 	const wrongHeaderType = `"snaps" header must be a list of maps`
 
-	entries, ok := snapList.([]interface{})
+	entries, ok := snapList.([]any)
 	if !ok {
-		return nil, fmt.Errorf(wrongHeaderType)
+		return nil, errors.New(wrongHeaderType)
 	}
 
 	seen := make(map[string]bool, len(entries))
 	seenIDs := make(map[string]string, len(entries))
 	snaps := make([]*ValidationSetSnap, 0, len(entries))
 	for _, entry := range entries {
-		snap, ok := entry.(map[string]interface{})
+		snap, ok := entry.(map[string]any)
 		if !ok {
-			return nil, fmt.Errorf(wrongHeaderType)
+			return nil, errors.New(wrongHeaderType)
 		}
 		valSetSnap, err := checkValidationSetSnap(snap)
 		if err != nil {
 			return nil, err
 		}
 
-		if seen[valSetSnap.Name] {
+		if seen[valSetSnap.Name.String()] {
 			return nil, fmt.Errorf("cannot list the same snap %q multiple times", valSetSnap.Name)
 		}
-		seen[valSetSnap.Name] = true
+		seen[valSetSnap.Name.String()] = true
 		snapID := valSetSnap.SnapID
 		if underName := seenIDs[snapID]; underName != "" {
 			return nil, fmt.Errorf("cannot specify the same snap id %q multiple times, specified for snaps %q and %q", snapID, underName, valSetSnap.Name)
 		}
-		seenIDs[snapID] = valSetSnap.Name
+		seenIDs[snapID] = valSetSnap.Name.String()
 
 		if valSetSnap.Presence == "" {
 			valSetSnap.Presence = PresenceRequired
@@ -167,7 +258,7 @@ func checkValidationSetSnaps(snapList interface{}) ([]*ValidationSetSnap, error)
 // well together). validation-sets are organized in sequences under a
 // name.
 type ValidationSet struct {
-	assertionBase
+	AssertionBase
 
 	seq int
 
@@ -216,7 +307,7 @@ func (vs *ValidationSet) Timestamp() time.Time {
 	return vs.timestamp
 }
 
-func checkSequence(headers map[string]interface{}, name string) (int, error) {
+func checkSequence(headers map[string]any, name string) (int, error) {
 	seqnum, err := checkInt(headers, name)
 	if err != nil {
 		return -1, err
@@ -231,7 +322,7 @@ var (
 	validValidationSetName = regexp.MustCompile("^[a-z0-9](?:-?[a-z0-9])*$")
 )
 
-func assembleValidationSet(assert assertionBase) (Assertion, error) {
+func assembleValidationSet(assert AssertionBase) (Assertion, error) {
 	authorityID := assert.AuthorityID()
 	accountID := assert.HeaderString("account-id")
 	if accountID != authorityID {
@@ -263,7 +354,7 @@ func assembleValidationSet(assert assertionBase) (Assertion, error) {
 	}
 
 	return &ValidationSet{
-		assertionBase: assert,
+		AssertionBase: assert,
 		seq:           seq,
 		snaps:         snaps,
 		timestamp:     timestamp,

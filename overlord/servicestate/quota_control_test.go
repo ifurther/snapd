@@ -30,8 +30,8 @@ import (
 
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/gadget/quantity"
-	"github.com/snapcore/snapd/overlord/configstate/config"
 	"github.com/snapcore/snapd/overlord/servicestate"
+	"github.com/snapcore/snapd/overlord/servicestate/internal"
 	"github.com/snapcore/snapd/overlord/servicestate/servicestatetest"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/snapstate/snapstatetest"
@@ -287,23 +287,6 @@ func checkQuotaControlTasks(c *C, tasks []*state.Task, expAction *servicestate.Q
 	c.Assert(qcs[0], DeepEquals, expAction)
 }
 
-func (s *quotaControlSuite) TestCreateQuotaExperimentalNotEnabled(c *C) {
-	// Test experimental quota group features that should not be enabled when
-	// quota-groups feature is disabled
-	s.state.Lock()
-	defer s.state.Unlock()
-
-	tr := config.NewTransaction(s.state)
-	tr.Set("core", "experimental.quota-groups", false)
-	tr.Commit()
-
-	// Journal Quota is experimental, must give an error
-	_, err := servicestate.CreateQuota(s.state, "foo", servicestate.CreateQuotaOptions{
-		ResourceLimits: quota.NewResourcesBuilder().WithJournalNamespace().Build(),
-	})
-	c.Assert(err, ErrorMatches, `journal quota options are experimental - test it by setting 'experimental.quota-groups' to true`)
-}
-
 func (s *quotaControlSuite) TestCreateQuotaSystemdTooOld(c *C) {
 	s.state.Lock()
 	defer s.state.Unlock()
@@ -350,28 +333,9 @@ func (s *quotaControlSuite) TestCreateQuotaPerQuotaSystemdTooOld(c *C) {
 	}
 }
 
-func (s *quotaControlSuite) TestCreateQuotaJournalNotEnabled(c *C) {
+func (s *quotaControlSuite) TestCreateQuotaJournal(c *C) {
 	s.state.Lock()
 	defer s.state.Unlock()
-
-	tr := config.NewTransaction(s.state)
-	tr.Set("core", "experimental.quota-groups", false)
-	tr.Commit()
-
-	quotaConstraints := quota.NewResourcesBuilder().WithJournalNamespace().Build()
-	_, err := servicestate.CreateQuota(s.state, "foo", servicestate.CreateQuotaOptions{
-		ResourceLimits: quotaConstraints,
-	})
-	c.Assert(err, ErrorMatches, `journal quota options are experimental - test it by setting 'experimental.quota-groups' to true`)
-}
-
-func (s *quotaControlSuite) TestCreateQuotaJournalEnabled(c *C) {
-	s.state.Lock()
-	defer s.state.Unlock()
-
-	tr := config.NewTransaction(s.state)
-	tr.Set("core", "experimental.quota-groups", true)
-	tr.Commit()
 
 	quotaConstraints := quota.NewResourcesBuilder().WithJournalNamespace().Build()
 	_, err := servicestate.CreateQuota(s.state, "foo", servicestate.CreateQuotaOptions{
@@ -799,23 +763,6 @@ func (s *quotaControlSuite) TestEnsureSnapAbsentFromQuotaGroup(c *C) {
 	c.Assert(err, IsNil)
 }
 
-func (s *quotaControlSuite) TestUpdateQuotaGroupExperimentalNotEnabled(c *C) {
-	// Test experimental quota group features that should not be enabled when
-	// quota-groups feature is disabled
-	s.state.Lock()
-	defer s.state.Unlock()
-	tr := config.NewTransaction(s.state)
-	tr.Set("core", "experimental.quota-groups", false)
-	tr.Commit()
-
-	// Journal Quotas is experimental, must give an error
-	opts := servicestate.UpdateQuotaOptions{
-		NewResourceLimits: quota.NewResourcesBuilder().WithJournalNamespace().Build(),
-	}
-	_, err := servicestate.UpdateQuota(s.state, "foo", opts)
-	c.Assert(err, ErrorMatches, `journal quota options are experimental - test it by setting 'experimental.quota-groups' to true`)
-}
-
 func (s *quotaControlSuite) TestUpdateQuotaPrecond(c *C) {
 	st := s.state
 	st.Lock()
@@ -1069,13 +1016,16 @@ func (s *quotaControlSuite) TestRemoveQuotaLateSnapOpConflict(c *C) {
 	))
 	defer r()
 
+	r = internal.MockOsutilBootID("boot-id")
+	defer r()
+
 	st := s.state
 	st.Lock()
 	defer st.Unlock()
 
 	// setup test-snap
 	snapstate.Set(s.state, "test-snap", s.testSnapState)
-	snaptest.MockSnapCurrent(c, testYaml, s.testSnapSideInfo)
+	info := snaptest.MockSnapCurrent(c, testYaml, s.testSnapSideInfo)
 
 	// create a quota group
 	defer s.se.Stop()
@@ -1091,10 +1041,9 @@ func (s *quotaControlSuite) TestRemoveQuotaLateSnapOpConflict(c *C) {
 	// the group is already gone, but the task is not finished
 	s.state.Set("quotas", nil)
 	task := ts.Tasks()[0]
-	task.Set("state-updated", servicestate.QuotaStateUpdated{
-		BootID: "boot-id",
-		AppsToRestartBySnap: map[string][]string{
-			"test-snap": {"svc1"},
+	internal.SetQuotaState(task, &internal.QuotaStateItems{
+		AppsToRestartBySnap: map[*snap.Info][]*snap.AppInfo{
+			info: {info.Apps["svc1"]},
 		},
 	})
 
@@ -1302,10 +1251,6 @@ func (s *quotaControlSuite) TestAddSnapServicesToQuotaJournalGroupQuotaFail(c *C
 	st.Lock()
 	defer st.Unlock()
 
-	tr := config.NewTransaction(s.state)
-	tr.Set("core", "experimental.journal-quota", true)
-	tr.Commit()
-
 	// setup test-snap
 	snapstate.Set(s.state, "test-snap", s.testSnapState)
 	snaptest.MockSnapCurrent(c, testYaml, s.testSnapSideInfo)
@@ -1323,10 +1268,6 @@ func (s *quotaControlSuite) TestAddJournalQuotaToGroupWithServicesFail(c *C) {
 	st := s.state
 	st.Lock()
 	defer st.Unlock()
-
-	tr := config.NewTransaction(s.state)
-	tr.Set("core", "experimental.quota-groups", true)
-	tr.Commit()
 
 	// setup test-snap
 	snapstate.Set(s.state, "test-snap", s.testSnapState)

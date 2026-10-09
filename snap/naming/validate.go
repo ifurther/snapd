@@ -23,21 +23,26 @@ package naming
 import (
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
+
+	"github.com/snapcore/snapd/arch"
 )
 
-// almostValidName is part of snap and socket name validation. The full regexp
-// we could use, "^(?:[a-z0-9]+-?)*[a-z](?:-?[a-z0-9])*$", is O(2ⁿ) on the
-// length of the string in python. An equivalent regexp that doesn't have the
-// nested quantifiers that trip up Python's re would be
+// almostValidNameRegexString is part of snap and socket name validation. The
+// full regexp we could use, "^(?:[a-z0-9]+-?)*[a-z](?:-?[a-z0-9])*$", is O(2ⁿ)
+// on the length of the string in python. An equivalent regexp that doesn't have
+// the nested quantifiers that trip up Python's re would be
 // "^(?:[a-z0-9]|(?<=[a-z0-9])-)*[a-z](?:[a-z0-9]|-(?=[a-z0-9]))*$", but Go's
 // regexp package doesn't support look-aheads nor look-behinds, so in order to
 // have a unified implementation in the Go and Python bits of the project we're
 // doing it this way instead. Check the length (if applicable), check this
-// regexp, then check the dashes. This still leaves sc_snap_name_validate
-// (in cmd/snap-confine/snap.c) and snap_validate
-// (cmd/snap-update-ns/bootstrap.c) with their own handcrafted validators.
-var almostValidName = regexp.MustCompile("^[a-z0-9-]*[a-z][a-z0-9-]*$")
+// regexp, then check the dashes. This still leaves sc_snap_name_validate (in
+// cmd/snap-confine/snap.c) and snap_validate (cmd/snap-update-ns/bootstrap.c)
+// with their own handcrafted validators.
+const almostValidNameRegexString = "[a-z0-9-]*[a-z][a-z0-9-]*"
+
+var almostValidName = regexp.MustCompile(fmt.Sprintf("^%s$", almostValidNameRegexString))
 
 // validInstanceKey is a regular expression describing a valid snap instance key
 var validInstanceKey = regexp.MustCompile("^[a-z0-9]{1,10}$")
@@ -57,14 +62,14 @@ func isValidName(name string) bool {
 func ValidateInstance(instanceName string) error {
 	// NOTE: This function should be synchronized with the two other
 	// implementations: sc_instance_name_validate and validate_instance_name .
-	pos := strings.IndexByte(instanceName, '_')
-	if pos == -1 {
+	before, after, ok := strings.Cut(instanceName, "_")
+	if !ok {
 		// just store name
 		return ValidateSnap(instanceName)
 	}
 
-	storeName := instanceName[:pos]
-	instanceKey := instanceName[pos+1:]
+	storeName := before
+	instanceKey := after
 	if err := ValidateSnap(storeName); err != nil {
 		return err
 	}
@@ -231,7 +236,7 @@ var ValidProvenance = regexp.MustCompile("^[a-zA-Z0-9](?:-?[a-zA-Z0-9])*$")
 // DefaultProvenance is the default value for provenance, i.e the provenance for snaps uplodaded through the global store pipeline.
 const DefaultProvenance = "global-upload"
 
-// ValidateProvenance checks fi the given string is valid non-empty provenance value.
+// ValidateProvenance checks if the given string is valid non-empty provenance value.
 func ValidateProvenance(prov string) error {
 	if prov == "" {
 		return fmt.Errorf("invalid provenance: must not be empty")
@@ -239,5 +244,169 @@ func ValidateProvenance(prov string) error {
 	if !ValidProvenance.MatchString(prov) {
 		return fmt.Errorf("invalid provenance: %q", prov)
 	}
+	return nil
+}
+
+// regular expression which matches a version expressed as groups of digits
+// separated with dots, with optional non-numbers afterwards
+var snapdVersionExp = regexp.MustCompile(`^(?:[1-9][0-9]*)(?:\.(?:[0-9]+))*`)
+
+// validateAssumedSnapdVersion checks if the snapd version requirement is valid
+// and satisfied by the current snapd version.
+func validateAssumedSnapdVersion(assumedVersion, currentVersion string) (bool, error) {
+	// double check that the input looks like a snapd version
+	reqVersionNumMatch := snapdVersionExp.FindStringSubmatch(assumedVersion)
+	if reqVersionNumMatch == nil {
+		return false, nil
+	}
+
+	if currentVersion == "" {
+		// Skip checking the assumed version against the current snapd version
+		return true, nil
+	}
+
+	// this check ensures that no one can use an assumes like snapd2.48.3~pre2
+	// or snapd2.48.5+20.10, as modifiers past the version number are not meant
+	// to be relied on for snaps via assumes, however the check against the real
+	// snapd version number below allows such non-numeric modifiers since real
+	// snapds do have versions like that (for example debian pkg of snapd)
+	if reqVersionNumMatch[0] != assumedVersion {
+		return false, nil
+	}
+
+	req := strings.Split(reqVersionNumMatch[0], ".")
+
+	if currentVersion == "unknown" {
+		return true, nil // Development tree.
+	}
+
+	// We could (should?) use strutil.VersionCompare here and simplify
+	// this code (see PR#7344). However this would change current
+	// behavior, i.e. "2.41~pre1" would *not* match [snapd2.41] anymore
+	// (which the code below does).
+	curVersionNumMatch := snapdVersionExp.FindStringSubmatch(currentVersion)
+	if curVersionNumMatch == nil {
+		return false, nil
+	}
+	cur := strings.Split(curVersionNumMatch[0], ".")
+
+	for i := range req {
+		if i == len(cur) {
+			// we hit the end of the elements of the current version number and have
+			// more required version numbers left, so this doesn't match, if the
+			// previous element was higher we would have broken out already, so the
+			// only case left here is where we have version requirements that are
+			// not met
+			return false, nil
+		}
+		reqN, err1 := strconv.Atoi(req[i])
+		curN, err2 := strconv.Atoi(cur[i])
+		if err1 != nil || err2 != nil {
+			// error not possible unless someone has messed up the regex
+			return false, fmt.Errorf("version regexp is broken")
+		}
+		if curN != reqN {
+			return curN > reqN, nil
+		}
+	}
+
+	return true, nil
+}
+
+var archIsISASupportedByCPU = arch.IsISASupportedByCPU
+
+// ISAError is a wrapper for errors returned while validating ISA assumes flags.
+type ISAError struct {
+	// Flag is of the form isa-<arch>-<isa_val>.
+	Flag string
+	// Err is the wrapped error.
+	Err error
+}
+
+func (e *ISAError) Error() string {
+	return fmt.Sprintf("%s: %s", e.Flag, e.Err)
+}
+
+// validateAssumedISAArch checks that, when a snap requires an ISA to be supported:
+//  1. compares the specified <arch> with the device's one. If they differ, it exits
+//     without error signaling that the flag is valid
+//  2. if the specified <arch> matches the device's one, the support for specifying ISAs
+//     for that architecture is verified. If it's absent, an error is returned
+//  3. if ISA specification is supported for that architecture, the arch-specific function,
+//     defined in the arch-specific file, is called. If no error is returned then the key
+//     is considered valid.
+func validateAssumedISAArch(flag string, currentArchitecture string) error {
+	// we allow keys like isa-<arch>-<isa_val>, so the result of the split will
+	// always be {"isa", "<arch>", "<isa_val>"}
+	tokens := strings.SplitN(flag, "-", 3)
+	if len(tokens) != 3 {
+		return fmt.Errorf("%s: must be in the format isa-<arch>-<isa_val>", flag)
+	}
+
+	if currentArchitecture != tokens[1] {
+		// Skip, it doesn't make sense to verify the ISA for architectures we
+		// are not running on
+		return nil
+	}
+
+	if err := archIsISASupportedByCPU(tokens[2]); err != nil {
+		return &ISAError{Flag: flag, Err: err}
+	}
+
+	return nil
+}
+
+// assumeFormat matches the expected string format for assume flags.
+var assumeFormat = regexp.MustCompile("^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+// ValidateAssumes checks if `assumes` lists features that are all supported.
+// Pass empty currentSnapdVersion to skip checking the assumed version against the current snap version.
+// Pass nil/empty featureSet to only validate assumes format & not feature support.
+// Pass empty currentArchitecture to skip checking the assumed ISAs against the current device architecture
+func ValidateAssumes(assumes []string, currentSnapdVersion string, featureSet map[string]bool, currentArchitecture string) error {
+	var failed []string
+	for _, flag := range assumes {
+		if strings.HasPrefix(flag, "snapd") {
+			validVersion, err := validateAssumedSnapdVersion(flag[5:], currentSnapdVersion)
+			if err != nil {
+				// error not possible unless someone has messed up the regex
+				return err
+			}
+
+			if validVersion {
+				continue
+			}
+		}
+
+		if strings.HasPrefix(flag, "isa-") {
+			err := validateAssumedISAArch(flag, currentArchitecture)
+			if err != nil {
+				return err
+			}
+			continue
+		}
+
+		// if featureSet is provided, check feature support;
+		// otherwise only validate format
+		isValid := false
+		if len(featureSet) > 0 {
+			isValid = featureSet[flag]
+		} else {
+			isValid = assumeFormat.MatchString(flag)
+		}
+
+		if !isValid {
+			failed = append(failed, flag)
+		}
+	}
+
+	if len(failed) > 0 {
+		if currentSnapdVersion == "" && len(featureSet) == 0 {
+			return fmt.Errorf("invalid features: %s", strings.Join(failed, ", "))
+		}
+
+		return fmt.Errorf("unsupported features: %s", strings.Join(failed, ", "))
+	}
+
 	return nil
 }

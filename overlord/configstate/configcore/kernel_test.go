@@ -159,23 +159,41 @@ func (s *kernelSuite) mockEarlyConfig() {
 	s.AddCleanup(func() { devicestate.EarlyConfig = nil })
 }
 
+func (s *kernelSuite) mockClassicBootModelWithoutSnaps() {
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	extras := map[string]any{
+		"architecture": "amd64",
+		"classic":      "true",
+	}
+	model := s.Brands.Model("my-brand", "pc", extras)
+
+	assertstatetest.AddMany(s.state, model)
+	devicestatetest.SetDevice(s.state, &auth.DeviceState{
+		Brand:  model.BrandID(),
+		Model:  model.Model(),
+		Serial: "serialserial",
+	})
+}
+
 func (s *kernelSuite) mockModelWithModeenv(grade string, isClassic bool) {
 	s.state.Lock()
 	defer s.state.Unlock()
 
 	// model setup
-	extras := map[string]interface{}{
+	extras := map[string]any{
 		"architecture": "amd64",
 		"base":         "core20",
 		"grade":        grade,
-		"snaps": []interface{}{
-			map[string]interface{}{
+		"snaps": []any{
+			map[string]any{
 				"name":            "pc-kernel",
 				"id":              "pYVQrBcKmBa0mZ4CCN7ExT6jH8rY1hza",
 				"type":            "kernel",
 				"default-channel": "20",
 			},
-			map[string]interface{}{
+			map[string]any{
 				"name":            "pc",
 				"id":              "UqFziVZDHLSyO3TqSWgNBoAdHbLI4dAH",
 				"type":            "gadget",
@@ -239,16 +257,29 @@ type cmdlineOption struct {
 }
 
 func (s *kernelSuite) testConfigureKernelCmdlineHappy(c *C, option []cmdlineOption, modelGrade string, isClassic bool) {
+	var seeded bool
+	s.state.Lock()
+	err := s.state.Get("seeded", &seeded)
+	c.Assert(err, IsNil)
+	s.state.Unlock()
+
+	// Mock in-progress apply-extra-snapd-kcmdline-fragments change so that
+	// ensure loop does not affect the test.
+	s.state.Lock()
+	chg := s.state.NewChange("apply-extra-snapd-kcmdline-fragments", "...")
+	chg.SetStatus(state.DoingStatus)
+	s.state.Unlock()
+
 	s.mockModelWithModeenv(modelGrade, isClassic)
 	s.mockGadget(c)
 	doHandlerCalls := 0
 	extraChange := true
 	expectedHandlerCalls := 1
-	expectedChanges := 2
-	if modelGrade != "dangerous" && len(option) == 1 && option[0].name == "system.kernel.dangerous-cmdline-append" {
+	expectedChanges := 3 // 2 + apply-extra-snapd-kcmdline-fragments mocked above
+	if (modelGrade != "dangerous" && len(option) == 1 && option[0].name == "system.kernel.dangerous-cmdline-append") || !seeded {
 		extraChange = false
 		expectedHandlerCalls = 0
-		expectedChanges = 1
+		expectedChanges = 2 // 1 + apply-extra-snapd-kcmdline-fragments mocked above
 	}
 
 	s.overlord.TaskRunner().AddHandler("update-gadget-cmdline",
@@ -288,8 +319,6 @@ func (s *kernelSuite) testConfigureKernelCmdlineHappy(c *C, option []cmdlineOpti
 		},
 		func(task *state.Task, tomb *tomb.Tomb) error { return nil })
 
-	var err error
-
 	s.state.Lock()
 	ts := s.state.NewTask("run-hook", "system hook task")
 	hsup := &hookstate.HookSetup{
@@ -303,7 +332,7 @@ func (s *kernelSuite) testConfigureKernelCmdlineHappy(c *C, option []cmdlineOpti
 	s.state.Unlock()
 
 	hookCtx.Lock()
-	patchVals := make(map[string]interface{})
+	patchVals := make(map[string]any)
 	for _, opt := range option {
 		patchVals[opt.name] = opt.cmdline
 	}
@@ -311,7 +340,7 @@ func (s *kernelSuite) testConfigureKernelCmdlineHappy(c *C, option []cmdlineOpti
 	hookCtx.Unlock()
 
 	s.state.Lock()
-	chg := s.state.NewChange("system-option", "...")
+	chg = s.state.NewChange("system-option", "...")
 	chg.AddTask(ts)
 	s.state.EnsureBefore(0)
 	s.state.Unlock()
@@ -341,6 +370,7 @@ func (s *kernelSuite) testConfigureKernelCmdlineHappy(c *C, option []cmdlineOpti
 			soCh = ch
 		case "apply-cmdline-append":
 			aecCh = ch
+		case "apply-extra-snapd-kcmdline-fragments":
 		default:
 			c.Fatal("unexpected change kind")
 		}
@@ -422,16 +452,28 @@ func (s *kernelSuite) TestConfigureKernelCmdlineSignedGradeDangerousCmdline(c *C
 		"signed", isClassic)
 }
 
-func (s *kernelSuite) TestConfigureKernelCmdlineConflict(c *C) {
+func (s *kernelSuite) TestConfigureKernelCmdlineNotSeeded(c *C) {
+	s.state.Lock()
+	s.state.Set("seeded", false)
+	s.state.Unlock()
+
+	const isClassic = false
+	s.testConfigureKernelCmdlineHappy(c,
+		[]cmdlineOption{{
+			name:    "system.kernel.dangerous-cmdline-append",
+			cmdline: "par=val param"}},
+		"dangerous", isClassic)
+}
+
+func (s *kernelSuite) TestConfigureKernelCmdlineExclusiveKindConflict(c *C) {
 	isClassic := false
 	s.mockModelWithModeenv("dangerous", isClassic)
 
 	cmdline := "param1=val1"
 	s.state.Lock()
 
-	tugc := s.state.NewTask("update-gadget-cmdline", "update gadget cmdline")
-	chgUpd := s.state.NewChange("optional-kernel-cmdline", "optional kernel cmdline")
-	chgUpd.AddTask(tugc)
+	chgExclusive := s.state.NewChange("remodel", "...")
+	chgExclusive.SetStatus(state.DoingStatus)
 
 	ts := s.state.NewTask("hook-task", "system hook task")
 	chg := s.state.NewChange("system-option", "...")
@@ -443,7 +485,7 @@ func (s *kernelSuite) TestConfigureKernelCmdlineConflict(c *C) {
 	rt.Set("core", "system.kernel.dangerous-cmdline-append", cmdline)
 
 	err := configcore.Run(core20Dev, rt)
-	c.Assert(err, ErrorMatches, "kernel command line already being updated, no additional changes for it allowed meanwhile")
+	c.Assert(err, ErrorMatches, "remodeling in progress, no other changes allowed until this is done")
 }
 
 func (s *kernelSuite) testConfigureKernelCmdlineSignedGradeNotAllowed(c *C, cmdline string) {
@@ -473,4 +515,27 @@ func (s *kernelSuite) TestConfigureKernelCmdlineSignedGradeNotAllowed(c *C) {
 	} {
 		s.testConfigureKernelCmdlineSignedGradeNotAllowed(c, cmdline)
 	}
+}
+
+func (s *kernelSuite) TestConfigureKernelCmdlineOnClassicBootFails(c *C) {
+	s.mockClassicBootModelWithoutSnaps()
+
+	cmdline := "param1=val1"
+	s.state.Lock()
+
+	tugc := s.state.NewTask("update-gadget-cmdline", "update gadget cmdline")
+	chgUpd := s.state.NewChange("optional-kernel-cmdline", "optional kernel cmdline")
+	chgUpd.AddTask(tugc)
+
+	ts := s.state.NewTask("hook-task", "system hook task")
+	chg := s.state.NewChange("system-option", "...")
+	chg.AddTask(ts)
+	rt := configcore.NewRunTransaction(config.NewTransaction(s.state), ts)
+
+	s.state.Unlock()
+
+	rt.Set("core", "system.kernel.cmdline-append", cmdline)
+
+	err := configcore.Run(core20Dev, rt)
+	c.Assert(err, ErrorMatches, "changing the kernel command line is not supported on a classic system")
 }

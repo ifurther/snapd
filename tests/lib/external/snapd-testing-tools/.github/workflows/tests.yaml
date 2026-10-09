@@ -9,7 +9,7 @@ on:
 
 jobs:
   unit-tests:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
     steps:
     - name: Checkout code
       uses: actions/checkout@v2
@@ -28,13 +28,17 @@ jobs:
 
     - name: Run codespell tool
       run: |
-          sudo apt install python3-pip
+          sudo apt install -y python3-pip
           pip3 install codespell
           codespell
 
+    - name: Run Python unit tests
+      run: |
+          python3 -m unittest discover -s utils
+
   test:
     needs: [unit-tests]
-    runs-on: self-hosted
+    runs-on: [self-hosted, spread-enabled]
     steps:
     - name: Checkout code
       uses: actions/checkout@v2
@@ -81,12 +85,19 @@ jobs:
 
     - name: Run test
       run: |
-          RUN_TESTS="google:tests/ google-nested:tests/"
+          RUN_TESTS="openstack:tests/"
           if [ -n "$FAILED_TESTS" ]; then
               RUN_TESTS="$FAILED_TESTS"
           fi
+          CHANGE_ID="${{ github.event.number }}"
+          if [ -z "$PR_ID" ]; then
+            CHANGE_ID="main"
+          fi
+          CHANGE_ID="${CHANGE_ID}_n${{ github.run_attempt }}"
+          # The log-filter tool is used to filter the spread logs to be stored
+          FILTER_PARAMS="-o spread_$CHANGE_ID.filtered.log -e Debug -e WARNING: -f Failed=NO_LINES -f Error=NO_LINES"
 
-          (set -o pipefail; spread $RUN_TESTS | tee spread.log)
+          (set -o pipefail; spread $RUN_TESTS | ./utils/log-filter $FILTER_PARAMS | tee spread.log)
 
     - name: Discard spread workers
       if: always()
@@ -104,7 +115,7 @@ jobs:
               ./utils/log-parser spread.log --output spread-results.json
     
               echo "Determining which tests were executed"
-              RUN_TESTS="google:tests/ google-nested:tests/"
+              RUN_TESTS="openstack:tests/"
               if [ -n "$FAILED_TESTS" ]; then
                   RUN_TESTS="$FAILED_TESTS"
               fi

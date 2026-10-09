@@ -19,7 +19,7 @@
 
 package builtin
 
-const sshPublicKeysSummary = `allows reading ssh public keys and non-sensitive configuration`
+const sshPublicKeysSummary = `allows reading ssh public keys and host public keys and non-sensitive configuration`
 
 const sshPublicKeysBaseDeclarationSlots = `
   ssh-public-keys:
@@ -30,21 +30,25 @@ const sshPublicKeysBaseDeclarationSlots = `
 `
 
 const sshPublicKeysConnectedPlugAppArmor = `
-# Description: Can read ssh public keys and non-sensitive configuration
+# Description: Can read ssh public keys and non-sensitive configuration as well as host public keys.
 
 /usr/bin/ssh ixr,
 owner @{HOME}/.ssh/ r,
 owner @{HOME}/.ssh/environment r,
 owner @{HOME}/.ssh/*.pub r,
+/etc/ssh/ssh_host_ecdsa_key.pub r,
+/etc/ssh/ssh_host_ed25519_key.pub r,
+/etc/ssh/ssh_host_rsa_key.pub r,
 `
 
 func init() {
 	registerIface(&commonInterface{
-		name:                  "ssh-public-keys",
-		summary:               sshPublicKeysSummary,
-		implicitOnCore:        true,
-		implicitOnClassic:     true,
-		baseDeclarationSlots:  sshPublicKeysBaseDeclarationSlots,
-		connectedPlugAppArmor: sshPublicKeysConnectedPlugAppArmor,
+		name:                     "ssh-public-keys",
+		summary:                  sshPublicKeysSummary,
+		implicitOnCore:           true,
+		implicitOnClassic:        true,
+		baseDeclarationSlots:     sshPublicKeysBaseDeclarationSlots,
+		connectedPlugAppArmor:    sshPublicKeysConnectedPlugAppArmor,
+		parallelInstancesSlotErr: errParallelInstancesSystemSlot,
 	})
 }

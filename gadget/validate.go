@@ -56,11 +56,12 @@ type roleInstance struct {
 
 func ruleValidateVolumes(vols map[string]*Volume, model Model, extra *ValidationConstraints) error {
 	roles := map[string]*roleInstance{
-		SystemSeed:     nil,
-		SystemSeedNull: nil,
-		SystemBoot:     nil,
-		SystemData:     nil,
-		SystemSave:     nil,
+		SystemSeed:      nil,
+		SystemSeedNull:  nil,
+		SystemBoot:      nil,
+		SystemData:      nil,
+		SystemSave:      nil,
+		SystemBootState: nil,
 	}
 
 	xvols := ""
@@ -141,12 +142,42 @@ func ruleValidateVolumes(vols map[string]*Volume, model Model, extra *Validation
 }
 
 func ruleValidateVolume(vol *Volume, hasModes bool) error {
+	if vol.Schema == schemaEMMC {
+		if err := ruleValidateEMMCVolume(vol); err != nil {
+			return err
+		}
+	}
+
 	for idx, s := range vol.Structure {
 		if err := ruleValidateVolumeStructure(&s, hasModes); err != nil {
 			return fmt.Errorf("invalid structure %v: %v", fmtIndexAndName(idx, s.Name), err)
 		}
 	}
 
+	return nil
+}
+
+func ruleValidateEMMCVolume(vol *Volume) error {
+	// Only content, schema and name can be set currently for eMMC
+	if vol.Bootloader != "" {
+		return fmt.Errorf(`cannot set "bootloader" for eMMC schemas`)
+	}
+	if vol.ID != "" {
+		return fmt.Errorf(`cannot set "id" for eMMC schemas`)
+	}
+	if len(vol.Partial) != 0 {
+		return fmt.Errorf(`cannot set "partial" content for eMMC schemas`)
+	}
+	return nil
+}
+
+func validateEMMCStructureName(vs *VolumeStructure) error {
+	if vs.EnclosingVolume.Schema != schemaEMMC {
+		return nil
+	}
+	if !strutil.ListContains(validEMMCVolumeNames, vs.Name) {
+		return fmt.Errorf("cannot use %q as emmc name, only %q is allowed", vs.Name, validEMMCVolumeNames)
+	}
 	return nil
 }
 
@@ -158,6 +189,9 @@ func ruleValidateVolumeStructure(vs *VolumeStructure, hasModes bool) error {
 		reservedLabels = reservedLabelsWithoutModes
 	}
 	if err := validateReservedLabels(vs, reservedLabels); err != nil {
+		return err
+	}
+	if err := validateEMMCStructureName(vs); err != nil {
 		return err
 	}
 	return nil
@@ -179,6 +213,9 @@ var (
 		ubuntuSeedLabel,
 		ubuntuDataLabel,
 	}
+
+	// valid names for volumes under an eMMC schema
+	validEMMCVolumeNames = []string{"boot0", "boot1"}
 )
 
 func validateReservedLabels(vs *VolumeStructure, reservedLabels []string) error {
@@ -394,6 +431,7 @@ func ValidateContent(info *Info, gadgetSnapRootDir, kernelSnapRootDir string) er
 	// "<bl-name>.conf" file indicates precisely which bootloader
 	// the gadget uses and as such there cannot be more than one
 	// such bootloader
+
 	var kernelInfo *kernel.Info
 	if kernelSnapRootDir != "" {
 		var err error

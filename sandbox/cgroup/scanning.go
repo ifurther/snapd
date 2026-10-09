@@ -25,6 +25,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/systemd"
 )
@@ -43,8 +44,8 @@ var (
 	roughAppTagPatternWithUUID = regexp.MustCompile(`(snap\.[^.]+\.[^.]+)(-` + uuidPattern + `)`)
 )
 
-// securityTagFromCgroupPath returns a security tag from cgroup path.
-func securityTagFromCgroupPath(path string) naming.SecurityTag {
+// SecurityTagFromCgroupPath returns a security tag from cgroup path.
+func SecurityTagFromCgroupPath(path string) naming.SecurityTag {
 	leaf := filepath.Base(filepath.Clean(path))
 
 	// If the security cgroup name doesn't start with "snap." then there is no
@@ -119,12 +120,12 @@ func InstancePathsOfSnap(snapInstanceName string, options InstancePathsOptions) 
 		// In v2 mode scan all of /sys/fs/cgroup as there is no specialization
 		// anymore (each directory represents a hierarchy with equal
 		// capabilities and old split into controllers is gone).
-		cgroupPathToScan = filepath.Join(rootPath, cgroupMountPoint)
+		cgroupPathToScan = filepath.Join(dirs.GlobalRootDir, cgroupMountPoint)
 	} else {
 		// In v1 mode scan just /sys/fs/cgroup/systemd as that is sufficient
 		// for finding snap-specific cgroup names. Systemd uses this for
 		// tracking and scopes and services are represented there.
-		cgroupPathToScan = filepath.Join(rootPath, cgroupMountPoint, "systemd")
+		cgroupPathToScan = filepath.Join(dirs.GlobalRootDir, cgroupMountPoint, "systemd")
 	}
 
 	// Walk the cgroup tree and look for "cgroup.procs" files. Having found one
@@ -162,7 +163,7 @@ func InstancePathsOfSnap(snapInstanceName string, options InstancePathsOptions) 
 		// not all cgroups are related to snaps it is not an error if the
 		// cgroup path does not denote a snap.
 		cgroupPath := filepath.Dir(path)
-		parsedTag := securityTagFromCgroupPath(cgroupPath)
+		parsedTag := SecurityTagFromCgroupPath(cgroupPath)
 		if parsedTag == nil {
 			return nil
 		}
@@ -228,7 +229,7 @@ func PidsOfSnap(snapInstanceName string) (map[string][]int, error) {
 			return nil, err
 		}
 		cgroupPath := filepath.Dir(path)
-		parsedTag := securityTagFromCgroupPath(cgroupPath)
+		parsedTag := SecurityTagFromCgroupPath(cgroupPath)
 		tag := parsedTag.String()
 		pidsByTag[tag] = append(pidsByTag[tag], pids...)
 	}

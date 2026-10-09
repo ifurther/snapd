@@ -2,7 +2,7 @@
 //go:build !nomanagers
 
 /*
- * Copyright (C) 2016-2022 Canonical Ltd
+ * Copyright (C) 2016-2026 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -38,21 +38,31 @@ import (
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/overlord/assertstate"
+
+	// import to register validation-set confdb schema and handler
+	_ "github.com/snapcore/snapd/overlord/assertstate/confdb"
+	"github.com/snapcore/snapd/overlord/certstate"
+	"github.com/snapcore/snapd/overlord/clusterstate"
 	"github.com/snapcore/snapd/overlord/cmdstate"
+	"github.com/snapcore/snapd/overlord/confdbstate"
 	"github.com/snapcore/snapd/overlord/configstate"
 	"github.com/snapcore/snapd/overlord/configstate/proxyconf"
+	"github.com/snapcore/snapd/overlord/devicemgmtstate"
 	"github.com/snapcore/snapd/overlord/devicestate"
+	"github.com/snapcore/snapd/overlord/fdestate"
 	"github.com/snapcore/snapd/overlord/healthstate"
 	"github.com/snapcore/snapd/overlord/hookstate"
 	"github.com/snapcore/snapd/overlord/ifacestate"
+	"github.com/snapcore/snapd/overlord/notices"
 	"github.com/snapcore/snapd/overlord/patch"
 	"github.com/snapcore/snapd/overlord/restart"
 	"github.com/snapcore/snapd/overlord/servicestate"
 	"github.com/snapcore/snapd/overlord/snapshotstate"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	_ "github.com/snapcore/snapd/overlord/snapstate/policy"
+	"github.com/snapcore/snapd/release"
+
 	// import to register linkNotify callback
-	_ "github.com/snapcore/snapd/overlord/snapstate/agentnotify"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/overlord/storecontext"
 	"github.com/snapcore/snapd/snapdenv"
@@ -72,8 +82,6 @@ var (
 
 	pruneMaxChanges = 500
 
-	defaultCachedDownloads = 5
-
 	configstateInit = configstate.Init
 	systemdSdNotify = systemd.SdNotify
 )
@@ -89,7 +97,8 @@ type Overlord struct {
 
 	stateEng *StateEngine
 	// ensure loop
-	loopTomb    *tomb.Tomb
+	loopTomb    tomb.Tomb
+	loopProceed chan struct{}
 	ensureLock  sync.Mutex
 	ensureTimer *time.Timer
 	ensureNext  time.Time
@@ -99,18 +108,25 @@ type Overlord struct {
 	startOfOperationTime time.Time
 
 	// managers
-	inited     bool
-	startedUp  bool
-	runner     *state.TaskRunner
-	restartMgr *restart.RestartManager
-	snapMgr    *snapstate.SnapManager
-	serviceMgr *servicestate.ServiceManager
-	assertMgr  *assertstate.AssertManager
-	ifaceMgr   *ifacestate.InterfaceManager
-	hookMgr    *hookstate.HookManager
-	deviceMgr  *devicestate.DeviceManager
-	cmdMgr     *cmdstate.CommandManager
-	shotMgr    *snapshotstate.SnapshotManager
+	inited        bool
+	startedUp     bool
+	runner        *state.TaskRunner
+	restartMgr    *restart.RestartManager
+	snapMgr       *snapstate.SnapManager
+	serviceMgr    *servicestate.ServiceManager
+	assertMgr     *assertstate.AssertManager
+	ifaceMgr      *ifacestate.InterfaceManager
+	hookMgr       *hookstate.HookManager
+	deviceMgr     *devicestate.DeviceManager
+	clusterMgr    *clusterstate.ClusterManager
+	cmdMgr        *cmdstate.CommandManager
+	shotMgr       *snapshotstate.SnapshotManager
+	fdeMgr        *fdestate.FDEManager
+	noticeMgr     *notices.NoticeManager
+	confdbMgr     *confdbstate.ConfdbManager
+	deviceMgmtMgr *devicemgmtstate.DeviceMgmtManager
+	certStateMgr  *certstate.CertManager
+
 	// proxyConf mediates the http proxy config
 	proxyConf func(req *http.Request) (*url.URL, error)
 }
@@ -121,8 +137,11 @@ var storeNew = store.New
 // It can be provided with an optional restart.Handler.
 func New(restartHandler restart.Handler) (*Overlord, error) {
 	o := &Overlord{
-		inited: true,
+		inited:      true,
+		loopProceed: make(chan struct{}),
 	}
+	// create the loop goroutine
+	o.loopTomb.Go(o.loop)
 
 	backend := &overlordStateBackend{
 		path:         dirs.SnapStateFile,
@@ -132,6 +151,8 @@ func New(restartHandler restart.Handler) (*Overlord, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	o.noticeMgr = notices.NewNoticeManager(s)
 
 	o.stateEng = NewStateEngine(s)
 	o.runner = state.NewTaskRunner(s)
@@ -165,25 +186,38 @@ func New(restartHandler restart.Handler) (*Overlord, error) {
 	}
 	o.addManager(assertMgr)
 
-	ifaceMgr, err := ifacestate.Manager(s, hookMgr, o.runner, nil, nil)
+	ifaceMgr, err := ifacestate.Manager(s, hookMgr, o.noticeMgr, o.runner, nil, nil)
 	if err != nil {
 		return nil, err
 	}
 	o.addManager(ifaceMgr)
 
+	fdeMgr, err := fdestate.Manager(s, o.runner)
+	if err != nil {
+		return nil, err
+	}
+	o.addManager(fdeMgr)
+
 	deviceMgr, err := devicestate.Manager(s, hookMgr, o.runner, o.newStore)
 	if err != nil {
 		return nil, err
 	}
+	deviceMgr.AddOnInit(fdeMgr)
 	o.addManager(deviceMgr)
+
+	o.addManager(clusterstate.Manager(s))
 
 	o.addManager(cmdstate.Manager(s, o.runner))
 	o.addManager(snapshotstate.Manager(s, o.runner))
+	o.addManager(confdbstate.Manager(s, hookMgr, o.runner, deviceMgr))
+	o.addManager(certstate.Manager(s, o.runner))
 
 	if err := configstateInit(s, hookMgr); err != nil {
 		return nil, err
 	}
 	healthstate.Init(hookMgr)
+
+	o.addManager(devicemgmtstate.Manager(s, o.runner, deviceMgr))
 
 	// the shared task runner should be added last!
 	o.stateEng.AddManager(o.runner)
@@ -214,12 +248,22 @@ func (o *Overlord) addManager(mgr StateManager) {
 		o.ifaceMgr = x
 	case *devicestate.DeviceManager:
 		o.deviceMgr = x
+	case *clusterstate.ClusterManager:
+		o.clusterMgr = x
 	case *cmdstate.CommandManager:
 		o.cmdMgr = x
 	case *snapshotstate.SnapshotManager:
 		o.shotMgr = x
 	case *restart.RestartManager:
 		o.restartMgr = x
+	case *fdestate.FDEManager:
+		o.fdeMgr = x
+	case *confdbstate.ConfdbManager:
+		o.confdbMgr = x
+	case *devicemgmtstate.DeviceMgmtManager:
+		o.deviceMgmtMgr = x
+	case *certstate.CertManager:
+		o.certStateMgr = x
 	}
 	o.stateEng.AddManager(mgr)
 }
@@ -338,7 +382,12 @@ func (o *Overlord) newStoreWithContext(storeCtx store.DeviceAndAuthContext) snap
 	cfg := store.DefaultConfig()
 	cfg.Proxy = o.proxyConf
 	sto := storeNew(cfg, storeCtx)
-	sto.SetCacheDownloads(defaultCachedDownloads)
+	// TODO add a way for overriding cache policy
+	if release.OnClassic {
+		sto.SetCachePolicy(store.DefaultCachePolicyClassic)
+	} else {
+		sto.SetCachePolicy(store.DefaultCachePolicyCore)
+	}
 	return sto
 }
 
@@ -447,49 +496,58 @@ var preseedExitWithError = func(err error) {
 }
 
 // Loop runs a loop in a goroutine to ensure the current state regularly through StateEngine Ensure.
+// It can be invoked only once otherwise it panics.
 func (o *Overlord) Loop() {
 	o.ensureTimerSetup()
 	preseed := snapdenv.Preseeding()
 	if preseed {
 		o.runner.OnTaskError(preseedExitWithError)
 	}
-	if o.loopTomb == nil {
-		o.loopTomb = new(tomb.Tomb)
+	// proceed with the loop
+	close(o.loopProceed)
+}
+
+func (o *Overlord) loop() error {
+	select {
+	case <-o.loopProceed:
+		// proceed with the loop
+	case <-o.loopTomb.Dying():
+		return nil
 	}
-	o.loopTomb.Go(func() error {
-		for {
-			// TODO: pass a proper context into Ensure
-			o.ensureTimerReset()
-			// in case of errors engine logs them,
-			// continue to the next Ensure() try for now
-			err := o.stateEng.Ensure()
-			if err != nil && preseed {
-				st := o.State()
-				// acquire state lock to ensure nothing attempts to write state
-				// as we are exiting; there is no deferred unlock to avoid
-				// potential race on exit.
-				st.Lock()
-				preseedExitWithError(err)
-			}
-			o.ensureDidRun()
-			pruneC := pruneTickerC(o.pruneTicker)
-			select {
-			case <-o.loopTomb.Dying():
-				return nil
-			case <-o.ensureTimer.C:
-			case <-pruneC:
-				if preseed {
-					// in preseed mode avoid setting StartOfOperationTime (it's
-					// an error), and don't Prune.
-					continue
-				}
-				st := o.State()
-				st.Lock()
-				st.Prune(o.startOfOperationTime, pruneWait, abortWait, pruneMaxChanges)
-				st.Unlock()
-			}
+	preseed := snapdenv.Preseeding()
+
+	for {
+		// TODO: pass a proper context into Ensure
+		o.ensureTimerReset()
+		// in case of errors engine logs them,
+		// continue to the next Ensure() try for now
+		err := o.stateEng.Ensure()
+		if err != nil && preseed {
+			st := o.State()
+			// acquire state lock to ensure nothing attempts to write state
+			// as we are exiting; there is no deferred unlock to avoid
+			// potential race on exit.
+			st.Lock()
+			preseedExitWithError(err)
 		}
-	})
+		o.ensureDidRun()
+		pruneC := pruneTickerC(o.pruneTicker)
+		select {
+		case <-o.loopTomb.Dying():
+			return nil
+		case <-o.ensureTimer.C:
+		case <-pruneC:
+			if preseed {
+				// in preseed mode avoid setting StartOfOperationTime (it's
+				// an error), and don't Prune.
+				continue
+			}
+			st := o.State()
+			st.Lock()
+			st.Prune(o.startOfOperationTime, pruneWait, abortWait, pruneMaxChanges)
+			st.Unlock()
+		}
+	}
 }
 
 func (o *Overlord) ensureDidRun() {
@@ -501,13 +559,16 @@ func (o *Overlord) CanStandby() bool {
 	return run != 0
 }
 
+// ShutDown asks the manager that implement the ShutDowner interface
+// to stop accepting new requests and finish handling existing requests.
+func (o *Overlord) ShutDown() {
+	o.stateEng.ShutDown()
+}
+
 // Stop stops the ensure loop and the managers under the StateEngine.
 func (o *Overlord) Stop() error {
-	var err error
-	if o.loopTomb != nil {
-		o.loopTomb.Kill(nil)
-		err = o.loopTomb.Wait()
-	}
+	o.loopTomb.Kill(nil)
+	err := o.loopTomb.Wait()
 	o.stateEng.Stop()
 	if o.stateFLock != nil {
 		// This will also unlock the file
@@ -517,7 +578,7 @@ func (o *Overlord) Stop() error {
 	return err
 }
 
-func (o *Overlord) settle(timeout time.Duration, beforeCleanups func()) error {
+func (o *Overlord) settle(timeout time.Duration, beforeCleanups func(), breakHint func() bool) error {
 	if err := o.StartUp(); err != nil {
 		return err
 	}
@@ -578,6 +639,9 @@ func (o *Overlord) settle(timeout time.Duration, beforeCleanups func()) error {
 			}
 			st.Unlock()
 		}
+		if breakHint != nil && breakHint() {
+			break
+		}
 	}
 	if len(errs) != 0 {
 		return &ensureError{errs}
@@ -593,7 +657,7 @@ func (o *Overlord) settle(timeout time.Duration, beforeCleanups func()) error {
 // conjunction with Loop. If timeout is non-zero and settling takes
 // longer than timeout, returns an error. Calls StartUp as well.
 func (o *Overlord) Settle(timeout time.Duration) error {
-	return o.settle(timeout, nil)
+	return o.settle(timeout, nil, nil)
 }
 
 // SettleObserveBeforeCleanups runs first a state engine Ensure and
@@ -605,7 +669,16 @@ func (o *Overlord) Settle(timeout time.Duration) error {
 // conjunction with Loop. If timeout is non-zero and settling takes
 // longer than timeout, returns an error. Calls StartUp as well.
 func (o *Overlord) SettleObserveBeforeCleanups(timeout time.Duration, beforeCleanups func()) error {
-	return o.settle(timeout, beforeCleanups)
+	return o.settle(timeout, beforeCleanups, nil)
+}
+
+// SettleWithBreakCondition is a convenience wrapper around Settle, which passes
+// caller provided helper for indicating when the processing loop should be
+// broken. The helper is evaluated after Ensure() calls and right before
+// starting another iteration. Returning true from the helper breaks the
+// settle loop.
+func (o *Overlord) SettleWithBreakCondition(timeout time.Duration, breakCond func() bool) error {
+	return o.settle(timeout, nil, breakCond)
 }
 
 // State returns the system state managed by the overlord.
@@ -665,15 +738,46 @@ func (o *Overlord) DeviceManager() *devicestate.DeviceManager {
 	return o.deviceMgr
 }
 
+// ClusterManager returns the manager responsible for the state of clustering.
+func (o *Overlord) ClusterManager() *clusterstate.ClusterManager {
+	return o.clusterMgr
+}
+
 // CommandManager returns the manager responsible for running odd
 // jobs.
 func (o *Overlord) CommandManager() *cmdstate.CommandManager {
 	return o.cmdMgr
 }
 
+// FDEManager returns the manager responsible for FDE
+func (o *Overlord) FDEManager() *fdestate.FDEManager {
+	return o.fdeMgr
+}
+
 // SnapshotManager returns the manager responsible for snapshots.
 func (o *Overlord) SnapshotManager() *snapshotstate.SnapshotManager {
 	return o.shotMgr
+}
+
+// NoticeManager returns the notice manager responsible for mediating requests
+// for notices across all notice backends.
+func (o *Overlord) NoticeManager() *notices.NoticeManager {
+	return o.noticeMgr
+}
+
+// ConfdbManager returns the manager responsible for accesses to confdb.
+func (o *Overlord) ConfdbManager() *confdbstate.ConfdbManager {
+	return o.confdbMgr
+}
+
+// DeviceMgmtManager returns the manager responsible for device management.
+func (o *Overlord) DeviceMgmtManager() *devicemgmtstate.DeviceMgmtManager {
+	return o.deviceMgmtMgr
+}
+
+// CertManager returns the manager responsible for system certificates.
+func (o *Overlord) CertManager() *certstate.CertManager {
+	return o.certStateMgr
 }
 
 // Mock creates an Overlord without any managers and with a backend
@@ -687,8 +791,12 @@ func Mock() *Overlord {
 // disk. Managers can be added with AddManager. For testing.
 func MockWithState(s *state.State) *Overlord {
 	o := &Overlord{
-		inited: false,
+		inited:      false,
+		loopProceed: make(chan struct{}),
 	}
+	// create the loop goroutine
+	o.loopTomb.Go(o.loop)
+
 	if s == nil {
 		s = state.New(mockBackend{o: o})
 	}

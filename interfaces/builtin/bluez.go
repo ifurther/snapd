@@ -240,9 +240,6 @@ const bluezPermanentSlotDBus = `
     <allow send_interface="org.freedesktop.DBus.ObjectManager"/>
     <allow send_interface="org.freedesktop.DBus.Properties"/>
 </policy>
-<policy context="default">
-    <deny send_destination="org.bluez"/>
-</policy>
 `
 
 type bluezInterface struct{}
@@ -272,7 +269,7 @@ func (iface *bluezInterface) AppArmorConnectedPlug(spec *apparmor.Specification,
 	if release.OnClassic {
 		new = "unconfined"
 	} else {
-		new = spec.SnapAppSet().SlotLabelExpression(slot)
+		new = slot.LabelExpression()
 	}
 	snippet := strings.Replace(bluezConnectedPlugAppArmor, old, new, -1)
 	spec.AddSnippet(snippet)
@@ -282,7 +279,7 @@ func (iface *bluezInterface) AppArmorConnectedPlug(spec *apparmor.Specification,
 func (iface *bluezInterface) AppArmorConnectedSlot(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	if !release.OnClassic {
 		old := "###PLUG_SECURITY_TAGS###"
-		new := spec.SnapAppSet().PlugLabelExpression(plug)
+		new := plug.LabelExpression()
 		snippet := strings.Replace(bluezConnectedSlotAppArmor, old, new, -1)
 		spec.AddSnippet(snippet)
 	}
@@ -311,6 +308,12 @@ func (iface *bluezInterface) SecCompPermanentSlot(spec *seccomp.Specification, s
 func (iface *bluezInterface) AutoConnect(*snap.PlugInfo, *snap.SlotInfo) bool {
 	// allow what declarations allowed
 	return true
+}
+
+func (iface *bluezInterface) ParallelInstancesSupportedForSlot(_ *snap.SlotInfo) error {
+	// bluez owns the well-known bus name org.bluez on the system bus; only
+	// one snap instance can hold it at a time.
+	return errParallelInstancesUniqueResourceOwner
 }
 
 func init() {

@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2014-2015 Canonical Ltd
+ * Copyright (C) 2014-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -28,8 +28,9 @@ import (
 )
 
 var (
-	NumberOfJobsParam  = numberOfJobsParam
-	SetupConfCacheDirs = setupConfCacheDirs
+	NumberOfJobsParam     = numberOfJobsParam
+	SetupConfCacheDirs    = setupConfCacheDirs
+	SetupNotifySocketPath = setupNotifySocketPath
 )
 
 func MockRuntimeNumCPU(new func() int) (restore func()) {
@@ -78,23 +79,35 @@ func MockProfilesPath(t *testutil.BaseTest, profiles string) {
 	})
 }
 
-func MockFsRootPath(path string) (restorer func()) {
-	old := rootPath
-	rootPath = path
-	return func() {
-		rootPath = old
-	}
-}
-
 func MockSnapdAppArmorSupportsReexec(new func() bool) (restore func()) {
 	restore = testutil.Backup(&snapdAppArmorSupportsReexec)
 	snapdAppArmorSupportsReexec = new
 	return restore
 }
 
+func MockHostAbi30File(new string) func() {
+	restore := testutil.Backup(&hostAbi30File)
+	hostAbi30File = new
+	return restore
+}
+
+func MockHostAbi40File(new string) func() {
+	restore := testutil.Backup(&hostAbi40File)
+	hostAbi40File = new
+	return restore
+}
+
+func MockHostAbi50File(new string) func() {
+	restore := testutil.Backup(&hostAbi50File)
+	hostAbi50File = new
+	return restore
+}
+
 var (
 	ProbeKernelFeatures = probeKernelFeatures
 	ProbeParserFeatures = probeParserFeatures
+
+	ProbeKernelFeaturesPermstable32Version = probeKernelFeaturesPermstable32Version
 
 	RequiredKernelFeatures  = requiredKernelFeatures
 	RequiredParserFeatures  = requiredParserFeatures

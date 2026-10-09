@@ -23,6 +23,8 @@ AC_SYS_LARGEFILE
 AC_CHECK_HEADERS([fcntl.h limits.h stdlib.h string.h sys/mount.h unistd.h])
 AC_CHECK_HEADERS([sys/quota.h], [], [AC_MSG_ERROR(sys/quota.h unavailable)])
 AC_CHECK_HEADERS([xfs/xqm.h], [], [AC_MSG_ERROR(xfs/xqm.h unavailable)])
+# Check for linux/nsfs.h, used for namespace probing workarounds (optional)
+AC_CHECK_HEADERS([linux/nsfs.h])
 
 # Checks for typedefs, structures, and compiler characteristics.
 AC_CHECK_HEADER_STDBOOL
@@ -82,11 +84,11 @@ AS_IF([test "x$with_unit_tests" = "xyes"], [
 
 # Check if apparmor userspace library is available.
 AS_IF([test "x$enable_apparmor" = "xyes"], [
-    # Expect AppArmor3 when building as a snap under snapcraft
+    # Expect AppArmor 5 when building as a snap under snapcraft
     AS_IF([test "x$SNAPCRAFT_PROJECT_NAME" = "xsnapd"], [
-        PKG_CHECK_MODULES([APPARMOR3], [libapparmor = 3.0.8], [
-            AC_DEFINE([HAVE_APPARMOR], [1], [Build with apparmor3 support])], [
-            AC_MSG_ERROR([unable to find apparmor3 for snap build of snapd])])], [
+        PKG_CHECK_MODULES([APPARMOR], [libapparmor = 5.0.2], [
+            AC_DEFINE([HAVE_APPARMOR], [1], [Build with apparmor 5 support])], [
+            AC_MSG_ERROR([unable to find apparmor 5 for snap build of snapd])])], [
         PKG_CHECK_MODULES([APPARMOR], [libapparmor], [
       AC_DEFINE([HAVE_APPARMOR], [1], [Build with apparmor support])])])
 ], [
@@ -104,10 +106,9 @@ PKG_CHECK_MODULES([SELINUX], [libselinux], [
 AC_DEFINE([HAVE_SELINUX], [1], [Build with SELinux support])])
 ])
 
-# Check if udev and libudev are available.
-# Those are now used unconditionally even if apparmor is disabled.
+# Check if libudev is available. It is used unconditionally even if apparmor is
+# disabled.
 PKG_CHECK_MODULES([LIBUDEV], [libudev])
-PKG_CHECK_MODULES([UDEV], [udev])
 
 # Check if libcap is available.
 # PKG_CHECK_MODULES([LIBCAP], [libcap])
@@ -153,14 +154,19 @@ AS_IF([test "x$enable_merged_usr" = "xyes"], [
     AC_DEFINE([MERGED_USR], [1],
         [Support for merged /usr directory])])
 
-SNAP_MOUNT_DIR="/snap"
+# Keep the --with-snap-mount-dir= option name the same for ease of transition.
+STATIC_SNAP_MOUNT_DIR="/snap"
 AC_ARG_WITH([snap-mount-dir],
-    AS_HELP_STRING([--with-snap-mount-dir=DIR], [Use an alternate snap mount directory]),
-    [SNAP_MOUNT_DIR="$withval"])
-AC_SUBST(SNAP_MOUNT_DIR)
-AC_DEFINE_UNQUOTED([SNAP_MOUNT_DIR], "${SNAP_MOUNT_DIR}", [Location of the snap mount points])
+    AS_HELP_STRING([--with-snap-mount-dir=DIR], [Use an alternate static snap mount directory]),
+    [STATIC_SNAP_MOUNT_DIR="$withval"])
+AC_SUBST(STATIC_SNAP_MOUNT_DIR)
+AC_DEFINE_UNQUOTED([STATIC_SNAP_MOUNT_DIR], "${STATIC_SNAP_MOUNT_DIR}", [Static location of the snap mount points])
 
-SNAP_MOUNT_DIR_SYSTEMD_UNIT="$(systemd-escape -p "$SNAP_MOUNT_DIR")"
+STATIC_SNAP_TOOLING_DIR="${libexecdir%/snapd}/snapd"
+AC_SUBST(STATIC_SNAP_TOOLING_DIR)
+AC_DEFINE_UNQUOTED([STATIC_SNAP_TOOLING_DIR], "${STATIC_SNAP_TOOLING_DIR}", [Static location of the snapd tooling directory])
+
+SNAP_MOUNT_DIR_SYSTEMD_UNIT="$(systemd-escape -p "$STATIC_SNAP_MOUNT_DIR")"
 AC_SUBST([SNAP_MOUNT_DIR_SYSTEMD_UNIT])
 AC_DEFINE_UNQUOTED([SNAP_MOUNT_DIR_SYSTEMD_UNIT], "${SNAP_MOUNT_DIR_SYSTEMD_UNIT}", [Systemd unit name for snap mount points location])
 
@@ -171,6 +177,20 @@ AM_CONDITIONAL([HAVE_RST2MAN], [test "x${HAVE_RST2MAN}" != "x"])
 AC_PATH_PROG([HAVE_VALGRIND],[valgrind])
 AM_CONDITIONAL([HAVE_VALGRIND], [test "x${HAVE_VALGRIND}" != "x"])
 AS_IF([test "x$HAVE_VALGRIND" = "x"], [AC_MSG_WARN(["cannot find the valgrind tool, will not run unit tests through valgrind"])])
+
+AC_MSG_CHECKING([for cap_set_ambient() in libcap])
+saved_CFLAGS="$CFLAGS"
+CFLAGS="$CFLAGS -Werror"
+AC_COMPILE_IFELSE([AC_LANG_SOURCE([[
+  #include <sys/capability.h>
+  static int f(void) { return cap_set_ambient(CAP_SYS_ADMIN, CAP_SET); }
+]])],[
+  AC_DEFINE([HAVE_CAP_SET_AMBIENT], 1, [Define 1 if libcap has cap_set_ambient])
+  AC_MSG_RESULT(yes)
+],[
+  AC_MSG_RESULT(no)
+])
+CFLAGS="$saved_CFLAGS"
 
 # Allow linking selected libraries statically for reexec.
 AC_ARG_ENABLE([static-libcap],
@@ -219,13 +239,27 @@ AC_ARG_WITH([host-arch-32bit-triplet],
 AC_SUBST(HOST_ARCH32_TRIPLET)
 AC_DEFINE_UNQUOTED([HOST_ARCH32_TRIPLET], "${HOST_ARCH32_TRIPLET}", [Arch triplet for 32bit libraries])
 
-SYSTEMD_SYSTEM_GENERATOR_DIR="$($PKG_CONFIG --variable=systemdsystemgeneratordir systemd)"
-AS_IF([test "x$SYSTEMD_SYSTEM_GENERATOR_DIR" = "x"], [SYSTEMD_SYSTEM_GENERATOR_DIR=/lib/systemd/system-generators])
-AC_SUBST(SYSTEMD_SYSTEM_GENERATOR_DIR)
+dnl FIXME: Use PKG_CHECK_VAR when we have dropped Trusty (14.04)
+AC_ARG_VAR([SYSTEMD_SYSTEM_GENERATOR_DIR], [value for systemdsystemgeneratordir (overriding pkg-config)])
+if test -z "${SYSTEMD_SYSTEM_GENERATOR_DIR}"; then
+  SYSTEMD_SYSTEM_GENERATOR_DIR="$($PKG_CONFIG --variable=systemdsystemgeneratordir systemd)"
+  if test -z "${SYSTEMD_SYSTEM_GENERATOR_DIR}"; then
+    SYSTEMD_SYSTEM_GENERATOR_DIR="${prefix}/lib/systemd/system-generators"
+  fi
+fi
 
-# FIXME: get this via something like pkgconf once it is defined there
-SYSTEMD_SYSTEM_ENV_GENERATOR_DIR="${prefix}/lib/systemd/system-environment-generators"
-AC_SUBST(SYSTEMD_SYSTEM_ENV_GENERATOR_DIR)
+dnl FIXME: get this via something like pkgconf once it is defined there
+dnl FIXME: Use PKG_CHECK_VAR when we have dropped Trusty (14.04)
+AC_ARG_VAR([SYSTEMD_PREFIX], [value for systemd prefix (overriding pkg-config)])
+if test -z "${SYSTEMD_PREFIX}"; then
+  SYSTEMD_PREFIX="$($PKG_CONFIG --variable=prefix systemd)"
+fi
+if test -n "${SYSTEMD_PREFIX}"; then
+  SYSTEMD_SYSTEM_ENV_GENERATOR_DIR="${SYSTEMD_PREFIX}/lib/systemd/system-environment-generators"
+else
+  SYSTEMD_SYSTEM_ENV_GENERATOR_DIR="${prefix}/lib/systemd/system-environment-generators"
+fi
+AC_SUBST([SYSTEMD_SYSTEM_ENV_GENERATOR_DIR])
 
 AC_ARG_ENABLE([bpf],
 AS_HELP_STRING([--enable-bpf], [Enable BPF support]),
@@ -274,6 +308,39 @@ struct { const char* a; int b; } b[] = { {.a = ""}, {} };
   CFLAGS="${save_CFLAGS}"
 ])
 
+AC_ARG_ENABLE([host-binaries],
+    AS_HELP_STRING([--enable-host-binaries], [Build binaries needed on host (not in snap)]),
+    [case "$enableval" in
+        yes)
+          build_host_binaries=yes
+          ;;
+        no)
+          build_host_binaries=no
+          ;;
+        *) AC_MSG_ERROR([bad value ${enableval} for --enable-host-binaries])
+    esac],
+    [build_host_binaries=yes])
+AM_CONDITIONAL([BUILD_HOST_BINARIES], [test "x$build_host_binaries" = "xyes"])
+
+AC_ARG_ENABLE([test-coverage],
+    AS_HELP_STRING([--enable-test-coverage], [Enable test coverage]),
+    [case "${enableval}" in
+        yes) enable_test_coverage=yes ;;
+        no)  enable_test_coverage=no ;;
+        *) AC_MSG_ERROR([bad value ${enableval} for --enable-test-coverage])
+    esac], [enable_test_coverage=no])
+AM_CONDITIONAL([TEST_COVERAGE], [test "x$enable_test_coverage" = "xyes"])
+
+AC_PATH_PROGS([HAVE_GCOVR],[gcovr])
+AS_IF([test "x$HAVE_GCOVR" = "x" -a "x$enable_test_coverage" = "xyes"], [
+  AC_MSG_ERROR(["gcovr is required for coverage data"])
+])
+
+AC_PATH_PROGS([HAVE_GCOV],[gcov])
+AS_IF([test "x$HAVE_GCOV" = "x" -a "x$enable_test_coverage" = "xyes"], [
+  AC_MSG_ERROR(["gcov tool is required for coverage data"])
+])
+
 AX_APPEND_COMPILE_FLAGS([ dnl
   -Wall dnl
   -Wextra dnl
@@ -289,6 +356,56 @@ AS_IF([test "x$snapd_cv_missing_field_initializers_works" = "xno"], [
 AS_IF([test "x$with_unit_tests" = "xyes"], [
   AX_APPEND_COMPILE_FLAGS([-Werror], [CHECK_CFLAGS])
 ])
+
+AS_IF([test "x$enable_test_coverage" = "xyes"], [
+  CODE_COVERAGE_CFLAGS="--coverage"
+  CODE_COVERAGE_LDFLAGS="--coverage"
+  AC_SUBST([CODE_COVERAGE_CFLAGS])
+  AC_SUBST([CODE_COVERAGE_LDFLAGS])
+])
+
+AC_ARG_ENABLE([sanitize],
+    AS_HELP_STRING([--enable-sanitize], [Build binaries with sanitizers (ASan and UBSan).
+                                        Note, this will perform a partial build, skipping binaries which
+                                        cannot be built with sanitizers enabled.]),
+    [case "$enableval" in
+        yes)
+          enable_sanitize=yes
+          ;;
+        no)
+          enable_sanitize=no
+          ;;
+        *) AC_MSG_ERROR([bad value ${enableval} for --enable-sanitize])
+    esac],
+    [enable_sanitize=no])
+AM_CONDITIONAL([ENABLE_SANITIZE], [test "x$enable_sanitize" = "xyes"])
+
+AC_SUBST([CHECK_CFLAGS])
+AC_SUBST([CHECK_LDFLAGS])
+
+AC_ARG_WITH([apparmorconfigdir],
+    [AS_HELP_STRING([--with-apparmorconfigdir], [path to apparmor.d configuration directory])], [
+  APPARMOR_SYSCONFIG="${withval}"
+], [
+  APPARMOR_SYSCONFIG="${sysconfdir}/apparmor.d"
+])
+AC_SUBST([APPARMOR_SYSCONFIG])
+
+AC_ARG_ENABLE([static-PIE],
+    AS_HELP_STRING([--enable-static-PIE], [Build static PIE binaries]),
+    [case "$enableval" in
+        yes)
+          build_static_pie=yes
+          ;;
+        no)
+          build_static_pie=no
+          ;;
+        *) AC_MSG_ERROR([bad value ${enableval} for --enable-static-PIE])
+    esac],
+    [build_static_pie=no])
+AM_CONDITIONAL([BUILD_STATIC_PIE], [test "x$build_static_pie" = "xyes"])
+
+AC_SUBST([snapdstatedir], "${localstatedir}/lib/snapd")
 
 AC_CONFIG_FILES([Makefile])
 AC_OUTPUT

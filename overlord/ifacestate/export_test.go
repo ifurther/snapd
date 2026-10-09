@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2016-2018 Canonical Ltd
+ * Copyright (C) 2016-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -21,16 +21,20 @@ import (
 	"time"
 
 	"github.com/snapcore/snapd/interfaces"
+	"github.com/snapcore/snapd/overlord/ifacestate/apparmorprompting"
 	"github.com/snapcore/snapd/overlord/ifacestate/schema"
 	"github.com/snapcore/snapd/overlord/ifacestate/udevmonitor"
+	"github.com/snapcore/snapd/overlord/notices"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
+	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/testutil"
 	"github.com/snapcore/snapd/timings"
 )
 
 var (
-	AddImplicitSlots             = addImplicitSlots
+	AddImplicitInterfaces        = addImplicitInterfaces
 	SnapsWithSecurityProfiles    = snapsWithSecurityProfiles
 	CheckAutoconnectConflicts    = checkAutoconnectConflicts
 	FindSymmetricAutoconnectTask = findSymmetricAutoconnectTask
@@ -63,8 +67,25 @@ var (
 
 	BatchConnectTasks                = batchConnectTasks
 	FirstTaskAfterBootWhenPreseeding = firstTaskAfterBootWhenPreseeding
-	BuildConfinementOptions          = buildConfinementOptions
+
+	NewDelayedEffectsForSnaps = newDelayedEffectsForSnaps
+	ShouldUndoSetupProfiles   = shouldUndoSetupProfiles
 )
+
+type (
+	DelayedEffectsForSnapData = delayedEffectsForSnapData
+)
+
+func NewInterfaceManagerWithAppArmorPrompting(useAppArmorPrompting bool) *InterfaceManager {
+	m := &InterfaceManager{
+		useAppArmorPrompting: useAppArmorPrompting,
+	}
+	return m
+}
+
+func (m *InterfaceManager) BuildConfinementOptions(st *state.State, task *state.Task, snapInfo *snap.Info, flags snapstate.Flags) (interfaces.ConfinementOptions, error) {
+	return m.buildConfinementOptions(st, task, snapInfo, flags)
+}
 
 type ConnectOpts = connectOpts
 
@@ -73,7 +94,7 @@ func NewConnectOptsWithAutoSet() connectOpts {
 }
 
 func NewDisconnectOptsWithAutoSet() disconnectOpts {
-	return disconnectOpts{AutoDisconnect: true}
+	return disconnectOpts{AutoDisconnect: true, IgnoreHookError: true}
 }
 
 func NewDisconnectOptsWithByHotplugSet() disconnectOpts {
@@ -116,6 +137,33 @@ func MockCreateUDevMonitor(new func(udevmonitor.DeviceAddedFunc, udevmonitor.Dev
 	}
 }
 
+func MockCreateInterfacesRequestsManager(new func(noticeMgr *notices.NoticeManager) (*apparmorprompting.InterfacesRequestsManager, error)) (restore func()) {
+	return testutil.Mock(&createInterfacesRequestsManager, new)
+}
+
+func MockInterfacesRequestsManagerShutDown(new func(m *apparmorprompting.InterfacesRequestsManager)) (restore func()) {
+	return testutil.Mock(&interfacesRequestsManagerShutDown, new)
+}
+
+func MockInterfacesRequestsManagerStop(new func(m *apparmorprompting.InterfacesRequestsManager) error) (restore func()) {
+	return testutil.Mock(&interfacesRequestsManagerStop, new)
+}
+
+func MockAssessAppArmorPrompting(new func(m *InterfaceManager) bool) (restore func()) {
+	return testutil.Mock(&assessAppArmorPrompting, new)
+}
+
+func MockInterfacesRequestsControlHandlerServicePresent(new func(m *InterfaceManager) (bool, error)) (restore func()) {
+	return testutil.Mock(&interfacesRequestsControlHandlerServicePresent, new)
+}
+
+func CallInterfacesRequestsControlHandlerServicePresent(s *state.State) (bool, error) {
+	manager := &InterfaceManager{
+		state: s,
+	}
+	return interfacesRequestsControlHandlerServicePresent(manager)
+}
+
 func MockUDevInitRetryTimeout(t time.Duration) (restore func()) {
 	old := udevInitRetryTimeout
 	udevInitRetryTimeout = t
@@ -151,7 +199,7 @@ func UpdateConnectionInConnState(conns map[string]*schema.ConnState, conn *inter
 	}
 }
 
-func GetConnStateAttrs(conns map[string]*schema.ConnState, connID string) (plugStatic, plugDynamic, slotStatic, SlotDynamic map[string]interface{}, ok bool) {
+func GetConnStateAttrs(conns map[string]*schema.ConnState, connID string) (plugStatic, plugDynamic, slotStatic, SlotDynamic map[string]any, ok bool) {
 	conn, ok := conns[connID]
 	if !ok {
 		return nil, nil, nil, nil, false
@@ -160,36 +208,32 @@ func GetConnStateAttrs(conns map[string]*schema.ConnState, connID string) (plugS
 }
 
 // SystemSnapName returns actual name of the system snap - reimplemented by concrete mapper.
-func (m *IdentityMapper) SystemSnapName() string {
-	return "unknown"
+func (m *IdentityMapper) SystemSnapName() naming.InstanceName {
+	return naming.NewInstanceName("unknown", "")
 }
 
 // MockProfilesNeedRegeneration mocks the function checking if profiles need regeneration.
-func MockProfilesNeedRegeneration(fn func() bool) func() {
-	old := profilesNeedRegeneration
-	profilesNeedRegeneration = fn
-	return func() { profilesNeedRegeneration = old }
+func MockProfilesNeedRegeneration(fn func(m *InterfaceManager) bool) func() {
+	old := profilesNeedRegenerationImpl
+	profilesNeedRegenerationImpl = fn
+	return func() { profilesNeedRegenerationImpl = old }
 }
 
 // MockWriteSystemKey mocks the function responsible for writing the system key.
-func MockWriteSystemKey(fn func() error) func() {
+func MockWriteSystemKey(fn func(extraData interfaces.SystemKeyExtraData) error) func() {
 	old := writeSystemKey
 	writeSystemKey = fn
 	return func() { writeSystemKey = old }
 }
 
-func MockSnapstateFinishRestart(f func(task *state.Task, snapsup *snapstate.SnapSetup) error) (restore func()) {
-	old := snapstateFinishRestart
-	snapstateFinishRestart = f
-	return func() {
-		snapstateFinishRestart = old
-	}
-}
-
-func (m *InterfaceManager) TransitionConnectionsCoreMigration(st *state.State, oldName, newName string) error {
+func (m *InterfaceManager) TransitionConnectionsCoreMigration(st *state.State, oldName, newName naming.InstanceName) error {
 	return m.transitionConnectionsCoreMigration(st, oldName, newName)
 }
 
-func (m *InterfaceManager) SetupSecurityByBackend(task *state.Task, appSets []*interfaces.SnapAppSet, opts []interfaces.ConfinementOptions, tm timings.Measurer) error {
-	return m.setupSecurityByBackend(task, appSets, opts, tm)
+func (m *InterfaceManager) SetupSecurityByBackend(task *state.Task, appSets []*interfaces.SnapAppSet, opts []interfaces.ConfinementOptions, sctxs map[string]interfaces.SetupContext, tm timings.Measurer) error {
+	return m.setupSecurityByBackend(task, appSets, opts, sctxs, tm)
+}
+
+func MockIsSnapVerified(new func(st *state.State, snapID string) bool) (restore func()) {
+	return testutil.Mock(&isSnapVerified, new)
 }

@@ -57,7 +57,7 @@ func (a filesAAPerm) String() string {
 	panic(fmt.Sprintf("invalid perm: %d", a))
 }
 
-func formatPath(ip interface{}) (string, error) {
+func formatPath(ip any) (string, error) {
 	p, ok := ip.(string)
 	if !ok {
 		return "", fmt.Errorf("%[1]v (%[1]T) is not a string", ip)
@@ -76,7 +76,7 @@ func formatPath(ip interface{}) (string, error) {
 	return fmt.Sprintf("%s%q", prefix, p), nil
 }
 
-func allowPathAccess(buf *bytes.Buffer, perm filesAAPerm, paths []interface{}) error {
+func allowPathAccess(buf *bytes.Buffer, perm filesAAPerm, paths []any) error {
 	for _, rawPath := range paths {
 		p, err := formatPath(rawPath)
 		if err != nil {
@@ -87,7 +87,7 @@ func allowPathAccess(buf *bytes.Buffer, perm filesAAPerm, paths []interface{}) e
 	return nil
 }
 
-func (iface *commonFilesInterface) validatePaths(attrName string, paths []interface{}) error {
+func (iface *commonFilesInterface) validatePaths(attrName string, paths []any) error {
 	for _, npp := range paths {
 		np, ok := npp.(string)
 		if !ok {
@@ -103,6 +103,13 @@ func (iface *commonFilesInterface) validatePaths(attrName string, paths []interf
 func (iface *commonFilesInterface) validateSinglePath(np string) error {
 	if strings.HasSuffix(np, "/") {
 		return fmt.Errorf(`%q cannot end with "/"`, np)
+	}
+	if strings.HasSuffix(np, "@") {
+		// Variables in AppArmor profiles have the form `@{FOO}`. Since we're
+		// going to add `{,/,/**}` to the end of the path, we cannot have a
+		// trailing '@', else we'll end up with a path which ends with
+		// `@{,/,/**}`, which looks problematically like an AppArmor variable.
+		return fmt.Errorf(`%q cannot end with "@"`, np)
 	}
 	p := filepath.Clean(np)
 	if p != np {
@@ -132,7 +139,7 @@ func (iface *commonFilesInterface) BeforePreparePlug(plug *snap.PlugInfo) error 
 		if _, ok := plug.Attrs[att]; !ok {
 			continue
 		}
-		paths, ok := plug.Attrs[att].([]interface{})
+		paths, ok := plug.Attrs[att].([]any)
 		if !ok {
 			return fmt.Errorf("cannot add %s plug: %q must be a list of strings", iface.name, att)
 		}
@@ -149,7 +156,7 @@ func (iface *commonFilesInterface) BeforePreparePlug(plug *snap.PlugInfo) error 
 }
 
 func (iface *commonFilesInterface) AppArmorConnectedPlug(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
-	var reads, writes []interface{}
+	var reads, writes []any
 	_ = plug.Attr("read", &reads)
 	_ = plug.Attr("write", &writes)
 

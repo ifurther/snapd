@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2015-2019 Canonical Ltd
+ * Copyright (C) 2015-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -197,7 +197,7 @@ func checkPreseedOrder(c *C, tsAll []*state.TaskSet, snaps ...string) {
 				default:
 					snapsup, err := snapstate.TaskSnapSetup(wt)
 					c.Assert(err, IsNil, Commentf("%#v", wt))
-					c.Check(snapsup.SnapName(), Equals, snaps[matched-1], Commentf("%s: %#v", hsup.Snap, wt))
+					c.Check(snapsup.SnapName().String(), Equals, snaps[matched-1], Commentf("%s: %#v", hsup.Snap, wt))
 					waitsForPreviousSnap = true
 				}
 			}
@@ -210,7 +210,7 @@ func checkPreseedOrder(c *C, tsAll []*state.TaskSet, snaps ...string) {
 
 		snapsup, err := snapstate.TaskSnapSetup(task0)
 		c.Assert(err, IsNil, Commentf("%#v", task0))
-		c.Check(snapsup.InstanceName(), Equals, snaps[matched])
+		c.Check(snapsup.InstanceName().String(), Equals, snaps[matched])
 		matched++
 
 		// find setup-aliases task in current taskset; its position
@@ -238,8 +238,10 @@ func (s *firstbootPreseedingClassic16Suite) SetUpTest(c *C) {
 	err := os.MkdirAll(filepath.Join(dirs.SnapSeedDir, "assertions"), 0755)
 	c.Assert(err, IsNil)
 
+	extraData := interfaces.SystemKeyExtraData{}
+
 	s.AddCleanup(interfaces.MockSystemKey(`{"core": "123"}`))
-	c.Assert(interfaces.WriteSystemKey(), IsNil)
+	c.Assert(interfaces.WriteSystemKey(extraData), IsNil)
 
 	restoreRelease := release.MockOnClassic(true)
 	s.AddCleanup(restoreRelease)
@@ -589,10 +591,12 @@ snaps:
 	restart.MockPending(st, restart.RestartUnset)
 	st.Unlock()
 	err = s.overlord.Settle(settleTimeout)
-	c.Assert(err, IsNil)
-	c.Assert(s.overlord.Stop(), IsNil)
-	c.Assert(err, IsNil)
 	st.Lock()
+	c.Assert(err, IsNil)
+	st.Unlock()
+	stopErr := s.overlord.Stop()
+	st.Lock()
+	c.Assert(stopErr, IsNil)
 
 	// Update the change pointer to the change in the new state
 	// otherwise we will be referring to the old one.
@@ -622,19 +626,19 @@ snaps:
 	c.Check(seedTime.IsZero(), Equals, false)
 
 	// verify that connections was made
-	var conns map[string]interface{}
+	var conns map[string]any
 	c.Assert(st.Get("conns", &conns), IsNil)
-	c.Assert(conns, DeepEquals, map[string]interface{}{
-		"foo:network core:network": map[string]interface{}{
+	c.Assert(conns, DeepEquals, map[string]any{
+		"foo:network core:network": map[string]any{
 			"auto": true, "interface": "network"},
-		"foo:shared-data-plug bar:shared-data-slot": map[string]interface{}{
+		"foo:shared-data-plug bar:shared-data-slot": map[string]any{
 			"auto": true, "interface": "content",
-			"plug-static": map[string]interface{}{
+			"plug-static": map[string]any{
 				"content": "mylib", "target": "import",
 			},
-			"slot-static": map[string]interface{}{
+			"slot-static": map[string]any{
 				"content": "mylib",
-				"read": []interface{}{
+				"read": []any{
 					"/",
 				},
 			},

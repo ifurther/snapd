@@ -7,7 +7,6 @@ details: |
 # Since it's only apt remove --purge and lxd tests are rather long, limit to a
 # couple of systems only. The postrm purge is more thoroughly checked in
 # tests/main/postrm-purge.
-# ubuntu-18.04-32: i386 is not supported by lxd
 systems: [ubuntu-18.04-64, ubuntu-2*]
 
 # start early
@@ -15,6 +14,12 @@ priority: 1000
 
 # lxd downloads can be quite slow
 kill-timeout: 25m
+
+skip:
+    - reason: Requires snapd .deb files built for testing
+      if: |
+        # "$GOHOME"/snapd_*.deb is used in the lxd container
+        [[ "$(find "$GOHOME" -name 'snapd_*.deb' | wc -l || echo 0)" -eq 0 ]]
 
 prepare: |
     # using apt here is ok because this test only runs on ubuntu
@@ -25,14 +30,7 @@ prepare: |
     fi
     echo "Install lxd"
     "$TESTSTOOLS"/lxd-state prepare-snap
-
-    REMOTE=ubuntu
-    # There isn't an official image for noble yet, let's use the daily one
-    if os.query is-ubuntu 24.04; then
-      REMOTE=ubuntu-daily
-    fi
-    VERSION_ID="$(. /etc/os-release && echo "$VERSION_ID" )"
-    lxd.lxc launch --quiet "$REMOTE:$VERSION_ID" my-ubuntu
+    "$TESTSTOOLS"/lxd-state launch --name my-ubuntu
 
     # precondition check
     if os.query is-pc-amd64 && lxd.lxc info my-ubuntu | grep "Architecture: i686"; then
@@ -47,23 +45,11 @@ prepare: |
     echo "Push snapd into container"
     lxd.lxc file push --quiet prep-snapd-in-lxd.sh "my-ubuntu/root/"
     lxd.lxc file push --quiet "$GOHOME"/snapd_*.deb "my-ubuntu/root/"
-
-    echo "Setting up proxy *inside* the container"
-    if [ -n "${http_proxy:-}" ]; then
-        lxd.lxc exec my-ubuntu -- sh -c "echo http_proxy=$http_proxy >> /etc/environment"
-    fi
-    if [ -n "${https_proxy:-}" ]; then
-        lxd.lxc exec my-ubuntu -- sh -c "echo https_proxy=$https_proxy >> /etc/environment"
-    fi
-
+    
     echo "Install snapd in container"
     lxd.lxc exec my-ubuntu -- /root/prep-snapd-in-lxd.sh
 
 restore: |
-    if  [[ "$(find "$GOHOME" -name 'snapd_*.deb' | wc -l || echo 0)" -eq 0 ]]; then
-        exit
-    fi
-
     lxd.lxc stop my-ubuntu --force || true
     lxd.lxc delete my-ubuntu || true
     snap remove --purge lxd

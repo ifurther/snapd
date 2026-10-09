@@ -126,6 +126,8 @@ umount /{,run/}media/**,
 
 # Needed for probing raw devices
 capability sys_rawio,
+# And chown to be able to set permissions in folders created at /media
+capability chown,
 
 /run/ rw,
 /run/cryptsetup/{,**} rwk,
@@ -177,6 +179,12 @@ const udisks2ConnectedPlugAppArmor = `
 
 #include <abstractions/dbus-strict>
 
+dbus (send)
+    bus=system
+    path=/org/freedesktop/UDisks2
+    interface=org.freedesktop.DBus.Peer
+    member=Ping
+    peer=(label=###SLOT_SECURITY_TAGS###),
 dbus (receive, send)
     bus=system
     path=/org/freedesktop/UDisks2/**
@@ -213,6 +221,7 @@ dbus (send)
 
 const udisks2PermanentSlotSecComp = `
 bind
+chown
 chown32
 fchown
 fchown32
@@ -421,7 +430,7 @@ func (iface *udisks2Interface) AppArmorConnectedPlug(spec *apparmor.Specificatio
 	if implicitSystemConnectedSlot(slot) {
 		new = "unconfined"
 	} else {
-		new = spec.SnapAppSet().SlotLabelExpression(slot)
+		new = slot.LabelExpression()
 	}
 	snippet := strings.Replace(udisks2ConnectedPlugAppArmor, old, new, -1)
 	spec.AddSnippet(snippet)
@@ -463,7 +472,7 @@ func (iface *udisks2Interface) UDevPermanentSlot(spec *udev.Specification, slot 
 func (iface *udisks2Interface) AppArmorConnectedSlot(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	if !implicitSystemConnectedSlot(slot) {
 		old := "###PLUG_SECURITY_TAGS###"
-		new := spec.SnapAppSet().PlugLabelExpression(plug)
+		new := plug.LabelExpression()
 		snippet := strings.Replace(udisks2ConnectedSlotAppArmor, old, new, -1)
 		spec.AddSnippet(snippet)
 	}
@@ -480,6 +489,12 @@ func (iface *udisks2Interface) SecCompPermanentSlot(spec *seccomp.Specification,
 func (iface *udisks2Interface) AutoConnect(*snap.PlugInfo, *snap.SlotInfo) bool {
 	// allow what declarations allowed
 	return true
+}
+
+func (iface *udisks2Interface) ParallelInstancesSupportedForSlot(_ *snap.SlotInfo) error {
+	// udisks2 owns the well-known bus name org.freedesktop.UDisks2 on the
+	// system bus; only one snap instance can hold it at a time.
+	return errParallelInstancesUniqueResourceOwner
 }
 
 func init() {

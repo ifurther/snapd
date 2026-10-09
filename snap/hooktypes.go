@@ -26,6 +26,7 @@ import (
 var supportedHooks = []*HookType{
 	NewHookType(regexp.MustCompile("^prepare-device$")),
 	NewHookType(regexp.MustCompile("^install-device$")),
+	NewHookType(regexp.MustCompile("^prepare-serial-request$")),
 	NewHookType(regexp.MustCompile("^default-configure$")),
 	NewHookType(regexp.MustCompile("^configure$")),
 	NewHookType(regexp.MustCompile("^install$")),
@@ -39,6 +40,11 @@ var supportedHooks = []*HookType{
 	NewHookType(regexp.MustCompile("^check-health$")),
 	NewHookType(regexp.MustCompile("^fde-setup$")),
 	NewHookType(regexp.MustCompile("^gate-auto-refresh$")),
+	NewHookType(regexp.MustCompile("^change-view-.+$")),
+	NewHookType(regexp.MustCompile("^save-view-.+$")),
+	NewHookType(regexp.MustCompile("^query-view-.+$")),
+	NewHookType(regexp.MustCompile("^load-view-.+$")),
+	NewHookType(regexp.MustCompile("^observe-view-.+$")),
 }
 
 var supportedComponentHooks = []*HookType{

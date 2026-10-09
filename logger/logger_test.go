@@ -77,14 +77,12 @@ func (s *LogSuite) TestDefault(c *C) {
 	c.Check(logger.GetLogger(), IsNil)
 
 	os.Setenv("TERM", "dumb")
-	err := logger.SimpleSetup()
-	c.Assert(err, IsNil)
+	logger.SimpleSetup(nil)
 	c.Check(logger.GetLogger(), NotNil)
 	c.Check(logger.GetLoggerFlags(), Equals, logger.DefaultFlags)
 
 	os.Unsetenv("TERM")
-	err = logger.SimpleSetup()
-	c.Assert(err, IsNil)
+	logger.SimpleSetup(nil)
 	c.Check(logger.GetLogger(), NotNil)
 	c.Check(logger.GetLoggerFlags(), Equals, log.Lshortfile)
 }
@@ -135,8 +133,7 @@ func (s *LogSuite) TestBootSetup(c *C) {
 
 func (s *LogSuite) TestNew(c *C) {
 	var buf bytes.Buffer
-	l, err := logger.New(&buf, logger.DefaultFlags)
-	c.Assert(err, IsNil)
+	l := logger.New(&buf, logger.DefaultFlags, nil)
 	c.Assert(l, NotNil)
 }
 
@@ -150,7 +147,7 @@ func (s *LogSuite) TestDebugfEnv(c *C) {
 	defer os.Unsetenv("SNAPD_DEBUG")
 
 	logger.Debugf("xyzzy")
-	c.Check(s.logbuf.String(), testutil.Contains, `DEBUG: xyzzy`)
+	c.Check(s.logbuf.String(), Matches, `(?m).*logger_test\.go:\d+: DEBUG: xyzzy`)
 }
 
 func (s *LogSuite) TestNoticef(c *C) {
@@ -202,8 +199,7 @@ func (s *LogSuite) TestIntegrationDebugFromKernelCmdline(c *C) {
 	defer restore()
 
 	var buf bytes.Buffer
-	l, err := logger.New(&buf, logger.DefaultFlags)
-	c.Assert(err, IsNil)
+	l := logger.New(&buf, logger.DefaultFlags, nil)
 	l.Debug("xyzzy")
 	c.Check(buf.String(), testutil.Contains, `DEBUG: xyzzy`)
 }
@@ -235,4 +231,18 @@ func (s *LogSuite) TestStartupTimestampMsg(c *C) {
 		Stage: "foo to bar",
 		Time:  "1652697792.022312",
 	})
+}
+
+func (s *LogSuite) TestForceDebug(c *C) {
+	var buf bytes.Buffer
+	l := logger.New(&buf, logger.DefaultFlags, &logger.LoggerOptions{ForceDebug: true})
+	l.Debug("xyzzy")
+	c.Check(buf.String(), testutil.Contains, `DEBUG: xyzzy`)
+}
+
+func (s *LogSuite) TestMockDebugLogger(c *C) {
+	logbuf, restore := logger.MockDebugLogger()
+	defer restore()
+	logger.Debugf("xyzzy")
+	c.Check(logbuf.String(), testutil.Contains, "DEBUG: xyzzy")
 }

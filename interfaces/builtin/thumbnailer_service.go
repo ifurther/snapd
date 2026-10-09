@@ -113,7 +113,7 @@ func (iface *thumbnailerServiceInterface) StaticInfo() interfaces.StaticInfo {
 func (iface *thumbnailerServiceInterface) AppArmorConnectedPlug(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	snippet := thumbnailerServiceConnectedPlugAppArmor
 	old := "###SLOT_SECURITY_TAGS###"
-	new := spec.SnapAppSet().SlotLabelExpression(slot)
+	new := slot.LabelExpression()
 	snippet = strings.Replace(snippet, old, new, -1)
 	spec.AddSnippet(snippet)
 	return nil
@@ -129,11 +129,11 @@ func (iface *thumbnailerServiceInterface) AppArmorConnectedSlot(spec *apparmor.S
 	old := "###PLUG_SNAP_NAME###"
 	// parallel-installs: PLUG_SNAP_NAME is used in the context of dbus
 	// mediation rules, need to use the actual instance name
-	new := plug.Snap().InstanceName()
+	new := plug.Snap().InstanceName().String()
 	snippet = strings.Replace(snippet, old, new, -1)
 
 	old = "###PLUG_SECURITY_TAGS###"
-	new = spec.SnapAppSet().PlugLabelExpression(plug)
+	new = plug.LabelExpression()
 	snippet = strings.Replace(snippet, old, new, -1)
 	spec.AddSnippet(snippet)
 	return nil
@@ -141,6 +141,12 @@ func (iface *thumbnailerServiceInterface) AppArmorConnectedSlot(spec *apparmor.S
 
 func (iface *thumbnailerServiceInterface) AutoConnect(plug *snap.PlugInfo, slot *snap.SlotInfo) bool {
 	return true
+}
+
+func (iface *thumbnailerServiceInterface) ParallelInstancesSupportedForSlot(_ *snap.SlotInfo) error {
+	// the thumbnailer service owns the well-known bus name com.canonical.Thumbnailer
+	// on the session bus; only one snap instance can hold it at a time.
+	return errParallelInstancesUniqueResourceOwner
 }
 
 func init() {

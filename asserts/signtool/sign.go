@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/snapcore/snapd/asserts"
 )
@@ -54,12 +55,16 @@ type Options struct {
 	// Complement are an error, except for "type" that needs
 	// instead to match if present. Pseudo-header "body" can also
 	// be specified here.
-	Complement map[string]interface{}
+	Complement map[string]any
+
+	// UpdateTimestamp is used to update the output "timestamp"
+	// header to the current time
+	UpdateTimestamp bool
 }
 
 // Sign produces the text of a signed assertion as specified by opts.
 func Sign(opts *Options, keypairMgr asserts.KeypairManager) ([]byte, error) {
-	var headers map[string]interface{}
+	var headers map[string]any
 	err := json.Unmarshal(opts.Statement, &headers)
 	if err != nil {
 		return nil, fmt.Errorf("cannot parse the assertion input as JSON: %v", err)
@@ -122,10 +127,35 @@ func Sign(opts *Options, keypairMgr asserts.KeypairManager) ([]byte, error) {
 		}
 	}
 
+	if typ.JSONBody() && len(body) != 0 {
+		body, err = reformatJSON(body)
+		if err != nil {
+			return nil, fmt.Errorf("cannot reformat body: %v", err)
+		}
+	}
+
+	if opts.UpdateTimestamp {
+		// Update the "timestamp" field with the current time in RFC3339 format.
+		headers["timestamp"] = time.Now().UTC().Format(time.RFC3339)
+	}
+
 	a, err := adb.Sign(typ, headers, body, opts.KeyID)
 	if err != nil {
 		return nil, err
 	}
 
 	return asserts.Encode(a), nil
+}
+
+func reformatJSON(raw []byte) ([]byte, error) {
+	var v map[string]any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil, fmt.Errorf("cannot unmarshal unformatted JSON: %v", err)
+	}
+
+	raw, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("cannot marshal into formatted JSON: %v", err)
+	}
+	return raw, nil
 }

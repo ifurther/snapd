@@ -22,8 +22,10 @@ import (
 
 	. "gopkg.in/check.v1"
 
+	"github.com/snapcore/snapd/interfaces"
 	"github.com/snapcore/snapd/interfaces/backends"
 	apparmor_sandbox "github.com/snapcore/snapd/sandbox/apparmor"
+	"github.com/snapcore/snapd/snapdenv"
 	"github.com/snapcore/snapd/testutil"
 )
 
@@ -40,18 +42,12 @@ func (s *backendsSuite) TestIsAppArmorEnabled(c *C) {
 		restore := apparmor_sandbox.MockLevel(level)
 		defer restore()
 
-		all := backends.All()
-		names := make([]string, len(all))
-		for i, backend := range all {
-			names[i] = string(backend.Name())
-		}
 		switch level {
 		case apparmor_sandbox.Unsupported, apparmor_sandbox.Unusable:
-			c.Assert(names, Not(testutil.Contains), "apparmor")
+			c.Assert(backendNames(backends.All()), Not(testutil.Contains), "apparmor")
 		case apparmor_sandbox.Partial, apparmor_sandbox.Full:
-			c.Assert(names, testutil.Contains, "apparmor")
+			c.Assert(backendNames(backends.All()), testutil.Contains, "apparmor")
 		}
-
 	}
 }
 
@@ -73,4 +69,30 @@ func (s *backendsSuite) TestEssentialOrdering(c *C) {
 	c.Assert(aaIndex, testutil.IntNotEqual, -1)
 	c.Assert(sdIndex, testutil.IntNotEqual, -1)
 	c.Assert(sdIndex, testutil.IntLessThan, aaIndex)
+}
+
+func (s *backendsSuite) TestUdevPreseedingInContainers(c *C) {
+	cmd := testutil.MockCommand(c, "systemd-detect-virt", `
+	for arg in "$@"; do
+		if [ "$arg" = --container ]; then
+			exit 0
+		fi
+	done
+
+	exit 1
+	`)
+	restore := snapdenv.MockPreseeding(true)
+	defer restore()
+
+	defer cmd.Restore()
+	c.Assert(backendNames(backends.All()), testutil.Contains, "udev")
+}
+
+func backendNames(bs []interfaces.SecurityBackend) (names []string) {
+	names = make([]string, len(bs))
+	for i, backend := range bs {
+		names[i] = string(backend.Name())
+	}
+
+	return names
 }

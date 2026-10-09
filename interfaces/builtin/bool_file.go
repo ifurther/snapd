@@ -63,7 +63,7 @@ func (iface *boolFileInterface) StaticInfo() interfaces.StaticInfo {
 var boolFileGPIOValuePattern = regexp.MustCompile(
 	"^/sys/class/gpio/gpio[0-9]+/value$")
 var boolFileLedPattern = regexp.MustCompile(
-	"^/sys/devices/platform/leds/[^/]+/[^/]+/brightness$")
+	"^/sys/devices/platform/.+/leds/[^/]+/brightness$")
 var boolFileAllowedPathPatterns = []*regexp.Regexp{
 	// The brightness of standard LED class device
 	regexp.MustCompile("^/sys/class/leds/[^/]+/brightness$"),
@@ -95,7 +95,7 @@ func (iface *boolFileInterface) AppArmorPermanentSlot(spec *apparmor.Specificati
 	gpioSnippet := `
 /sys/class/gpio/export rw,
 /sys/class/gpio/unexport rw,
-/sys/class/gpio/gpio[0-9]+/direction rw,
+/sys/class/gpio/gpio[0-9]*/direction rw,
 `
 	if iface.isGPIO(slot) {
 		spec.AddSnippet(gpioSnippet)
@@ -153,6 +153,10 @@ func (iface *boolFileInterface) isGPIO(slot *snap.SlotInfo) bool {
 // By default we allow what declarations allowed.
 func (iface *boolFileInterface) AutoConnect(*snap.PlugInfo, *snap.SlotInfo) bool {
 	return true
+}
+
+func (iface *boolFileInterface) ParallelInstancesSupportedForSlot(slot *snap.SlotInfo) error {
+	return parallelInstancesSystemOrGadgetSlotErr(slot)
 }
 
 func init() {

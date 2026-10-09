@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2015-2022 Canonical Ltd
+ * Copyright (C) 2015-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -27,10 +27,11 @@ import (
 
 	"github.com/gorilla/mux"
 
-	"github.com/snapcore/snapd/overlord/aspectstate"
 	"github.com/snapcore/snapd/overlord/assertstate"
 	"github.com/snapcore/snapd/overlord/auth"
+	"github.com/snapcore/snapd/overlord/confdbstate"
 	"github.com/snapcore/snapd/overlord/configstate"
+	"github.com/snapcore/snapd/overlord/devicestate"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/strutil"
@@ -39,9 +40,10 @@ import (
 var api = []*Command{
 	rootCmd,
 	sysInfoCmd,
+	sysInfoStorageEncCmd,
 	loginCmd,
 	logoutCmd,
-	appIconCmd,
+	snapIconCmd,
 	findCmd,
 	snapsCmd,
 	snapCmd,
@@ -82,9 +84,50 @@ var api = []*Command{
 	systemRecoveryKeysCmd,
 	quotaGroupsCmd,
 	quotaGroupInfoCmd,
-	aspectsCmd,
+	confdbCmd,
+	confdbControlCmd,
 	noticesCmd,
 	noticeCmd,
+	interfacesRequestsCmd,
+	requestsPromptsCmd,
+	requestsPromptCmd,
+	requestsRulesCmd,
+	requestsRuleCmd,
+	systemSecurebootCmd,
+	systemVolumesCmd,
+}
+
+type featureEndpoint struct {
+	Path    string   `json:"path"`
+	Method  string   `json:"method"`
+	Actions []string `json:"actions,omitempty"`
+}
+
+var featureList []featureEndpoint
+
+func init() {
+	// Create a complete list of all endpoints, which constitute
+	// the complete set of endpoint feature tags. It is created
+	// here instead of in api_debug to avoid circular dependencies.
+	featureList = []featureEndpoint{}
+	for _, cmd := range api {
+		var path string
+		if cmd.Path != "" {
+			path = cmd.Path
+		} else {
+			path = cmd.PathPrefix
+		}
+
+		if cmd.GET != nil {
+			featureList = append(featureList, featureEndpoint{Path: path, Method: "GET"})
+		}
+		if cmd.POST != nil {
+			featureList = append(featureList, featureEndpoint{Path: path, Actions: cmd.Actions, Method: "POST"})
+		}
+		if cmd.PUT != nil {
+			featureList = append(featureList, featureEndpoint{Path: path, Actions: cmd.Actions, Method: "PUT"})
+		}
+	}
 }
 
 const (
@@ -92,10 +135,14 @@ const (
 	polkitActionManage              = "io.snapcraft.snapd.manage"
 	polkitActionManageInterfaces    = "io.snapcraft.snapd.manage-interfaces"
 	polkitActionManageConfiguration = "io.snapcraft.snapd.manage-configuration"
+	polkitActionManageFDE           = "io.snapcraft.snapd.manage-fde"
 )
 
-// userFromRequest extracts user information from request and return the respective user in state, if valid
-// It requires the state to be locked
+// userFromRequest extracts user information from request and return the
+// respective user in state, if valid.
+//
+// Locks state to check authentication, if headers are valid, so the caller
+// must not hold the state lock.
 func userFromRequest(st *state.State, req *http.Request) (*auth.UserState, error) {
 	// extract macaroons data from request
 	header := req.Header.Get("Authorization")
@@ -123,6 +170,8 @@ func userFromRequest(st *state.State, req *http.Request) (*auth.UserState, error
 		return nil, fmt.Errorf("invalid authorization header")
 	}
 
+	st.Lock()
+	defer st.Unlock()
 	user, err := auth.CheckMacaroon(st, macaroon, discharges)
 	return user, err
 }
@@ -138,15 +187,19 @@ func storeFrom(d *Daemon) snapstate.StoreService {
 }
 
 var (
-	snapstateInstall                        = snapstate.Install
+	snapstateStoreInstallGoal               = snapstate.StoreInstallGoal
+	snapstatePathUpdateGoal                 = snapstate.PathUpdateGoal
+	snapstateInstallWithGoal                = snapstate.InstallWithGoal
 	snapstateInstallPath                    = snapstate.InstallPath
 	snapstateInstallPathMany                = snapstate.InstallPathMany
 	snapstateInstallComponentPath           = snapstate.InstallComponentPath
+	snapstateInstallComponents              = snapstate.InstallComponents
 	snapstateRefreshCandidates              = snapstate.RefreshCandidates
 	snapstateTryPath                        = snapstate.TryPath
-	snapstateUpdate                         = snapstate.Update
-	snapstateUpdateMany                     = snapstate.UpdateMany
-	snapstateInstallMany                    = snapstate.InstallMany
+	snapstateStoreUpdateGoal                = snapstate.StoreUpdateGoal
+	snapstateUpdateWithGoal                 = snapstate.UpdateWithGoal
+	snapstateUpdateOne                      = snapstate.UpdateOne
+	snapstateRemove                         = snapstate.Remove
 	snapstateRemoveMany                     = snapstate.RemoveMany
 	snapstateResolveValSetsEnforcementError = snapstate.ResolveValidationSetsEnforcementError
 	snapstateRevert                         = snapstate.Revert
@@ -156,14 +209,19 @@ var (
 	snapstateHoldRefreshesBySystem          = snapstate.HoldRefreshesBySystem
 	snapstateLongestGatingHold              = snapstate.LongestGatingHold
 	snapstateSystemHold                     = snapstate.SystemHold
+	snapstateRemoveComponents               = snapstate.RemoveComponents
 
 	configstateConfigureInstalled = configstate.ConfigureInstalled
 
 	assertstateRefreshSnapAssertions         = assertstate.RefreshSnapAssertions
 	assertstateRestoreValidationSetsTracking = assertstate.RestoreValidationSetsTracking
+	assertstateFetchAllValidationSets        = assertstate.FetchAllValidationSets
 
-	aspectstateGetAspect = aspectstate.GetAspect
-	aspectstateSetAspect = aspectstate.SetAspect
+	confdbstateGetView     = confdbstate.GetView
+	confdbstateWriteConfdb = confdbstate.WriteConfdb
+	confdbstateReadConfdb  = confdbstate.ReadConfdb
+
+	devicestateSignConfdbControl = (*devicestate.DeviceManager).SignConfdbControl
 )
 
 func ensureStateSoonImpl(st *state.State) {
@@ -172,7 +230,9 @@ func ensureStateSoonImpl(st *state.State) {
 
 var ensureStateSoon = ensureStateSoonImpl
 
-func newChange(st *state.State, kind, summary string, tsets []*state.TaskSet, snapNames []string) *state.Change {
+var newChange = newChangeImpl
+
+func newChangeImpl(st *state.State, kind, summary string, tsets []*state.TaskSet, snapNames []string) *state.Change {
 	chg := st.NewChange(kind, summary)
 	for _, ts := range tsets {
 		chg.AddAll(ts)

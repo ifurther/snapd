@@ -20,17 +20,18 @@
 package snapenv
 
 import (
+	"bufio"
 	"fmt"
 	"os"
-	"os/user"
 	"path/filepath"
+	"strings"
 
 	"github.com/snapcore/snapd/arch"
 	"github.com/snapcore/snapd/dirs"
-	"github.com/snapcore/snapd/features"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/osutil/sys"
+	"github.com/snapcore/snapd/osutil/user"
 	"github.com/snapcore/snapd/snap"
 )
 
@@ -47,24 +48,57 @@ var userCurrent = user.Current
 //
 // It ensures all SNAP_* override any pre-existing environment
 // variables.
-func ExtendEnvForRun(env osutil.Environment, info *snap.Info, opts *dirs.SnapDirOptions) {
+func ExtendEnvForRun(env osutil.Environment, info *snap.Info, app *snap.AppInfo, component *snap.ComponentInfo, opts *dirs.SnapDirOptions) {
 	// Set various SNAP_ environment variables as well as some non-SNAP variables,
 	// depending on snap confinement mode. Note that this does not include environment
 	// set by snap-exec.
-	for k, v := range snapEnv(info, opts) {
+	for k, v := range snapEnv(info, app, component, opts) {
 		env[k] = v
 	}
 }
 
-func snapEnv(info *snap.Info, opts *dirs.SnapDirOptions) osutil.Environment {
+func snapEnv(info *snap.Info, app *snap.AppInfo, component *snap.ComponentInfo, opts *dirs.SnapDirOptions) osutil.Environment {
 	// Environment variables with basic properties of a snap.
 	env := basicEnv(info)
+
+	if app != nil {
+		for k, v := range appEnv(info, app) {
+			env[k] = v
+		}
+	}
+
+	if component != nil {
+		for k, v := range componentEnv(info, component) {
+			env[k] = v
+		}
+	}
+
 	if usr, err := userCurrent(); err == nil && usr.HomeDir != "" {
 		// Environment variables with values specific to the calling user.
 		for k, v := range userEnv(info, usr.HomeDir, opts) {
 			env[k] = v
 		}
 	}
+	return env
+}
+
+func componentEnv(info *snap.Info, component *snap.ComponentInfo) osutil.Environment {
+	env := osutil.Environment{
+		// this uses dirs.CoreSnapMountDir for the same reasons that it is used
+		// to set SNAP in basicEnv, see comment there for more details
+		"SNAP_COMPONENT": filepath.Join(
+			dirs.CoreSnapMountDir,
+			info.SnapName().String(),
+			"components",
+			"mnt",
+			component.Component.ComponentName,
+			component.Revision.String(),
+		),
+		"SNAP_COMPONENT_NAME":     component.FullName(),
+		"SNAP_COMPONENT_VERSION":  component.Version(info.Version),
+		"SNAP_COMPONENT_REVISION": component.Revision.String(),
+	}
+
 	return env
 }
 
@@ -84,32 +118,111 @@ func basicEnv(info *snap.Info) osutil.Environment {
 		// environment of each snap instance appear as if it's the only
 		// snap, i.e. SNAP paths point to the same locations within the
 		// mount namespace
-		"SNAP":               filepath.Join(dirs.CoreSnapMountDir, info.SnapName(), info.Revision.String()),
-		"SNAP_COMMON":        snap.CommonDataDir(info.SnapName()),
-		"SNAP_DATA":          snap.DataDir(info.SnapName(), info.Revision),
-		"SNAP_NAME":          info.SnapName(),
-		"SNAP_INSTANCE_NAME": info.InstanceName(),
+		"SNAP":               filepath.Join(dirs.CoreSnapMountDir, info.SnapName().String(), info.Revision.String()),
+		"SNAP_COMMON":        snap.CommonDataDir(info.SnapName().String()),
+		"SNAP_DATA":          snap.DataDir(info.SnapName().String(), info.Revision),
+		"SNAP_NAME":          info.SnapName().String(),
+		"SNAP_INSTANCE_NAME": info.InstanceName().String(),
 		"SNAP_INSTANCE_KEY":  info.InstanceKey,
 		"SNAP_VERSION":       info.Version,
 		"SNAP_REVISION":      info.Revision.String(),
 		"SNAP_ARCH":          arch.DpkgArchitecture(),
-		// see https://github.com/snapcore/snapd/pull/2732#pullrequestreview-18827193
-		"SNAP_LIBRARY_PATH": "/var/lib/snapd/lib/gl:/var/lib/snapd/lib/gl32:/var/lib/snapd/void",
-		"SNAP_REEXEC":       os.Getenv("SNAP_REEXEC"),
+		"SNAP_LIBRARY_PATH":  buildLibPath(),
+		"SNAP_REEXEC":        os.Getenv("SNAP_REEXEC"),
 		// these two environment variables match what BASH does, but with SNAP prefix.
 		"SNAP_UID":  fmt.Sprint(sys.Getuid()),
 		"SNAP_EUID": fmt.Sprint(sys.Geteuid()),
 	}
 
+	if len(info.Components) > 0 {
+		env["SNAP_COMPONENTS"] = filepath.Join(dirs.CoreSnapMountDir, info.SnapName().String(),
+			"components", info.Revision.String())
+	}
+
 	// Add the ubuntu-save specific environment variable if
 	// the snap folder exists in the save directory.
-	if exists, isDir, err := osutil.DirExists(snap.CommonDataSaveDir(info.InstanceName())); err == nil && exists && isDir {
-		env["SNAP_SAVE_DATA"] = snap.CommonDataSaveDir(info.InstanceName())
+	if exists, isDir, err := osutil.DirExists(snap.CommonDataSaveDir(info.InstanceName().String())); err == nil && exists && isDir {
+		env["SNAP_SAVE_DATA"] = snap.CommonDataSaveDir(info.InstanceName().String())
 	} else if err != nil {
 		logger.Noticef("cannot determine existence of save data directory for snap %q: %v",
 			info.InstanceName(), err)
 	}
+
 	return env
+}
+
+// appEnv returns the app-level environment variables for a snap.
+func appEnv(info *snap.Info, app *snap.AppInfo) osutil.Environment {
+	env := osutil.Environment{
+		"SNAP_APP_NAME": app.Name,
+	}
+
+	if app.CommonID != "" {
+		env["SNAP_APP_COMMON_ID"] = app.CommonID
+	}
+	if df := app.DesktopFile(); df != "" && osutil.FileExists(df) {
+		env["SNAP_APP_DESKTOP_FILE"] = df
+	}
+	if app.BusName != "" {
+		env["SNAP_APP_BUS_NAME"] = app.BusName
+	}
+
+	return env
+}
+
+func buildLibPath() string {
+	// SNAP_LIBRARY_PATH points to graphics libraries that are in the
+	// system and are exposed to snaps. This happens only in classic
+	// systems. Currently only snaps connected to the opengl interface can
+	// use these libraries (the interface provides the necessary apparmor
+	// permissions).
+	sourceFiles := []string{}
+	for _, iface := range []string{"egl-driver-libs", "gbm-driver-libs", "cuda-driver-libs",
+		"nvidia-video-driver-libs", "opengl-driver-libs", "opengles-driver-libs",
+		"vulkan-driver-libs"} {
+		sourcesGlob := filepath.Join(dirs.SnapExportDirUnder(dirs.GlobalRootDir),
+			"system_*_"+iface+".library-source")
+		// Only possible error is a malformed pattern
+		ifaceFiles, _ := filepath.Glob(sourcesGlob)
+		sourceFiles = append(sourceFiles, ifaceFiles...)
+	}
+	libPaths := []string{}
+	snapDirs := make(map[string]bool)
+	for _, path := range sourceFiles {
+		logger.Debugf("opening source file %q", path)
+		file, err := os.Open(path)
+		if err != nil {
+			logger.Noticef("while opening %q: %v", path, err)
+			continue
+		}
+		defer file.Close()
+
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			snapDir := scanner.Text()
+			snapDir = strings.TrimPrefix(snapDir, "/snap")
+			// Avoid duplicates
+			if _, ok := snapDirs[snapDir]; ok {
+				continue
+			}
+			snapDirs[snapDir] = true
+			// Exported paths are bind mounted to the export libs directory.
+			libPaths = append(libPaths, filepath.Join(
+				dirs.SnapExportLibDirUnder(dirs.GlobalRootDir), "system/gpu", snapDir))
+		}
+
+		if err := scanner.Err(); err != nil {
+			logger.Noticef("while reading %q: %v", path, err)
+		}
+	}
+	snapLibPath := "/var/lib/snapd/lib/gl:/var/lib/snapd/lib/gl32"
+	// If we have libPaths, Nvidia libraries are provided by snaps and we
+	// do not use the gl/gl32 folders used if libs are provided by debian
+	// packages.
+	if len(libPaths) > 0 {
+		snapLibPath = strings.Join(libPaths, ":")
+	}
+	return snapLibPath
 }
 
 // userEnv returns the user-level environment variables for a snap.
@@ -127,13 +240,7 @@ func userEnv(info *snap.Info, home string, opts *dirs.SnapDirOptions) osutil.Env
 		"SNAP_USER_COMMON": info.UserCommonDataDir(home, opts),
 		"SNAP_USER_DATA":   info.UserDataDir(home, opts),
 	}
-	if info.NeedsClassic() {
-		// Snaps using classic confinement don't have an override for
-		// HOME but may have an override for XDG_RUNTIME_DIR.
-		if !features.ClassicPreservesXdgRuntimeDir.IsEnabled() {
-			env["XDG_RUNTIME_DIR"] = info.UserXdgRuntimeDir(sys.Geteuid())
-		}
-	} else {
+	if !info.NeedsClassic() {
 		// Snaps using strict or devmode confinement get an override for both
 		// HOME and XDG_RUNTIME_DIR.
 		env["HOME"] = info.UserDataDir(home, opts)

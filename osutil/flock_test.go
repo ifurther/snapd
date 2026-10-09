@@ -21,11 +21,9 @@ package osutil_test
 
 import (
 	"bytes"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"time"
 
 	. "gopkg.in/check.v1"
 
@@ -76,6 +74,19 @@ func (s *flockSuite) TestNewFileLockWithMode(c *C) {
 func (s *flockSuite) TestNewFileLock(c *C) {
 	lock, err := osutil.NewFileLock(filepath.Join(c.MkDir(), "name"))
 	c.Assert(err, IsNil)
+	defer lock.Close()
+
+	fi, err := os.Stat(lock.Path())
+	c.Assert(err, IsNil)
+	c.Assert(fi.Mode().Perm(), Equals, os.FileMode(0600))
+}
+
+// Test that opening and closing a lock works as expected, and that the mode is right.
+func (s *flockSuite) TestNewFileLockWithFile(c *C) {
+	myfile, err := os.OpenFile(filepath.Join(c.MkDir(), "name"), os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+	c.Assert(err, IsNil)
+
+	lock := osutil.NewFileLockWithFile(myfile)
 	defer lock.Close()
 
 	fi, err := os.Stat(lock.Path())
@@ -206,27 +217,13 @@ func (s *flockSuite) TestUsingClosedLock(c *C) {
 
 // Test that non-blocking locking reports error on pre-acquired lock.
 func (s *flockSuite) TestLockUnlockNonblockingWorks(c *C) {
-	// Use the "flock" command to grab a lock for 9999 seconds in another process.
 	lockPath := filepath.Join(c.MkDir(), "lock")
-	sleeperKillerPath := filepath.Join(c.MkDir(), "pid")
-	// we can't use --no-fork because we still support 14.04
-	cmd := exec.Command("flock", "--exclusive", lockPath, "-c", fmt.Sprintf(`echo "kill $$" > %s && exec sleep 30`, sleeperKillerPath))
 
-	// flock uses the env variable 'SHELL' to run the passed in command. a non-posix
-	// shell will not understand $$. we can force flock to use its default by unsetting
-	// the variable
-	cmd.Env = append(cmd.Env, "SHELL=")
-
-	c.Assert(cmd.Start(), IsNil)
-	defer func() { exec.Command("/bin/sh", sleeperKillerPath).Run() }()
-
-	// Give flock some chance to create the lock file.
-	for i := 0; i < 10; i++ {
-		if osutil.FileExists(lockPath) {
-			break
-		}
-		time.Sleep(time.Millisecond * 300)
-	}
+	// Acquire the lock.
+	lockTaken, err := osutil.NewFileLock(lockPath)
+	c.Assert(err, IsNil)
+	defer lockTaken.Close()
+	c.Assert(lockTaken.Lock(), IsNil)
 
 	// Try to acquire the same lock file and see that it is busy.
 	lock, err := osutil.NewFileLock(lockPath)
@@ -235,4 +232,10 @@ func (s *flockSuite) TestLockUnlockNonblockingWorks(c *C) {
 	defer lock.Close()
 
 	c.Assert(lock.TryLock(), Equals, osutil.ErrAlreadyLocked)
+
+	// Close the file, releasing the lock.
+	lockTaken.Close()
+
+	// Non blocking lock is successful.
+	c.Assert(lock.TryLock(), IsNil)
 }

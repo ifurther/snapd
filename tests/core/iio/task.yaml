@@ -9,14 +9,14 @@ details: |
     that, after a snap declared a iio plug is installed and connected, it can
     access the node and read/write its content.
 
-systems: [ubuntu-core-16-64]
+systems: [ubuntu-core-*-64]
+
+skip:
+    - reason: This test needs test keys to be trusted
+      if: |
+        [ "$TRUST_TEST_KEYS" = "false" ]
 
 prepare: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
-
     # Mock IIO device node and give it some content we can verify
     # the test snap can read.
     echo "iio-0" > /dev/iio:device0
@@ -28,18 +28,9 @@ prepare: |
     snap connect iio-consumer:iio core:iio0
 
 restore: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
     rm -f /dev/iio:device0
 
 execute: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
-
     echo "Checks the snap can read from the IIO device node"
     SNAP_MOUNT_DIR="$(os.paths snap-mount-dir)"
     test "$("$SNAP_MOUNT_DIR"/bin/iio-consumer.read)" = "iio-0"

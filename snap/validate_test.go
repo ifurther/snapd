@@ -204,6 +204,15 @@ func (s *ValidateSuite) TestValidateAppSocketsMissingNetworkBindPlug(c *C) {
 		`"network-bind" interface plug is required when sockets are used`)
 }
 
+func (s *ValidateSuite) TestValidateAppSocketsClassic(c *C) {
+	app := createSampleApp()
+	// no network-bind but the snap is classic
+	app.Snap.Confinement = ClassicConfinement
+	delete(app.Plugs, "network-bind")
+	err := ValidateApp(app)
+	c.Assert(err, IsNil)
+}
+
 func (s *ValidateSuite) TestValidateAppSocketsEmptyListenStream(c *C) {
 	app := createSampleApp()
 	app.Sockets["sock"].ListenStream = ""
@@ -302,6 +311,20 @@ func (s *ValidateSuite) TestValidateAppSocketsInvalidListenStreamAbstractSocket(
 		err := ValidateApp(app)
 		c.Assert(err, ErrorMatches, `invalid definition of socket "sock": path for "listen-stream" must be prefixed with.*`)
 	}
+}
+
+func (s *ValidateSuite) TestValidateAppSocketsAbstractSocketParallelInstanceUsesSnapNamePrefix(c *C) {
+	app := createSampleApp()
+	app.Snap.InstanceKey = "inst1"
+	socket := app.Sockets["sock"]
+
+	socket.ListenStream = "@snap.mysnap.my.socket"
+	err := ValidateApp(app)
+	c.Assert(err, IsNil)
+
+	socket.ListenStream = "@snap.mysnap_inst1.my.socket"
+	err = ValidateApp(app)
+	c.Assert(err, ErrorMatches, `invalid definition of socket "sock": path for "listen-stream" must be prefixed with.*`)
 }
 
 func (s *ValidateSuite) TestValidateAppSocketsInvalidListenStreamAddress(c *C) {
@@ -782,7 +805,7 @@ version: 1.0
 	c.Assert(Validate(info), IsNil)
 }
 
-func (s *ValidateSuite) TestIllegalHookName(c *C) {
+func (s *ValidateSuite) TestValidateHookName(c *C) {
 	hookType := NewHookType(regexp.MustCompile(".*"))
 	restore := MockSupportedHookTypes([]*HookType{hookType})
 	defer restore()
@@ -798,7 +821,83 @@ hooks:
 	c.Check(err, ErrorMatches, `invalid hook name: "123abc"`)
 }
 
-func (s *ValidateSuite) TestIllegalHookDefaultConfigureWithoutConfigure(c *C) {
+func (s *ValidateSuite) TestValidateHookSnapdBaseOSWithConfigureHooksError(c *C) {
+	testMap := map[string]struct {
+		snapType  string
+		hasDflt   bool
+		hasConf   bool
+		allowConf bool
+	}{
+		"snapd-both":      {"snapd", true, true, false},
+		"snapd-dflt-only": {"snapd", true, false, false},
+		"snapd-conf-only": {"snapd", false, true, false},
+		"base-both":       {"base", true, true, false},
+		"os-both":         {"os", true, true, true},
+		"os-dflt-only":    {"os", true, false, false},
+	}
+
+	var snapYaml []byte
+	for name, test := range testMap {
+		var dfltDef, confDef string
+		if test.hasDflt {
+			dfltDef = "default-configure:"
+		}
+		if test.hasConf {
+			confDef = "configure:"
+		}
+		snapYaml = []byte(fmt.Sprintf(`name: %[1]s
+version: 1.0
+hooks:
+  %[2]s
+  %[3]s
+type: %[1]s`, test.snapType, dfltDef, confDef))
+		info, err := InfoFromSnapYaml(snapYaml)
+		c.Assert(err, IsNil)
+		err = Validate(info)
+		var invalidHooks []string
+		if test.hasDflt {
+			invalidHooks = append(invalidHooks, `"default-configure"`)
+		}
+		if test.hasConf && !test.allowConf {
+			invalidHooks = append(invalidHooks, `"configure"`)
+		}
+		c.Check(err, ErrorMatches, fmt.Sprintf(`cannot specify %s hook for %[2]q snap %[2]q`,
+			strings.Join(invalidHooks, " or "), test.snapType), Commentf("Failed test: %s", name))
+	}
+}
+
+func (s *ValidateSuite) TestValidateHookKernelGadgetOSAppWithConfigureHookHappy(c *C) {
+	var snapYaml []byte
+	for _, snapType := range []string{"kernel", "gadget", "os", "app"} {
+		snapYaml = []byte(fmt.Sprintf(`name: %[1]s
+version: 1.0
+hooks:
+  configure:
+type: %[1]s`, snapType))
+		info, err := InfoFromSnapYaml(snapYaml)
+		c.Assert(err, IsNil)
+		err = Validate(info)
+		c.Assert(err, IsNil)
+	}
+}
+
+func (s *ValidateSuite) TestValidateHookKernelGadgetAppWithDefaultConfigureHookHappy(c *C) {
+	var snapYaml []byte
+	for _, snapType := range []string{"kernel", "gadget", "app"} {
+		snapYaml = []byte(fmt.Sprintf(`name: %[1]s
+version: 1.0
+hooks:
+  default-configure:
+  configure:
+type: %[1]s`, snapType))
+		info, err := InfoFromSnapYaml(snapYaml)
+		c.Assert(err, IsNil)
+		err = Validate(info)
+		c.Assert(err, IsNil)
+	}
+}
+
+func (s *ValidateSuite) TestValidateHookDefaultConfigureWithoutConfigureError(c *C) {
 	info, err := InfoFromSnapYaml([]byte(`name: foo
 version: 1.0
 hooks:
@@ -1672,7 +1771,7 @@ base: bar
 	c.Assert(err, IsNil)
 
 	err = Validate(info)
-	c.Check(err, ErrorMatches, `cannot have "base" field on "os" snap "foo"`)
+	c.Check(err, ErrorMatches, `cannot have "base" field with value other than "none" on "os" snap "foo"`)
 }
 
 func (s *ValidateSuite) TestValidateOsCanHaveBaseNone(c *C) {
@@ -1716,7 +1815,7 @@ base: bar
 	c.Assert(err, IsNil)
 
 	err = Validate(info)
-	c.Check(err, ErrorMatches, `cannot have "base" field on "base" snap "foo"`)
+	c.Check(err, ErrorMatches, `cannot have "base" field with value other than "none" on "base" snap "foo"`)
 }
 
 func (s *ValidateSuite) TestValidateBaseCanHaveBaseNone(c *C) {
@@ -1916,6 +2015,80 @@ apps:
 		name: "negative restart-delay",
 		desc: fooNegativeDelay,
 		err:  `restart-delay cannot be negative`,
+	}}
+	for _, tc := range tcs {
+		c.Logf("trying %q", tc.name)
+		info, err := InfoFromSnapYaml(append(meta, tc.desc...))
+		c.Assert(err, IsNil)
+		c.Assert(info, NotNil)
+
+		err = Validate(info)
+		if tc.err != "" {
+			c.Assert(err, ErrorMatches, `invalid definition of application "foo": `+tc.err)
+		} else {
+			c.Assert(err, IsNil)
+		}
+	}
+}
+
+func (s *ValidateSuite) TestValidateAppSuccessExitStatus(c *C) {
+	meta := []byte(`
+name: foo
+version: 1.0
+`)
+	fooAllGood := []byte(`
+apps:
+  foo:
+    daemon: simple
+    success-exit-status: [42, 250]
+`)
+	fooSuccessExitStatusNotADaemon := []byte(`
+apps:
+  foo:
+    success-exit-status: [0, 1]
+`)
+	fooSuccessExitStatusEmpty := []byte(`
+apps:
+  foo:
+    daemon: simple
+    success-exit-status: [""]
+`)
+	fooSuccessExitStatusCodeOutOfRange := []byte(`
+apps:
+  foo:
+    daemon: simple
+    success-exit-status: [400]
+`)
+	fooSuccessExitStatusWrongName := []byte(`
+apps:
+  foo:
+    daemon: simple
+    success-exit-status: [bar]
+`)
+
+	tcs := []struct {
+		name string
+		desc []byte
+		err  string
+	}{{
+		name: "foo success-exit-status all good",
+		desc: fooAllGood,
+	}, {
+		name: "foo success-exit-status but not a service",
+		desc: fooSuccessExitStatusNotADaemon,
+		err:  `success exit status is only applicable to services`,
+	}, {
+		name: "foo success-exit-status with empty value",
+		desc: fooSuccessExitStatusEmpty,
+		err:  `exit code must be an integer in range 1 to 255`,
+	}, {
+		name: "foo success-exit-status with status code out of range",
+		desc: fooSuccessExitStatusCodeOutOfRange,
+		err:  `exit code must be an integer in range 1 to 255`,
+	}, {
+		name: "foo success-exit-status with wrong status name",
+		desc: fooSuccessExitStatusWrongName,
+		err:  `exit code must be an integer in range 1 to 255`,
 	}}
 	for _, tc := range tcs {
 		c.Logf("trying %q", tc.name)
@@ -2248,19 +2421,19 @@ func (s *ValidateSuite) TestSimplePrereqTracker(c *C) {
 		Snap:      info,
 		Name:      "sound-themes",
 		Interface: "content",
-		Attrs:     map[string]interface{}{"default-provider": "common-themes", "content": "foo"},
+		Attrs:     map[string]any{"default-provider": "common-themes", "content": "foo"},
 	}
 	info.Plugs["bar"] = &PlugInfo{
 		Snap:      info,
 		Name:      "visual-themes",
 		Interface: "content",
-		Attrs:     map[string]interface{}{"default-provider": "common-themes", "content": "bar"},
+		Attrs:     map[string]any{"default-provider": "common-themes", "content": "bar"},
 	}
 	info.Plugs["baz"] = &PlugInfo{
 		Snap:      info,
 		Name:      "not-themes",
 		Interface: "content",
-		Attrs:     map[string]interface{}{"default-provider": "some-snap", "content": "baz"},
+		Attrs:     map[string]any{"default-provider": "some-snap", "content": "baz"},
 	}
 	info.Plugs["qux"] = &PlugInfo{Snap: info, Interface: "not-content"}
 
@@ -2277,15 +2450,20 @@ func (s *ValidateSuite) TestSimplePrereqTracker(c *C) {
 		c.Assert(repo.AddInterface(i), IsNil)
 	}
 
-	slotSnap := &Info{SuggestedName: "slot-snap"}
+	slotSnap := &Info{SuggestedName: "slot-snap", Slots: map[string]*SlotInfo{}, Version: "1"}
 	barSlot := &SlotInfo{
 		Snap:      slotSnap,
 		Name:      "visual-themes",
 		Interface: "content",
-		Attrs:     map[string]interface{}{"content": "bar"},
+		Attrs:     map[string]any{"content": "bar"},
 	}
-	err := repo.AddSlot(barSlot)
+	slotSnap.Slots["visual-themes"] = barSlot
+
+	slotSnapAppSet, err := interfaces.NewSnapAppSet(slotSnap, nil)
 	c.Assert(err, IsNil)
+	err = repo.AddAppSet(slotSnapAppSet)
+	c.Assert(err, IsNil)
+
 	providerContentAttrs = prqt.MissingProviderContentTags(info, repo)
 	c.Check(providerContentAttrs, HasLen, 2)
 	c.Check(providerContentAttrs["common-themes"], DeepEquals, []string{"foo"})
@@ -2296,7 +2474,7 @@ func (s *ValidateSuite) TestSimplePrereqTracker(c *C) {
 		Snap:      slotSnap,
 		Name:      "sound-themes",
 		Interface: "content",
-		Attrs:     map[string]interface{}{"content": "foo"},
+		Attrs:     map[string]any{"content": "foo"},
 	}
 	err = repo.AddSlot(fooSlot)
 	c.Assert(err, IsNil)
@@ -2589,11 +2767,11 @@ func (s *ValidateSuite) TestValidateComponentNames(c *C) {
 version: 1.0
 components:
   comp-1:
-    type: test
+    type: standard
     summary: short summary
     description: some loooong description
   comp-long123-1-name:
-    type: test
+    type: standard
 `))
 	c.Assert(err, IsNil)
 
@@ -2606,7 +2784,7 @@ func (s *ValidateSuite) TestDetectInvalidComponentName(c *C) {
 version: 1.0
 components:
   comp_1:
-    type: test
+    type: standard
 `))
 	c.Assert(err, IsNil)
 
@@ -2619,7 +2797,7 @@ func (s *ValidateSuite) TestDetectInvalidComponentTextFields(c *C) {
 version: 1.0
 components:
   comp1:
-    type: test
+    type: standard
     %s: %s
 `
 
@@ -2641,7 +2819,7 @@ func (s *ValidateSuite) TestDetectInvalidComponentHooks(c *C) {
 version: 1.0
 components:
   test:
-    type: test
+    type: standard
     hooks:
       install:
         command-chain: [">_>"]
@@ -2650,4 +2828,157 @@ components:
 
 	err = Validate(info)
 	c.Check(err, ErrorMatches, `hook command-chain contains illegal.*`)
+}
+
+func (s *ValidateSuite) TestValidateGpioChardev(c *C) {
+	info, err := InfoFromSnapYaml([]byte(`name: foo
+version: 0
+type: gadget
+slots:
+  gpio-chardev-0:
+    interface: gpio-chardev
+    source-chip: [chip0]
+    lines: 4,1-3,5
+  gpio-chardev-1:
+    interface: gpio-chardev
+    source-chip: [chip1]
+    lines: 4,1-3,5
+  # unrelated slot
+  dbus-slot:
+`))
+	c.Assert(err, IsNil)
+
+	err = Validate(info)
+	c.Check(err, IsNil)
+}
+
+func (s *ValidateSuite) TestValidateGpioChardevInvalidLines(c *C) {
+	info, err := InfoFromSnapYaml([]byte(`name: foo
+version: 0
+type: gadget
+slots:
+  gpio-chardev:
+    source-chip: [chip0]
+    lines: 2-1
+`))
+	c.Assert(err, IsNil)
+
+	err = Validate(info)
+	c.Check(err, ErrorMatches, `invalid "lines" attribute found in slot "gpio-chardev": invalid range span "2-1": ends before it starts`)
+}
+
+func (s *ValidateSuite) TestValidateGpioChardevOverlappingLines(c *C) {
+	info, err := InfoFromSnapYaml([]byte(`name: foo
+version: 0
+type: gadget
+slots:
+  gpio-chardev-0:
+    interface: gpio-chardev
+    source-chip: [chip0]
+    lines: 4,1-3,5
+  gpio-chardev-1:
+    interface: gpio-chardev
+    source-chip: [chip0]
+    lines: "2"
+  gpio-chardev-2:
+    interface: gpio-chardev
+    source-chip: [chip1]
+    lines: 1,2
+  gpio-chardev-3:
+    interface: gpio-chardev
+    source-chip: [chip1]
+    lines: 1,2
+`))
+	c.Assert(err, IsNil)
+
+	expectedErrs := []string{
+		`invalid "lines" attribute: chip "chip0" has reused conflicting line spans: "2" in slot "gpio-chardev-1" conflicts with "1-3" in slot "gpio-chardev-0"`,
+		`invalid "lines" attribute: chip "chip1" has reused conflicting line spans: "1" in slot "gpio-chardev-3" conflicts with "1" in slot "gpio-chardev-2"`,
+		`invalid "lines" attribute: chip "chip1" has reused conflicting line spans: "2" in slot "gpio-chardev-3" conflicts with "2" in slot "gpio-chardev-2"`,
+	}
+
+	err = Validate(info)
+	c.Check(err, ErrorMatches, strings.Join(expectedErrs, "\n"))
+}
+
+func (s *ValidateSuite) TestValidateUbuntuCoreTracksOnSnapd(c *C) {
+	info, err := InfoFromSnapYaml([]byte(`
+name: snapd
+version: 1.0
+snapd-info:
+  ubuntu-core-tracks:
+    "18":
+      latest: "18"
+`))
+	c.Assert(err, IsNil)
+	c.Check(Validate(info), IsNil)
+}
+
+func (s *ValidateSuite) TestValidateUbuntuCoreTracksEmptyOnSnapd(c *C) {
+	for _, yaml := range []string{
+		`
+name: snapd
+version: 1.0
+snapd-info: {}
+`,
+		`
+name: snapd
+version: 1.0
+snapd-info:
+  ubuntu-core-tracks: {}
+`,
+	} {
+		info, err := InfoFromSnapYaml([]byte(yaml))
+		c.Assert(err, IsNil, Commentf("yaml=%s", yaml))
+		c.Check(Validate(info), IsNil, Commentf("yaml=%s", yaml))
+	}
+}
+
+func (s *ValidateSuite) TestValidateUbuntuCoreTracksExtraKeyOnSnapd(c *C) {
+	info, err := InfoFromSnapYaml([]byte(`
+name: snapd
+version: 1.0
+snapd-info:
+  other-policy: {foo: bar}
+  ubuntu-core-tracks:
+    "18":
+      latest: "18"
+`))
+	c.Assert(err, IsNil)
+	c.Check(Validate(info), IsNil)
+}
+
+func (s *ValidateSuite) TestValidateUbuntuCoreTracksConstructedOnApp(c *C) {
+	info, err := InfoFromSnapYaml([]byte(`
+name: foo
+version: 1.0
+`))
+	c.Assert(err, IsNil)
+	info.UbuntuCoreTracks = UbuntuCoreTracks{
+		"18": {"latest": "18"},
+	}
+	c.Check(Validate(info), ErrorMatches, `cannot specify snapd-info except on the snapd snap`)
+}
+
+func (s *ValidateSuite) TestValidateUbuntuCoreTracksConstructedInvalid(c *C) {
+	info, err := InfoFromSnapYaml([]byte(`
+name: snapd
+version: 1.0
+`))
+	c.Assert(err, IsNil)
+	info.UbuntuCoreTracks = UbuntuCoreTracks{
+		"18": {"latest": "18/stable"},
+	}
+	c.Check(Validate(info), ErrorMatches, `invalid ubuntu-core-tracks: target track "18/stable" for boot base 18 is not a track-only channel`)
+
+	info.UbuntuCoreTracks = UbuntuCoreTracks{
+		"18": {},
+	}
+	c.Check(Validate(info), ErrorMatches, `invalid ubuntu-core-tracks: empty track map for boot base 18`)
+
+	// such a key would never be found by uctrack.Resolve
+	info.UbuntuCoreTracks = UbuntuCoreTracks{
+		"018": {"latest": "18"},
+	}
+	c.Check(Validate(info), ErrorMatches, `invalid ubuntu-core-tracks: boot base "018" is not a plain Ubuntu Core version number`)
 }

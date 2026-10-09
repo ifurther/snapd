@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2022-2023 Canonical Ltd
+ * Copyright (C) 2022-2026 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -33,6 +33,7 @@ import (
 
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/sandbox/apparmor"
+	"github.com/snapcore/snapd/snap/channel"
 	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/spdx"
 	"github.com/snapcore/snapd/strutil"
@@ -171,6 +172,24 @@ func validateHooks(info *Info) error {
 
 	hasDefaultConfigureHook := info.Hooks["default-configure"] != nil
 	hasConfigureHook := info.Hooks["configure"] != nil
+
+	if info.SnapType == TypeSnapd || info.SnapType == TypeBase || info.SnapType == TypeOS {
+		var invalidHooks []string
+		if hasDefaultConfigureHook {
+			invalidHooks = append(invalidHooks, `"default-configure"`)
+		}
+		if hasConfigureHook && info.SnapType != TypeOS {
+			invalidHooks = append(invalidHooks, `"configure"`)
+		}
+		if len(invalidHooks) > 0 {
+			// The default-configure hook is not supported for snapd, base or OS snaps.
+			// The configure hook is also not supported for snapd and base snaps. While
+			// it is not required for OS snaps (core and ubuntu-core), it is tolerated
+			// to prevent errors due to existing configure hooks.
+			return fmt.Errorf("cannot specify %s hook for %q snap %q", strings.Join(invalidHooks, " or "), info.Type(), info.InstanceName())
+		}
+	}
+
 	if hasDefaultConfigureHook && !hasConfigureHook {
 		return fmt.Errorf(`cannot specify "default-configure" hook without "configure" hook`)
 	}
@@ -333,6 +352,84 @@ func validateProvenance(prov string) error {
 	return naming.ValidateProvenance(prov)
 }
 
+type gpioChipLinesOverlapError struct {
+	chip, slotA, slotB string
+	spanA, spanB       strutil.RangeSpan
+}
+
+func (e *gpioChipLinesOverlapError) Error() string {
+	return fmt.Sprintf(`invalid "lines" attribute: chip %q has reused conflicting line spans: %q in slot %q conflicts with %q in slot %q`,
+		e.chip, e.spanB.String(), e.slotB, e.spanA.String(), e.slotA,
+	)
+}
+
+func validateGpioChardevSlots(info *Info) error {
+	if info.Type() != TypeGadget {
+		// not a gadget, nothing to do
+		return nil
+	}
+
+	type chipSlotInfo struct {
+		chip  string
+		slot  string
+		lines strutil.Range
+	}
+
+	chipSlots := make([]chipSlotInfo, 0)
+	for _, slot := range info.Slots {
+		if slot.Interface != "gpio-chardev" {
+			continue
+		}
+		var sourceChip []string
+		if err := slot.Attr("source-chip", &sourceChip); err != nil {
+			return err
+		}
+		var lines string
+		if err := slot.Attr("lines", &lines); err != nil {
+			return err
+		}
+		r, err := strutil.ParseRange(lines)
+		if err != nil {
+			return fmt.Errorf(`invalid "lines" attribute found in slot %q: %w`, slot.Name, err)
+		}
+		for _, chip := range sourceChip {
+			chipSlots = append(chipSlots, chipSlotInfo{
+				chip:  chip,
+				slot:  slot.Name,
+				lines: r,
+			})
+		}
+	}
+
+	sort.SliceStable(chipSlots, func(i, j int) bool {
+		return chipSlots[i].slot < chipSlots[j].slot
+	})
+
+	// detect line overlaps for every chip label across all gpio-chardev slots
+	var errs []error
+	for i, a := range chipSlots {
+		for _, b := range chipSlots[i+1:] {
+			if a.chip != b.chip {
+				continue
+			}
+
+			for _, spanA := range a.lines {
+				for _, spanB := range b.lines {
+					if spanA.Intersects(spanB) {
+						errs = append(errs, &gpioChipLinesOverlapError{
+							chip:  a.chip,
+							slotA: a.slot, spanA: spanA,
+							slotB: b.slot, spanB: spanB,
+						})
+					}
+				}
+			}
+		}
+	}
+
+	return strutil.JoinErrors(errs...)
+}
+
 // Validate verifies the content in the info.
 func Validate(info *Info) error {
 	name := info.InstanceName()
@@ -344,10 +441,10 @@ func Validate(info *Info) error {
 		return err
 	}
 
-	if err := ValidateName(info.SnapName()); err != nil {
+	if err := ValidateName(info.SnapName().String()); err != nil {
 		return err
 	}
-	if err := ValidateInstanceName(name); err != nil {
+	if err := ValidateInstanceName(name.String()); err != nil {
 		return err
 	}
 
@@ -429,6 +526,11 @@ func Validate(info *Info) error {
 		return err
 	}
 
+	// Ensure that any given gpio line is only be exported by one slot.
+	if err := validateGpioChardevSlots(info); err != nil {
+		return err
+	}
+
 	// Ensure that base field is valid
 	if err := ValidateBase(info); err != nil {
 		return err
@@ -449,7 +551,61 @@ func Validate(info *Info) error {
 		return err
 	}
 
+	if err := validateUbuntuCoreTracks(info.UbuntuCoreTracks, info.Type()); err != nil {
+		return err
+	}
+
 	return ValidateLayoutAll(info)
+}
+
+// validateUbuntuCoreTracks checks track maps. A non-empty map is only valid on the
+// snapd snap; an empty or nil map is valid on any type.
+func validateUbuntuCoreTracks(tracks UbuntuCoreTracks, typ Type) error {
+	if len(tracks) != 0 && typ != TypeSnapd {
+		return errSnapdInfoNotSnapd
+	}
+	for bootBase, redirects := range tracks {
+		if err := checkBootBaseKey(bootBase); err != nil {
+			return fmt.Errorf("invalid ubuntu-core-tracks: %v", err)
+		}
+		if err := checkUbuntuCoreTrackRedirects(bootBase, redirects); err != nil {
+			return fmt.Errorf("invalid ubuntu-core-tracks: %v", err)
+		}
+	}
+	return nil
+}
+
+// checkBootBaseKey checks that bootBase is a plain Ubuntu Core version
+// number, as looked up by uctrack.Resolve. Accepting other spellings would
+// make "018" and "18" two keys that can never both be resolved.
+func checkBootBaseKey(bootBase string) error {
+	if bootBase == "" {
+		return errors.New("empty boot base")
+	}
+	n, err := strconv.Atoi(bootBase)
+	if err != nil {
+		return fmt.Errorf("cannot parse boot base %q: %v", bootBase, err)
+	}
+	if n <= 0 || strconv.Itoa(n) != bootBase {
+		return fmt.Errorf("boot base %q is not a plain Ubuntu Core version number", bootBase)
+	}
+	return nil
+}
+
+// checkUbuntuCoreTrackRedirects checks the from-and-to track pairs of a single boot base.
+func checkUbuntuCoreTrackRedirects(bootBase string, redirects map[string]string) error {
+	if len(redirects) == 0 {
+		return fmt.Errorf("empty track map for boot base %s", bootBase)
+	}
+	for input, target := range redirects {
+		if !channel.IsVerbatimTrackOnly(input) {
+			return fmt.Errorf("input track %q for boot base %s is not a track-only channel", input, bootBase)
+		}
+		if !channel.IsVerbatimTrackOnly(target) {
+			return fmt.Errorf("target track %q for boot base %s is not a track-only channel", target, bootBase)
+		}
+	}
+	return nil
 }
 
 // ValidateBase validates the base field.
@@ -457,7 +613,7 @@ func ValidateBase(info *Info) error {
 	// validate that bases do not have base fields
 	if info.Type() == TypeOS || info.Type() == TypeBase {
 		if info.Base != "" && info.Base != "none" {
-			return fmt.Errorf(`cannot have "base" field on %q snap %q`, info.Type(), info.InstanceName())
+			return fmt.Errorf(`cannot have "base" field with value other than "none" on %q snap %q`, info.Type(), info.InstanceName())
 		}
 	}
 
@@ -549,7 +705,7 @@ func ValidateLayoutAll(info *Info) error {
 	// Validate that layout are not attempting to define elements that normally
 	// come from other snaps. This is separate from the ValidateLayout below to
 	// simplify argument passing.
-	thisSnapMntDir := filepath.Join("/snap/", info.SnapName())
+	thisSnapMntDir := filepath.Join("/snap/", info.SnapName().String())
 	for _, path := range paths {
 		if strings.HasPrefix(path, "/snap/") && !strings.HasPrefix(path, thisSnapMntDir) {
 			return fmt.Errorf("layout %q defines a layout in space belonging to another snap", path)
@@ -712,6 +868,24 @@ func validateAppRestart(app *AppInfo) error {
 	return nil
 }
 
+func validateAppSuccessExitStatus(app *AppInfo) error {
+	if len(app.SuccessExitStatus) == 0 {
+		return nil
+	}
+
+	if !app.IsService() {
+		return errors.New("success exit status is only applicable to services")
+	}
+
+	for _, status := range app.SuccessExitStatus {
+		if code, err := strconv.Atoi(status); err != nil || code < 1 || code > 255 {
+			return fmt.Errorf("exit code must be an integer in range 1 to 255")
+		}
+	}
+
+	return nil
+}
+
 func validateAppActivatesOn(app *AppInfo) error {
 	if len(app.ActivatesOn) == 0 {
 		return nil
@@ -812,7 +986,7 @@ func ValidateApp(app *AppInfo) error {
 
 	// Socket activation requires the "network-bind" plug
 	if len(app.Sockets) > 0 {
-		if _, ok := app.Plugs["network-bind"]; !ok {
+		if _, ok := app.Plugs["network-bind"]; !ok && app.Snap.Confinement != ClassicConfinement {
 			return fmt.Errorf(`"network-bind" interface plug is required when sockets are used`)
 		}
 	}
@@ -838,6 +1012,10 @@ func ValidateApp(app *AppInfo) error {
 	}
 
 	if err := validateAppTimeouts(app); err != nil {
+		return err
+	}
+
+	if err := validateAppSuccessExitStatus(app); err != nil {
 		return err
 	}
 
@@ -1279,7 +1457,7 @@ func maybeContentPlug(plug *PlugInfo) (contentTag, defaultProviderSnap string) {
 // provider but the default-provider is missing and/or many slots
 // are available.
 type ProviderWarning struct {
-	Snap            string
+	Snap            naming.InstanceName
 	Plug            string
 	ContentTag      string
 	DefaultProvider string
@@ -1362,7 +1540,7 @@ func (prqt *SelfContainedSetPrereqTracker) Check() (warnings, errs []error) {
 			case 0:
 				errs = append(errs, fmt.Errorf("cannot use snap %q: default provider %q or any alternative provider for content %q is missing", info.InstanceName(), defaultProvider, wantedTag))
 			case 1:
-				if candSlots[0].Snap.InstanceName() == defaultProvider {
+				if candSlots[0].Snap.InstanceName().String() == defaultProvider {
 					continue
 				}
 				// XXX TODO: consider also publisher

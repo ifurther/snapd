@@ -20,10 +20,14 @@
 package daemon
 
 import (
+	"github.com/snapcore/snapd/client"
 	"github.com/snapcore/snapd/gadget"
+	"github.com/snapcore/snapd/gadget/device"
 	"github.com/snapcore/snapd/overlord/devicestate"
 	"github.com/snapcore/snapd/overlord/install"
 	"github.com/snapcore/snapd/overlord/state"
+	"github.com/snapcore/snapd/secboot"
+	"github.com/snapcore/snapd/secboot/keys"
 	"github.com/snapcore/snapd/testutil"
 )
 
@@ -39,32 +43,59 @@ type (
 	SystemsResponse = systemsResponse
 )
 
-func MockDeviceManagerSystemAndGadgetAndEncryptionInfo(f func(*devicestate.DeviceManager, string) (*devicestate.System, *gadget.Info, *install.EncryptionSupportInfo, error)) (restore func()) {
-	restore = testutil.Backup(&deviceManagerSystemAndGadgetAndEncryptionInfo)
-	deviceManagerSystemAndGadgetAndEncryptionInfo = f
-	return restore
+func MockDeviceManagerSystemAndGadgetAndEncryptionInfo(f func(
+	*devicestate.DeviceManager,
+	string,
+	bool,
+) (*devicestate.System, *gadget.Info, *install.EncryptionSupportInfo, error)) (restore func()) {
+	return testutil.Mock(&deviceManagerSystemAndGadgetAndEncryptionInfo, f)
 }
 
-func MockDevicestateInstallFinish(f func(*state.State, string, map[string]*gadget.Volume) (*state.Change, error)) (restore func()) {
-	restore = testutil.Backup(&devicestateInstallFinish)
-	devicestateInstallFinish = f
-	return restore
+func MockDeviceManagerApplyActionOnSystemAndGadgetAndEncryptionInfo(f func(
+	*devicestate.DeviceManager,
+	string,
+	*secboot.PreinstallAction,
+) (*devicestate.System, *gadget.Info, *install.EncryptionSupportInfo, error)) (restore func()) {
+	return testutil.Mock(&deviceManagerApplyActionOnSystemAndGadgetAndEncryptionInfo, f)
 }
 
-func MockDevicestateInstallSetupStorageEncryption(f func(*state.State, string, map[string]*gadget.Volume) (*state.Change, error)) (restore func()) {
-	restore = testutil.Backup(&devicestateInstallSetupStorageEncryption)
-	devicestateInstallSetupStorageEncryption = f
-	return restore
+func MockDeviceManagerRunningSystemAndGadgetAndEncryptionInfo(f func(
+	*devicestate.DeviceManager,
+) (*devicestate.System, *gadget.Info, *install.EncryptionSupportInfo, error)) (restore func()) {
+	return testutil.Mock(&deviceManagerRunningSystemAndGadgetAndEncryptionInfo, f)
+}
+
+func MockDeviceManagerApplyActionOnRunningSystemAndGadgetAndEncryptionInfo(f func(
+	*devicestate.DeviceManager,
+	*secboot.PreinstallAction,
+) (*devicestate.System, *gadget.Info, *install.EncryptionSupportInfo, error)) (restore func()) {
+	return testutil.Mock(&deviceManagerApplyActionOnRunningSystemAndGadgetAndEncryptionInfo, f)
+}
+
+func MockDevicestateInstallFinish(f func(*state.State, string, map[string]*gadget.Volume, *devicestate.OptionalContainers) (*state.Change, error)) (restore func()) {
+	return testutil.Mock(&devicestateInstallFinish, f)
+}
+
+func MockDevicestateInstallSetupStorageEncryption(f func(*state.State, string, map[string]*gadget.Volume, *device.VolumesAuthOptions, *client.KeyboardConfig) (*state.Change, error)) (restore func()) {
+	return testutil.Mock(&devicestateInstallSetupStorageEncryption, f)
 }
 
 func MockDevicestateCreateRecoverySystem(f func(*state.State, string, devicestate.CreateRecoverySystemOptions) (*state.Change, error)) (restore func()) {
-	restore = testutil.Backup(&devicestateCreateRecoverySystem)
-	devicestateCreateRecoverySystem = f
-	return restore
+	return testutil.Mock(&devicestateCreateRecoverySystem, f)
 }
 
 func MockDevicestateRemoveRecoverySystem(f func(*state.State, string) (*state.Change, error)) (restore func()) {
-	restore = testutil.Backup(&devicestateRemoveRecoverySystem)
-	devicestateRemoveRecoverySystem = f
-	return restore
+	return testutil.Mock(&devicestateRemoveRecoverySystem, f)
+}
+
+func MockDevicestateGeneratePreInstallRecoveryKey(f func(st *state.State, label string) (rkey keys.RecoveryKey, err error)) (restore func()) {
+	return testutil.Mock(&devicestateGeneratePreInstallRecoveryKey, f)
+}
+
+func MockDeviceCheckAuthQuality(f func(mode device.AuthMode, authVal string) (device.AuthQuality, error)) (restore func()) {
+	return testutil.Mock(&deviceCheckAuthQuality, f)
+}
+
+func MockDevicestateGenerateReprovisionRecoveryKey(f func(st *state.State) (rkey keys.RecoveryKey, err error)) (restore func()) {
+	return testutil.Mock(&devicestateGenerateReprovisionRecoveryKey, f)
 }

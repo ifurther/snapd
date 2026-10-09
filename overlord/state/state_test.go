@@ -120,6 +120,22 @@ func (ss *stateSuite) TestStrayTaskWithNoChange(c *C) {
 	c.Assert(st.TaskCount(), Equals, 2)
 }
 
+func (ss *stateSuite) TestAllTasksForTestsIncludesUnlinked(c *C) {
+	st := state.New(nil)
+	st.Lock()
+	defer st.Unlock()
+
+	chg := st.NewChange("change", "...")
+	t1 := st.NewTask("foo", "...")
+	chg.AddTask(t1)
+	t2 := st.NewTask("bar", "...")
+
+	allTasks := st.AllTasksForTests()
+	c.Assert(allTasks, HasLen, 2)
+	c.Check(allTasks, testutil.Contains, t1)
+	c.Check(allTasks, testutil.Contains, t2)
+}
+
 func (ss *stateSuite) TestSetPanic(c *C) {
 	st := state.New(nil)
 	st.Lock()
@@ -759,6 +775,8 @@ func (ss *stateSuite) TestMethodEntrance(c *C) {
 		func() { st.Warnf("hello") },
 		func() { st.OkayWarnings(time.Time{}) },
 		func() { st.UnshowAllWarnings() },
+		func() { st.AddNotice(nil, state.WarningNotice, "foo", nil) },
+		func() { st.DrainNotices(nil) },
 	}
 
 	reads := []func(){
@@ -772,9 +790,6 @@ func (ss *stateSuite) TestMethodEntrance(c *C) {
 		func() { st.MarshalJSON() },
 		func() { st.Prune(time.Now(), time.Hour, time.Hour, 100) },
 		func() { st.TaskCount() },
-		func() { st.AllWarnings() },
-		func() { st.PendingWarnings() },
-		func() { st.WarningsSummary() },
 	}
 
 	for i, f := range reads {
@@ -1132,12 +1147,13 @@ func (ss *stateSuite) TestTaskChangedHandler(c *C) {
 	defer st.Unlock()
 
 	var taskObservedChanges []taskAndStatus
-	oId := st.AddTaskStatusChangedHandler(func(t *state.Task, old, new state.Status) {
+	oId := st.AddTaskStatusChangedHandler(func(t *state.Task, old, new state.Status) bool {
 		taskObservedChanges = append(taskObservedChanges, taskAndStatus{
 			t:   t,
 			old: old,
 			new: new,
 		})
+		return false
 	})
 
 	t1 := st.NewTask("foo", "...")
@@ -1167,6 +1183,37 @@ func (ss *stateSuite) TestTaskChangedHandler(c *C) {
 			t:   t1,
 			old: state.DoingStatus,
 			new: state.DoneStatus,
+		},
+	})
+}
+
+func (ss *stateSuite) TestTaskChangedHandlerCanRemoveItself(c *C) {
+	st := state.New(nil)
+	st.Lock()
+	defer st.Unlock()
+
+	var transitions []taskAndStatus
+	st.AddTaskStatusChangedHandler(func(t *state.Task, old, new state.Status) bool {
+		transitions = append(transitions, taskAndStatus{t: t, old: old, new: new})
+		return new == state.ErrorStatus
+	})
+
+	t1 := st.NewTask("foo", "...")
+	t1.SetStatus(state.DoingStatus)
+	// should remove handler after this transition
+	t1.SetStatus(state.ErrorStatus)
+	t1.SetStatus(state.UndoneStatus)
+
+	c.Check(transitions, DeepEquals, []taskAndStatus{
+		{
+			t:   t1,
+			old: state.DefaultStatus,
+			new: state.DoingStatus,
+		},
+		{
+			t:   t1,
+			old: state.DoingStatus,
+			new: state.ErrorStatus,
 		},
 	})
 }

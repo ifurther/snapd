@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2014-2021 Canonical Ltd
+ * Copyright (C) 2014-2026 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -20,6 +20,7 @@
 package snap
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -47,25 +48,62 @@ type snapYaml struct {
 	Epoch           Epoch                    `yaml:"epoch,omitempty"`
 	Base            string                   `yaml:"base,omitempty"`
 	Confinement     ConfinementType          `yaml:"confinement,omitempty"`
+	Grade           GradeType                `yaml:"grade,omitempty"`
 	Environment     strutil.OrderedMap       `yaml:"environment,omitempty"`
-	Plugs           map[string]interface{}   `yaml:"plugs,omitempty"`
-	Slots           map[string]interface{}   `yaml:"slots,omitempty"`
+	Plugs           map[string]any           `yaml:"plugs,omitempty"`
+	Slots           map[string]any           `yaml:"slots,omitempty"`
 	Apps            map[string]appYaml       `yaml:"apps,omitempty"`
 	Hooks           map[string]hookYaml      `yaml:"hooks,omitempty"`
 	Layout          map[string]layoutYaml    `yaml:"layout,omitempty"`
-	SystemUsernames map[string]interface{}   `yaml:"system-usernames,omitempty"`
+	SystemUsernames map[string]any           `yaml:"system-usernames,omitempty"`
 	Links           map[string][]string      `yaml:"links,omitempty"`
 	Components      map[string]componentYaml `yaml:"components,omitempty"`
+	SnapdInfo       snapdInfoYaml            `yaml:"snapd-info,omitempty"`
+	// true if the snapd-info key was present
+	snapdInfoPresent bool
 
 	// TypoLayouts is used to detect the use of the incorrect plural form of "layout"
 	TypoLayouts typoDetector `yaml:"layouts,omitempty"`
 }
 
+// snapdInfoYaml is metadata that may only appear in the snapd snap. Unknown
+// keys alongside ubuntu-core-tracks are ignored, so the envelope can grow.
+type snapdInfoYaml struct {
+	UbuntuCoreTracks UbuntuCoreTracks `yaml:"ubuntu-core-tracks,omitempty"`
+}
+
+const snapdInfoKey = "snapd-info"
+
+type ignored struct{}
+
+// UnmarshalYAML skips the value so only the map key is kept.
+func (*ignored) UnmarshalYAML(func(any) error) error { return nil }
+
+// UnmarshalYAML decodes snap.yaml and records whether the snapd-info key was present.
+func (y *snapYaml) UnmarshalYAML(unmarshal func(any) error) error {
+	// same fields, no UnmarshalYAML, so this does not recurse
+	type plain snapYaml
+	if err := unmarshal((*plain)(y)); err != nil {
+		return err
+	}
+	// key presence including null, without decoding values
+	var topLevelKeys map[string]ignored
+	if err := unmarshal(&topLevelKeys); err != nil {
+		return err
+	}
+	_, y.snapdInfoPresent = topLevelKeys[snapdInfoKey]
+	return nil
+}
+
+// errSnapdInfoNotSnapd is reported both when parsing snap.yaml and when
+// validating a constructed Info, so the two agree verbatim.
+var errSnapdInfoNotSnapd = errors.New("cannot specify snapd-info except on the snapd snap")
+
 type typoDetector struct {
 	Hint string
 }
 
-func (td *typoDetector) UnmarshalYAML(func(interface{}) error) error {
+func (td *typoDetector) UnmarshalYAML(func(any) error) error {
 	return fmt.Errorf("typo detected: %s", td.Hint)
 }
 
@@ -89,10 +127,11 @@ type appYaml struct {
 	StopMode        StopModeType    `yaml:"stop-mode,omitempty"`
 	InstallMode     string          `yaml:"install-mode,omitempty"`
 
-	RestartCond  RestartCondition `yaml:"restart-condition,omitempty"`
-	RestartDelay timeout.Timeout  `yaml:"restart-delay,omitempty"`
-	SlotNames    []string         `yaml:"slots,omitempty"`
-	PlugNames    []string         `yaml:"plugs,omitempty"`
+	RestartCond       RestartCondition `yaml:"restart-condition,omitempty"`
+	RestartDelay      timeout.Timeout  `yaml:"restart-delay,omitempty"`
+	SuccessExitStatus []string         `yaml:"success-exit-status,omitempty"`
+	SlotNames         []string         `yaml:"slots,omitempty"`
+	PlugNames         []string         `yaml:"plugs,omitempty"`
 
 	BusName     string   `yaml:"bus-name,omitempty"`
 	ActivatesOn []string `yaml:"activates-on,omitempty"`
@@ -182,6 +221,9 @@ func infoFromSnapYaml(yamlData []byte, strk *scopedTracker) (*Info, error) {
 	}
 
 	snap := infoSkeletonFromSnapYaml(y)
+	if snap.Type() != TypeSnapd && y.snapdInfoPresent {
+		return nil, errSnapdInfoNotSnapd
+	}
 
 	// Collect top-level definitions of plugs and slots
 	if err := setPlugsFromSnapYaml(y, snap); err != nil {
@@ -250,7 +292,12 @@ func infoFromSnapYaml(yamlData []byte, strk *scopedTracker) (*Info, error) {
 		return nil, err
 	}
 
+	if err := setUbuntuCoreTracks(y, snap); err != nil {
+		return nil, err
+	}
+
 	// FIXME: validation of the fields
+
 	return snap, nil
 }
 
@@ -297,6 +344,7 @@ func infoSkeletonFromSnapYaml(y snapYaml) *Info {
 		License:             y.License,
 		Epoch:               y.Epoch,
 		Confinement:         confinement,
+		Grade:               y.Grade,
 		Base:                y.Base,
 		Apps:                make(map[string]*AppInfo),
 		LegacyAliases:       make(map[string]*AppInfo),
@@ -318,7 +366,26 @@ func setComponentsFromSnapYaml(y snapYaml, snap *Info, strk *scopedTracker) erro
 		snap.Components = make(map[string]*Component, len(y.Components))
 	}
 
+	// Some componen types are valid only for some snap types,
+	// check this with this table. If the component type is not in
+	// the table it is valid for any snap type.
+	compToValidSnapType := map[ComponentType][]Type{
+		KernelModulesComponent: {TypeKernel},
+	}
 	for name, data := range y.Components {
+		if validTypes, ok := compToValidSnapType[data.Type]; ok {
+			isValid := false
+			for _, tp := range validTypes {
+				if tp == snap.Type() {
+					isValid = true
+					break
+				}
+			}
+			if !isValid {
+				return fmt.Errorf("%s components can exist only for %s snaps",
+					KernelModulesComponent, TypeKernel)
+			}
+		}
 		component := Component{
 			Name:        name,
 			Type:        data.Type,
@@ -410,31 +477,32 @@ func setAppsFromSnapYaml(y snapYaml, snap *Info, strk *scopedTracker) error {
 	for appName, yApp := range y.Apps {
 		// Collect all apps
 		app := &AppInfo{
-			Snap:            snap,
-			Name:            appName,
-			LegacyAliases:   yApp.Aliases,
-			Command:         yApp.Command,
-			CommandChain:    yApp.CommandChain,
-			StartTimeout:    yApp.StartTimeout,
-			Daemon:          yApp.Daemon,
-			DaemonScope:     yApp.DaemonScope,
-			StopTimeout:     yApp.StopTimeout,
-			StopCommand:     yApp.StopCommand,
-			ReloadCommand:   yApp.ReloadCommand,
-			PostStopCommand: yApp.PostStopCommand,
-			RestartCond:     yApp.RestartCond,
-			RestartDelay:    yApp.RestartDelay,
-			BusName:         yApp.BusName,
-			CommonID:        yApp.CommonID,
-			Environment:     yApp.Environment,
-			Completer:       yApp.Completer,
-			StopMode:        yApp.StopMode,
-			RefreshMode:     yApp.RefreshMode,
-			InstallMode:     yApp.InstallMode,
-			Before:          yApp.Before,
-			After:           yApp.After,
-			Autostart:       yApp.Autostart,
-			WatchdogTimeout: yApp.WatchdogTimeout,
+			Snap:              snap,
+			Name:              appName,
+			LegacyAliases:     yApp.Aliases,
+			Command:           yApp.Command,
+			CommandChain:      yApp.CommandChain,
+			StartTimeout:      yApp.StartTimeout,
+			Daemon:            yApp.Daemon,
+			DaemonScope:       yApp.DaemonScope,
+			StopTimeout:       yApp.StopTimeout,
+			StopCommand:       yApp.StopCommand,
+			ReloadCommand:     yApp.ReloadCommand,
+			PostStopCommand:   yApp.PostStopCommand,
+			RestartCond:       yApp.RestartCond,
+			RestartDelay:      yApp.RestartDelay,
+			SuccessExitStatus: yApp.SuccessExitStatus,
+			BusName:           yApp.BusName,
+			CommonID:          yApp.CommonID,
+			Environment:       yApp.Environment,
+			Completer:         yApp.Completer,
+			StopMode:          yApp.StopMode,
+			RefreshMode:       yApp.RefreshMode,
+			InstallMode:       yApp.InstallMode,
+			Before:            yApp.Before,
+			After:             yApp.After,
+			Autostart:         yApp.Autostart,
+			WatchdogTimeout:   yApp.WatchdogTimeout,
 		}
 		if len(y.Plugs) > 0 || len(yApp.PlugNames) > 0 {
 			app.Plugs = make(map[string]*PlugInfo)
@@ -631,6 +699,17 @@ func setLinksFromSnapYaml(y snapYaml, snap *Info) error {
 	return nil
 }
 
+func setUbuntuCoreTracks(y snapYaml, snap *Info) error {
+	if err := validateUbuntuCoreTracks(y.SnapdInfo.UbuntuCoreTracks, snap.Type()); err != nil {
+		return err
+	}
+	if len(y.SnapdInfo.UbuntuCoreTracks) == 0 {
+		return nil
+	}
+	snap.UbuntuCoreTracks = y.SnapdInfo.UbuntuCoreTracks
+	return nil
+}
+
 func bindUnscopedPlugs(snap *Info, strk *scopedTracker) {
 	for plugName, plug := range snap.Plugs {
 		if strk.plug(plug) {
@@ -704,15 +783,15 @@ func bindImplicitHooks(snap *Info, strk *scopedTracker) {
 	}
 }
 
-func convertToSlotOrPlugData(plugOrSlot, name string, data interface{}) (iface, label string, attrs map[string]interface{}, err error) {
+func convertToSlotOrPlugData(plugOrSlot, name string, data any) (iface, label string, attrs map[string]any, err error) {
 	iface = name
 	switch data.(type) {
 	case string:
 		return data.(string), "", nil, nil
 	case nil:
 		return name, "", nil, nil
-	case map[interface{}]interface{}:
-		for keyData, valueData := range data.(map[interface{}]interface{}) {
+	case map[any]any:
+		for keyData, valueData := range data.(map[any]any) {
 			key, ok := keyData.(string)
 			if !ok {
 				err := fmt.Errorf("%s %q has attribute key that is not a string (found %T)",
@@ -744,7 +823,7 @@ func convertToSlotOrPlugData(plugOrSlot, name string, data interface{}) (iface, 
 				label = value
 			default:
 				if attrs == nil {
-					attrs = make(map[string]interface{})
+					attrs = make(map[string]any)
 				}
 				value, err := metautil.NormalizeValue(valueData)
 				if err != nil {
@@ -774,14 +853,14 @@ func convertToSlotOrPlugData(plugOrSlot, name string, data interface{}) (iface, 
 //	    scope: shared
 //	    attrib1: ...
 //	    attrib2: ...
-func convertToUsernamesData(user string, data interface{}) (scope string, attrs map[string]interface{}, err error) {
+func convertToUsernamesData(user string, data any) (scope string, attrs map[string]any, err error) {
 	switch data.(type) {
 	case string:
 		return data.(string), nil, nil
 	case nil:
 		return "", nil, nil
-	case map[interface{}]interface{}:
-		for keyData, valueData := range data.(map[interface{}]interface{}) {
+	case map[any]any:
+		for keyData, valueData := range data.(map[any]any) {
 			key, ok := keyData.(string)
 			if !ok {
 				err := fmt.Errorf("system username %q has attribute key that is not a string (found %T)", user, keyData)
@@ -799,7 +878,7 @@ func convertToUsernamesData(user string, data interface{}) (scope string, attrs 
 				return "", nil, fmt.Errorf("system username %q has an empty attribute key", user)
 			default:
 				if attrs == nil {
-					attrs = make(map[string]interface{})
+					attrs = make(map[string]any)
 				}
 				value, err := metautil.NormalizeValue(valueData)
 				if err != nil {

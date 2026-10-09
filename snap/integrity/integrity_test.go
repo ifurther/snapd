@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2023 Canonical Ltd
+ * Copyright (C) 2023-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -21,17 +21,17 @@ package integrity_test
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"os"
-	"strings"
 	"testing"
+	"time"
 
 	. "gopkg.in/check.v1"
 
+	"github.com/snapcore/snapd/asserts"
 	"github.com/snapcore/snapd/snap/integrity"
 	"github.com/snapcore/snapd/snap/integrity/dmverity"
-	"github.com/snapcore/snapd/snap/snaptest"
 	"github.com/snapcore/snapd/testutil"
 )
 
@@ -51,230 +51,272 @@ func (s *IntegrityTestSuite) TearDownTest(c *C) {
 	s.BaseTest.TearDownTest(c)
 }
 
-func (s *IntegrityTestSuite) TestAlign(c *C) {
-	align := integrity.Align
-	blockSize := uint64(integrity.BlockSize)
+func (s *IntegrityTestSuite) TestLookupDmVerityDataSuccess(c *C) {
+	snapPath := "foo.snap"
 
-	for _, tc := range []struct {
-		input          uint64
-		expectedOutput uint64
+	// sb, _ := dmverity.ReadSuperBlockFromFile("testdata/testdisk.verity")
+	// sbJson, _ := json.Marshal(sb)
+	sbJson := `{"version":1,"hashType":1,"uuid":[147,116,13,94,144,57,74,7,146,25,189,53,88,130,182,75],"algorithm":[115,104,97,50,53,54,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"dataBlockSize":4096,"hashBlockSize":4096,"dataBlocks":2048,"saltSize":32,"salt":[70,174,227,175,251,208,69,86,35,233,7,187,127,198,34,153,155,172,76,134,250,38,56,8,172,21,36,11,22,40,100,88,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}`
+	var sb dmverity.VeritySuperblock
+	err := json.Unmarshal([]byte(sbJson), &sb)
+	c.Assert(err, IsNil)
+
+	digest := "test"
+	verityFilePath := snapPath + ".dmverity_" + digest
+
+	restore := integrity.MockReadDmVeritySuperblock(func(filename string) (*dmverity.VeritySuperblock, error) {
+		c.Assert(filename, Equals, verityFilePath)
+		return &sb, nil
+	})
+	defer restore()
+
+	integrityDataParams := integrity.IntegrityDataParams{
+		Type:          "dm-verity",
+		HashAlg:       "sha256",
+		DataBlockSize: 4096,
+		HashBlockSize: 4096,
+		Salt:          sb.EncodedSalt(),
+		Digest:        digest,
+	}
+
+	hashFileName, err := integrity.LookupDmVerityDataAndCrossCheck(snapPath, &integrityDataParams)
+	c.Assert(err, IsNil)
+	c.Check(hashFileName, Equals, verityFilePath)
+}
+
+func (s *IntegrityTestSuite) TestLookupDmVerityDataCrossCheckError(c *C) {
+	snapPath := "foo.snap"
+
+	// sb, _ := dmverity.ReadSuperBlockFromFile("testdata/testdisk.verity")
+	// sbJson, _ := json.Marshal(sb)
+	sbJson := `{"version":1,"hashType":1,"uuid":[147,116,13,94,144,57,74,7,146,25,189,53,88,130,182,75],"algorithm":[115,104,97,50,53,54,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"dataBlockSize":4096,"hashBlockSize":4096,"dataBlocks":2048,"saltSize":32,"salt":[70,174,227,175,251,208,69,86,35,233,7,187,127,198,34,153,155,172,76,134,250,38,56,8,172,21,36,11,22,40,100,88,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}`
+	var sb dmverity.VeritySuperblock
+	err := json.Unmarshal([]byte(sbJson), &sb)
+	c.Assert(err, IsNil)
+
+	digest := "test"
+	verityFilePath := snapPath + ".dmverity_" + digest
+
+	restore := integrity.MockReadDmVeritySuperblock(func(filename string) (*dmverity.VeritySuperblock, error) {
+		c.Assert(filename, Equals, verityFilePath)
+		return &sb, nil
+	})
+	defer restore()
+
+	errMsg := fmt.Sprintf("unexpected dm-verity data %q: ", verityFilePath)
+	tests := []struct {
+		idp         integrity.IntegrityDataParams
+		expectedErr string
+		comment     string
 	}{
-		{0, 0},
-		{1, blockSize},
-		{blockSize, blockSize},
-		{blockSize + 1, 2 * blockSize},
-	} {
-		ret := align(tc.input)
-		c.Check(ret, Equals, tc.expectedOutput, Commentf("%v", tc))
+		{
+			idp: integrity.IntegrityDataParams{
+				Type:          "dm-verity",
+				HashAlg:       "foo",
+				DataBlockSize: 4096,
+				HashBlockSize: 4096,
+				Salt:          sb.EncodedSalt(),
+				Digest:        digest,
+			},
+			expectedErr: errMsg + "unexpected algorithm: sha256 != foo",
+			comment:     "error when algorithm doesn't match",
+		},
+		{
+			idp: integrity.IntegrityDataParams{
+				Type:          "dm-verity",
+				HashAlg:       "sha256",
+				DataBlockSize: 1,
+				HashBlockSize: 4096,
+				Salt:          sb.EncodedSalt(),
+				Digest:        digest,
+			},
+			expectedErr: errMsg + "unexpected data block size: 4096 != 1",
+			comment:     "error when block size doesn't match",
+		},
+		{
+			idp: integrity.IntegrityDataParams{
+				Type:          "dm-verity",
+				HashAlg:       "sha256",
+				DataBlockSize: 4096,
+				HashBlockSize: 1,
+				Salt:          sb.EncodedSalt(),
+				Digest:        digest,
+			},
+			expectedErr: errMsg + "unexpected hash block size: 4096 != 1",
+			comment:     "error when hash block size doesn't match",
+		},
+		{
+			idp: integrity.IntegrityDataParams{
+				Type:          "dm-verity",
+				HashAlg:       "sha256",
+				DataBlockSize: 4096,
+				HashBlockSize: 4096,
+				Salt:          "salt",
+				Digest:        digest,
+			},
+			expectedErr: errMsg + "unexpected salt: " + sb.EncodedSalt() + " != salt",
+			comment:     "error when salt doesn't match",
+		},
+	}
+
+	for _, t := range tests {
+		hashFileName, err := integrity.LookupDmVerityDataAndCrossCheck(snapPath, &t.idp)
+		c.Assert(hashFileName, Equals, "", Commentf(t.comment))
+		c.Check(errors.Is(err, integrity.ErrUnexpectedDmVerityData), Equals, true, Commentf(t.comment))
+		c.Check(err, ErrorMatches, t.expectedErr, Commentf(t.comment))
 	}
 }
 
-func (s *IntegrityTestSuite) TestIntegrityHeaderMarshalJSON(c *C) {
-	dmVerityBlock := &dmverity.Info{}
-	integrityDataHeader := integrity.NewIntegrityDataHeader(dmVerityBlock, 4096)
+func (s *IntegrityTestSuite) TestLookupDmVerityDataNilParams(c *C) {
+	snapPath := "foo.snap"
 
-	jsonHeader, err := json.Marshal(integrityDataHeader)
-	c.Assert(err, IsNil)
+	restore := integrity.MockReadDmVeritySuperblock(func(filename string) (*dmverity.VeritySuperblock, error) {
+		return nil, os.ErrNotExist
+	})
+	defer restore()
 
-	c.Check(json.Valid(jsonHeader), Equals, true)
-
-	expected := []byte(`{"type":"integrity","size":"8192","dm-verity":{"root-hash":""}}`)
-	c.Check(jsonHeader, DeepEquals, expected)
+	hashFileName, err := integrity.LookupDmVerityDataAndCrossCheck(snapPath, nil)
+	c.Check(hashFileName, Equals, "")
+	c.Check(errors.Is(err, integrity.ErrIntegrityDataParamsNotFound), Equals, true)
+	c.Check(err, ErrorMatches, "integrity data parameters not found")
 }
 
-func (s *IntegrityTestSuite) TestIntegrityHeaderUnmarshalJSON(c *C) {
-	var integrityDataHeader integrity.IntegrityDataHeader
-	integrityHeaderJSON := `{
-		"type": "integrity",
-		"size": "4096",
-		"dm-verity": {
-			"root-hash": "00000000000000000000000000000000"
-		}
-	}`
+func (s *IntegrityTestSuite) TestLookupDmVerityDataUnexpectedType(c *C) {
+	snapPath := "foo.snap"
 
-	err := json.Unmarshal([]byte(integrityHeaderJSON), &integrityDataHeader)
-	c.Assert(err, IsNil)
+	restore := integrity.MockReadDmVeritySuperblock(func(filename string) (*dmverity.VeritySuperblock, error) {
+		return nil, os.ErrNotExist
+	})
+	defer restore()
 
-	c.Check(integrityDataHeader.Type, Equals, "integrity")
-	c.Check(integrityDataHeader.Size, Equals, uint64(4096))
-	c.Check(integrityDataHeader.DmVerity.RootHash, Equals, "00000000000000000000000000000000")
+	integrityDataParams := integrity.IntegrityDataParams{
+		Type:          "foo",
+		HashAlg:       "sha256",
+		DataBlockSize: 4096,
+		HashBlockSize: 4096,
+	}
+
+	hashFileName, err := integrity.LookupDmVerityDataAndCrossCheck(snapPath, &integrityDataParams)
+	c.Check(hashFileName, Equals, "")
+	c.Check(errors.Is(err, integrity.ErrUnexpectedIntegrityDataType), Equals, true)
+	c.Check(err, ErrorMatches, "unexpected integrity data type: expected \"dm-verity\" but found \"foo\".")
 }
 
-func (s *IntegrityTestSuite) TestIntegrityHeaderEncode(c *C) {
-	var integrityDataHeader integrity.IntegrityDataHeader
-	magic := integrity.Magic
+func (s *IntegrityTestSuite) TestLookupDmVerityDataNotExist(c *C) {
+	snapPath := "foo.snap"
 
-	header, err := integrityDataHeader.Encode()
-	c.Assert(err, IsNil)
+	restore := integrity.MockReadDmVeritySuperblock(func(filename string) (*dmverity.VeritySuperblock, error) {
+		return nil, os.ErrNotExist
+	})
+	defer restore()
 
-	magicRead := header[0:len(magic)]
-	c.Check(magicRead, DeepEquals, magic)
+	integrityDataParams := integrity.IntegrityDataParams{
+		Type:          "dm-verity",
+		HashAlg:       "sha256",
+		DataBlockSize: 4096,
+		HashBlockSize: 4096,
+	}
 
-	nullByte := header[len(header)-1:]
-	c.Check(nullByte, DeepEquals, []byte{0x0})
+	digest := ""
+	verityFilePath := snapPath + ".dmverity_" + digest
 
-	c.Check(uint64(len(header)), Equals, integrity.Align(uint64(len(header))))
+	hashFileName, err := integrity.LookupDmVerityDataAndCrossCheck(snapPath, &integrityDataParams)
+	c.Check(hashFileName, Equals, "")
+	c.Check(errors.Is(err, integrity.ErrDmVerityDataNotFound), Equals, true)
+	c.Check(err, ErrorMatches, fmt.Sprintf("dm-verity data not found: %q doesn't exist.", verityFilePath))
 }
 
-func (s *IntegrityTestSuite) TestIntegrityHeaderEncodeInvalidSize(c *C) {
-	var integrityDataHeader integrity.IntegrityDataHeader
-	integrityDataHeader.Type = strings.Repeat("a", integrity.BlockSize)
+func (s *IntegrityTestSuite) TestLookupDmVerityDataAnyError(c *C) {
+	snapPath := "foo.snap"
 
-	_, err := integrityDataHeader.Encode()
-	c.Assert(err, ErrorMatches, "internal error: invalid integrity data header: wrong size")
+	restore := integrity.MockReadDmVeritySuperblock(func(filename string) (*dmverity.VeritySuperblock, error) {
+		return nil, errors.New("any other error")
+	})
+	defer restore()
+
+	hashFileName, err := integrity.LookupDmVerityDataAndCrossCheck(snapPath, &integrity.IntegrityDataParams{Type: "dm-verity"})
+	c.Check(hashFileName, Equals, "")
+	c.Check(err, ErrorMatches, "any other error")
 }
 
-func (s *IntegrityTestSuite) TestIntegrityHeaderDecode(c *C) {
-	var integrityDataHeader integrity.IntegrityDataHeader
-	magic := integrity.Magic
+func makeMockSnapRevisionAssertion(c *C, integrityData string) *asserts.SnapRevision {
+	hash := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	ts := time.Now().Truncate(time.Second).UTC()
+	tsLine := "timestamp: " + ts.Format(time.RFC3339) + "\n"
 
-	integrityHeaderJSON := `{
-		"type": "integrity",
-		"size": "4096",
-		"dm-verity": {
-			"root-hash": "00000000000000000000000000000000"
-		}
-	}`
-	header := append(magic, integrityHeaderJSON...)
-	header = append(header, 0)
+	assertsString := "type: snap-revision\n" +
+		"authority-id: store-id1\n" +
+		"snap-sha3-384: " + hash + "\n" +
+		"snap-id: snap-id-1\n" +
+		"snap-size: 123\n" +
+		"snap-revision: 1\n" +
+		integrityData +
+		"developer-id: dev-id1\n" +
+		"revision: 1\n" +
+		tsLine +
+		"body-length: 0\n" +
+		"sign-key-sha3-384: Jv8_JiHiIzJVcO9M55pPdqSDWUvuhfDIBJUS-3VW7F_idjix7Ffn5qMxB21ZQuij" +
+		"\n\n" +
+		"AXNpZw=="
 
-	headerBlock := make([]byte, 4096)
-	copy(headerBlock, header)
-
-	err := integrityDataHeader.Decode(headerBlock)
+	a, err := asserts.Decode([]byte(assertsString))
 	c.Assert(err, IsNil)
+	c.Check(a.Type(), Equals, asserts.SnapRevisionType)
+	snapRev := a.(*asserts.SnapRevision)
 
-	c.Check(integrityDataHeader.Type, Equals, "integrity")
-	c.Check(integrityDataHeader.Size, Equals, uint64(4096))
-	c.Check(integrityDataHeader.DmVerity.RootHash, Equals, "00000000000000000000000000000000")
+	return snapRev
 }
 
-func (s *IntegrityTestSuite) TestIntegrityHeaderDecodeInvalidMagic(c *C) {
-	var integrityDataHeader integrity.IntegrityDataHeader
-	magic := []byte("invalid")
+func (s *IntegrityTestSuite) TestNewIntegrityDataParamsFromRevision(c *C) {
+	verity_hash := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	verity_salt := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	integrityData := "integrity:\n" +
+		"  -\n" +
+		"    type: dm-verity\n" +
+		"    digest: " + verity_hash + "\n" +
+		"    version: 1\n" +
+		"    hash-algorithm: sha256\n" +
+		"    data-block-size: 4096\n" +
+		"    hash-block-size: 4096\n" +
+		"    salt: " + verity_salt + "\n"
+	rev := makeMockSnapRevisionAssertion(c, integrityData)
 
-	integrityHeaderJSON := `{
-		"type": "integrity",
-		"size": "4096",
-		"dm-verity": {
-			"root-hash": "00000000000000000000000000000000"
-		}
-	}`
-	header := append(magic, integrityHeaderJSON...)
-	header = append(header, 0)
+	expectedParams := &integrity.IntegrityDataParams{
+		Type:          "dm-verity",
+		Version:       0x1,
+		HashAlg:       "sha256",
+		DataBlocks:    0x0,
+		DataBlockSize: 0x1000,
+		HashBlockSize: 0x1000,
+		Digest:        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Salt:          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	}
 
-	headerBlock := make([]byte, 4096)
-	copy(headerBlock, header)
-
-	err := integrityDataHeader.Decode(headerBlock)
-	c.Check(err, ErrorMatches, "invalid integrity data header: invalid magic value")
-}
-
-func (s *IntegrityTestSuite) TestIntegrityHeaderDecodeInvalidJSON(c *C) {
-	var integrityDataHeader integrity.IntegrityDataHeader
-	magic := integrity.Magic
-
-	integrityHeaderJSON := `
-		"type": "integrity",
-		"size": "4096",
-		"dm-verity": {
-			"root-hash": "00000000000000000000000000000000"
-		}
-	}`
-	header := append(magic, integrityHeaderJSON...)
-	header = append(header, 0)
-
-	headerBlock := make([]byte, 4096)
-	copy(headerBlock, header)
-
-	err := integrityDataHeader.Decode(headerBlock)
-
-	_, ok := err.(*json.SyntaxError)
-	c.Check(ok, Equals, true)
-}
-
-func (s *IntegrityTestSuite) TestIntegrityHeaderDecodeInvalidTermination(c *C) {
-	var integrityDataHeader integrity.IntegrityDataHeader
-	magic := integrity.Magic
-
-	integrityHeaderJSON := `{
-		"type": "integrity",
-		"size": "4096",
-		"dm-verity": {
-			"root-hash": "00000000000000000000000000000000"
-		}
-	}`
-	header := append(magic, integrityHeaderJSON...)
-
-	headerBlock := make([]byte, len(header))
-	copy(headerBlock, header)
-
-	err := integrityDataHeader.Decode(headerBlock)
-	c.Check(err, ErrorMatches, "invalid integrity data header: no null byte found at end of input")
-}
-
-func (s *IntegrityTestSuite) TestGenerateAndAppendSuccess(c *C) {
-	blockSize := uint64(integrity.BlockSize)
-
-	snapPath, _ := snaptest.MakeTestSnapInfoWithFiles(c, "name: foo\nversion: 1.0", nil, nil)
-
-	// 8192 is the hash size that is created when running 'veritysetup format'
-	// on a minimally sized snap. there is not an easy way to calculate this
-	// value dynamically.
-	const verityHashSize = 8192
-
-	// mock the verity-setup command, what it does is make a copy of the snap
-	// and then returns pre-calculated output
-	vscmd := testutil.MockCommand(c, "veritysetup", fmt.Sprintf(`
-case "$1" in
-	--version)
-		echo "veritysetup 2.2.6"
-		exit 0
-		;;
-	format)
-		truncate -s %[1]d %[2]s.verity
-		echo "VERITY header information for %[2]s.verity"
-		echo "UUID:            	f8b4f201-fe4e-41a2-9f1d-4908d3c76632"
-		echo "Hash type:       	1"
-		echo "Data blocks:     	4"
-		echo "Data block size: 	4096"
-		echo "Hash block size: 	4096"
-		echo "Hash algorithm:  	sha256"
-		echo "Salt:            	f1a7f87b88692b388f47dbda4a3bdf790f5adc3104b325f8772aee593488bf15"
-		echo "Root hash:      	e2926364a8b1242d92fb1b56081e1ddb86eba35411961252a103a1c083c2be6d"
-		;;
-esac
-`, verityHashSize, snapPath))
-	defer vscmd.Restore()
-
-	snapFileInfo, err := os.Stat(snapPath)
-	c.Assert(err, IsNil)
-	orig_size := snapFileInfo.Size()
-
-	err = integrity.GenerateAndAppend(snapPath)
-	c.Assert(err, IsNil)
-
-	snapFile, err := os.Open(snapPath)
-	c.Assert(err, IsNil)
-	defer snapFile.Close()
-
-	// check integrity header
-	_, err = snapFile.Seek(orig_size, io.SeekStart)
-	c.Assert(err, IsNil)
-
-	header := make([]byte, blockSize-1)
-	n, err := snapFile.Read(header)
-	c.Assert(err, IsNil)
-	c.Assert(n, Equals, int(blockSize)-1)
-
-	var integrityDataHeader integrity.IntegrityDataHeader
-	err = integrityDataHeader.Decode(header)
+	params, err := integrity.NewIntegrityDataParamsFromRevision(rev)
 	c.Check(err, IsNil)
-	c.Check(integrityDataHeader.Type, Equals, "integrity")
-	c.Check(integrityDataHeader.Size, Equals, uint64(verityHashSize+integrity.HeaderSize))
-	c.Check(integrityDataHeader.DmVerity.RootHash, HasLen, 64)
+	c.Check(params, DeepEquals, expectedParams)
+}
 
-	c.Assert(vscmd.Calls(), HasLen, 2)
-	c.Check(vscmd.Calls()[0], DeepEquals, []string{"veritysetup", "--version"})
-	c.Check(vscmd.Calls()[1], DeepEquals, []string{"veritysetup", "format", snapPath, snapPath + ".verity"})
+func (s *IntegrityTestSuite) TestNewIntegrityDataParamsFromRevisionNotFound(c *C) {
+	rev := makeMockSnapRevisionAssertion(c, "")
+	_, err := integrity.NewIntegrityDataParamsFromRevision(rev)
+	c.Check(err, Equals, integrity.ErrNoIntegrityDataFoundInRevision)
+}
+
+func (s *IntegrityTestSuite) TestIntegrityDataParamsIntegrityFile(c *C) {
+	idp := integrity.IntegrityDataParams{
+		Type:   "dm-verity",
+		Digest: "aaa",
+	}
+
+	integrityFile, err := idp.IntegrityFile("/path/to/instance.snap")
+	c.Assert(err, IsNil)
+	c.Check(integrityFile, Equals, "/path/to/instance.snap.dmverity_aaa")
+
+	idp = integrity.IntegrityDataParams{
+		Type:   "bad-type",
+		Digest: "aaa",
+	}
+	_, err = idp.IntegrityFile("/path/to/instance.snap")
+	c.Assert(err, ErrorMatches, `unexpected integrity data type "bad-type"`)
 }

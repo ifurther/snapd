@@ -27,7 +27,6 @@ import (
 	"github.com/snapcore/snapd/interfaces/builtin"
 	"github.com/snapcore/snapd/interfaces/seccomp"
 	"github.com/snapcore/snapd/snap"
-	"github.com/snapcore/snapd/snap/snaptest"
 	"github.com/snapcore/snapd/testutil"
 )
 
@@ -47,20 +46,21 @@ apps:
   plugs: [network-observe]
 `
 
+const netobsMockSlotSnapInfoYaml = `name: core
+version: 1.0
+type: os
+slots:
+ network-observe:
+  interface: network-observe
+`
+
 var _ = Suite(&NetworkObserveInterfaceSuite{
 	iface: builtin.MustInterface("network-observe"),
 })
 
 func (s *NetworkObserveInterfaceSuite) SetUpTest(c *C) {
-	s.slotInfo = &snap.SlotInfo{
-		Snap:      &snap.Info{SuggestedName: "core", SnapType: snap.TypeOS},
-		Name:      "network-observe",
-		Interface: "network-observe",
-	}
-	s.slot = interfaces.NewConnectedSlot(s.slotInfo, nil, nil)
-	plugSnap := snaptest.MockInfo(c, netobsMockPlugSnapInfoYaml, nil)
-	s.plugInfo = plugSnap.Plugs["network-observe"]
-	s.plug = interfaces.NewConnectedPlug(s.plugInfo, nil, nil)
+	s.slot, s.slotInfo = MockConnectedSlot(c, netobsMockSlotSnapInfoYaml, nil, "network-observe")
+	s.plug, s.plugInfo = MockConnectedPlug(c, netobsMockPlugSnapInfoYaml, nil, "network-observe")
 }
 
 func (s *NetworkObserveInterfaceSuite) TestName(c *C) {
@@ -77,18 +77,35 @@ func (s *NetworkObserveInterfaceSuite) TestSanitizePlug(c *C) {
 
 func (s *NetworkObserveInterfaceSuite) TestUsedSecuritySystems(c *C) {
 	// connected plugs have a non-nil security snippet for apparmor
-	apparmorSpec := apparmor.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	apparmorSpec := apparmor.NewSpecification(s.plug.AppSet())
 	err := apparmorSpec.AddConnectedPlug(s.iface, s.plug, s.slot)
 	c.Assert(err, IsNil)
 	c.Assert(apparmorSpec.SecurityTags(), DeepEquals, []string{"snap.other.app2"})
 	c.Assert(apparmorSpec.SnippetForTag("snap.other.app2"), testutil.Contains, `net_raw`)
 
 	// connected plugs have a non-nil security snippet for seccomp
-	seccompSpec := seccomp.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	seccompSpec := seccomp.NewSpecification(s.plug.AppSet())
 	err = seccompSpec.AddConnectedPlug(s.iface, s.plug, s.slot)
 	c.Assert(err, IsNil)
 	c.Assert(seccompSpec.SecurityTags(), DeepEquals, []string{"snap.other.app2"})
 	c.Check(seccompSpec.SnippetForTag("snap.other.app2"), testutil.Contains, "capset\n")
+}
+
+func (s *NetworkObserveInterfaceSuite) TestAppArmorSpecSystemdNetworkd(c *C) {
+	apparmorSpec := apparmor.NewSpecification(s.plug.AppSet())
+	err := apparmorSpec.AddConnectedPlug(s.iface, s.plug, s.slot)
+	c.Assert(err, IsNil)
+	c.Assert(apparmorSpec.SecurityTags(), DeepEquals, []string{"snap.other.app2"})
+
+	snippet := apparmorSpec.SnippetForTag("snap.other.app2")
+	c.Assert(snippet, testutil.Contains, "path=/org/freedesktop/network1")
+	c.Assert(snippet, testutil.Contains, "path=/org/freedesktop/network1/link/_*")
+	c.Assert(snippet, testutil.Contains, "interface=org.freedesktop.DBus.Properties")
+	c.Assert(snippet, testutil.Contains, "member=PropertiesChanged")
+	c.Assert(snippet, testutil.Contains, "member=Get{,All}")
+	c.Assert(snippet, testutil.Contains, "interface=org.freedesktop.network1.Manager")
+	c.Assert(snippet, testutil.Contains, "member={ListLinks,GetLinkByName,DescribeLink,Describe}")
+	c.Assert(snippet, testutil.Contains, "peer=(name=org.freedesktop.network1, label=unconfined)")
 }
 
 func (s *NetworkObserveInterfaceSuite) TestInterfaces(c *C) {

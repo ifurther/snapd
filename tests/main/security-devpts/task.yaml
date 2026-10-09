@@ -1,10 +1,16 @@
 summary: Ensure that the basic devpts security rules are in place.
 
-execute: |
-    if [ "$(snap debug confinement)" = none ] ; then
-        exit 0
-    fi
+details: |
+    Test that a snap which has a plug for the physical-memory-observe interface
+    can read /dev/pts, can openpty, and can access the PTY via /dev/ptmx, both
+    with and without the physical-memory-observe interface connected.
 
+skip:
+    - reason: The systems has "none" debug confinement
+      if: |
+        [ "$(snap debug confinement)" = none ]
+
+execute: |
     echo "Given a basic snap is installed"
     "$TESTSTOOLS"/snaps-state install-local test-snapd-devpts
 

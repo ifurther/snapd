@@ -21,11 +21,11 @@ package backend
 
 import (
 	"archive/zip"
+	"context"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
 	"strings"
 
@@ -33,6 +33,7 @@ import (
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil/sys"
+	"github.com/snapcore/snapd/osutil/user"
 	"github.com/snapcore/snapd/snap"
 )
 
@@ -165,7 +166,7 @@ var userWrapper = pickUserWrapper()
 // If neither runuser nor sudo are found on the path, exec.Command is also used
 // directly. This will result in tar running as root in this situation (so it
 // will fail if on NFS; I don't think there's an attack vector though).
-var tarAsUser = func(username string, args ...string) *exec.Cmd {
+var tarAsUser = func(ctx context.Context, username string, args ...string) *exec.Cmd {
 	if sysGeteuid() == 0 && username != "root" {
 		if userWrapper != "" {
 			uwArgs := make([]string, len(args)+5)
@@ -184,7 +185,7 @@ var tarAsUser = func(username string, args ...string) *exec.Cmd {
 		logger.Noticef("No user wrapper found; running tar for user data as root. Please make sure 'sudo' or 'runuser' (from util-linux) is on $PATH to avoid this.")
 	}
 
-	return exec.Command("tar", args...)
+	return exec.CommandContext(ctx, "tar", args...)
 }
 
 func MockUserLookup(newLookup func(string) (*user.User, error)) func() {

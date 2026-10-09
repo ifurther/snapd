@@ -185,7 +185,7 @@ func (mockstat) Size() int64        { return 42 }
 func (mockstat) Mode() os.FileMode  { return 0644 }
 func (mockstat) ModTime() time.Time { return time.Now() }
 func (mockstat) IsDir() bool        { return false }
-func (mockstat) Sys() interface{}   { return nil }
+func (mockstat) Sys() any           { return nil }
 
 func (s *cpSuite) TestCopySpecialFileSimple(c *C) {
 	sync := testutil.MockCommand(c, "sync", "")
@@ -331,22 +331,11 @@ func (s *cpSuite) TestAtomicWriteFileCopyOverwrites(c *C) {
 }
 
 func (s *cpSuite) TestAtomicWriteFileCopySymlinks(c *C) {
-	f2Symlink := filepath.Join(s.dir, "f2-symlink")
-	err := os.Symlink(s.f2, f2Symlink)
-	c.Assert(err, IsNil)
-
 	f2SymlinkNoFollow := filepath.Join(s.dir, "f2-symlink-no-follow")
-	err = os.Symlink(s.f2, f2SymlinkNoFollow)
+	err := os.Symlink(s.f2, f2SymlinkNoFollow)
 	c.Assert(err, IsNil)
 
-	// follows symlink, dst is f2
-	err = osutil.AtomicWriteFileCopy(f2Symlink, s.f1, osutil.AtomicWriteFollow)
-	c.Assert(err, IsNil)
-	c.Check(osutil.IsSymlink(f2Symlink), Equals, true, Commentf("%q is not a symlink", f2Symlink))
-	c.Check(s.f2, testutil.FileEquals, s.data)
-	c.Check(f2SymlinkNoFollow, testutil.FileEquals, s.data)
-
-	// when not following, copy overwrites the symlink
+	// copy overwrites the symlink
 	err = osutil.AtomicWriteFileCopy(f2SymlinkNoFollow, s.f1, 0)
 	c.Assert(err, IsNil)
 	c.Check(osutil.IsSymlink(f2SymlinkNoFollow), Equals, false, Commentf("%q is not a file", f2SymlinkNoFollow))
@@ -354,6 +343,9 @@ func (s *cpSuite) TestAtomicWriteFileCopySymlinks(c *C) {
 }
 
 func (s *cpSuite) TestAtomicWriteFileCopyErrReal(c *C) {
+	if os.Geteuid() == 0 {
+		c.Skip("this test cannot run as root (root bypasses directory write permissions)")
+	}
 	err := osutil.AtomicWriteFileCopy(s.f2, filepath.Join(s.dir, "random-file"), 0)
 	c.Assert(err, ErrorMatches, "unable to open source file .*/random-file: open .* no such file or directory")
 

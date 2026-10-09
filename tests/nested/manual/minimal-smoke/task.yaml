@@ -21,12 +21,16 @@ execute: |
 
     # Get the nested system to use
     NESTED_SPREAD_SYSTEM="$(tests.nested nested-system)"
+    VERSION="$(tests.nested show version)"
 
     # see https://ubuntu.com/core/docs/system-requirements for ubuntu-core
     # minimum requirements by version
-    MINIMAL_MEM=256
-    if tests.nested is-nested uc20 || tests.nested is-nested uc22; then
+    MINIMAL_MEM=256    
+    if [ "$VERSION" -ge 20 ]; then
         MINIMAL_MEM=512
+    fi
+    if [ "${NESTED_ENABLE_SECURE_BOOT}" = "true" ] && [ "$VERSION" -ge 26 ]; then
+        MINIMAL_MEM=768
     fi
 
     tests.nested create-vm core --param-mem "$MINIMAL_MEM"
@@ -34,4 +38,9 @@ execute: |
     echo "Run spread smoke tests using mem: $MINIMAL_MEM"
     set +x
     export SPREAD_EXTERNAL_ADDRESS=localhost:8022
+    export SPREAD_HTTP_PROXY="$HTTP_PROXY"
+    export SPREAD_HTTPS_PROXY="$HTTPS_PROXY"
+    export SPREAD_NO_PROXY="$NO_PROXY"
+    export SPREAD_SNAPD_USE_PROXY="$SNAPD_USE_PROXY"
+
     "$SPREAD" -v "external:$NESTED_SPREAD_SYSTEM:tests/smoke/..."

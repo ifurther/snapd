@@ -29,6 +29,7 @@ import (
 	"github.com/snapcore/snapd/interfaces"
 	"github.com/snapcore/snapd/interfaces/apparmor"
 	"github.com/snapcore/snapd/interfaces/builtin"
+	"github.com/snapcore/snapd/interfaces/seccomp"
 	"github.com/snapcore/snapd/release"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/testutil"
@@ -90,22 +91,30 @@ func (s *cupsControlSuite) TestAppArmorSpecCore(c *C) {
 	defer restore()
 
 	// core to consumer on core is empty for ConnectedPlug
-	spec := apparmor.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	appSet, err := interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec := apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.coreSlot), IsNil)
 	c.Assert(spec.SecurityTags(), HasLen, 0)
 
 	// core to consumer on core is empty for PermanentSlot
-	spec = apparmor.NewSpecification(interfaces.NewSnapAppSet(s.coreSlotInfo.Snap))
+	appSet, err = interfaces.NewSnapAppSet(s.coreSlotInfo.Snap, nil)
+	c.Assert(err, IsNil)
+	spec = apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddPermanentSlot(s.iface, s.coreSlotInfo), IsNil)
 	c.Assert(spec.SecurityTags(), HasLen, 0)
 
 	// core to consumer on core is empty for ConnectedSlot
-	spec = apparmor.NewSpecification(interfaces.NewSnapAppSet(s.coreSlot.Snap()))
+	appSet, err = interfaces.NewSnapAppSet(s.coreSlot.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec = apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedSlot(s.iface, s.plug, s.coreSlot), IsNil)
 	c.Assert(spec.SecurityTags(), HasLen, 0)
 
 	// consumer to provider on core for ConnectedPlug
-	spec = apparmor.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	appSet, err = interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec = apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.providerSlot), IsNil)
 	c.Assert(spec.SecurityTags(), DeepEquals, []string{"snap.consumer.app"})
 	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "# Allow communicating with the cups server for printing and configuration.")
@@ -114,14 +123,18 @@ func (s *cupsControlSuite) TestAppArmorSpecCore(c *C) {
 	c.Assert(spec.SnippetForTag("snap.provider.app"), Not(testutil.Contains), "# Allow daemon access to create the CUPS socket")
 
 	// provider to consumer on core for PermanentSlot
-	spec = apparmor.NewSpecification(interfaces.NewSnapAppSet(s.providerSlotInfo.Snap))
+	appSet, err = interfaces.NewSnapAppSet(s.providerSlotInfo.Snap, nil)
+	c.Assert(err, IsNil)
+	spec = apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddPermanentSlot(s.iface, s.providerSlotInfo), IsNil)
 	c.Assert(spec.SecurityTags(), DeepEquals, []string{"snap.provider.app"})
 	c.Assert(spec.SnippetForTag("snap.provider.app"), testutil.Contains, "# Allow daemon access to create the CUPS socket")
 	c.Assert(spec.SnippetForTag("snap.provider.app"), Not(testutil.Contains), "label=\"snap.consumer.app\"")
 
 	// provider to consumer on core for ConnectedSlot
-	spec = apparmor.NewSpecification(interfaces.NewSnapAppSet(s.providerSlot.Snap()))
+	appSet, err = interfaces.NewSnapAppSet(s.providerSlot.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec = apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedSlot(s.iface, s.plug, s.providerSlot), IsNil)
 	c.Assert(spec.SecurityTags(), DeepEquals, []string{"snap.provider.app"})
 	c.Assert(spec.SnippetForTag("snap.provider.app"), testutil.Contains, "peer=(label=\"snap.consumer.app\"")
@@ -132,7 +145,9 @@ func (s *cupsControlSuite) TestAppArmorSpecClassic(c *C) {
 	defer restore()
 
 	// consumer to core on classic for ConnectedPlug
-	spec := apparmor.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	appSet, err := interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec := apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.coreSlot), IsNil)
 	c.Assert(spec.SecurityTags(), DeepEquals, []string{"snap.consumer.app"})
 	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "# Allow communicating with the cups server for printing and configuration.")
@@ -141,17 +156,23 @@ func (s *cupsControlSuite) TestAppArmorSpecClassic(c *C) {
 	c.Assert(spec.SnippetForTag("snap.provider.app"), Not(testutil.Contains), "# Allow daemon access to create the CUPS socket")
 
 	// core to consumer on classic is empty for PermanentSlot
-	spec = apparmor.NewSpecification(interfaces.NewSnapAppSet(s.coreSlotInfo.Snap))
+	appSet, err = interfaces.NewSnapAppSet(s.coreSlotInfo.Snap, nil)
+	c.Assert(err, IsNil)
+	spec = apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddPermanentSlot(s.iface, s.coreSlotInfo), IsNil)
 	c.Assert(spec.SecurityTags(), HasLen, 0)
 
 	// core to consumer on classic is empty for ConnectedSlot
-	spec = apparmor.NewSpecification(interfaces.NewSnapAppSet(s.coreSlot.Snap()))
+	appSet, err = interfaces.NewSnapAppSet(s.coreSlot.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec = apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedSlot(s.iface, s.plug, s.coreSlot), IsNil)
 	c.Assert(spec.SecurityTags(), HasLen, 0)
 
 	// consumer to provider on classic for ConnectedPlug
-	spec = apparmor.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	appSet, err = interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec = apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.providerSlot), IsNil)
 	c.Assert(spec.SecurityTags(), DeepEquals, []string{"snap.consumer.app"})
 	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "# Allow communicating with the cups server for printing and configuration.")
@@ -160,17 +181,53 @@ func (s *cupsControlSuite) TestAppArmorSpecClassic(c *C) {
 	c.Assert(spec.SnippetForTag("snap.provider.app"), Not(testutil.Contains), "# Allow daemon access to create the CUPS socket")
 
 	// provider to consumer on classic for PermanentSlot
-	spec = apparmor.NewSpecification(interfaces.NewSnapAppSet(s.providerSlotInfo.Snap))
+	appSet, err = interfaces.NewSnapAppSet(s.providerSlotInfo.Snap, nil)
+	c.Assert(err, IsNil)
+	spec = apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddPermanentSlot(s.iface, s.providerSlotInfo), IsNil)
 	c.Assert(spec.SecurityTags(), DeepEquals, []string{"snap.provider.app"})
 	c.Assert(spec.SnippetForTag("snap.provider.app"), testutil.Contains, "# Allow daemon access to create the CUPS socket")
 	c.Assert(spec.SnippetForTag("snap.provider.app"), Not(testutil.Contains), "label=\"snap.consumer.app\"")
 
 	// provider to consumer on classic for ConnectedSlot
-	spec = apparmor.NewSpecification(interfaces.NewSnapAppSet(s.providerSlot.Snap()))
+	appSet, err = interfaces.NewSnapAppSet(s.providerSlot.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec = apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedSlot(s.iface, s.plug, s.providerSlot), IsNil)
 	c.Assert(spec.SecurityTags(), DeepEquals, []string{"snap.provider.app"})
 	c.Assert(spec.SnippetForTag("snap.provider.app"), testutil.Contains, "peer=(label=\"snap.consumer.app\"")
+}
+
+func (s *cupsControlSuite) TestSecCompSpecCore(c *C) {
+	restore := release.MockOnClassic(false)
+	defer restore()
+
+	// core to consumer on core is empty for PermanentSlot
+	spec := seccomp.NewSpecification(s.coreSlot.AppSet())
+	c.Assert(spec.AddPermanentSlot(s.iface, s.coreSlotInfo), IsNil)
+	c.Assert(spec.SecurityTags(), HasLen, 0)
+
+	// provider to consumer on core gets permanent slot seccomp policy
+	spec = seccomp.NewSpecification(s.providerSlot.AppSet())
+	c.Assert(spec.AddPermanentSlot(s.iface, s.providerSlotInfo), IsNil)
+	c.Assert(spec.SecurityTags(), DeepEquals, []string{"snap.provider.app"})
+	c.Assert(spec.SnippetForTag("snap.provider.app"), testutil.Contains, "lsm_get_self_attr\n")
+}
+
+func (s *cupsControlSuite) TestSecCompSpecClassic(c *C) {
+	restore := release.MockOnClassic(true)
+	defer restore()
+
+	// core to consumer on classic is empty for PermanentSlot
+	spec := seccomp.NewSpecification(s.coreSlot.AppSet())
+	c.Assert(spec.AddPermanentSlot(s.iface, s.coreSlotInfo), IsNil)
+	c.Assert(spec.SecurityTags(), HasLen, 0)
+
+	// provider to consumer on classic gets permanent slot seccomp policy
+	spec = seccomp.NewSpecification(s.providerSlot.AppSet())
+	c.Assert(spec.AddPermanentSlot(s.iface, s.providerSlotInfo), IsNil)
+	c.Assert(spec.SecurityTags(), DeepEquals, []string{"snap.provider.app"})
+	c.Assert(spec.SnippetForTag("snap.provider.app"), testutil.Contains, "lsm_get_self_attr\n")
 }
 
 func (s *cupsControlSuite) TestAutoConnect(c *C) {

@@ -19,34 +19,15 @@
 
 package snapdtool
 
-var (
-	DistroSupportsReExec     = distroSupportsReExec
-	SystemSnapSupportsReExec = systemSnapSupportsReExec
+import (
+	"github.com/snapcore/snapd/testutil"
 )
 
-func MockCoreSnapdPaths(newCoreSnap, newSnapdSnap string) func() {
-	oldOldCore := coreSnap
-	oldNewCore := snapdSnap
-	snapdSnap = newSnapdSnap
-	coreSnap = newCoreSnap
-	return func() {
-		snapdSnap = oldNewCore
-		coreSnap = oldOldCore
-	}
-}
+var (
+	CandidateVersionNewer = candidateVersionNewer
+	ExeAndRoot            = exeAndRoot
+)
 
-func MockSelfExe(newSelfExe string) func() {
-	oldSelfExe := selfExe
-	selfExe = newSelfExe
-	return func() {
-		selfExe = oldSelfExe
-	}
-}
-
-func MockSyscallExec(f func(argv0 string, argv []string, envv []string) (err error)) func() {
-	oldSyscallExec := syscallExec
-	syscallExec = f
-	return func() {
-		syscallExec = oldSyscallExec
-	}
+func MockElfInterp(f func(string) (string, error)) (restore func()) {
+	return testutil.Mock(&elfInterp, f)
 }

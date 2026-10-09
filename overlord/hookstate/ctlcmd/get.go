@@ -21,23 +21,44 @@ package ctlcmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 
+	"github.com/snapcore/snapd/client"
+	"github.com/snapcore/snapd/client/clientutil"
+	"github.com/snapcore/snapd/confdb"
+	"github.com/snapcore/snapd/features"
 	"github.com/snapcore/snapd/i18n"
 	"github.com/snapcore/snapd/interfaces"
+	"github.com/snapcore/snapd/jsonutil"
+	"github.com/snapcore/snapd/overlord/confdbstate"
 	"github.com/snapcore/snapd/overlord/configstate"
 	"github.com/snapcore/snapd/overlord/configstate/config"
 	"github.com/snapcore/snapd/overlord/hookstate"
+	"github.com/snapcore/snapd/overlord/ifacestate/ifacerepo"
 	"github.com/snapcore/snapd/overlord/state"
+	"github.com/snapcore/snapd/snap"
+)
+
+var (
+	confdbstateGetView    = confdbstate.GetView
+	confdbstateReadConfdb = confdbstate.ReadConfdbFromSnap
 )
 
 type getCommand struct {
 	baseCommand
 
 	// these two options are mutually exclusive
-	ForceSlotSide bool `long:"slot" description:"return attribute values from the slot side of the connection"`
-	ForcePlugSide bool `long:"plug" description:"return attribute values from the plug side of the connection"`
+	ForceSlotSide bool     `long:"slot" description:"return attribute values from the slot side of the connection"`
+	ForcePlugSide bool     `long:"plug" description:"return attribute values from the plug side of the connection"`
+	View          bool     `long:"view" description:"return confdb values from the view declared in the plug"`
+	Previous      bool     `long:"previous" description:"return confdb values disregarding changes from the current transaction"`
+	With          []string `long:"with" value-name:"<param>=<constraint>" description:"parameter constraints for filtering confdb queries"`
+	Default       string   `long:"default" unquote:"false" description:"a default value to be used when no value is set"`
+	WaitFor       string   `long:"wait-for" description:"maximum duration to wait for confdb access (e.g. 10s)"`
 
 	Positional struct {
 		PlugOrSlotSpec string   `positional-args:"true" positional-arg-name:":<plug|slot>"`
@@ -84,14 +105,36 @@ This requests the "usb-vendor" setting from the slot that is connected to
 "myplug".
 `)
 
+var longConfdbGetHelp = i18n.G(`
+If the --view flag is used, 'snapctl get' expects the name of a connected
+interface plug referencing a confdb view. In that case, the command returns the
+data at the provided paths according to the view referenced by the plug.
+
+When using 'snacptl get' in a confdb hook, the --previous flag can be used to
+return confdb data disregarding the changes being committed in the transaction
+that invoked the hook.
+
+The --default flag can be used to provide a default value to be returned if no
+value is stored.
+
+The --with flag can be used to provide constraints in the form of 
+<param>=<constraint> pairs. Constraints are parsed as JSON values. If they
+cannot be interpreted as non-null JSON scalars, snapctl defaults to 
+interpreting values as strings unless -t is also provided.
+`)
+
 func init() {
+	if features.Confdb.IsEnabled() {
+		longGetHelp += longConfdbGetHelp
+	}
+
 	addCommand("get", shortGetHelp, longGetHelp, func() command {
 		return &getCommand{}
 	})
 }
 
-func (c *getCommand) printValues(getByKey func(string) (interface{}, bool, error)) error {
-	patch := make(map[string]interface{})
+func (c *getCommand) printValues(getByKey func(string) (any, bool, error)) error {
+	patch := make(map[string]any)
 	for _, key := range c.Positional.Keys {
 		value, output, err := getByKey(key)
 		if err == nil {
@@ -103,9 +146,15 @@ func (c *getCommand) printValues(getByKey func(string) (interface{}, bool, error
 		}
 	}
 
-	var confToPrint interface{} = patch
+	return c.printPatch(patch)
+}
+
+func (c *getCommand) printPatch(patch any) error {
+	var confToPrint any = patch
 	if !c.Document && len(c.Positional.Keys) == 1 {
-		confToPrint = patch[c.Positional.Keys[0]]
+		if confMap, ok := patch.(map[string]any); ok {
+			confToPrint = confMap[c.Positional.Keys[0]]
+		}
 	}
 
 	if c.Typed && confToPrint == nil {
@@ -134,7 +183,7 @@ func (c *getCommand) printValues(getByKey func(string) (interface{}, bool, error
 
 func (c *getCommand) Execute(args []string) error {
 	if len(c.Positional.Keys) == 0 && c.Positional.PlugOrSlotSpec == "" {
-		return fmt.Errorf(i18n.G("get which option?"))
+		return errors.New(i18n.G("get which option?"))
 	}
 
 	context, err := c.ensureContext()
@@ -146,6 +195,26 @@ func (c *getCommand) Execute(args []string) error {
 		return fmt.Errorf("cannot use -d and -t together")
 	}
 
+	if c.Previous {
+		if !c.View {
+			return fmt.Errorf("cannot use --previous without --view")
+		}
+
+		hookPref := func(p string) bool { return strings.HasPrefix(context.HookName(), p) }
+		if context == nil || context.IsEphemeral() || !(hookPref("save-view-") ||
+			hookPref("change-view-") || hookPref("observe-view-")) {
+			return fmt.Errorf(`cannot use --previous outside of save-view, change-view or observe-view hooks`)
+		}
+	}
+
+	if c.Default != "" && !c.View {
+		return fmt.Errorf(`cannot use --default with non-confdb read (missing --view)`)
+	}
+
+	if len(c.With) > 0 && !c.View {
+		return fmt.Errorf(`cannot use --with with non-confdb read (missing --view)`)
+	}
+
 	if strings.Contains(c.Positional.PlugOrSlotSpec, ":") {
 		parts := strings.SplitN(c.Positional.PlugOrSlotSpec, ":", 2)
 		snap, name := parts[0], parts[1]
@@ -155,8 +224,24 @@ func (c *getCommand) Execute(args []string) error {
 		if snap != "" {
 			return fmt.Errorf(`"snapctl get %s" not supported, use "snapctl get :%s" instead`, c.Positional.PlugOrSlotSpec, parts[1])
 		}
+
+		if c.View {
+			if err := validateConfdbFeatureFlag(context.State()); err != nil {
+				return err
+			}
+
+			requests := c.Positional.Keys
+			if c.Default != "" && len(requests) > 1 {
+				// TODO: what if some keys are fulfilled and others aren't? Do we fill in
+				// just the ones that are missing or none?
+				return fmt.Errorf("cannot use --default with more than one confdb request")
+			}
+
+			return c.getConfdbValues(context, name, requests, c.Previous)
+		}
+
 		if len(c.Positional.Keys) == 0 {
-			return fmt.Errorf(i18n.G("get which attribute?"))
+			return errors.New(i18n.G("get which attribute?"))
 		}
 
 		return c.getInterfaceSetting(context, name)
@@ -178,9 +263,9 @@ func (c *getCommand) getConfigSetting(context *hookstate.Context) error {
 	transaction := configstate.ContextTransaction(context)
 	context.Unlock()
 
-	return c.printValues(func(key string) (interface{}, bool, error) {
-		var value interface{}
-		err := transaction.Get(c.context().InstanceName(), key, &value)
+	return c.printValues(func(key string) (any, bool, error) {
+		var value any
+		err := transaction.Get(c.context().InstanceName().String(), key, &value)
 		if err == nil {
 			return value, true, nil
 		}
@@ -250,7 +335,7 @@ func validatePlugOrSlot(attrsTask *state.Task, plugSide bool, plugOrSlot string)
 		}
 	}
 	if err != nil {
-		return fmt.Errorf(i18n.G("internal error: cannot find plug or slot data in the appropriate task"))
+		return errors.New(i18n.G("internal error: cannot find plug or slot data in the appropriate task"))
 	}
 	if name != plugOrSlot {
 		return fmt.Errorf(i18n.G("unknown plug or slot %q"), plugOrSlot)
@@ -271,7 +356,7 @@ func attributesTask(context *hookstate.Context) (*state.Task, error) {
 
 	attrsTask := st.Task(attrsTaskID)
 	if attrsTask == nil {
-		return nil, fmt.Errorf(i18n.G("internal error: cannot find attrs task"))
+		return nil, errors.New(i18n.G("internal error: cannot find attrs task"))
 	}
 
 	return attrsTask, nil
@@ -281,11 +366,10 @@ func (c *getCommand) getInterfaceSetting(context *hookstate.Context, plugOrSlot 
 	// Make sure get :<plug|slot> is only supported during the execution of interface hooks
 	hookType, err := interfaceHookType(context.HookName())
 	if err != nil {
-		return fmt.Errorf(i18n.G("interface attributes can only be read during the execution of interface hooks"))
+		return errors.New(i18n.G("interface attributes can only be read during the execution of interface hooks"))
 	}
 
-	var attrsTask *state.Task
-	attrsTask, err = attributesTask(context)
+	attrsTask, err := attributesTask(context)
 	if err != nil {
 		return err
 	}
@@ -310,7 +394,7 @@ func (c *getCommand) getInterfaceSetting(context *hookstate.Context, plugOrSlot 
 	st.Lock()
 	defer st.Unlock()
 
-	var staticAttrs, dynamicAttrs map[string]interface{}
+	var staticAttrs, dynamicAttrs map[string]any
 	if err = attrsTask.Get(which+"-static", &staticAttrs); err != nil {
 		return fmt.Errorf(i18n.G("internal error: cannot get %s from appropriate task"), which)
 	}
@@ -318,23 +402,166 @@ func (c *getCommand) getInterfaceSetting(context *hookstate.Context, plugOrSlot 
 		return fmt.Errorf(i18n.G("internal error: cannot get %s from appropriate task"), which)
 	}
 
-	return c.printValues(func(key string) (interface{}, bool, error) {
+	return c.printValues(func(key string) (any, bool, error) {
 		subkeys, err := config.ParseKey(key)
 		if err != nil {
 			return nil, false, err
 		}
 
-		var value interface{}
-		err = getAttribute(context.InstanceName(), subkeys, 0, staticAttrs, &value)
+		var value any
+		err = getAttribute(context.InstanceName().String(), subkeys, 0, staticAttrs, &value)
 		if err == nil {
 			return value, true, nil
 		}
 		if isNoAttribute(err) {
-			err = getAttribute(context.InstanceName(), subkeys, 0, dynamicAttrs, &value)
+			err = getAttribute(context.InstanceName().String(), subkeys, 0, dynamicAttrs, &value)
 			if err == nil {
 				return value, true, nil
 			}
 		}
 		return nil, false, err
 	})
+}
+
+func (c *getCommand) getConfdbValues(ctx *hookstate.Context, plugName string, requests []string, previous bool) error {
+	if c.ForcePlugSide || c.ForceSlotSide {
+		return errors.New(i18n.G("cannot use --plug or --slot with --view"))
+	}
+	ctx.Lock()
+	defer ctx.Unlock()
+
+	plug, err := checkConfdbPlugConnection(ctx, plugName)
+	if err != nil {
+		return err
+	}
+
+	account, dbSchemaName, viewName, err := snap.ConfdbPlugAttrs(plug)
+	if err != nil {
+		return fmt.Errorf(i18n.G("invalid plug :%s: %w"), plugName, err)
+	}
+
+	view, err := confdbstateGetView(ctx.State(), account, dbSchemaName, viewName)
+	if err != nil {
+		return err
+	}
+
+	parseOpts := clientutil.ConfdbOptions{Typed: c.Typed}
+	constraints, err := clientutil.ParseConfdbConstraints(c.With, parseOpts)
+	if err != nil {
+		return err
+	}
+
+	opts := &client.ConfdbOptions{}
+	if c.WaitFor != "" {
+		timeout, err := time.ParseDuration(c.WaitFor)
+		if err != nil {
+			return fmt.Errorf("cannot parse --wait-for value %s: %v", c.WaitFor, err)
+		}
+
+		if timeout < 0 {
+			return fmt.Errorf("--wait-for value must be non-negative")
+		}
+
+		opts.AccessTimeout = &timeout
+	}
+
+	tx, err := confdbstateReadConfdb(ctx, view, requests, constraints, opts)
+	if err != nil {
+		return err
+	}
+
+	var bag confdb.Databag = tx
+	if previous {
+		bag = tx.Previous()
+	}
+
+	uid, err := strconv.Atoi(c.baseCommand.uid)
+	if err != nil {
+		return err
+	}
+	var userAccess confdb.Access
+	if uid == 0 {
+		userAccess = confdb.AdminAccess
+	} else {
+		userAccess = confdb.UnprivilegedAccess
+	}
+
+	res, err := confdbstate.GetViaView(bag, view, requests, constraints, userAccess)
+	if err != nil {
+		if !errors.As(err, new(*confdb.NoDataError)) || c.Default == "" {
+			return err
+		}
+
+		// we don't allow --default with multiple keys so we know there's only one
+		res, err = c.buildDefaultOutput(requests[0])
+		if err != nil {
+			return err
+		}
+	}
+
+	return c.printPatch(res)
+}
+
+func (c *getCommand) buildDefaultOutput(request string) (map[string]any, error) {
+	var defaultVal any
+	if err := jsonutil.DecodeWithNumber(strings.NewReader(c.Default), &defaultVal); err != nil {
+		var merr *json.SyntaxError
+		if !errors.As(err, &merr) {
+			// shouldn't happen as other errors are due to programmer error
+			return nil, fmt.Errorf("internal error: cannot unmarshal --default value: %v", err)
+		}
+
+		if c.Typed {
+			return nil, fmt.Errorf("cannot unmarshal default value as strictly typed")
+		}
+
+		// the value isn't typed, fallback to using it as is
+		defaultVal = c.Default
+	}
+
+	return map[string]any{request: defaultVal}, nil
+}
+
+func checkConfdbPlugConnection(ctx *hookstate.Context, plugName string) (*snap.PlugInfo, error) {
+	// TODO: this check currently doesn't support per-app plugs but it should eventually
+	repo := ifacerepo.Get(ctx.State())
+	plug := repo.Plug(ctx.InstanceName(), plugName)
+	if plug == nil {
+		return nil, fmt.Errorf(i18n.G("cannot find plug :%s for snap %q"), plugName, ctx.InstanceName())
+	}
+
+	if plug.Interface != "confdb" {
+		return nil, fmt.Errorf(i18n.G("cannot use --view with non-confdb plug :%s"), plugName)
+	}
+
+	conns, err := repo.Connected(ctx.InstanceName(), plugName)
+	if err != nil {
+		return nil, fmt.Errorf(i18n.G("cannot check if plug :%s is connected: %v"), plugName, err)
+	}
+
+	if len(conns) == 0 {
+		return nil, fmt.Errorf(i18n.G("cannot access confdb through unconnected plug :%s"), plugName)
+	}
+
+	return plug, nil
+}
+
+// validateConfdbFeatureFlag checks whether the confdb experimental flag
+// is enabled. The state should not be locked by the caller.
+func validateConfdbFeatureFlag(st *state.State) error {
+	st.Lock()
+	defer st.Unlock()
+
+	tr := config.NewTransaction(st)
+	enabled, err := features.Flag(tr, features.Confdb)
+	if err != nil && !config.IsNoOption(err) {
+		return fmt.Errorf(i18n.G("internal error: cannot check confdb feature flag: %v"), err)
+	}
+
+	if !enabled {
+		_, confName := features.Confdb.ConfigOption()
+		return fmt.Errorf(i18n.G(`"confdb" feature flag is disabled: set '%s' to true`), confName)
+	}
+
+	return nil
 }

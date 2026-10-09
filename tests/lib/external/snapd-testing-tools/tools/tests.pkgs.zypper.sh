@@ -19,7 +19,7 @@ remap_one() {
             echo "python3-gobject"
             ;;
         test-snapd-pkg-1)
-            echo "nudoku"
+            echo "w3m"
             ;;
         test-snapd-pkg-2)
             echo "system-user-games"
@@ -57,10 +57,15 @@ cmd_query() {
 }
 
 cmd_list_installed() {
-    rpm -qa | sort
+    # Keep only the stable package identity (name.arch), excluding version data,
+    # so restore diffs do not treat package upgrades during a test as new installs.
+    rpm -qa --qf '%{NAME}.%{ARCH}\n' | sort -u
 }
 
 cmd_remove() {
-    # shellcheck disable=SC2068
-    zypper remove -y $@
+    zypper remove -y "$@"
+}
+
+cmd_download() {
+    zypper --pkg-cache-dir "${PWD:-.}" -q download "$@"
 }

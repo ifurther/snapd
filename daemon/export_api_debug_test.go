@@ -19,10 +19,22 @@
 
 package daemon
 
+import "github.com/snapcore/snapd/testutil"
+
 type (
 	ConnectivityStatus = connectivityStatus
+
+	RAAInfo              = raaInfo
+	MonitoredSnapInfo    = monitoredSnapInfo
+	RefreshCandidateInfo = refreshCandidateInfo
+	RefreshCandidate     = refreshCandidate
+	FeatureResponse      = featureResponse
 )
 
 var (
 	MinLane = minLane
 )
+
+func MockCgroupPidsOfSnap(f func(instanceName string) (map[string][]int, error)) (restore func()) {
+	return testutil.Mock(&cgroupPidsOfSnap, f)
+}

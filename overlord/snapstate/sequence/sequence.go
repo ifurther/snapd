@@ -25,6 +25,7 @@ package sequence
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/snap/naming"
@@ -137,14 +138,16 @@ func (snapSeq *SnapSequence) LastIndex(revision snap.Revision) int {
 	return -1
 }
 
-var ErrSnapRevNotInSequence = errors.New("snap is not in the sequence")
+// ErrSnapRevNotInSequence is returned when an operation targets a snap
+// revision that is not present in the snap sequence.
+var ErrSnapRevNotInSequence = errors.New("snap revision is not in the sequence")
 
 // AddComponentForRevision adds a component to the last instance of snapRev in
 // the sequence.
 func (snapSeq *SnapSequence) AddComponentForRevision(snapRev snap.Revision, cs *ComponentState) error {
 	snapIdx := snapSeq.LastIndex(snapRev)
 	if snapIdx == -1 {
-		return ErrSnapRevNotInSequence
+		return fmt.Errorf("%w: %s", ErrSnapRevNotInSequence, snapRev)
 	}
 	revSt := snapSeq.Revisions[snapIdx]
 
@@ -182,12 +185,12 @@ func (snapSeq *SnapSequence) RemoveComponentForRevision(snapRev snap.Revision, c
 	return unlinkedComp
 }
 
-// ComponentSideInfoForRev returns cref's component side info for the revision
+// ComponentStateForRev returns cref's component side info for the revision
 // (sequence point) indicated by revIdx if there is one.
-func (snapSeq *SnapSequence) ComponentSideInfoForRev(revIdx int, cref naming.ComponentRef) *snap.ComponentSideInfo {
+func (snapSeq *SnapSequence) ComponentStateForRev(revIdx int, cref naming.ComponentRef) *ComponentState {
 	for _, comp := range snapSeq.Revisions[revIdx].Components {
 		if comp.SideInfo.Component == cref {
-			return comp.SideInfo
+			return comp
 		}
 	}
 	// component not found
@@ -226,4 +229,70 @@ func (snapSeq *SnapSequence) ComponentsWithTypeForRev(rev snap.Revision, compTyp
 		kmodComps = append(kmodComps, comp.SideInfo)
 	}
 	return kmodComps
+}
+
+// IsComponentRevInRefSeqPtInAnyOtherSeqPt tells us if the component cref in
+// the sequence point defined by refIdx is used in another sequence point too.
+func (snapSeq *SnapSequence) IsComponentRevInRefSeqPtInAnyOtherSeqPt(cref naming.ComponentRef, refIdx int) bool {
+	// Find component in reference sequence point
+	refSeqPt := snapSeq.Revisions[refIdx]
+	refSeqPtComp := refSeqPt.FindComponent(cref)
+	if refSeqPtComp == nil {
+		return false
+	}
+
+	// Find if the reference component revision is used elsewhere
+	for idx, seqPt := range snapSeq.Revisions {
+		if idx == refIdx {
+			continue
+		}
+		compInSeqPt := seqPt.FindComponent(cref)
+		if compInSeqPt == nil {
+			continue
+		}
+		if compInSeqPt.SideInfo.Revision == refSeqPtComp.SideInfo.Revision {
+			return true
+		}
+	}
+
+	return false
+}
+
+// MinimumLocalRevision returns the the smallest local revision for the
+// sequence. Local revisions start at -1 and are counted down. 0 will be
+// returned if no local revision for the snap is found.
+func (snapSeq *SnapSequence) MinimumLocalRevision() snap.Revision {
+	var local snap.Revision
+	for _, rev := range snapSeq.Revisions {
+		if rev.Snap.Revision.N < local.N {
+			local = rev.Snap.Revision
+		}
+	}
+	return local
+}
+
+// MinimumLocalComponentRevision returns the smallest local revision for the
+// compName component in the sequence. Local revisions start at -1 and are
+// counted down. 0 will be returned if no local revision for the component is
+// found.
+func (snapSeq *SnapSequence) MinimumLocalComponentRevision(compName string) snap.Revision {
+	var local snap.Revision
+	for _, revSt := range snapSeq.Revisions {
+		for _, compSt := range revSt.Components {
+			if compSt.SideInfo.Component.ComponentName != compName {
+				continue
+			}
+			if compSt.SideInfo.Revision.N >= local.N {
+				continue
+			}
+			local = compSt.SideInfo.Revision
+		}
+	}
+	return local
+}
+
+// HasComponents returns true if the revision at the given index has
+// any components installed with it.
+func (snapSeq *SnapSequence) HasComponents(revIdx int) bool {
+	return len(snapSeq.Revisions[revIdx].Components) > 0
 }

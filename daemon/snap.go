@@ -24,16 +24,20 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/snapcore/snapd/client"
 	"github.com/snapcore/snapd/client/clientutil"
 	"github.com/snapcore/snapd/logger"
+	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/overlord/assertstate"
 	"github.com/snapcore/snapd/overlord/healthstate"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 )
 
 var errNoSnap = errors.New("snap not installed")
@@ -155,7 +159,7 @@ func allLocalSnapInfos(st *state.State, sel snapSelect, wanted map[string]bool) 
 		var info *snap.Info
 		if sel == snapSelectAll {
 			for _, si := range snapst.Sequence.SideInfos() {
-				info, err = snap.ReadInfo(name, si)
+				info, err = snap.ReadInfo(naming.InstanceName(name), si)
 				if err != nil {
 					// single revision may be broken
 					_, instanceKey := snap.SplitInstanceName(name)
@@ -223,6 +227,10 @@ func clientHealthFromHealthstate(h *healthstate.HealthState) *client.SnapHealth 
 
 func clientSnapRefreshInhibit(st *state.State, snapst *snapstate.SnapState, instanceName string) *client.SnapRefreshInhibit {
 	proceedTime := snapst.RefreshInhibitProceedTime(st)
+	if proceedTime.IsZero() {
+		return nil
+	}
+
 	if proceedTime.After(time.Now()) || snapstate.IsSnapMonitored(st, instanceName) {
 		return &client.SnapRefreshInhibit{
 			ProceedTime: proceedTime,
@@ -240,7 +248,7 @@ func mapLocal(about aboutSnap, sd clientutil.StatusDecorator) *client.Snap {
 	}
 	result.InstalledSize = localSnap.Size
 
-	if icon := snapIcon(localSnap); icon != "" {
+	if icon := snapIcon(localSnap, localSnap.SnapID); icon != "" {
 		result.Icon = icon
 	}
 
@@ -255,6 +263,7 @@ func mapLocal(about aboutSnap, sd clientutil.StatusDecorator) *client.Snap {
 	result.DevMode = snapst.DevMode
 	result.TryMode = snapst.TryMode
 	result.JailMode = snapst.JailMode
+	result.RefreshFailures = snapst.RefreshFailures
 	result.MountedFrom = localSnap.MountFile()
 	if result.TryMode {
 		// Readlink instead of EvalSymlinks because it's only expected
@@ -272,15 +281,94 @@ func mapLocal(about aboutSnap, sd clientutil.StatusDecorator) *client.Snap {
 	if !about.gatingHold.IsZero() {
 		result.GatingHold = &about.gatingHold
 	}
+
+	if len(about.info.Components) > 0 {
+		result.Components = fillComponentInfo(about)
+	}
+
 	return result
 }
 
-// snapIcon tries to find the icon inside the snap
-func snapIcon(info snap.PlaceInfo) string {
-	found, _ := filepath.Glob(filepath.Join(info.MountDir(), "meta", "gui", "icon.*"))
-	if len(found) == 0 {
-		return ""
+type compsByName []client.Component
+
+func (c compsByName) Len() int           { return len(c) }
+func (c compsByName) Swap(i, j int)      { c[i], c[j] = c[j], c[i] }
+func (c compsByName) Less(i, j int) bool { return c[i].Name < c[j].Name }
+
+func fillComponentInfo(about aboutSnap) []client.Component {
+	localSnap, snapst := about.info, about.snapst
+	comps := make([]client.Component, 0, len(about.info.Components))
+
+	// First present installed components
+	currentComps, err := snapst.CurrentComponentInfos()
+	if err != nil {
+		logger.Noticef("cannot retrieve installed components: %v", err)
+	}
+	currentCompsSet := map[string]bool{}
+	for _, comp := range currentComps {
+		currentCompsSet[comp.Component.ComponentName] = true
+		csi := snapst.CurrentComponentSideInfo(comp.Component)
+		cpi := snap.MinimalComponentContainerPlaceInfo(
+			comp.Component.ComponentName, csi.Revision, localSnap.InstanceName())
+		compSz, err := snap.ComponentSize(cpi)
+		if err != nil {
+			logger.Noticef("cannot get size of %s: %v", comp.Component, err)
+			compSz = 0
+		}
+		comps = append(comps, client.Component{
+			Name:          comp.Component.ComponentName,
+			Type:          comp.Type,
+			Version:       comp.Version(about.info.Version),
+			Summary:       comp.Summary,
+			Description:   comp.Description,
+			Revision:      csi.Revision,
+			InstallDate:   snap.ComponentInstallDate(cpi, localSnap.Revision),
+			InstalledSize: compSz,
+		})
 	}
 
-	return found[0]
+	// Then, non-installed components
+	for name, comp := range about.info.Components {
+		if _, ok := currentCompsSet[name]; ok {
+			continue
+		}
+		comps = append(comps, client.Component{
+			Name:        name,
+			Type:        comp.Type,
+			Summary:     comp.Summary,
+			Description: comp.Description,
+		})
+	}
+
+	// for test stability
+	sort.Sort(compsByName(comps))
+
+	return comps
+}
+
+// snapIcon tries to find the icon inside the snap at meta/gui/icon.*, and if
+// the snap does not ship an icon there, then tries to find the fallback icon
+// in the icons install directory.
+func snapIcon(info snap.PlaceInfo, snapID string) string {
+	// Look in the snap itself
+	found, _ := filepath.Glob(filepath.Join(info.MountDir(), "meta", "gui", "icon.*"))
+	// Prioritize svg if it exists, else png, else whatever we can get
+	for _, filetype := range []string{".svg", ".png"} {
+		for _, filename := range found {
+			if strings.HasSuffix(filename, filetype) {
+				return filename
+			}
+		}
+	}
+	if len(found) > 0 {
+		return found[0]
+	}
+
+	// Look in the snap icons directory as a fallback
+	if fallback := snapstate.IconInstallFilename(snapID); fallback != "" && osutil.FileExists(fallback) {
+		return fallback
+	}
+
+	// Didn't find an icon
+	return ""
 }

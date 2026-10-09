@@ -20,22 +20,25 @@
 package snapstate_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"os/user"
 
 	. "gopkg.in/check.v1"
 
 	"github.com/snapcore/snapd/arch"
+	"github.com/snapcore/snapd/arch/archtest"
 	"github.com/snapcore/snapd/asserts"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/osutil"
+	"github.com/snapcore/snapd/osutil/user"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/snapstate/snapstatetest"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/release"
 	seccomp_compiler "github.com/snapcore/snapd/sandbox/seccomp"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/snap/snaptest"
 	"github.com/snapcore/snapd/snapdtool"
 	"github.com/snapcore/snapd/testutil"
@@ -54,7 +57,7 @@ func (s *checkSnapSuite) SetUpTest(c *C) {
 	dirs.SetRootDir(c.MkDir())
 	s.st = state.New(nil)
 	s.BaseTest.AddCleanup(snap.MockSanitizePlugsSlots(func(snapInfo *snap.Info) {}))
-	s.deviceCtx = &snapstatetest.TrivialDeviceContext{DeviceModel: MakeModel(map[string]interface{}{
+	s.deviceCtx = &snapstatetest.TrivialDeviceContext{DeviceModel: MakeModel(map[string]any{
 		"kernel": "kernel",
 		"gadget": "gadget",
 	})}
@@ -93,134 +96,43 @@ architectures:
 	c.Assert(err.Error(), Equals, errorMsg)
 }
 
-var assumesTests = []struct {
-	version string
-	assumes string
-	classic bool
-	error   string
-}{{
-	assumes: "[common-data-dir]",
-}, {
-	assumes: "[f1, f2]",
-	error:   `snap "foo" assumes unsupported features: f1, f2 \(try to refresh snapd\)`,
-}, {
-	assumes: "[f1, f2]",
-	classic: true,
-	error:   `snap "foo" assumes unsupported features: f1, f2 \(try to refresh snapd\)`,
-}, {
-	assumes: "[snapd2.15]",
-	version: "unknown",
-}, {
-	assumes: "[snapdnono]",
-	version: "unknown",
-	error:   `.* unsupported features: snapdnono .*`,
-}, {
-	assumes: "[snapd2.15nono]",
-	version: "unknown",
-	error:   `.* unsupported features: snapd2.15nono .*`,
-}, {
-	assumes: "[snapd2.15~pre1]",
-	version: "unknown",
-	error:   `.* unsupported features: snapd2.15~pre1 .*`,
-}, {
-	assumes: "[snapd2.15]",
-	version: "2.15",
-}, {
-	assumes: "[snapd2.15]",
-	version: "2.15.1",
-}, {
-	assumes: "[snapd2.15]",
-	version: "2.15+git",
-}, {
-	assumes: "[snapd2.15]",
-	version: "2.16",
-}, {
-	assumes: "[snapd2.15.1]",
-	version: "2.16",
-}, {
-	assumes: "[snapd2.15.1]",
-	version: "2.15.1",
-}, {
-	assumes: "[snapd2.15.1.2]",
-	version: "2.15.1.2",
-}, {
-	assumes: "[snapd2.15.1.2]",
-	version: "2.15.1.3",
-}, {
-	// the horror the horror!
-	assumes: "[snapd2.15.1.2.4.5.6.7.8.8]",
-	version: "2.15.1.2.4.5.6.7.8.8",
-}, {
-	assumes: "[snapd2.15.1.2.4.5.6.7.8.8]",
-	version: "2.15.1.2.4.5.6.7.8.9",
-}, {
-	assumes: "[snapd2.15.1.2]",
-	version: "2.15.1.3",
-}, {
-	assumes: "[snapd2.15.2]",
-	version: "2.16.1",
-}, {
-	assumes: "[snapd2.1000]",
-	version: "3.1",
-}, {
-	assumes: "[snapd3]",
-	version: "3.1",
-}, {
-	assumes: "[snapd2]",
-	version: "3.1",
-}, {
-	assumes: "[snapd3]",
-	version: "2.48",
-	error:   `.* unsupported features: snapd3 .*`,
-}, {
-	assumes: "[snapd2.15.1.2]",
-	version: "2.15.1.1",
-	error:   `.* unsupported features: snapd2\.15\.1\.2 .*`,
-}, {
-	assumes: "[snapd2.15.1.2.4.5.6.7.8.8]",
-	version: "2.15.1.2.4.5.6.7.8.1",
-	error:   `.* unsupported features: snapd2\.15\.1\.2\.4\.5\.6\.7\.8\.8 .*`,
-}, {
-	assumes: "[snapd2.16]",
-	version: "2.15",
-	error:   `.* unsupported features: snapd2\.16 .*`,
-}, {
-	assumes: "[snapd2.15.1]",
-	version: "2.15",
-	error:   `.* unsupported features: snapd2\.15\.1 .*`,
-}, {
-	assumes: "[snapd2.15.1]",
-	version: "2.15.0",
-	error:   `.* unsupported features: snapd2\.15\.1 .*`,
-}, {
-	// Note that this is different from how strconv.VersionCompare
-	// (dpkg version numbering) would behave - it would error here
-	assumes: "[snapd2.15]",
-	version: "2.15~pre1",
-}, {
-	assumes: "[command-chain]",
-}, {
-	assumes: "[kernel-assets]",
-}, {
-	assumes: "[snap-uid-envvars]",
-},
-}
-
 func (s *checkSnapSuite) TestCheckSnapAssumes(c *C) {
-	restore := snapdtool.MockVersion("2.15")
+	s.AddCleanup(archtest.MockArchitecture("arm64"))
+
+	var assumesTests = []struct {
+		version string
+		assumes string
+		classic bool
+		error   string
+	}{{
+		assumes: "[common-data-dir]",
+	}, {
+		assumes: "[f1, f2]",
+		error:   `snap "foo" assumes unsupported features: f1, f2 \(try to refresh snapd\)`,
+	}, {
+		assumes: "[f1, f2]",
+		classic: true,
+		error:   `snap "foo" assumes unsupported features: f1, f2 \(try to refresh snapd\)`,
+	}, {
+		assumes: "[isa-arm64-someisa]",
+		error:   `snap "foo" assumes isa-arm64-someisa: ISA specification is not supported for arch: arm64`,
+	},
+	}
+
+	restore := snapdtool.MockVersion("2.15", "")
 	defer restore()
 
 	restore = release.MockOnClassic(false)
 	defer restore()
 
 	for _, test := range assumesTests {
-
-		snapdtool.Version = test.version
-		if snapdtool.Version == "" {
-			snapdtool.Version = "2.15"
+		// FIXME: This relies on eventual defer of snapdtool.MockVersion above ^^^.
+		snapdtool.UpstreamVersion = test.version
+		if snapdtool.UpstreamVersion == "" {
+			snapdtool.UpstreamVersion = "2.15"
 		}
 
-		comment := Commentf("snap assumes %q, but snapd version is %q", test.assumes, snapdtool.Version)
+		comment := Commentf("snap assumes %q, but snapd version is %q", test.assumes, snapdtool.UpstreamVersion)
 		release.OnClassic = test.classic
 
 		yaml := fmt.Sprintf("name: foo\nversion: 1.0\nassumes: %s\n", test.assumes)
@@ -264,7 +176,7 @@ version: 1.0`
 		data, err := sf.ReadFile("canary")
 		c.Assert(err, IsNil)
 		c.Assert(data, DeepEquals, []byte("canary"))
-		c.Assert(s.InstanceName(), Equals, "foo")
+		c.Assert(s.InstanceName().String(), Equals, "foo")
 		c.Assert(s.SnapID, Equals, "snap-id")
 		checkCbCalled = true
 		return nil
@@ -476,21 +388,21 @@ func (s *checkSnapSuite) TestCheckUnassertedOrAssertedGadgetKernelSnapVsModelGra
 	defer reset()
 
 	gradeUnsetDeviceCtx := &snapstatetest.TrivialDeviceContext{
-		DeviceModel: MakeModel(map[string]interface{}{
+		DeviceModel: MakeModel(map[string]any{
 			"kernel": "kernel",
 			"gadget": "gadget",
 		}),
 	}
 	c.Check(gradeUnsetDeviceCtx.DeviceModel.Grade(), Equals, asserts.ModelGradeUnset)
 	gradeSignedDeviceCtx := &snapstatetest.TrivialDeviceContext{
-		DeviceModel: MakeModel20("gadget", map[string]interface{}{
+		DeviceModel: MakeModel20("gadget", map[string]any{
 			"base":  "core20",
 			"grade": "signed",
 		}),
 	}
 	c.Check(gradeSignedDeviceCtx.DeviceModel.Grade(), Equals, asserts.ModelSigned)
 	gradeDangerousDeviceCtx := &snapstatetest.TrivialDeviceContext{
-		DeviceModel: MakeModel20("gadget", map[string]interface{}{
+		DeviceModel: MakeModel20("gadget", map[string]any{
 			"base":  "core20",
 			"grade": "dangerous",
 		}),
@@ -1013,8 +925,8 @@ version: 1.0`
 	checkCbCalled := false
 	checkCb := func(st *state.State, s, cur *snap.Info, sf snap.Container, flags snapstate.Flags, deviceCtx snapstate.DeviceContext) error {
 		c.Assert(sf, NotNil)
-		c.Assert(s.InstanceName(), Equals, "foo_instance")
-		c.Assert(s.SnapName(), Equals, "foo")
+		c.Assert(s.InstanceName().String(), Equals, "foo_instance")
+		c.Assert(s.SnapName().String(), Equals, "foo")
 		c.Assert(s.SnapID, Equals, "snap-id")
 		checkCbCalled = true
 		return nil
@@ -1368,7 +1280,7 @@ func (s *checkSnapSuite) testCheckSnapSystemUsernamesCallsCommon(c *C, expectedU
 		mockUserAdd := testutil.MockCommand(c, "useradd", "")
 		defer mockUserAdd.Restore()
 
-		err = snapstate.CheckSnap(s.st, "snap-path", info.SnapName(), nil, nil, snapstate.Flags{}, nil)
+		err = snapstate.CheckSnap(s.st, "snap-path", info.SnapName().String(), nil, nil, snapstate.Flags{}, nil)
 		c.Assert(err, IsNil)
 		if classic {
 			c.Check(mockGroupAdd.Calls(), DeepEquals, [][]string{
@@ -1432,7 +1344,7 @@ version: 2
 	// happy case, the new-kernel matches the model
 	deviceCtx := &snapstatetest.TrivialDeviceContext{
 		Remodeling: true,
-		DeviceModel: MakeModel(map[string]interface{}{
+		DeviceModel: MakeModel(map[string]any{
 			"kernel": "new-kernel",
 			"gadget": "gadget",
 		}),
@@ -1484,7 +1396,7 @@ version: 2
 	// support this yet
 	deviceCtx := &snapstatetest.TrivialDeviceContext{
 		Remodeling: true,
-		DeviceModel: MakeModel(map[string]interface{}{
+		DeviceModel: MakeModel(map[string]any{
 			"kernel": "kernel",
 			"gadget": "new-gadget",
 		}),
@@ -1523,4 +1435,159 @@ func (s *checkSnapSuite) TestCheckConfigureHooksUnHappy(c *C) {
 
 	err := snapstate.CheckSnap(s.st, "snap-path", "snap-with-default-configure", nil, nil, snapstate.Flags{}, nil)
 	c.Check(err, ErrorMatches, `cannot specify "default-configure" hook without "configure" hook`)
+}
+
+const desktopFileIDsYamlTemplate = `
+name: %s
+version: 1.0
+plugs:
+  desktop:
+    desktop-file-ids: [org.example.Foo]
+`
+
+func (s *snapmgrTestSuite) TestCheckDesktopFileIDsConflicts(c *C) {
+	someSnap, err := snap.InfoFromSnapYaml([]byte(fmt.Sprintf(desktopFileIDsYamlTemplate, "some-snap")))
+	c.Assert(err, IsNil)
+	c.Assert(someSnap.Plugs["desktop"], NotNil)
+	otherSnap, err := snap.InfoFromSnapYaml([]byte(fmt.Sprintf(desktopFileIDsYamlTemplate, "other-snap")))
+	c.Assert(err, IsNil)
+	c.Assert(otherSnap.Plugs["desktop"], NotNil)
+
+	restore := snapstate.MockSnapReadInfo(func(name naming.InstanceName, si *snap.SideInfo) (*snap.Info, error) {
+		switch name {
+		case "some-snap":
+			return someSnap, nil
+		case "other-snap":
+			return otherSnap, nil
+		default:
+			return s.fakeBackend.ReadInfo(name, si)
+		}
+	})
+	defer restore()
+
+	s.state.Lock()
+	defer s.state.Unlock()
+	si := &snap.SideInfo{
+		RealName: "other-snap",
+		Revision: snap.R(-42),
+	}
+	snapstate.Set(s.state, "other-snap", &snapstate.SnapState{
+		Active:   true,
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{si}),
+		Current:  si.Revision,
+		SnapType: "app",
+	})
+
+	err = snapstate.CheckDesktopFileIDsConflicts(s.state, someSnap)
+	c.Assert(err, ErrorMatches, `snap "some-snap" requesting desktop-file-id "org.example.Foo.desktop" conflicts with snap "other-snap" use`)
+}
+
+func (s *snapmgrTestSuite) TestCheckDesktopFileIDsConflictsNoConflictWithSelf(c *C) {
+	someSnap, err := snap.InfoFromSnapYaml([]byte(fmt.Sprintf(desktopFileIDsYamlTemplate, "some-snap")))
+	c.Assert(err, IsNil)
+	c.Assert(someSnap.Plugs["desktop"], NotNil)
+
+	restore := snapstate.MockSnapReadInfo(func(name naming.InstanceName, si *snap.SideInfo) (*snap.Info, error) {
+		switch name {
+		case "some-snap":
+			return someSnap, nil
+		default:
+			return s.fakeBackend.ReadInfo(name, si)
+		}
+	})
+	defer restore()
+
+	s.state.Lock()
+	defer s.state.Unlock()
+	si := &snap.SideInfo{
+		RealName: "some-snap",
+		Revision: snap.R(-42),
+	}
+	snapstate.Set(s.state, "some-snap", &snapstate.SnapState{
+		Active:   true,
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{si}),
+		Current:  si.Revision,
+		SnapType: "app",
+	})
+
+	err = snapstate.CheckDesktopFileIDsConflicts(s.state, someSnap)
+	c.Assert(err, IsNil)
+}
+
+func (s *snapmgrTestSuite) TestInstallDesktopFileIDsConflicts(c *C) {
+	someSnap, err := snap.InfoFromSnapYaml([]byte(fmt.Sprintf(desktopFileIDsYamlTemplate, "some-snap")))
+	c.Assert(err, IsNil)
+	c.Assert(someSnap.Plugs["desktop"], NotNil)
+	otherSnap, err := snap.InfoFromSnapYaml([]byte(fmt.Sprintf(desktopFileIDsYamlTemplate, "other-snap")))
+	c.Assert(err, IsNil)
+	c.Assert(otherSnap.Plugs["desktop"], NotNil)
+
+	restore := snapstate.MockSnapReadInfo(func(name naming.InstanceName, si *snap.SideInfo) (*snap.Info, error) {
+		switch name {
+		case "some-snap":
+			return someSnap, nil
+		case "other-snap":
+			return otherSnap, nil
+		default:
+			return s.fakeBackend.ReadInfo(name, si)
+		}
+	})
+	defer restore()
+
+	s.state.Lock()
+	defer s.state.Unlock()
+	si := &snap.SideInfo{
+		RealName: "other-snap",
+		Revision: snap.R(-42),
+	}
+	snapstate.Set(s.state, "other-snap", &snapstate.SnapState{
+		Active:   true,
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{si}),
+		Current:  si.Revision,
+		SnapType: "app",
+	})
+
+	// Conflict should be detected in early checks
+	opts := &snapstate.RevisionOptions{Channel: "channel-for-desktop-file-ids"}
+	_, err = snapstate.Install(context.Background(), s.state, "some-snap", opts, s.user.ID, snapstate.Flags{})
+	c.Assert(err, ErrorMatches, `snap "some-snap" requesting desktop-file-id "org.example.Foo.desktop" conflicts with snap "other-snap" use`)
+}
+
+func (s *snapmgrTestSuite) TestInstallManyDesktopFileIDsConflicts(c *C) {
+	someSnap, err := snap.InfoFromSnapYaml([]byte(fmt.Sprintf(desktopFileIDsYamlTemplate, "some-snap")))
+	c.Assert(err, IsNil)
+	c.Assert(someSnap.Plugs["desktop"], NotNil)
+	otherSnap, err := snap.InfoFromSnapYaml([]byte(fmt.Sprintf(desktopFileIDsYamlTemplate, "other-snap")))
+	c.Assert(err, IsNil)
+	c.Assert(otherSnap.Plugs["desktop"], NotNil)
+
+	restore := snapstate.MockSnapReadInfo(func(name naming.InstanceName, si *snap.SideInfo) (*snap.Info, error) {
+		switch name {
+		case "some-snap":
+			return someSnap, nil
+		case "other-snap":
+			return otherSnap, nil
+		default:
+			return s.fakeBackend.ReadInfo(name, si)
+		}
+	})
+	defer restore()
+
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	snapNames := []string{"some-snap", "other-snap"}
+	// Don't use channel-for-desktop-file-ids to pass early checks and instead fail inside the install transaction
+	_, tss, err := snapstate.InstallMany(s.state, snapNames, nil, s.user.ID, nil)
+	c.Assert(err, IsNil)
+
+	chg := s.state.NewChange("install", "install two snaps")
+	for _, ts := range tss {
+		chg.AddAll(ts)
+	}
+
+	s.settle(c)
+
+	// The order of installation is indeterminant, but one will fail
+	c.Check(chg.Err(), ErrorMatches, `cannot perform the following tasks:\n- Make snap "(some|other)-snap" \(11\) available to the system \(snap "(some|other)-snap" requesting desktop-file-id "org.example.Foo.desktop" conflicts with snap "(some|other)-snap" use\)`)
 }

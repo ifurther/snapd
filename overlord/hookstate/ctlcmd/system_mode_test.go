@@ -69,9 +69,21 @@ func (s *systemModeSuite) TestSystemMode(c *C) {
 	})
 	defer r()
 
+	var systemEncrypted bool
+	var systemEncryptedErr error
+	defer ctlcmd.MockFdestateSystemEncryptedFromState(func(s *state.State) (bool, error) {
+		// the mocked function requires the state lock,
+		// panic if it is not held
+		s.Unlock()
+		defer s.Lock()
+		return systemEncrypted, systemEncryptedErr
+	})()
+
 	tests := []struct {
 		smi                 devicestate.SystemModeInfo
 		smiErr              error
+		systemEncrypted     bool
+		systemEncryptedErr  error
 		stdout, stderr, err string
 		exitCode            int
 	}{
@@ -79,11 +91,15 @@ func (s *systemModeSuite) TestSystemMode(c *C) {
 			smiErr: fmt.Errorf("too early"),
 			err:    "too early",
 		}, {
+			systemEncryptedErr: fmt.Errorf("cannot get fde state"),
+			err:                "cannot get fde state",
+		}, {
 			smi: devicestate.SystemModeInfo{
 				Mode:   "run",
 				Seeded: true,
 			},
-			stdout: "system-mode: run\nseed-loaded: true\n",
+			systemEncrypted: true,
+			stdout:          "system-mode: run\nseed-loaded: true\nstorage-encrypted: managed\n",
 		}, {
 			smi: devicestate.SystemModeInfo{
 				Mode:       "install",
@@ -91,7 +107,8 @@ func (s *systemModeSuite) TestSystemMode(c *C) {
 				Seeded:     true,
 				BootFlags:  []string{"factory"},
 			},
-			stdout: "system-mode: install\nseed-loaded: true\nfactory: true\n",
+			systemEncrypted: false,
+			stdout:          "system-mode: install\nseed-loaded: true\nfactory: true\n",
 		}, {
 			smi: devicestate.SystemModeInfo{
 				Mode:       "run",
@@ -106,8 +123,10 @@ func (s *systemModeSuite) TestSystemMode(c *C) {
 		for _, test := range tests {
 			smi = &test.smi
 			smiErr = test.smiErr
+			systemEncrypted = test.systemEncrypted
+			systemEncryptedErr = test.systemEncryptedErr
 
-			stdout, stderr, err := ctlcmd.Run(mockContext, []string{"system-mode"}, uid)
+			stdout, stderr, _, err := ctlcmd.Run(mockContext, []string{"system-mode"}, uid, nil)
 			comment := Commentf("%v", test)
 			if test.exitCode > 0 {
 				c.Check(err, DeepEquals, &ctlcmd.UnsuccessfulError{ExitCode: test.exitCode}, comment)

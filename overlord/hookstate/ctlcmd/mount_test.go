@@ -32,41 +32,17 @@ import (
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/systemd"
+	"github.com/snapcore/snapd/systemd/systemdtest"
 	"github.com/snapcore/snapd/testutil"
 )
 
-type ResultForEnsureMountUnitFileWithOptions struct {
-	path string
-	err  error
-}
-
-type FakeSystemdForMount struct {
-	systemd.Systemd
-
-	RemoveMountUnitFileCalls  []string
-	RemoveMountUnitFileResult error
-
-	EnsureMountUnitFileWithOptionsCalls  []*systemd.MountUnitOptions
-	EnsureMountUnitFileWithOptionsResult ResultForEnsureMountUnitFileWithOptions
-}
-
-func (s *FakeSystemdForMount) RemoveMountUnitFile(baseDir string) error {
-	s.RemoveMountUnitFileCalls = append(s.RemoveMountUnitFileCalls, baseDir)
-	return s.RemoveMountUnitFileResult
-}
-
-func (s *FakeSystemdForMount) EnsureMountUnitFileWithOptions(options *systemd.MountUnitOptions) (string, error) {
-	s.EnsureMountUnitFileWithOptionsCalls = append(s.EnsureMountUnitFileWithOptionsCalls, options)
-	return s.EnsureMountUnitFileWithOptionsResult.path, s.EnsureMountUnitFileWithOptionsResult.err
-}
-
-func CopyMap(m map[string]interface{}) map[string]interface{} {
-	cp := make(map[string]interface{})
+func CopyMap(m map[string]any) map[string]any {
+	cp := make(map[string]any)
 	for k, v := range m {
 		switch value := v.(type) {
-		case map[string]interface{}:
+		case map[string]any:
 			cp[k] = CopyMap(value)
-		case []interface{}:
+		case []any:
 			cp[k] = CopySlice(value)
 		default:
 			cp[k] = v
@@ -75,13 +51,13 @@ func CopyMap(m map[string]interface{}) map[string]interface{} {
 	return cp
 }
 
-func CopySlice(s []interface{}) []interface{} {
-	cp := make([]interface{}, len(s))
+func CopySlice(s []any) []any {
+	cp := make([]any, len(s))
 	for i, v := range s {
 		switch value := v.(type) {
-		case map[string]interface{}:
+		case map[string]any:
 			cp[i] = CopyMap(value)
-		case []interface{}:
+		case []any:
 			cp[i] = CopySlice(value)
 		default:
 			cp[i] = v
@@ -96,10 +72,10 @@ type mountSuite struct {
 	mockContext *hookstate.Context
 	mockHandler *hooktest.MockHandler
 	hookTask    *state.Task
-	sysd        *FakeSystemdForMount
+	sysd        *systemdtest.FakeSystemd
 	// A connection state for a snap using the mount interface with the plug
 	// properly configured, which we'll be reusing in different test cases
-	regularConnState map[string]interface{}
+	regularConnState map[string]any
 }
 
 var _ = Suite(&mountSuite{})
@@ -120,35 +96,45 @@ func (s *mountSuite) SetUpTest(c *C) {
 	c.Assert(err, IsNil)
 	s.mockContext = ctx
 
-	s.regularConnState = map[string]interface{}{
+	s.regularConnState = map[string]any{
 		"interface": "mount-control",
-		"plug-static": map[string]interface{}{
-			"mount": []interface{}{
-				map[string]interface{}{
+		"plug-static": map[string]any{
+			"mount": []any{
+				map[string]any{
 					"what":       "/src",
 					"where":      "/dest",
 					"type":       []string{"ext4"},
 					"options":    []string{"bind", "rw", "sync"},
 					"persistent": true,
 				},
-				map[string]interface{}{
+				map[string]any{
 					"what":       "/media/me/data",
 					"where":      "$SNAP_DATA/dest",
 					"options":    []string{"bind", "ro"},
 					"persistent": false,
 				},
-				map[string]interface{}{
+				map[string]any{
 					"what":       "/dev/dma_heap/qcom,qseecom",
 					"where":      "/dest,with,commas",
 					"options":    []string{"ro"},
 					"persistent": false,
+				},
+				map[string]any{
+					"where":   "/nfs-dest",
+					"options": []string{"rw"},
+					"type":    []string{"nfs"},
+				},
+				map[string]any{
+					"where":   "/cifs-dest",
+					"options": []string{"rw", "guest"},
+					"type":    []string{"cifs"},
 				},
 			},
 		},
 	}
 	s.hookTask = task
 
-	s.sysd = &FakeSystemdForMount{}
+	s.sysd = &systemdtest.FakeSystemd{}
 	s.AddCleanup(systemd.MockNewSystemd(func(be systemd.Backend, roodDir string, mode systemd.InstanceMode, meter systemd.Reporter) systemd.Systemd {
 		return s.sysd
 	}))
@@ -157,14 +143,14 @@ func (s *mountSuite) SetUpTest(c *C) {
 func (s *mountSuite) injectSnapWithProperPlug(c *C) {
 	s.state.Lock()
 	mockInstalledSnap(c, s.state, `name: snap1`, "")
-	s.state.Set("conns", map[string]interface{}{
+	s.state.Set("conns", map[string]any{
 		"snap1:plug1 snap2:slot2": s.regularConnState,
 	})
 	s.state.Unlock()
 }
 
 func (s *mountSuite) TestMissingContext(c *C) {
-	_, _, err := ctlcmd.Run(nil, []string{"mount", "/src", "/dest"}, 0)
+	_, _, _, err := ctlcmd.Run(nil, []string{"mount", "/src", "/dest"}, 0, nil)
 	c.Check(err, ErrorMatches, `cannot invoke snapctl operation commands \(here "mount"\) from outside of a snap`)
 }
 
@@ -181,7 +167,7 @@ func (s *mountSuite) TestBadConnection(c *C) {
 	ctx, err := hookstate.NewContext(task, state, setup, s.mockHandler, "")
 	c.Assert(err, IsNil)
 
-	_, _, err = ctlcmd.Run(ctx, []string{"mount", "/src", "/dest"}, 0)
+	_, _, _, err = ctlcmd.Run(ctx, []string{"mount", "/src", "/dest"}, 0, nil)
 	c.Assert(err, ErrorMatches, `.*internal error: cannot get connections: .*`)
 }
 
@@ -194,7 +180,7 @@ func (s *mountSuite) TestBadSnapInfo(c *C) {
 	ctx, err := hookstate.NewContext(task, s.state, setup, s.mockHandler, "")
 	c.Assert(err, IsNil)
 
-	_, _, err = ctlcmd.Run(ctx, []string{"mount", "/src", "/dest"}, 0)
+	_, _, _, err = ctlcmd.Run(ctx, []string{"mount", "/src", "/dest"}, 0, nil)
 	c.Assert(err, ErrorMatches, `.*cannot get snap info: snap \"test-snap\" is not installed`)
 }
 
@@ -203,7 +189,7 @@ func (s *mountSuite) TestMissingProperPlug(c *C) {
 	mockInstalledSnap(c, s.state, `name: snap1`, "")
 	// Inject a lot of connections in the state, but all of them defective for
 	// one or another reason
-	connections := make(map[string]interface{})
+	connections := make(map[string]any)
 	// wrong interface
 	conn := CopyMap(s.regularConnState)
 	conn["interface"] = "unrelated"
@@ -225,8 +211,8 @@ func (s *mountSuite) TestMissingProperPlug(c *C) {
 	connections["snap1:plug4 snap2:slot1"] = conn
 	// incompatible "what" field
 	conn = CopyMap(s.regularConnState)
-	plugInfo := func(conn map[string]interface{}) map[string]interface{} {
-		return conn["plug-static"].(map[string]interface{})["mount"].([]interface{})[0].(map[string]interface{})
+	plugInfo := func(conn map[string]any) map[string]any {
+		return conn["plug-static"].(map[string]any)["mount"].([]any)[0].(map[string]any)
 	}
 	plugInfo(conn)["what"] = "/some/other/path"
 	connections["snap1:plug5 snap2:slot1"] = conn
@@ -262,31 +248,55 @@ func (s *mountSuite) TestMissingProperPlug(c *C) {
 	s.state.Set("conns", connections)
 	s.state.Unlock()
 
-	_, _, err := ctlcmd.Run(s.mockContext, []string{"mount", "--persistent", "-t", "ext4", "-o", "bind,rw", "/src", "/dest"}, 0)
+	_, _, _, err := ctlcmd.Run(s.mockContext, []string{"mount", "--persistent", "-t", "ext4", "-o", "bind,rw", "/src", "/dest"}, 0, nil)
 	c.Check(err, ErrorMatches, `.*no matching mount-control connection found`)
-	c.Check(s.sysd.EnsureMountUnitFileWithOptionsCalls, HasLen, 0)
+	c.Check(s.sysd.EnsureMountUnitFileCalls, HasLen, 0)
 
 	// Try the same without the filesystem type
-	_, _, err = ctlcmd.Run(s.mockContext, []string{"mount", "--persistent", "-o", "bind,rw", "/src", "/dest"}, 0)
+	_, _, _, err = ctlcmd.Run(s.mockContext, []string{"mount", "--persistent", "-o", "bind,rw", "/src", "/dest"}, 0, nil)
 	c.Check(err, ErrorMatches, `.*no matching mount-control connection found`)
-	c.Check(s.sysd.EnsureMountUnitFileWithOptionsCalls, HasLen, 0)
+	c.Check(s.sysd.EnsureMountUnitFileCalls, HasLen, 0)
+
+	// bad NFS source format, expecting <host>:<share>
+	_, _, _, err = ctlcmd.Run(s.mockContext, []string{"mount", "-o", "rw", "-t", "nfs", "/src", "/dest"}, 0, nil)
+	c.Check(err, ErrorMatches, `.*no matching mount-control connection found`)
+	_, _, _, err = ctlcmd.Run(s.mockContext, []string{"mount", "-o", "rw", "-t", "nfs", "/host:/src", "/dest"}, 0, nil)
+	c.Check(err, ErrorMatches, `.*no matching mount-control connection found`)
+	_, _, _, err = ctlcmd.Run(s.mockContext, []string{"mount", "-o", "rw", "-t", "nfs", ":/share", "/dest"}, 0, nil)
+	c.Check(err, ErrorMatches, `.*no matching mount-control connection found`)
+	c.Check(s.sysd.EnsureMountUnitFileCalls, HasLen, 0)
+
+	// bad CIFS source format, expecting //<host-share>
+	_, _, _, err = ctlcmd.Run(s.mockContext, []string{"mount", "-o", "rw,guest", "-t", "cifs", "/src", "/dest"}, 0, nil)
+	c.Check(err, ErrorMatches, `.*no matching mount-control connection found`)
+	_, _, _, err = ctlcmd.Run(s.mockContext, []string{"mount", "-o", "rw,guest", "-t", "cifs", "host:/src", "/dest"}, 0, nil)
+	c.Check(err, ErrorMatches, `.*no matching mount-control connection found`)
+	_, _, _, err = ctlcmd.Run(s.mockContext, []string{"mount", "-o", "rw,guest", "-t", "cifs", "/share", "/dest"}, 0, nil)
+	c.Check(err, ErrorMatches, `.*no matching mount-control connection found`)
+	_, _, _, err = ctlcmd.Run(s.mockContext, []string{"mount", "-o", "rw,guest", "-t", "cifs", "//", "/dest"}, 0, nil)
+	c.Check(err, ErrorMatches, `.*no matching mount-control connection found`)
+	// incorrect CIFS mount options
+	_, _, _, err = ctlcmd.Run(s.mockContext, []string{"mount", "-o", "rw", "-t", "cifs", "//foo/share", "/dest"}, 0, nil)
+	c.Check(err, ErrorMatches, `.*no matching mount-control connection found`)
+	c.Check(s.sysd.EnsureMountUnitFileCalls, HasLen, 0)
 }
 
 func (s *mountSuite) TestUnitCreationFailure(c *C) {
 	s.injectSnapWithProperPlug(c)
 
-	s.sysd.EnsureMountUnitFileWithOptionsResult = ResultForEnsureMountUnitFileWithOptions{"", errors.New("creation error")}
+	s.sysd.EnsureMountUnitFileResult.Err = errors.New("creation error")
 
-	_, _, err := ctlcmd.Run(s.mockContext, []string{"mount", "-t", "ext4", "/src", "/dest"}, 0)
+	_, _, _, err := ctlcmd.Run(s.mockContext, []string{"mount", "-t", "ext4", "/src", "/dest"}, 0, nil)
 	c.Check(err, ErrorMatches, `cannot ensure mount unit: creation error`)
-	c.Check(s.sysd.EnsureMountUnitFileWithOptionsCalls, DeepEquals, []*systemd.MountUnitOptions{
+	c.Check(s.sysd.EnsureMountUnitFileCalls, DeepEquals, []*systemd.MountUnitOptions{
 		{
-			Lifetime:    systemd.Transient,
-			Description: "Mount unit for snap1, revision 1 via mount-control",
-			What:        "/src",
-			Where:       "/dest",
-			Fstype:      "ext4",
-			Origin:      "mount-control",
+			Lifetime:               systemd.Transient,
+			Description:            "Mount unit for snap1, revision 1 via mount-control",
+			What:                   "/src",
+			Where:                  "/dest",
+			Fstype:                 "ext4",
+			Origin:                 "mount-control",
+			EnsureStartIfUnchanged: true,
 		},
 	})
 }
@@ -294,19 +304,20 @@ func (s *mountSuite) TestUnitCreationFailure(c *C) {
 func (s *mountSuite) TestHappy(c *C) {
 	s.injectSnapWithProperPlug(c)
 
-	s.sysd.EnsureMountUnitFileWithOptionsResult = ResultForEnsureMountUnitFileWithOptions{"/path/unit.mount", nil}
+	s.sysd.EnsureMountUnitFileResult.Path = "/path/unit.mount"
 
-	_, _, err := ctlcmd.Run(s.mockContext, []string{"mount", "--persistent", "-t", "ext4", "-o", "sync,rw", "/src", "/dest"}, 0)
+	_, _, _, err := ctlcmd.Run(s.mockContext, []string{"mount", "--persistent", "-t", "ext4", "-o", "sync,rw", "/src", "/dest"}, 0, nil)
 	c.Check(err, IsNil)
-	c.Check(s.sysd.EnsureMountUnitFileWithOptionsCalls, DeepEquals, []*systemd.MountUnitOptions{
+	c.Check(s.sysd.EnsureMountUnitFileCalls, DeepEquals, []*systemd.MountUnitOptions{
 		{
-			Lifetime:    systemd.Persistent,
-			Description: "Mount unit for snap1, revision 1 via mount-control",
-			What:        "/src",
-			Where:       "/dest",
-			Fstype:      "ext4",
-			Options:     []string{"sync", "rw"},
-			Origin:      "mount-control",
+			Lifetime:               systemd.Persistent,
+			Description:            "Mount unit for snap1, revision 1 via mount-control",
+			What:                   "/src",
+			Where:                  "/dest",
+			Fstype:                 "ext4",
+			Options:                []string{"sync", "rw"},
+			Origin:                 "mount-control",
+			EnsureStartIfUnchanged: true,
 		},
 	})
 }
@@ -314,21 +325,22 @@ func (s *mountSuite) TestHappy(c *C) {
 func (s *mountSuite) TestHappyWithVariableExpansion(c *C) {
 	s.injectSnapWithProperPlug(c)
 
-	s.sysd.EnsureMountUnitFileWithOptionsResult = ResultForEnsureMountUnitFileWithOptions{"/path/unit.mount", nil}
+	s.sysd.EnsureMountUnitFileResult.Path = "/path/unit.mount"
 
 	// Now try with $SNAP_* variables in the paths
 	snapDataDir := filepath.Join(dirs.SnapDataDir, "snap1", "1")
 	where := filepath.Join(snapDataDir, "/dest")
-	_, _, err := ctlcmd.Run(s.mockContext, []string{"mount", "-o", "bind,ro", "/media/me/data", where}, 0)
+	_, _, _, err := ctlcmd.Run(s.mockContext, []string{"mount", "-o", "bind,ro", "/media/me/data", where}, 0, nil)
 	c.Check(err, IsNil)
-	c.Check(s.sysd.EnsureMountUnitFileWithOptionsCalls, DeepEquals, []*systemd.MountUnitOptions{
+	c.Check(s.sysd.EnsureMountUnitFileCalls, DeepEquals, []*systemd.MountUnitOptions{
 		{
-			Lifetime:    systemd.Transient,
-			Description: "Mount unit for snap1, revision 1 via mount-control",
-			What:        "/media/me/data",
-			Where:       where,
-			Options:     []string{"bind", "ro"},
-			Origin:      "mount-control",
+			Lifetime:               systemd.Transient,
+			Description:            "Mount unit for snap1, revision 1 via mount-control",
+			What:                   "/media/me/data",
+			Where:                  where,
+			Options:                []string{"bind", "ro"},
+			Origin:                 "mount-control",
+			EnsureStartIfUnchanged: true,
 		},
 	})
 }
@@ -336,19 +348,64 @@ func (s *mountSuite) TestHappyWithVariableExpansion(c *C) {
 func (s *mountSuite) TestHappyWithCommasInPath(c *C) {
 	s.injectSnapWithProperPlug(c)
 
-	s.sysd.EnsureMountUnitFileWithOptionsResult = ResultForEnsureMountUnitFileWithOptions{"/path/unit.mount", nil}
+	s.sysd.EnsureMountUnitFileResult.Path = "/path/unit.mount"
 
 	// Now try with commas in the paths
-	_, _, err := ctlcmd.Run(s.mockContext, []string{"mount", "-o", "ro", "/dev/dma_heap/qcom,qseecom", "/dest,with,commas"}, 0)
+	_, _, _, err := ctlcmd.Run(s.mockContext, []string{"mount", "-o", "ro", "/dev/dma_heap/qcom,qseecom", "/dest,with,commas"}, 0, nil)
 	c.Check(err, IsNil)
-	c.Check(s.sysd.EnsureMountUnitFileWithOptionsCalls, DeepEquals, []*systemd.MountUnitOptions{
+	c.Check(s.sysd.EnsureMountUnitFileCalls, DeepEquals, []*systemd.MountUnitOptions{
 		{
-			Lifetime:    systemd.Transient,
-			Description: "Mount unit for snap1, revision 1 via mount-control",
-			What:        "/dev/dma_heap/qcom,qseecom",
-			Where:       "/dest,with,commas",
-			Options:     []string{"ro"},
-			Origin:      "mount-control",
+			Lifetime:               systemd.Transient,
+			Description:            "Mount unit for snap1, revision 1 via mount-control",
+			What:                   "/dev/dma_heap/qcom,qseecom",
+			Where:                  "/dest,with,commas",
+			Options:                []string{"ro"},
+			Origin:                 "mount-control",
+			EnsureStartIfUnchanged: true,
+		},
+	})
+}
+
+func (s *mountSuite) TestHappyNFS(c *C) {
+	s.injectSnapWithProperPlug(c)
+
+	s.sysd.EnsureMountUnitFileResult.Path = "/path/unit.mount"
+
+	// Now try with commas in the paths
+	_, _, _, err := ctlcmd.Run(s.mockContext, []string{"mount", "-o", "rw", "-t", "nfs", "localhost:/var/share", "/nfs-dest"}, 0, nil)
+	c.Check(err, IsNil)
+	c.Check(s.sysd.EnsureMountUnitFileCalls, DeepEquals, []*systemd.MountUnitOptions{
+		{
+			Lifetime:               systemd.Transient,
+			Description:            "Mount unit for snap1, revision 1 via mount-control",
+			What:                   "localhost:/var/share",
+			Where:                  "/nfs-dest",
+			Fstype:                 "nfs",
+			Options:                []string{"rw"},
+			Origin:                 "mount-control",
+			EnsureStartIfUnchanged: true,
+		},
+	})
+}
+
+func (s *mountSuite) TestHappyCIFS(c *C) {
+	s.injectSnapWithProperPlug(c)
+
+	s.sysd.EnsureMountUnitFileResult.Path = "/path/unit.mount"
+
+	// Now try with commas in the paths
+	_, _, _, err := ctlcmd.Run(s.mockContext, []string{"mount", "-o", "rw,guest", "-t", "cifs", "//10.0.0.1/share/path", "/cifs-dest"}, 0, nil)
+	c.Check(err, IsNil)
+	c.Check(s.sysd.EnsureMountUnitFileCalls, DeepEquals, []*systemd.MountUnitOptions{
+		{
+			Lifetime:               systemd.Transient,
+			Description:            "Mount unit for snap1, revision 1 via mount-control",
+			What:                   "//10.0.0.1/share/path",
+			Where:                  "/cifs-dest",
+			Fstype:                 "cifs",
+			Options:                []string{"rw", "guest"},
+			Origin:                 "mount-control",
+			EnsureStartIfUnchanged: true,
 		},
 	})
 }
@@ -356,19 +413,20 @@ func (s *mountSuite) TestHappyWithCommasInPath(c *C) {
 func (s *mountSuite) TestEnsureMountUnitFailed(c *C) {
 	s.injectSnapWithProperPlug(c)
 
-	s.sysd.EnsureMountUnitFileWithOptionsResult = ResultForEnsureMountUnitFileWithOptions{"", errors.New("some error")}
+	s.sysd.EnsureMountUnitFileResult.Err = errors.New("some error")
 
-	_, _, err := ctlcmd.Run(s.mockContext, []string{"mount", "--persistent", "-t", "ext4", "-o", "sync,rw", "/src", "/dest"}, 0)
+	_, _, _, err := ctlcmd.Run(s.mockContext, []string{"mount", "--persistent", "-t", "ext4", "-o", "sync,rw", "/src", "/dest"}, 0, nil)
 	c.Check(err, ErrorMatches, `cannot ensure mount unit: some error`)
-	c.Check(s.sysd.EnsureMountUnitFileWithOptionsCalls, DeepEquals, []*systemd.MountUnitOptions{
+	c.Check(s.sysd.EnsureMountUnitFileCalls, DeepEquals, []*systemd.MountUnitOptions{
 		{
-			Lifetime:    systemd.Persistent,
-			Description: "Mount unit for snap1, revision 1 via mount-control",
-			What:        "/src",
-			Where:       "/dest",
-			Fstype:      "ext4",
-			Options:     []string{"sync", "rw"},
-			Origin:      "mount-control",
+			Lifetime:               systemd.Persistent,
+			Description:            "Mount unit for snap1, revision 1 via mount-control",
+			What:                   "/src",
+			Where:                  "/dest",
+			Fstype:                 "ext4",
+			Options:                []string{"sync", "rw"},
+			Origin:                 "mount-control",
+			EnsureStartIfUnchanged: true,
 		},
 	})
 
@@ -378,20 +436,21 @@ func (s *mountSuite) TestEnsureMountUnitFailed(c *C) {
 func (s *mountSuite) TestEnsureMountUnitFailedRemoveFailed(c *C) {
 	s.injectSnapWithProperPlug(c)
 
-	s.sysd.EnsureMountUnitFileWithOptionsResult = ResultForEnsureMountUnitFileWithOptions{"", errors.New("some error")}
+	s.sysd.EnsureMountUnitFileResult.Err = errors.New("some error")
 	s.sysd.RemoveMountUnitFileResult = errors.New("some other error")
 
-	_, _, err := ctlcmd.Run(s.mockContext, []string{"mount", "--persistent", "-t", "ext4", "-o", "sync,rw", "/src", "/dest"}, 0)
+	_, _, _, err := ctlcmd.Run(s.mockContext, []string{"mount", "--persistent", "-t", "ext4", "-o", "sync,rw", "/src", "/dest"}, 0, nil)
 	c.Check(err, ErrorMatches, `cannot ensure mount unit: some error`)
-	c.Check(s.sysd.EnsureMountUnitFileWithOptionsCalls, DeepEquals, []*systemd.MountUnitOptions{
+	c.Check(s.sysd.EnsureMountUnitFileCalls, DeepEquals, []*systemd.MountUnitOptions{
 		{
-			Lifetime:    systemd.Persistent,
-			Description: "Mount unit for snap1, revision 1 via mount-control",
-			What:        "/src",
-			Where:       "/dest",
-			Fstype:      "ext4",
-			Options:     []string{"sync", "rw"},
-			Origin:      "mount-control",
+			Lifetime:               systemd.Persistent,
+			Description:            "Mount unit for snap1, revision 1 via mount-control",
+			What:                   "/src",
+			Where:                  "/dest",
+			Fstype:                 "ext4",
+			Options:                []string{"sync", "rw"},
+			Origin:                 "mount-control",
+			EnsureStartIfUnchanged: true,
 		},
 	})
 

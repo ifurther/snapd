@@ -22,11 +22,14 @@ package backends
 import (
 	"github.com/snapcore/snapd/interfaces"
 	"github.com/snapcore/snapd/interfaces/apparmor"
+	"github.com/snapcore/snapd/interfaces/configfiles"
 	"github.com/snapcore/snapd/interfaces/dbus"
 	"github.com/snapcore/snapd/interfaces/kmod"
+	"github.com/snapcore/snapd/interfaces/ldconfig"
 	"github.com/snapcore/snapd/interfaces/mount"
 	"github.com/snapcore/snapd/interfaces/polkit"
 	"github.com/snapcore/snapd/interfaces/seccomp"
+	"github.com/snapcore/snapd/interfaces/symlinks"
 	"github.com/snapcore/snapd/interfaces/systemd"
 	"github.com/snapcore/snapd/interfaces/udev"
 	"github.com/snapcore/snapd/logger"
@@ -35,9 +38,15 @@ import (
 
 // All returns a set of all available security backends.
 func All() []interfaces.SecurityBackend {
+	// Backends have non-obvious ordering constraints. The order in which they
+	// are registered below is significant.  Please refrain from reordering
+	// them when refactoring this code. Because this list changes rarely it is
+	// most likely that interactions are implicit and not well-known. Having
+	// said that we know of one specific constraint that is documented:
+	//
+	// Because of how the GPIO interface is implemented the systemd backend
+	// must be earlier in the sequence than the apparmor backend.
 	all := []interfaces.SecurityBackend{
-		// Because of how the GPIO interface is implemented the systemd backend
-		// must be earlier in the sequence than the apparmor backend.
 		&systemd.Backend{},
 		&seccomp.Backend{},
 		&dbus.Backend{},
@@ -45,6 +54,9 @@ func All() []interfaces.SecurityBackend {
 		&mount.Backend{},
 		&kmod.Backend{},
 		&polkit.Backend{},
+		&ldconfig.Backend{},
+		&configfiles.Backend{},
+		&symlinks.Backend{},
 	}
 
 	// TODO use something like:

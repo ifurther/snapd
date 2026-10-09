@@ -35,6 +35,10 @@ func init() {
 	NumAssertionType = len(typeRegistry)
 }
 
+func NewAssertionBase(headers map[string]any) AssertionBase {
+	return AssertionBase{headers: headers}
+}
+
 // v1FixedTimestamp exposed for tests
 var V1FixedTimestamp = v1FixedTimestamp
 
@@ -43,6 +47,12 @@ var AssembleAndSignInTest = assembleAndSign
 
 // decodePrivateKey exposed for tests
 var DecodePrivateKeyInTest = decodePrivateKey
+
+// readOpenPGPRSAPublicKey exposed for tests
+var ReadOpenPGPRSAPublicKeyInTest = readOpenPGPRSAPublicKey
+
+// CompileOnClassicSystemConstraintForTest exposes the on-classic system parser for focused tests.
+var CompileOnClassicSystemConstraintForTest = compileOnClassicSystemConstraint
 
 // NewDecoderStressed makes a Decoder with a stressed setup with the given buffer and maximum sizes.
 func NewDecoderStressed(r io.Reader, bufSize, maxHeadersSize, maxBodySize, maxSigSize int) *Decoder {
@@ -57,8 +67,8 @@ func NewDecoderStressed(r io.Reader, bufSize, maxHeadersSize, maxBodySize, maxSi
 
 func BootstrapAccountForTest(authorityID string) *Account {
 	return &Account{
-		assertionBase: assertionBase{
-			headers: map[string]interface{}{
+		AssertionBase: AssertionBase{
+			headers: map[string]any{
 				"type":         "account",
 				"authority-id": authorityID,
 				"account-id":   authorityID,
@@ -75,8 +85,8 @@ func MakeAccountKeyForTest(authorityID string, openPGPPubKey PublicKey, since ti
 
 func MakeAccountKeyForTestWithUntil(authorityID string, openPGPPubKey PublicKey, since, until time.Time, validYears int) *AccountKey {
 	return &AccountKey{
-		assertionBase: assertionBase{
-			headers: map[string]interface{}{
+		AssertionBase: AssertionBase{
+			headers: map[string]any{
 				"type":                "account-key",
 				"authority-id":        authorityID,
 				"account-id":          authorityID,
@@ -112,10 +122,10 @@ func MockTimeNow(t time.Time) (restore func()) {
 // define test assertion types to use in the tests
 
 type TestOnly struct {
-	assertionBase
+	AssertionBase
 }
 
-func assembleTestOnly(assert assertionBase) (Assertion, error) {
+func assembleTestOnly(assert AssertionBase) (Assertion, error) {
 	// for testing error cases
 	if _, err := checkIntWithDefault(assert.headers, "count", 0); err != nil {
 		return nil, err
@@ -126,10 +136,10 @@ func assembleTestOnly(assert assertionBase) (Assertion, error) {
 var TestOnlyType = &AssertionType{"test-only", []string{"primary-key"}, nil, assembleTestOnly, 0}
 
 type TestOnly2 struct {
-	assertionBase
+	AssertionBase
 }
 
-func assembleTestOnly2(assert assertionBase) (Assertion, error) {
+func assembleTestOnly2(assert AssertionBase) (Assertion, error) {
 	return &TestOnly2{assert}, nil
 }
 
@@ -138,7 +148,7 @@ var TestOnly2Type = &AssertionType{"test-only-2", []string{"pk1", "pk2"}, nil, a
 // TestOnlyDecl is a test-only assertion that mimics snap-declaration
 // relations with other assertions.
 type TestOnlyDecl struct {
-	assertionBase
+	AssertionBase
 }
 
 func (dcl *TestOnlyDecl) ID() string {
@@ -155,7 +165,7 @@ func (dcl *TestOnlyDecl) Prerequisites() []*Ref {
 	}
 }
 
-func assembleTestOnlyDecl(assert assertionBase) (Assertion, error) {
+func assembleTestOnlyDecl(assert AssertionBase) (Assertion, error) {
 	return &TestOnlyDecl{assert}, nil
 }
 
@@ -164,7 +174,7 @@ var TestOnlyDeclType = &AssertionType{"test-only-decl", []string{"id"}, nil, ass
 // TestOnlyRev is a test-only assertion that mimics snap-revision
 // relations with other assertions.
 type TestOnlyRev struct {
-	assertionBase
+	AssertionBase
 }
 
 func (rev *TestOnlyRev) H() string {
@@ -186,7 +196,7 @@ func (rev *TestOnlyRev) Prerequisites() []*Ref {
 	}
 }
 
-func assembleTestOnlyRev(assert assertionBase) (Assertion, error) {
+func assembleTestOnlyRev(assert AssertionBase) (Assertion, error) {
 	return &TestOnlyRev{assert}, nil
 }
 
@@ -194,7 +204,7 @@ var TestOnlyRevType = &AssertionType{"test-only-rev", []string{"h"}, nil, assemb
 
 // TestOnlySeq is a test-only assertion that is sequence-forming.
 type TestOnlySeq struct {
-	assertionBase
+	AssertionBase
 	seq int
 }
 
@@ -206,13 +216,13 @@ func (seq *TestOnlySeq) Sequence() int {
 	return seq.seq
 }
 
-func assembleTestOnlySeq(assert assertionBase) (Assertion, error) {
+func assembleTestOnlySeq(assert AssertionBase) (Assertion, error) {
 	seq, err := checkSequence(assert.headers, "sequence")
 	if err != nil {
 		return nil, err
 	}
 	return &TestOnlySeq{
-		assertionBase: assert,
+		AssertionBase: assert,
 		seq:           seq,
 	}, nil
 }
@@ -220,10 +230,10 @@ func assembleTestOnlySeq(assert assertionBase) (Assertion, error) {
 var TestOnlySeqType = &AssertionType{"test-only-seq", []string{"n", "sequence"}, nil, assembleTestOnlySeq, sequenceForming}
 
 type TestOnlyNoAuthority struct {
-	assertionBase
+	AssertionBase
 }
 
-func assembleTestOnlyNoAuthority(assert assertionBase) (Assertion, error) {
+func assembleTestOnlyNoAuthority(assert AssertionBase) (Assertion, error) {
 	if _, err := checkNotEmptyString(assert.headers, "hdr"); err != nil {
 		return nil, err
 	}
@@ -233,10 +243,10 @@ func assembleTestOnlyNoAuthority(assert assertionBase) (Assertion, error) {
 var TestOnlyNoAuthorityType = &AssertionType{"test-only-no-authority", nil, nil, assembleTestOnlyNoAuthority, noAuthority}
 
 type TestOnlyNoAuthorityPK struct {
-	assertionBase
+	AssertionBase
 }
 
-func assembleTestOnlyNoAuthorityPK(assert assertionBase) (Assertion, error) {
+func assembleTestOnlyNoAuthorityPK(assert AssertionBase) (Assertion, error) {
 	return &TestOnlyNoAuthorityPK{assert}, nil
 }
 
@@ -248,7 +258,7 @@ func init() {
 	typeRegistry[TestOnly2Type.Name] = TestOnly2Type
 	typeRegistry[TestOnlyNoAuthorityType.Name] = TestOnlyNoAuthorityType
 	typeRegistry[TestOnlyNoAuthorityPKType.Name] = TestOnlyNoAuthorityPKType
-	formatAnalyzer[TestOnlyType] = func(headers map[string]interface{}, _ []byte) (int, error) {
+	formatAnalyzer[TestOnlyType] = func(headers map[string]any, _ []byte) (int, error) {
 		if _, ok := headers["format-1-feature"]; ok {
 			return 1, nil
 		}
@@ -303,6 +313,28 @@ var (
 	AppendEntry  = appendEntry
 )
 
+// builtin assertion tests
+
+type BuiltinCheckParams struct {
+	Order           []string
+	ExpectedHeaders map[string]any
+}
+
+func AssembleBuiltinAssertion(assertType *AssertionType, headerBytes, body []byte, params BuiltinCheckParams) (Assertion, error) {
+	return assembleBuiltinAssertion(assertType, headerBytes, body, builtinCheckParams{
+		order:           params.Order,
+		expectedHeaders: params.ExpectedHeaders,
+	})
+}
+
+func MockBuiltinAssertions(assertions []Assertion) (restore func()) {
+	oldBuiltinAssertions := builtinAssertions
+	builtinAssertions = assertions
+	return func() {
+		builtinAssertions = oldBuiltinAssertions
+	}
+}
+
 // ParametersForGenerate exposes parametersForGenerate for tests.
 func (gkm *GPGKeypairManager) ParametersForGenerate(passphrase string, name string) string {
 	return gkm.parametersForGenerate(passphrase, name)
@@ -310,18 +342,19 @@ func (gkm *GPGKeypairManager) ParametersForGenerate(passphrase string, name stri
 
 // constraint tests
 
-func CompileAttrMatcher(constraints interface{}, allowedOperations []string) (func(attrs map[string]interface{}, helper AttrMatchContext) error, error) {
+func CompileAttrMatcher(constraints any, allowedOperations, allowedRefs []string) (func(attrs map[string]any, helper AttrMatchContext) error, error) {
 	// XXX adjust
 	cc := compileContext{
 		opts: &compileAttrMatcherOptions{
 			allowedOperations: allowedOperations,
+			allowedRefs:       allowedRefs,
 		},
 	}
 	matcher, err := compileAttrMatcher(cc, constraints)
 	if err != nil {
 		return nil, err
 	}
-	domatch := func(attrs map[string]interface{}, helper AttrMatchContext) error {
+	domatch := func(attrs map[string]any, helper AttrMatchContext) error {
 		return matcher.match("", attrs, &attrMatchingContext{
 			attrWord: "field",
 			helper:   helper,

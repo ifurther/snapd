@@ -30,6 +30,11 @@ type Backend struct {
 	preseed bool
 }
 
+// Undoer collects undo actions to reverse system changes on error.
+type Undoer interface {
+	AddUndo(f func() error)
+}
+
 // Candidate is a test hook.
 func (b Backend) Candidate(*snap.SideInfo) {}
 
@@ -56,14 +61,14 @@ func OpenSnapFile(snapPath string, sideInfo *snap.SideInfo) (*snap.Info, snap.Co
 // OpenComponentFile opens a component blob returning a snap.ComponentInfo and a
 // corresponding snap.Container. Assumes the file was verified beforehand or the
 // user asked for --dangerous. The returned snap.ComponentInfo is completed by
-// the provided snap.Info, if it is not nil.
-func OpenComponentFile(compPath string, snapInfo *snap.Info) (*snap.ComponentInfo, snap.Container, error) {
+// the provided snap.Info and snap.ComponentSideInfo, if they are not nil.
+func OpenComponentFile(compPath string, snapInfo *snap.Info, csi *snap.ComponentSideInfo) (*snap.ComponentInfo, snap.Container, error) {
 	snapf, err := snapfile.Open(compPath)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	info, err := snap.ReadComponentInfoFromContainer(snapf, snapInfo)
+	info, err := snap.ReadComponentInfoFromContainer(snapf, snapInfo, csi)
 	if err != nil {
 		return nil, nil, err
 	}

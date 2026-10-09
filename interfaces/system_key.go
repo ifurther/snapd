@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2018-2019 Canonical Ltd
+ * Copyright (C) 2018-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -75,6 +75,7 @@ type systemKey struct {
 	AppArmorFeatures       []string `json:"apparmor-features"`
 	AppArmorParserMtime    int64    `json:"apparmor-parser-mtime"`
 	AppArmorParserFeatures []string `json:"apparmor-parser-features"`
+	AppArmorPrompting      bool     `json:"apparmor-prompting"`
 	NFSHome                bool     `json:"nfs-home"`
 	OverlayRoot            string   `json:"overlay-root"`
 	SecCompActions         []string `json:"seccomp-features"`
@@ -82,8 +83,23 @@ type systemKey struct {
 	CgroupVersion          string   `json:"cgroup-version"`
 }
 
+func (s *systemKey) String() string {
+	d, _ := json.Marshal(s)
+	return string(d)
+}
+
+var (
+	_ fmt.Stringer = (*systemKey)(nil)
+)
+
+// SystemKeyFromString unpacks the system key from a string obtained previously
+// by using the system key's Stringer interface.
+func SystemKeyFromString(s string) (any, error) {
+	return UnmarshalJSONSystemKey(strings.NewReader(s))
+}
+
 // IMPORTANT: when adding/removing/changing inputs bump this
-const systemKeyVersion = 10
+const systemKeyVersion = 11
 
 var (
 	isHomeUsingRemoteFS   = osutil.IsHomeUsingRemoteFS
@@ -163,7 +179,7 @@ func generateSystemKey() (*systemKey, error) {
 
 // UnmarshalJSONSystemKey unmarshalls the data from the reader as JSON into a
 // system key usable with SystemKeysMatch.
-func UnmarshalJSONSystemKey(r io.Reader) (interface{}, error) {
+func UnmarshalJSONSystemKey(r io.Reader) (any, error) {
 	sk := &systemKey{}
 	err := json.NewDecoder(r).Decode(sk)
 	if err != nil {
@@ -172,8 +188,20 @@ func UnmarshalJSONSystemKey(r io.Reader) (interface{}, error) {
 	return sk, nil
 }
 
+// SystemKeyExtraData holds information about the current state of the system
+// key so that some values do not need to be re-checked and can thus be
+// guaranteed to be consistent across multiple uses of system key functions.
+type SystemKeyExtraData struct {
+	// AppArmorPrompting indicates whether AppArmorPrompting should be set in
+	// the system key, assuming that prompting is supported. If prompting is
+	// unsupported, the value in the system key will be set to false.
+	AppArmorPrompting bool
+}
+
+var apparmorPromptingSupportedByFeatures = apparmor.PromptingSupportedByFeatures
+
 // WriteSystemKey will write the current system-key to disk
-func WriteSystemKey() error {
+func WriteSystemKey(extraData SystemKeyExtraData) error {
 	sk, err := generateSystemKey()
 	if err != nil {
 		return err
@@ -188,6 +216,15 @@ func WriteSystemKey() error {
 		// simply unconditionally write this out here.
 		sk.AppArmorParserFeatures, _ = apparmor.ParserFeatures()
 	}
+
+	// AppArmorPrompting should be true if the given extra data prompting value
+	// is true and if the AppArmor kernel and parser features support prompting.
+	apparmorFeatures := apparmor.FeaturesSupported{
+		KernelFeatures: sk.AppArmorFeatures,
+		ParserFeatures: sk.AppArmorParserFeatures,
+	}
+	promptingSupported, _ := apparmorPromptingSupportedByFeatures(&apparmorFeatures)
+	sk.AppArmorPrompting = extraData.AppArmorPrompting && promptingSupported
 
 	sks, err := json.Marshal(sk)
 	if err != nil {
@@ -228,15 +265,17 @@ func WriteSystemKey() error {
 // to disk whenever apparmor-parser-mtime changes (in this manner
 // snap run only has to obtain the mtime of apparmor_parser and
 // doesn't have to invoke it)
-func SystemKeyMismatch() (bool, error) {
+//
+// Returns the current system key whenever it was possible to generate one.
+func SystemKeyMismatch(extraData SystemKeyExtraData) (mismatch bool, myKey any, err error) {
 	mySystemKey, err := generateSystemKey()
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 
 	diskSystemKey, err := readSystemKey()
 	if err != nil {
-		return false, err
+		return false, mySystemKey, err
 	}
 
 	// deal with the race that "snap run" may start, then snapd
@@ -245,19 +284,22 @@ func SystemKeyMismatch() (bool, error) {
 	// should be fine because new security profiles will also
 	// have been written to disk.
 	if mySystemKey.Version != diskSystemKey.Version {
-		return false, ErrSystemKeyVersion
+		return false, mySystemKey, ErrSystemKeyVersion
 	}
 
 	// special case to detect local runs
 	if mockedSystemKey == nil {
 		if exe, err := os.Readlink("/proc/self/exe"); err == nil {
 			// detect running local local builds
-			if !strings.HasPrefix(exe, "/usr") && !strings.HasPrefix(exe, "/snap") {
+			if !strings.HasPrefix(exe, "/usr") && !strings.HasPrefix(exe, dirs.SnapMountDir) {
 				logger.Noticef("running from non-installed location %s: ignoring system-key", exe)
-				return false, ErrSystemKeyVersion
+				return false, mySystemKey, ErrSystemKeyVersion
 			}
 		}
 	}
+
+	// Store previous parser features so we can use them later, if unchanged
+	parserFeatures := diskSystemKey.AppArmorParserFeatures
 
 	// since we always write out apparmor-parser-feature when
 	// apparmor-parser-mtime changes, we don't need to compare it here
@@ -266,8 +308,27 @@ func SystemKeyMismatch() (bool, error) {
 	diskSystemKey.AppArmorParserFeatures = nil
 	mySystemKey.AppArmorParserFeatures = nil
 
+	// AppArmorPrompting should be true if the given extra data prompting value
+	// is true and if the AppArmor kernel and parser features support prompting.
+	// Since generateSystemKey() does not exec apparmor_parser to check parser
+	// features, we cannot use mySystemKey parser features to check prompting
+	// support. If parser features differ between mySystemKey and diskSystemKey,
+	// then parser mtime will differ and we'll return true anyway. If parser
+	// features are the same, then we can use the disk parser features to check
+	// if AppArmorPrompting should be set.
+	apparmorFeatures := apparmor.FeaturesSupported{
+		KernelFeatures: mySystemKey.AppArmorFeatures,
+		ParserFeatures: parserFeatures,
+	}
+	promptingSupported, _ := apparmorPromptingSupportedByFeatures(&apparmorFeatures)
+	mySystemKey.AppArmorPrompting = extraData.AppArmorPrompting && promptingSupported
+
 	ok, err := SystemKeysMatch(mySystemKey, diskSystemKey)
-	return !ok, err
+	if err != nil || !ok {
+		return true, mySystemKey, err
+	}
+
+	return false, mySystemKey, nil
 }
 
 func readSystemKey() (*systemKey, error) {
@@ -285,8 +346,8 @@ func readSystemKey() (*systemKey, error) {
 	return &diskSystemKey, nil
 }
 
-// RecordedSystemKey returns the system key read from the disk as opaque interface{}.
-func RecordedSystemKey() (interface{}, error) {
+// RecordedSystemKey returns the system key read from the disk as opaque type.
+func RecordedSystemKey() (any, error) {
 	diskSystemKey, err := readSystemKey()
 	if err != nil {
 		return nil, err
@@ -294,14 +355,14 @@ func RecordedSystemKey() (interface{}, error) {
 	return diskSystemKey, nil
 }
 
-// CurrentSystemKey calculates and returns the current system key as opaque interface{}.
-func CurrentSystemKey() (interface{}, error) {
+// CurrentSystemKey calculates and returns the current system key as opaque type.
+func CurrentSystemKey() (any, error) {
 	currentSystemKey, err := generateSystemKey()
 	return currentSystemKey, err
 }
 
 // SystemKeysMatch returns whether the given system keys match.
-func SystemKeysMatch(systemKey1, systemKey2 interface{}) (bool, error) {
+func SystemKeysMatch(systemKey1, systemKey2 any) (bool, error) {
 	// precondition check
 	_, ok1 := systemKey1.(*systemKey)
 	_, ok2 := systemKey2.(*systemKey)
@@ -323,11 +384,97 @@ func RemoveSystemKey() error {
 }
 
 func MockSystemKey(s string) func() {
-	var sk systemKey
-	err := json.Unmarshal([]byte(s), &sk)
+	sk, err := SystemKeyFromString(s)
 	if err != nil {
 		panic(err)
 	}
-	mockedSystemKey = &sk
+	mockedSystemKey = sk.(*systemKey)
 	return func() { mockedSystemKey = nil }
+}
+
+type SystemKeyMismatchAction int
+
+const (
+	SystemKeyMismatchActionUndefined SystemKeyMismatchAction = iota
+	SystemKeyMismatchActionNone
+	SystemKeyMismatchActionRegenerateProfiles
+)
+
+func (s SystemKeyMismatchAction) String() string {
+	switch s {
+	case SystemKeyMismatchActionNone:
+		return "none"
+	case SystemKeyMismatchActionRegenerateProfiles:
+		return "regenerate-profiles"
+	default:
+		return fmt.Sprintf("SystemKeyMismatchAction(%d)", int(s))
+	}
+}
+
+var (
+	ErrSystemKeyMismatchVersionTooHigh = errors.New("system-key version higher than supported")
+)
+
+// SystemKeyMismatchAdvice checks the provided and currently saved system keys
+// to advise whether security profiles should be regenerated. Returns
+// ErrSystemKeyMismatchVersionTooHigh when the provided system key is newer than
+// one supported by the current process.
+func SystemKeyMismatchAdvice(maybeOther any) (SystemKeyMismatchAction, error) {
+	other, ok := maybeOther.(*systemKey)
+	if !ok {
+		return SystemKeyMismatchActionUndefined, fmt.Errorf("internal error: %T is not a system key", maybeOther)
+	}
+
+	// system-key is regeneraterd on startup of snapd, so anything read back
+	// from disk should match what currently exeuting snapd supports
+	my, err := readSystemKey()
+	if err != nil {
+		return SystemKeyMismatchActionUndefined, err
+	}
+
+	if other.Version == my.Version {
+		// same version as our key, let's double check the mismatch, as the
+		// client may have generated a system key right right before snapd
+		// startup, so they did not observe the latest content of the key
+		//
+		// The apparmor-parser-features field must be excluded from the
+		// comparison. It can only be populated by snapd, which runs
+		// apparmor_parser when writing the key to disk (see WriteSystemKey);
+		// a key generated by a client (e.g. "snap run") always leaves it
+		// unset, because the client deliberately avoids invoking the parser.
+		// This mirrors SystemKeyMismatch, which clears the field on both sides
+		// before comparing. Comparing it here would make the populated on-disk
+		// key never match the unset client key, so snapd would advise
+		// regenerating profiles on *every* request - which, combined with the
+		// system key being briefly removed during regeneration, results in an
+		// endless regeneration loop. See LP: #2161845.
+		otherCopy := *other
+		if otherCopy.AppArmorParserFeatures == nil {
+			my.AppArmorParserFeatures = nil
+		}
+
+		match, err := SystemKeysMatch(my, &otherCopy)
+		if err != nil {
+			// unreachable
+			return SystemKeyMismatchActionUndefined, err
+		}
+
+		if match {
+			return SystemKeyMismatchActionNone, nil
+		}
+	} else if other.Version < systemKeyVersion {
+		// fallback behavior for lower versions of system key observed by the
+		// client, most likely the client is older than the current snapd
+		// process, selectively compare keys that have special meaning
+		if other.NFSHome == my.NFSHome {
+			// client's view of NFS home is same as ours, let the client proceed
+			return SystemKeyMismatchActionNone, nil
+		}
+	} else {
+		// client is likely newer than the current snapd process, we don't know
+		// how to interpret, let the caller decide
+		return SystemKeyMismatchActionUndefined, ErrSystemKeyMismatchVersionTooHigh
+	}
+
+	return SystemKeyMismatchActionRegenerateProfiles, nil
 }

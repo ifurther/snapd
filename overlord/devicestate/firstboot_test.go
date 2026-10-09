@@ -39,6 +39,7 @@ import (
 	"github.com/snapcore/snapd/bootloader"
 	"github.com/snapcore/snapd/bootloader/bootloadertest"
 	"github.com/snapcore/snapd/dirs"
+	"github.com/snapcore/snapd/dirs/dirstest"
 	"github.com/snapcore/snapd/gadget"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
@@ -50,12 +51,16 @@ import (
 	"github.com/snapcore/snapd/overlord/configstate/configcore"
 	"github.com/snapcore/snapd/overlord/devicestate"
 	"github.com/snapcore/snapd/overlord/devicestate/devicestatetest"
+	"github.com/snapcore/snapd/overlord/fdestate"
 	"github.com/snapcore/snapd/overlord/hookstate"
 	"github.com/snapcore/snapd/overlord/ifacestate"
 	"github.com/snapcore/snapd/overlord/restart"
 	"github.com/snapcore/snapd/overlord/snapstate"
+	"github.com/snapcore/snapd/overlord/snapstate/snapstatetest"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/release"
+	"github.com/snapcore/snapd/sandbox/cgroup"
+	"github.com/snapcore/snapd/secboot"
 	"github.com/snapcore/snapd/seed/seedtest"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/snap/snaptest"
@@ -86,6 +91,7 @@ func (t *firstBootBaseTest) setupBaseTest(c *C, s *seedtest.SeedSnaps) {
 	}
 
 	tempdir := c.MkDir()
+	dirstest.MustMockCanonicalSnapMountDir(tempdir)
 	dirs.SetRootDir(tempdir)
 	t.AddCleanup(func() { dirs.SetRootDir("/") })
 
@@ -106,11 +112,11 @@ func (t *firstBootBaseTest) setupBaseTest(c *C, s *seedtest.SeedSnaps) {
 	t.AddCleanup(t.systemctl.Restore)
 
 	s.SetupAssertSigning("canonical")
-	s.Brands.Register("my-brand", brandPrivKey, map[string]interface{}{
+	s.Brands.Register("my-brand", brandPrivKey, map[string]any{
 		"verification": "verified",
 	})
 
-	t.devAcct = assertstest.NewAccount(s.StoreSigning, "developer", map[string]interface{}{
+	t.devAcct = assertstest.NewAccount(s.StoreSigning, "developer", map[string]any{
 		"account-id": "developerid",
 	}, "")
 
@@ -123,6 +129,15 @@ func (t *firstBootBaseTest) setupBaseTest(c *C, s *seedtest.SeedSnaps) {
 		return sysconfig.CloudInitRestrictedBySnapd, nil
 	})
 	t.AddCleanup(r)
+
+	t.AddCleanup(snapstatetest.MockProcessDelayedSecurityBackendEffects(func(st *state.State, lanes []int, joinLane int) *state.TaskSet {
+		// no reason for devicestate to set up tasks for delayed effects
+		panic("unexpected call")
+	}))
+
+	t.AddCleanup(fdestate.MockSecbootGetDALockoutInfo(func() (*secboot.DALockoutInfo, error) {
+		return &secboot.DALockoutInfo{LockoutCounter: 0}, nil
+	}))
 }
 
 // startOverlord will setup and create a new overlord, note that it will not
@@ -133,6 +148,14 @@ func (t *firstBootBaseTest) setupBaseTest(c *C, s *seedtest.SeedSnaps) {
 // your own before calling this again
 func (t *firstBootBaseTest) startOverlord(c *C) {
 	ovld, err := overlord.New(nil)
+	func() {
+		st := ovld.State()
+		st.Lock()
+		defer st.Unlock()
+		// set a fake fde state to avoid failure in initialization
+		st.Set("fde", &struct{}{})
+	}()
+
 	c.Assert(err, IsNil)
 	ovld.InterfaceManager().DisableUDevMonitor()
 	// avoid gadget preload in the general tests cases
@@ -206,8 +229,8 @@ func checkTrivialSeeding(c *C, tsAll []*state.TaskSet) {
 	c.Check(tasks[0].Kind(), Equals, "mark-seeded")
 }
 
-func modelHeaders(modelStr string, reqSnaps ...string) map[string]interface{} {
-	headers := map[string]interface{}{
+func modelHeaders(modelStr string, reqSnaps ...string) map[string]any {
+	headers := map[string]any{
 		"architecture": "amd64",
 		"store":        "canonical",
 	}
@@ -217,14 +240,14 @@ func modelHeaders(modelStr string, reqSnaps ...string) map[string]interface{} {
 		headers["classic"] = "true"
 		headers["distribution"] = "ubuntu"
 		headers["base"] = "core22"
-		headers["snaps"] = []interface{}{
-			map[string]interface{}{
+		headers["snaps"] = []any{
+			map[string]any{
 				"name":            "pc-kernel",
 				"id":              snaptest.AssertedSnapID("pc-kernel"),
 				"type":            "kernel",
 				"default-channel": "22",
 			},
-			map[string]interface{}{
+			map[string]any{
 				"name":            "pc",
 				"id":              snaptest.AssertedSnapID("pc"),
 				"type":            "gadget",
@@ -236,7 +259,7 @@ func modelHeaders(modelStr string, reqSnaps ...string) map[string]interface{} {
 		headers["gadget"] = "pc"
 	}
 	if len(reqSnaps) != 0 {
-		reqs := make([]interface{}, len(reqSnaps))
+		reqs := make([]any, len(reqSnaps))
 		for i, req := range reqSnaps {
 			reqs[i] = req
 		}
@@ -245,7 +268,7 @@ func modelHeaders(modelStr string, reqSnaps ...string) map[string]interface{} {
 	return headers
 }
 
-func (s *firstBoot16BaseTest) makeModelAssertionChain(c *C, modName string, extraHeaders map[string]interface{}, reqSnaps ...string) []asserts.Assertion {
+func (s *firstBoot16BaseTest) makeModelAssertionChain(c *C, modName string, extraHeaders map[string]any, reqSnaps ...string) []asserts.Assertion {
 	return s.MakeModelAssertionChain("my-brand", modName, modelHeaders(modName, reqSnaps...), extraHeaders)
 }
 
@@ -487,7 +510,7 @@ func checkOrder(c *C, tsAll []*state.TaskSet, snaps ...string) {
 		}
 		snapsup, err := snapstate.TaskSnapSetup(task0)
 		c.Assert(err, IsNil, Commentf("%#v", task0))
-		c.Check(snapsup.InstanceName(), Equals, snaps[matched])
+		c.Check(snapsup.InstanceName().String(), Equals, snaps[matched])
 		matched++
 	}
 	c.Check(matched, Equals, len(snaps))
@@ -700,7 +723,7 @@ func (s *firstBoot16Suite) TestPopulateFromSeedMissingBootloader(c *C) {
 	c.Assert(err, IsNil)
 	o.AddManager(snapmgr)
 
-	ifacemgr, err := ifacestate.Manager(st, nil, o.TaskRunner(), nil, nil)
+	ifacemgr, err := ifacestate.Manager(st, nil, nil, o.TaskRunner(), nil, nil)
 	c.Assert(err, IsNil)
 	o.AddManager(ifacemgr)
 	c.Assert(o.StartUp(), IsNil)
@@ -918,7 +941,7 @@ snaps:
 		ok, err := snapstate.HasSnapOfType(st, snap.TypeGadget)
 		c.Check(err, IsNil)
 		c.Check(ok, Equals, true)
-		configured = append(configured, ctx.InstanceName())
+		configured = append(configured, ctx.InstanceName().String())
 		return nil, nil
 	}
 
@@ -1090,12 +1113,12 @@ snaps:
 	c.Check(pubAcct.AccountID(), Equals, "developerid")
 
 	// check connection
-	var conns map[string]interface{}
+	var conns map[string]any
 	err = state.Get("conns", &conns)
 	c.Assert(err, IsNil)
 	c.Check(conns, HasLen, 1)
-	c.Check(conns, DeepEquals, map[string]interface{}{
-		"foo:network-control core:network-control": map[string]interface{}{
+	c.Check(conns, DeepEquals, map[string]any{
+		"foo:network-control core:network-control": map[string]any{
 			"interface": "network-control", "auto": true, "by-gadget": true,
 		},
 	})
@@ -1125,8 +1148,27 @@ func (s *firstBoot16Suite) TestImportAssertionsFromSeedClassicModelMismatch(c *C
 	defer st.Unlock()
 
 	isCoreBoot := true
-	_, err = devicestate.ImportAssertionsFromSeed(ovld.DeviceManager(), isCoreBoot)
+	_, err = devicestate.ImportAssertionsFromSeed(ovld.DeviceManager(), "run", isCoreBoot)
 	c.Assert(err, ErrorMatches, "cannot seed a classic system with an all-snaps model")
+}
+
+func (s *firstBoot16Suite) TestImportAssertionsFromSeedClassicModelOnCoreRunMode(c *C) {
+	ovld, err := overlord.New(nil)
+	defer ovld.Stop()
+	c.Assert(err, IsNil)
+	st := ovld.State()
+
+	// add the model assertion and its chain
+	assertsChain := s.makeModelAssertionChain(c, "my-model-classic-modes", nil)
+	s.WriteAssertions("model.asserts", assertsChain...)
+
+	// import them
+	st.Lock()
+	defer st.Unlock()
+
+	isCoreBoot := true
+	_, err = devicestate.ImportAssertionsFromSeed(ovld.DeviceManager(), "run", isCoreBoot)
+	c.Assert(err, ErrorMatches, "can only seed an all-snaps system with a classic model in recovery mode")
 }
 
 func (s *firstBoot16Suite) TestImportAssertionsFromSeedClassicWithModes(c *C) {
@@ -1147,18 +1189,18 @@ func (s *firstBoot16Suite) TestImportAssertionsFromSeedClassicWithModes(c *C) {
 	defer st.Unlock()
 
 	isCoreBoot := true
-	_, err = devicestate.ImportAssertionsFromSeed(ovld.DeviceManager(), isCoreBoot)
+	_, err = devicestate.ImportAssertionsFromSeed(ovld.DeviceManager(), "run", isCoreBoot)
 	c.Assert(err, IsNil)
 }
 
-func (s *firstBoot16Suite) TestImportAssertionsFromSeedAllSnapsModelMismatch(c *C) {
+func (s *firstBoot16Suite) TestImportAssertionsFromSeedClassicRecoveryMode(c *C) {
 	ovld, err := overlord.New(nil)
 	defer ovld.Stop()
 	c.Assert(err, IsNil)
 	st := ovld.State()
 
 	// add the model assertion and its chain
-	assertsChain := s.makeModelAssertionChain(c, "my-model-classic", nil)
+	assertsChain := s.makeModelAssertionChain(c, "my-model-classic-modes", nil)
 	s.WriteAssertions("model.asserts", assertsChain...)
 
 	// import them
@@ -1166,8 +1208,8 @@ func (s *firstBoot16Suite) TestImportAssertionsFromSeedAllSnapsModelMismatch(c *
 	defer st.Unlock()
 
 	isCoreBoot := true
-	_, err = devicestate.ImportAssertionsFromSeed(ovld.DeviceManager(), isCoreBoot)
-	c.Assert(err, ErrorMatches, "cannot seed an all-snaps system with a classic model")
+	_, err = devicestate.ImportAssertionsFromSeed(ovld.DeviceManager(), "recover", isCoreBoot)
+	c.Assert(err, IsNil)
 }
 
 func (s *firstBoot16Suite) TestLoadDeviceSeed(c *C) {
@@ -1228,7 +1270,7 @@ func (s *firstBoot16Suite) TestImportAssertionsFromSeedHappy(c *C) {
 	defer st.Unlock()
 
 	isCoreBoot := true
-	deviceSeed, err := devicestate.ImportAssertionsFromSeed(ovld.DeviceManager(), isCoreBoot)
+	deviceSeed, err := devicestate.ImportAssertionsFromSeed(ovld.DeviceManager(), "run", isCoreBoot)
 	c.Assert(err, IsNil)
 	c.Assert(deviceSeed, NotNil)
 
@@ -1272,7 +1314,7 @@ func (s *firstBoot16Suite) TestImportAssertionsFromSeedMissingSig(c *C) {
 	// try import and verify that its rejects because other assertions are
 	// missing
 	isCoreBoot := true
-	_, err := devicestate.ImportAssertionsFromSeed(s.overlord.DeviceManager(), isCoreBoot)
+	_, err := devicestate.ImportAssertionsFromSeed(s.overlord.DeviceManager(), "run", isCoreBoot)
 	c.Assert(err, ErrorMatches, "cannot resolve prerequisite assertion: account-key .*")
 }
 
@@ -1292,7 +1334,7 @@ func (s *firstBoot16Suite) TestImportAssertionsFromSeedTwoModelAsserts(c *C) {
 	// try import and verify that its rejects because other assertions are
 	// missing
 	isCoreBoot := true
-	_, err := devicestate.ImportAssertionsFromSeed(s.overlord.DeviceManager(), isCoreBoot)
+	_, err := devicestate.ImportAssertionsFromSeed(s.overlord.DeviceManager(), "run", isCoreBoot)
 	c.Assert(err, ErrorMatches, "cannot have multiple model assertions in seed")
 }
 
@@ -1312,7 +1354,7 @@ func (s *firstBoot16Suite) TestImportAssertionsFromSeedNoModelAsserts(c *C) {
 	// try import and verify that its rejects because other assertions are
 	// missing
 	isCoreBoot := true
-	_, err := devicestate.ImportAssertionsFromSeed(s.overlord.DeviceManager(), isCoreBoot)
+	_, err := devicestate.ImportAssertionsFromSeed(s.overlord.DeviceManager(), "run", isCoreBoot)
 	c.Assert(err, ErrorMatches, "seed must have a model assertion")
 }
 
@@ -1340,7 +1382,7 @@ version: 1.0
 	// the info file is needed by the Ensure() loop of snapstate manager
 	snapdSnapFiles := [][]string{
 		{"usr/lib/snapd/info", `
-VERSION=2.54.3+git1.g479e745-dirty
+VERSION=2.54.3+g1.479e745-dirty
 SNAPD_APPARMOR_REEXEC=1
 `},
 	}
@@ -1400,7 +1442,7 @@ func (s *firstBoot16Suite) TestPopulateFromSeedWithBaseHappy(c *C) {
 	s.WriteAssertions("developer.account", s.devAcct)
 
 	// add a model assertion and its chain
-	assertsChain := s.makeModelAssertionChain(c, "my-model", map[string]interface{}{"base": "core18"})
+	assertsChain := s.makeModelAssertionChain(c, "my-model", map[string]any{"base": "core18"})
 	s.WriteAssertions("model.asserts", assertsChain...)
 
 	// create a seed.yaml
@@ -1426,7 +1468,7 @@ snaps:
 	tsAll, err := devicestate.PopulateStateFromSeedImpl(s.overlord.DeviceManager(), s.perfTimings)
 	c.Assert(err, IsNil)
 
-	checkOrder(c, tsAll, "snapd", "pc-kernel", "core18", "pc")
+	checkOrder(c, tsAll, "snapd", "core18", "pc-kernel", "pc")
 
 	// now run the change and check the result
 	// use the expected kind otherwise settle with start another one
@@ -1504,7 +1546,7 @@ func (s *firstBoot16Suite) TestPopulateFromSeedOrdering(c *C) {
 	s.WriteAssertions("developer.account", s.devAcct)
 
 	// add a model assertion and its chain
-	assertsChain := s.makeModelAssertionChain(c, "my-model", map[string]interface{}{"base": "core18"})
+	assertsChain := s.makeModelAssertionChain(c, "my-model", map[string]any{"base": "core18"})
 	s.WriteAssertions("model.asserts", assertsChain...)
 
 	core18Fname, snapdFname, kernelFname, gadgetFname := s.makeCore18Snaps(c, nil)
@@ -1549,14 +1591,14 @@ snaps:
 	tsAll, err := devicestate.PopulateStateFromSeedImpl(s.overlord.DeviceManager(), s.perfTimings)
 	c.Assert(err, IsNil)
 
-	checkOrder(c, tsAll, "snapd", "pc-kernel", "core18", "pc", "other-base", "snap-req-other-base")
+	checkOrder(c, tsAll, "snapd", "core18", "pc-kernel", "pc", "other-base", "snap-req-other-base")
 }
 
 func (s *firstBoot16Suite) TestFirstbootGadgetBaseModelBaseMismatch(c *C) {
 	s.WriteAssertions("developer.account", s.devAcct)
 
 	// add a model assertion and its chain
-	assertsChain := s.makeModelAssertionChain(c, "my-model", map[string]interface{}{"base": "core18"})
+	assertsChain := s.makeModelAssertionChain(c, "my-model", map[string]any{"base": "core18"})
 	s.WriteAssertions("model.asserts", assertsChain...)
 
 	core18Fname, snapdFname, kernelFname, _ := s.makeCore18Snaps(c, nil)
@@ -1672,14 +1714,14 @@ snaps:
 	c.Assert(err, IsNil)
 
 	// verify the result
-	var conns map[string]interface{}
+	var conns map[string]any
 	err = st.Get("conns", &conns)
 	c.Assert(err, IsNil)
 	c.Check(conns, HasLen, 1)
 	conn, hasConn := conns["gnome-calculator:gtk-3-themes gtk-common-themes:gtk-3-themes"]
 	c.Check(hasConn, Equals, true)
-	c.Check(conn.(map[string]interface{})["auto"], Equals, true)
-	c.Check(conn.(map[string]interface{})["interface"], Equals, "content")
+	c.Check(conn.(map[string]any)["auto"], Equals, true)
+	c.Check(conn.(map[string]any)["interface"], Equals, "content")
 }
 
 func (s *firstBoot16Suite) TestPopulateFromSeedAlternativeContentProviderAndOrder(c *C) {
@@ -1767,14 +1809,14 @@ snaps:
 	c.Assert(err, IsNil)
 
 	// verify the result
-	var conns map[string]interface{}
+	var conns map[string]any
 	err = st.Get("conns", &conns)
 	c.Assert(err, IsNil)
 	c.Check(conns, HasLen, 1)
 	conn, hasConn := conns["gnome-calculator:gtk-3-themes gtk-common-themes-alt:gtk-3-themes"]
 	c.Check(hasConn, Equals, true)
-	c.Check(conn.(map[string]interface{})["auto"], Equals, true)
-	c.Check(conn.(map[string]interface{})["interface"], Equals, "content")
+	c.Check(conn.(map[string]any)["auto"], Equals, true)
+	c.Check(conn.(map[string]any)["interface"], Equals, "content")
 
 	c.Check(logbuf.String(), Matches, `(?sm).*seed prerequisites: snap "gnome-calculator" requires a provider for content "gtk-3-themes", a candidate slot is available \(gtk-common-themes-alt:gtk-3-themes\) but not the default-provider, ensure a single auto-connection \(or possibly a connection\) is in-place.*`)
 }
@@ -1986,7 +2028,7 @@ base: core18
 	s.WriteAssertions("foo.asserts", s.devAcct, fooRev, fooDecl)
 
 	// add a model assertion and its chain
-	assertsChain := s.makeModelAssertionChain(c, "my-model-classic", map[string]interface{}{"gadget": "pc"})
+	assertsChain := s.makeModelAssertionChain(c, "my-model-classic", map[string]any{"gadget": "pc"})
 	s.WriteAssertions("model.asserts", assertsChain...)
 
 	// create a seed.yaml
@@ -2252,19 +2294,19 @@ snaps:
 	c.Check(hooksCalled[0].HookName(), Equals, "connect-plug-network")
 
 	// verify that connections was made
-	var conns map[string]interface{}
+	var conns map[string]any
 	c.Assert(st.Get("conns", &conns), IsNil)
-	c.Assert(conns, DeepEquals, map[string]interface{}{
-		"foo:network snapd:network": map[string]interface{}{
+	c.Assert(conns, DeepEquals, map[string]any{
+		"foo:network snapd:network": map[string]any{
 			"auto": true, "interface": "network"},
-		"foo:shared-data-plug bar:shared-data-slot": map[string]interface{}{
+		"foo:shared-data-plug bar:shared-data-slot": map[string]any{
 			"auto": true, "interface": "content",
-			"plug-static": map[string]interface{}{
+			"plug-static": map[string]any{
 				"content": "mylib", "target": "import",
 			},
-			"slot-static": map[string]interface{}{
+			"slot-static": map[string]any{
 				"content": "mylib",
-				"read": []interface{}{
+				"read": []any{
 					"/",
 				},
 			},
@@ -2288,13 +2330,13 @@ func (s *firstBoot16Suite) mockServer(c *C, reqID string) *httptest.Server {
 	return mockServer
 }
 
-func (s *firstBoot16Suite) signSerial(c *C, bhv *devicestatetest.DeviceServiceBehavior, headers map[string]interface{}, body []byte) (serial asserts.Assertion, ancillary []asserts.Assertion, err error) {
+func (s *firstBoot16Suite) signSerial(c *C, bhv *devicestatetest.DeviceServiceBehavior, headers map[string]any, body []byte) (serial asserts.Assertion, ancillary []asserts.Assertion, err error) {
 	signing := assertstest.NewStoreStack("canonical", nil)
 	a, err := signing.Sign(asserts.SerialType, headers, body, "")
 	return a, nil, err
 }
 
-func (s *firstBoot16Suite) testPopulateFromSeedCore18ValidationSetTracking(c *C, vsAsserts []asserts.Assertion, vsHeaders []interface{}) *state.Change {
+func (s *firstBoot16Suite) testPopulateFromSeedCore18ValidationSetTracking(c *C, vsAsserts []asserts.Assertion, vsHeaders []any) *state.Change {
 	var sysdLog [][]string
 	systemctlRestorer := systemd.MockSystemctl(func(cmd ...string) ([]byte, error) {
 		sysdLog = append(sysdLog, cmd)
@@ -2313,7 +2355,7 @@ func (s *firstBoot16Suite) testPopulateFromSeedCore18ValidationSetTracking(c *C,
 	core18Fname, snapdFname, kernelFname, gadgetFname := s.makeCore18Snaps(c, &core18SnapsOpts{})
 
 	// add a model assertion and its chain
-	assertsChain := s.makeModelAssertionChain(c, "my-model", map[string]interface{}{"base": "core18", "validation-sets": vsHeaders})
+	assertsChain := s.makeModelAssertionChain(c, "my-model", map[string]any{"base": "core18", "validation-sets": vsHeaders})
 	s.WriteAssertions("model.asserts", assertsChain...)
 
 	// write validation set assertions
@@ -2354,7 +2396,7 @@ snaps:
 	expectedSeqs := make(map[string]int)
 	expectedVss := make(map[string][]string)
 	for _, vs := range vsHeaders {
-		hdrs := vs.(map[string]interface{})
+		hdrs := vs.(map[string]any)
 		seq, err := strconv.Atoi(hdrs["sequence"].(string))
 		c.Assert(err, IsNil)
 		key := fmt.Sprintf("%s/%s/%s", release.Series, hdrs["account-id"].(string), hdrs["name"].(string))
@@ -2379,7 +2421,11 @@ snaps:
 	}
 	c.Assert(st.Changes(), HasLen, 1)
 
-	checkOrder(c, tsAll, "snapd", "pc-kernel", "core18", "pc")
+	// avoid device registration
+	chg1 := st.NewChange("become-operational", "init device")
+	chg1.SetStatus(state.DoingStatus)
+
+	checkOrder(c, tsAll, "snapd", "core18", "pc-kernel", "pc")
 
 	st.Unlock()
 	err = s.overlord.Settle(settleTimeout)
@@ -2399,21 +2445,21 @@ snaps:
 }
 
 func (s *firstBoot16Suite) TestPopulateFromSeedCore18ValidationSetTrackingHappy(c *C) {
-	a, err := s.StoreSigning.Sign(asserts.ValidationSetType, map[string]interface{}{
+	a, err := s.StoreSigning.Sign(asserts.ValidationSetType, map[string]any{
 		"type":         "validation-set",
 		"authority-id": "canonical",
 		"series":       "16",
 		"account-id":   "canonical",
 		"name":         "base-set",
 		"sequence":     "1",
-		"snaps": []interface{}{
-			map[string]interface{}{
+		"snaps": []any{
+			map[string]any{
 				"name":     "pc-kernel",
 				"id":       s.AssertedSnapID("pc-kernel"),
 				"presence": "required",
 				"revision": "1",
 			},
-			map[string]interface{}{
+			map[string]any{
 				"name":     "pc",
 				"id":       s.AssertedSnapID("pc"),
 				"presence": "required",
@@ -2424,13 +2470,13 @@ func (s *firstBoot16Suite) TestPopulateFromSeedCore18ValidationSetTrackingHappy(
 	}, nil, "")
 	c.Assert(err, IsNil)
 
-	headers := map[string]interface{}{
+	headers := map[string]any{
 		"account-id": "canonical",
 		"name":       "base-set",
 		"sequence":   "1",
 		"mode":       "enforce",
 	}
-	chg := s.testPopulateFromSeedCore18ValidationSetTracking(c, []asserts.Assertion{a}, []interface{}{headers})
+	chg := s.testPopulateFromSeedCore18ValidationSetTracking(c, []asserts.Assertion{a}, []any{headers})
 
 	s.overlord.State().Lock()
 	defer s.overlord.State().Unlock()
@@ -2450,22 +2496,24 @@ func (s *firstBoot16Suite) TestPopulateFromSeedCore18ValidationSetTrackingHappy(
 }
 
 func (s *firstBoot16Suite) TestPopulateFromSeedCore18ValidationSetTrackingUnmetCriteria(c *C) {
-	a, err := s.StoreSigning.Sign(asserts.ValidationSetType, map[string]interface{}{
+	defer cgroup.MockVersion(cgroup.V2, nil)()
+
+	a, err := s.StoreSigning.Sign(asserts.ValidationSetType, map[string]any{
 		"type":         "validation-set",
 		"authority-id": "canonical",
 		"series":       "16",
 		"account-id":   "canonical",
 		"name":         "base-set",
 		"sequence":     "1",
-		"snaps": []interface{}{
-			map[string]interface{}{
+		"snaps": []any{
+			map[string]any{
 				"name":     "pc-kernel",
 				"id":       s.AssertedSnapID("pc-kernel"),
 				"presence": "required",
 				// Set required revision of pc-kernel to 7, this should make it fail
 				"revision": "7",
 			},
-			map[string]interface{}{
+			map[string]any{
 				"name":     "pc",
 				"id":       s.AssertedSnapID("pc"),
 				"presence": "required",
@@ -2476,16 +2524,20 @@ func (s *firstBoot16Suite) TestPopulateFromSeedCore18ValidationSetTrackingUnmetC
 	}, nil, "")
 	c.Assert(err, IsNil)
 
-	headers := map[string]interface{}{
+	headers := map[string]any{
 		"account-id": "canonical",
 		"name":       "base-set",
 		"sequence":   "1",
 		"mode":       "enforce",
 	}
-	chg := s.testPopulateFromSeedCore18ValidationSetTracking(c, []asserts.Assertion{a}, []interface{}{headers})
+	chg := s.testPopulateFromSeedCore18ValidationSetTracking(c, []asserts.Assertion{a}, []any{headers})
 
-	s.overlord.State().Lock()
-	defer s.overlord.State().Unlock()
+	st := s.overlord.State()
+
+	err = s.overlord.Settle(settleTimeout)
+	st.Lock()
+	defer st.Unlock()
+	c.Assert(err, IsNil)
 	c.Assert(chg.Status(), Equals, state.ErrorStatus)
 	c.Check(chg.Err().Error(), testutil.Contains, "pc-kernel (required at revision 7 by sets canonical/base-set))")
 }

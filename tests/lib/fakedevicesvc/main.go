@@ -20,6 +20,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -57,11 +58,11 @@ func main() {
 	l.Close()
 }
 
-func internalError(w http.ResponseWriter, msg string, a ...interface{}) {
+func internalError(w http.ResponseWriter, msg string, a ...any) {
 	http.Error(w, fmt.Sprintf(msg, a...), 500)
 }
 
-func badRequestError(w http.ResponseWriter, msg string, a ...interface{}) {
+func badRequestError(w http.ResponseWriter, msg string, a ...any) {
 	http.Error(w, fmt.Sprintf(msg, a...), 400)
 }
 
@@ -124,12 +125,23 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		}
 
 		serialStr := "7777"
+
+		// Modify serial id for prepare serial request
+		var bodyMap map[string]any
+		err = json.Unmarshal(serialReq.Body(), &bodyMap)
+		// We only change the serial if the body was JSON and hardware-id-key is present
+		if err == nil {
+			if _, ok := bodyMap["hardware-id-key"]; ok {
+				serialStr = "3333"
+			}
+		}
+
 		if r.Header.Get("X-Use-Proposed") == "yes" {
 			// use proposed serial
 			serialStr = serialReq.Serial()
 		}
 
-		serial, err := db.Sign(asserts.SerialType, map[string]interface{}{
+		serial, err := db.Sign(asserts.SerialType, map[string]any{
 			"authority-id":        "developer1",
 			"brand-id":            "developer1",
 			"model":               serialReq.Model(),

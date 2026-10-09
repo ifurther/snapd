@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2017 Canonical Ltd
+ * Copyright (C) 2026 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -20,40 +20,51 @@
 package systemd
 
 import (
-	"fmt"
-	"net"
+	"errors"
 	"os"
-	"strings"
+	"sync"
 )
 
-var osGetenv = os.Getenv
+var (
+	// ErrSdNotifySocketNotInitialized indicates that NotifySocket was called
+	// before InitSdNotifySocket.
+	ErrSdNotifySocketNotInitialized = errors.New("internal error: InitSdNotifySocket must be called first")
+	// ErrNotifySocketNotSet indicates that the NOTIFY_SOCKET environment
+	// variable was not set.
+	ErrNotifySocketNotSet = errors.New("cannot find NOTIFY_SOCKET environment variable")
+)
 
-// SdNotify sends the given state string notification to systemd.
+var sdNotifySocket string
+var sdNotifySocketInitialized bool
+var sdNotifySocketMu sync.Mutex
+
+// InitSdNotifySocket reads and unsets the NOTIFY_SOCKET environment variable.
 //
-// inspired by libsystemd/sd-daemon/sd-daemon.c from the systemd source
-func SdNotify(notifyState string) error {
-	if notifyState == "" {
-		return fmt.Errorf("cannot use empty notify state")
+// To get the cached value, use NotifySocket().
+func InitSdNotifySocket() {
+	sdNotifySocketMu.Lock()
+	defer sdNotifySocketMu.Unlock()
+	if sdNotifySocketInitialized {
+		return
 	}
+	sdNotifySocket = os.Getenv("NOTIFY_SOCKET")
+	os.Unsetenv("NOTIFY_SOCKET")
+	sdNotifySocketInitialized = true
+}
 
-	notifySocket := osGetenv("NOTIFY_SOCKET")
-	if notifySocket == "" {
-		return fmt.Errorf("cannot find NOTIFY_SOCKET environment")
+// NotifySocket returns the cached value of the NOTIFY_SOCKET environment
+// variable.
+//
+// It returns ErrSdNotifySocketNotInitialized if InitSdNotifySocket has not been
+// called yet, or ErrNotifySocketNotSet if NOTIFY_SOCKET was not set.
+func NotifySocket() (string, error) {
+	sdNotifySocketMu.Lock()
+	defer sdNotifySocketMu.Unlock()
+	if !sdNotifySocketInitialized {
+		return "", ErrSdNotifySocketNotInitialized
 	}
-	if !strings.HasPrefix(notifySocket, "@") && !strings.HasPrefix(notifySocket, "/") {
-		return fmt.Errorf("cannot use NOTIFY_SOCKET %q", notifySocket)
+	if sdNotifySocket == "" {
+		return "", ErrNotifySocketNotSet
 	}
-
-	raddr := &net.UnixAddr{
-		Name: notifySocket,
-		Net:  "unixgram",
-	}
-	conn, err := net.DialUnix("unixgram", nil, raddr)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	_, err = conn.Write([]byte(notifyState))
-	return err
+	return sdNotifySocket, nil
 }

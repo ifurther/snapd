@@ -1,5 +1,20 @@
 summary: Check that the basic snapshots functionality is ok
 
+details: |
+    A snapshot is a copy of the user, system and configuration data stored
+    by snapd for one or more snaps on your system. This data can be found
+    in $HOME/snap/<snap-name> and /var/snap/<snap-name>.
+
+    Snapshots are generated manually with the snap save command and
+    automatically when a snap is removed (unless --purge is used with
+    remove, in which case no snapshot is created).
+
+    Having few snaps installed in the system, this test checks that
+    `snap save` command shows the created snapshots for the snaps. Then it runs
+    `snap check-snapshot` to check the snapshot created for the snaps are
+    valid. Finally, it verifies that the snapshots can be exported and restored
+    (the data is restored properly) and removed by running `snap forget` command.
+
 environment:
     # tar invoked when creating snapshots triggers OOM
     SNAPD_NO_MEMORY_LIMIT: 1
@@ -116,7 +131,8 @@ execute: |
 
     # check automatic snapshot can be disabled
     snap set core snapshots.automatic.retention=no
-    snap remove test-snapd-sh
+    snap remove test-snapd-sh > remove-snapshot-disabled.out
+    MATCH 'test-snapd-sh removed$' < remove-snapshot-disabled.out
     if snap saved | MATCH "test-snapd-sh"; then
         echo "did not expect a snapshot for test-snapd-sh"
         exit 1
@@ -125,7 +141,8 @@ execute: |
     # re-enable snapshots, check automatic snapshot is created on snap remove
     snap install test-snapd-sh
     snap set core snapshots.automatic.retention=30h
-    snap remove test-snapd-sh
+    snap remove test-snapd-sh > remove-snapshot-auto.out
+    MATCH 'test-snapd-sh removed \(snap data snapshot saved\)$' < remove-snapshot-auto.out
     snap saved test-snapd-sh | MATCH "auto"
     SET_ID=$( snap saved test-snapd-sh | cut -d\  -f1 | tail -n1 )
     snap forget "$SET_ID"
@@ -133,7 +150,8 @@ execute: |
     # removing with --purge doesn't create automatic snapshot
     snap set core snapshots.automatic.retention=30h
     snap install test-snapd-sh
-    snap remove --purge test-snapd-sh
+    snap remove --purge test-snapd-sh > remove-purge.out
+    MATCH 'test-snapd-sh removed$' < remove-purge.out
     if snap saved test-snapd-sh | MATCH "auto" ; then
         echo "automatic snapshot is not expected"
         exit 1

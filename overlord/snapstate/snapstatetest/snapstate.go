@@ -30,6 +30,7 @@ import (
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/snap/snaptest"
+	"github.com/snapcore/snapd/testutil"
 	"gopkg.in/check.v1"
 )
 
@@ -43,6 +44,7 @@ func fakeSnapID(name string) string {
 type InstallSnapOptions struct {
 	Required         bool
 	PreserveSequence bool
+	Components       []*sequence.ComponentState
 }
 
 func InstallSnap(c *check.C, st *state.State, yaml string, files [][]string, si *snap.SideInfo, opts InstallSnapOptions) *snap.Info {
@@ -56,14 +58,14 @@ func InstallSnap(c *check.C, st *state.State, yaml string, files [][]string, si 
 	var seq sequence.SnapSequence
 	if opts.PreserveSequence {
 		var ss snapstate.SnapState
-		err := snapstate.Get(st, info.InstanceName(), &ss)
+		err := snapstate.Get(st, info.InstanceName().String(), &ss)
 		c.Assert(err, check.IsNil)
 		seq.Revisions = append(seq.Revisions, ss.Sequence.Revisions...)
 	}
 
-	seq.Revisions = append(seq.Revisions, sequence.NewRevisionSideState(si, nil))
+	seq.Revisions = append(seq.Revisions, sequence.NewRevisionSideState(si, opts.Components))
 
-	snapstate.Set(st, info.InstanceName(), &snapstate.SnapState{
+	snapstate.Set(st, info.InstanceName().String(), &snapstate.SnapState{
 		SnapType:        string(t),
 		Active:          true,
 		Sequence:        seq,
@@ -79,18 +81,21 @@ func InstallEssentialSnaps(c *check.C, st *state.State, base string, gadgetFiles
 		SnapID:   fakeSnapID("pc"),
 		Revision: snap.R(1),
 		RealName: "pc",
+		Channel:  "latest/stable",
 	}, InstallSnapOptions{Required: true})
 
 	InstallSnap(c, st, "name: pc-kernel\nversion: 1\ntype: kernel\n", nil, &snap.SideInfo{
 		SnapID:   fakeSnapID("pc-kernel"),
 		Revision: snap.R(1),
 		RealName: "pc-kernel",
+		Channel:  "latest/stable",
 	}, InstallSnapOptions{Required: true})
 
 	InstallSnap(c, st, fmt.Sprintf("name: %s\nversion: 1\ntype: base\n", base), nil, &snap.SideInfo{
 		SnapID:   fakeSnapID(base),
 		Revision: snap.R(1),
 		RealName: base,
+		Channel:  "latest/stable",
 	}, InstallSnapOptions{Required: true})
 
 	if bloader != nil {
@@ -113,4 +118,8 @@ func NewSequenceFromSnapSideInfos(snapSideInfo []*snap.SideInfo) sequence.SnapSe
 
 func NewSequenceFromRevisionSideInfos(revsSideInfo []*sequence.RevisionSideState) sequence.SnapSequence {
 	return sequence.SnapSequence{Revisions: revsSideInfo}
+}
+
+func MockProcessDelayedSecurityBackendEffects(f func(st *state.State, lanes []int, joinLane int) *state.TaskSet) (restore func()) {
+	return testutil.Mock(&snapstate.ProcessDelayedSecurityBackendEffects, f)
 }

@@ -1,17 +1,26 @@
 summary: Integration tests for the bootstrap.Run autodetect
 
+details: |
+    When working on a core system, snapd contains logic to install the system
+    from scratch, creating partitions and file systems as necessary. The test
+    uses snapd internal API loaded through a helper Go program, to exercise that
+    in a hybrid unit/integration test, and observe the outcome.
+
+    This test focuses on the re-installation scenario. A similar test looks at
+    the first installation scenario and yet another test looks at creating
+    encrypted file systems.
+
 # use the same system and tooling as uc20
 systems: [ubuntu-2*]
 
 environment:
     SNAPD_DEBUG: "1"
 
-prepare: |
-    if not os.query is-pc-amd64; then
-        echo "test designed for amd64 architecture, exiting..."
-        exit
-    fi
+skip:
+    - reason: The test is designed for amd64 architecture
+      if: not os.query is-pc-amd64
 
+prepare: |
     echo "Create a fake block device image that looks like an image from u-i"
     truncate --size=20GB fake.img
 
@@ -40,11 +49,6 @@ prepare: |
     unsquashfs -d gadget-dir pc_*.snap
 
 restore: |
-    if not os.query is-pc-amd64; then
-        echo "test designed for amd64 architecture, exiting..."
-        exit
-    fi
-
     for label in ubuntu-seed ubuntu-save ubuntu-data ubuntu-boot; do
         if mountpoint "/run/mnt/$label"; then
             umount "/run/mnt/$label"
@@ -73,11 +77,6 @@ debug: |
     fi
 
 execute: |
-    if not os.query is-pc-amd64; then
-        echo "test designed for amd64 architecture, exiting..."
-        exit
-    fi
-
     LOOP="$(cat loop.txt)"
 
     # debug message to see if the udev database is correctly updated
@@ -87,7 +86,7 @@ execute: |
     # TODO:UC20: make kernel-dir non-empty once we have a gadget that has a
     #            "$kernel:" style ref in the meta/gadget.yaml
     kerneldir=""
-    uc20-create-partitions ./gadget-dir "$kerneldir"
+    uc20-create-partitions ./gadget-dir pc-kernel "$kerneldir" x1
 
     echo "And check that the partitions are created"
     sfdisk -l "$LOOP" | MATCH '750M Linux filesystem'
@@ -109,7 +108,7 @@ execute: |
 
     # re-create partitions on a new install attempt
     echo "Run the snap-bootstrap again"
-    uc20-create-partitions ./gadget-dir "$kerneldir"
+    uc20-create-partitions ./gadget-dir pc-kernel "$kerneldir" x1
 
     echo "And check that the partitions are there"
     sfdisk -l "$LOOP" | MATCH '750M Linux filesystem'

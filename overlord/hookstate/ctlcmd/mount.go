@@ -59,7 +59,7 @@ type mountCommand struct {
 	optionsList []string
 }
 
-func matchMountPathAttribute(path string, attribute interface{}, snapInfo *snap.Info) bool {
+func matchMountPathAttribute(path string, attribute any, snapInfo *snap.Info) bool {
 	pattern, ok := attribute.(string)
 	if !ok {
 		return false
@@ -72,19 +72,50 @@ func matchMountPathAttribute(path string, attribute interface{}, snapInfo *snap.
 	return err == nil && pp.Matches(path)
 }
 
+func matchMountSourceAttribute(path string, attribute any, fsType string, snapInfo *snap.Info) bool {
+	switch fsType {
+	case "nfs":
+		// NFS mount source AppArmor profiles expects a match for "*:**", so
+		// make sure that the attribute is unset, and the path matches the
+		// format
+		if _, ok := attribute.(string); ok {
+			return false
+		}
+
+		host, share, found := strings.Cut(path, ":")
+		if !found || host == "" || strings.Contains(host, "/") || share == "" {
+			return false
+		}
+
+		return true
+	case "cifs":
+		// CIFS mount source AppArmor profiles expects a match for "//**",
+		// make sure that the attribute is unset, and the path matches the
+		// format
+		if _, ok := attribute.(string); ok {
+			return false
+		}
+
+		if !strings.HasPrefix(path, "//") {
+			return false
+		}
+
+		hostSlashShare := strings.TrimPrefix(path, "//")
+		if hostSlashShare == "" {
+			return false
+		}
+
+		return true
+	default:
+		return matchMountPathAttribute(path, attribute, snapInfo)
+	}
+}
+
 // matchConnection checks whether the given mount connection attributes give
 // the snap permission to execute the mount command
-func (m *mountCommand) matchConnection(attributes map[string]interface{}) bool {
-	if !matchMountPathAttribute(m.Positional.What, attributes["what"], m.snapInfo) {
-		return false
-	}
-
-	if !matchMountPathAttribute(m.Positional.Where, attributes["where"], m.snapInfo) {
-		return false
-	}
-
+func (m *mountCommand) matchConnection(attributes map[string]any) bool {
 	if m.Type != "" {
-		if types, ok := attributes["type"].([]interface{}); ok {
+		if types, ok := attributes["type"].([]any); ok {
 			found := false
 			for _, iface := range types {
 				if typeString, ok := iface.(string); ok && typeString == m.Type {
@@ -106,7 +137,20 @@ func (m *mountCommand) matchConnection(attributes map[string]interface{}) bool {
 		}
 	}
 
-	if optionsIfaces, ok := attributes["options"].([]interface{}); ok {
+	if !matchMountSourceAttribute(m.Positional.What, attributes["what"], m.Type, m.snapInfo) {
+		return false
+	}
+
+	if !matchMountPathAttribute(m.Positional.Where, attributes["where"], m.snapInfo) {
+		return false
+	}
+
+	// TODO we do exact match on the mount options, which means that plugs
+	// referencing filesystems, which may require authentication options passed
+	// in -o <option-list>, would need to spell out all authentication options
+	// directly in plug declaration. This may be unacceptable in certain
+	// scenarios, e.g. CIFS with user=foo,password=foo options.
+	if optionsIfaces, ok := attributes["options"].([]any); ok {
 		var allowedOptions []string
 		for _, iface := range optionsIfaces {
 			if option, ok := iface.(string); ok {
@@ -132,7 +176,7 @@ func (m *mountCommand) matchConnection(attributes map[string]interface{}) bool {
 // checkConnections checks whether the established connections give the snap
 // permission to execute the mount command
 func (m *mountCommand) checkConnections(context *hookstate.Context) error {
-	snapName := context.InstanceName()
+	instanceName := context.InstanceName()
 
 	st := context.State()
 	st.Lock()
@@ -143,7 +187,7 @@ func (m *mountCommand) checkConnections(context *hookstate.Context) error {
 		return fmt.Errorf("internal error: cannot get connections: %s", err)
 	}
 
-	m.snapInfo, err = snapstate.CurrentInfo(st, snapName)
+	m.snapInfo, err = snapstate.CurrentInfo(st, instanceName.String())
 	if err != nil {
 		return fmt.Errorf("internal error: cannot get snap info: %s", err)
 	}
@@ -162,17 +206,17 @@ func (m *mountCommand) checkConnections(context *hookstate.Context) error {
 			return err
 		}
 
-		if connRef.PlugRef.Snap != snapName {
+		if connRef.PlugRef.Snap != instanceName {
 			continue
 		}
 
-		mounts, ok := connState.StaticPlugAttrs["mount"].([]interface{})
+		mounts, ok := connState.StaticPlugAttrs["mount"].([]any)
 		if !ok {
 			continue
 		}
 
 		for _, mountAttributes := range mounts {
-			if m.matchConnection(mountAttributes.(map[string]interface{})) {
+			if m.matchConnection(mountAttributes.(map[string]any)) {
 				return nil
 			}
 		}
@@ -181,20 +225,21 @@ func (m *mountCommand) checkConnections(context *hookstate.Context) error {
 }
 
 func (m *mountCommand) ensureMount(sysd systemd.Systemd) (string, error) {
-	snapName := m.snapInfo.InstanceName()
+	instanceName := m.snapInfo.InstanceName()
 	revision := m.snapInfo.SnapRevision().String()
 	lifetime := systemd.Transient
 	if m.Persistent {
 		lifetime = systemd.Persistent
 	}
-	unitName, err := sysd.EnsureMountUnitFileWithOptions(&systemd.MountUnitOptions{
-		Lifetime:    lifetime,
-		Description: fmt.Sprintf("Mount unit for %s, revision %s via mount-control", snapName, revision),
-		What:        m.Positional.What,
-		Where:       m.Positional.Where,
-		Fstype:      m.Type,
-		Options:     m.optionsList,
-		Origin:      "mount-control",
+	unitName, err := sysd.EnsureMountUnitFile(&systemd.MountUnitOptions{
+		Lifetime:               lifetime,
+		Description:            fmt.Sprintf("Mount unit for %s, revision %s via mount-control", instanceName, revision),
+		What:                   m.Positional.What,
+		Where:                  m.Positional.Where,
+		Fstype:                 m.Type,
+		Options:                m.optionsList,
+		Origin:                 "mount-control",
+		EnsureStartIfUnchanged: true,
 	})
 	if err != nil {
 		_ = sysd.RemoveMountUnitFile(m.Positional.Where)
@@ -216,8 +261,8 @@ func (m *mountCommand) Execute([]string) error {
 	}
 
 	if err := m.checkConnections(context); err != nil {
-		snapName := context.InstanceName()
-		return fmt.Errorf("snap %q lacks permissions to create the requested mount: %v", snapName, err)
+		instanceName := context.InstanceName()
+		return fmt.Errorf("snap %q lacks permissions to create the requested mount: %v", instanceName, err)
 	}
 
 	sysd := systemd.New(systemd.SystemMode, nil)

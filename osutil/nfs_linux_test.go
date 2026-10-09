@@ -20,6 +20,11 @@
 package osutil_test
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
+	"syscall"
+
 	. "gopkg.in/check.v1"
 
 	"github.com/snapcore/snapd/osutil"
@@ -104,5 +109,54 @@ func (s *nfsSuite) TestIsHomeUsingRemoteFS(c *C) {
 			c.Assert(err, IsNil)
 		}
 		c.Assert(isRemoteFS, Equals, tc.isRemoteFS)
+	}
+}
+
+func (s *nfsSuite) TestSnapDirsUnderNFSMounts(c *C) {
+	restore := osutil.MockSyscallStatfs(func(path string, statfs *syscall.Statfs_t) error {
+		dir, _ := filepath.Split(path)
+		_, fs := filepath.Split(strings.TrimSuffix(dir, "/"))
+
+		// statfs.Type is arch dependent:
+		// https://go.googlesource.com/go/+/refs/heads/dev.boringcrypto.go1.16/src/syscall/ztypes_linux_<arch>.go
+		switch fs {
+		case "autofs":
+			statfs.Type = 0x0187
+		case "nfs":
+			statfs.Type = 0x6969
+		case "cifs":
+			// CIFS_MAGIC_NUMBER 0xFF534D42 does not fit int32 (armhf, s390x). For this test focused on NFS,
+			// rather use SMB_SUPER_MAGIC as a stable non-NFS network filesystem value that fits statfs.Type
+			// on both 32-bit and 64-bit arches.
+			statfs.Type = 0x517B
+		default:
+			c.Fatalf("unknown filesystem %q", fs)
+		}
+
+		return nil
+	})
+	defer restore()
+
+	dirPath := c.MkDir()
+	restore = osutil.MockAllDataHomeGlobs(func() []string {
+		return []string{filepath.Join(dirPath, "*", "snap")}
+	})
+	defer restore()
+
+	types := []string{"autofs", "nfs", "cifs"}
+
+	for _, typ := range types {
+		cmt := Commentf("testcase %q", typ)
+
+		fsDir := filepath.Join(dirPath, typ)
+		err := os.MkdirAll(filepath.Join(fsDir, "snap"), 0755)
+		c.Assert(err, IsNil, cmt)
+
+		res, err := osutil.SnapDirsUnderNFSMounts()
+		c.Assert(err, IsNil, cmt)
+		c.Assert(res, Equals, typ == "nfs")
+
+		err = os.RemoveAll(fsDir)
+		c.Assert(err, IsNil)
 	}
 }

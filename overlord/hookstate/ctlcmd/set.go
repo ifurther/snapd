@@ -21,18 +21,30 @@ package ctlcmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/snapcore/snapd/client"
+	"github.com/snapcore/snapd/client/clientutil"
+	"github.com/snapcore/snapd/features"
 	"github.com/snapcore/snapd/i18n"
 	"github.com/snapcore/snapd/jsonutil"
+	"github.com/snapcore/snapd/overlord/confdbstate"
 	"github.com/snapcore/snapd/overlord/configstate"
 	"github.com/snapcore/snapd/overlord/configstate/config"
 	"github.com/snapcore/snapd/overlord/hookstate"
+	"github.com/snapcore/snapd/snap"
 )
+
+var confdbstateWriteConfdb = confdbstate.WriteConfdbFromSnap
 
 type setCommand struct {
 	baseCommand
+
+	View    bool   `long:"view" description:"return confdb values from the view declared in the plug"`
+	WaitFor string `long:"wait-for" description:"maximum duration to wait for confdb access (e.g. 10s)"`
 
 	Positional struct {
 		PlugOrSlotSpec string   `positional-arg-name:":<plug|slot>"`
@@ -65,13 +77,23 @@ by naming the respective plug or slot:
     $ snapctl set :myplug path=/dev/ttyS0
 `)
 
+var longConfdbSetHelp = i18n.G(`
+If the --view flag is used, 'snapctl set' expects the name of a connected
+interface plug referencing a confdb view. In that case, the command modifies
+the data at the provided paths according to the view referenced by the plug.
+`)
+
 func init() {
+	if features.Confdb.IsEnabled() {
+		longSetHelp += longConfdbSetHelp
+	}
+
 	addCommand("set", shortSetHelp, longSetHelp, func() command { return &setCommand{} })
 }
 
 func (s *setCommand) Execute(args []string) error {
 	if s.Positional.PlugOrSlotSpec == "" && len(s.Positional.ConfValues) == 0 {
-		return fmt.Errorf(i18n.G("set which option?"))
+		return errors.New(i18n.G("set which option?"))
 	}
 
 	context, err := s.ensureContext()
@@ -99,47 +121,58 @@ func (s *setCommand) Execute(args []string) error {
 	if snap != "" {
 		return fmt.Errorf(`"snapctl set %s" not supported, use "snapctl set :%s" instead`, s.Positional.PlugOrSlotSpec, parts[1])
 	}
+
+	if s.View {
+		if err := validateConfdbFeatureFlag(context.State()); err != nil {
+			return err
+		}
+
+		opts := &clientutil.ParseConfigOptions{String: s.String, Typed: s.Typed}
+		requests, _, err := clientutil.ParseConfigValues(s.Positional.ConfValues, opts)
+		if err != nil {
+			return fmt.Errorf(i18n.G("cannot set %s plug: %w"), s.Positional.PlugOrSlotSpec, err)
+		}
+
+		copts := &client.ConfdbOptions{}
+		if s.WaitFor != "" {
+			timeout, err := time.ParseDuration(s.WaitFor)
+			if err != nil {
+				return fmt.Errorf("cannot parse --wait-for value %s: %v", s.WaitFor, err)
+			}
+
+			if timeout < 0 {
+				return fmt.Errorf("--wait-for value must be non-negative")
+			}
+
+			copts.AccessTimeout = &timeout
+		}
+		return setConfdbValues(context, name, requests, copts)
+	}
+
 	return s.setInterfaceSetting(context, name)
 }
 
 func (s *setCommand) setConfigSetting(context *hookstate.Context) error {
 	context.Lock()
+	defer context.Unlock()
 	tr := configstate.ContextTransaction(context)
-	context.Unlock()
 
-	for _, patchValue := range s.Positional.ConfValues {
-		parts := strings.SplitN(patchValue, "=", 2)
-		if len(parts) == 1 && strings.HasSuffix(patchValue, "!") {
-			key := strings.TrimSuffix(patchValue, "!")
-			tr.Set(s.context().InstanceName(), key, nil)
-			continue
+	opts := &clientutil.ParseConfigOptions{String: s.String, Typed: s.Typed}
+	confValues, confKeys, err := clientutil.ParseConfigValues(s.Positional.ConfValues, opts)
+	if err != nil {
+		return err
+	}
+
+	for _, key := range confKeys {
+		if err := tr.Set(s.context().InstanceName().String(), key, confValues[key]); err != nil {
+			return err
 		}
-		if len(parts) != 2 {
-			return fmt.Errorf(i18n.G("invalid parameter: %q (want key=value)"), patchValue)
-		}
-		key := parts[0]
-
-		var value interface{}
-		if s.String {
-			value = parts[1]
-		} else {
-			if err := jsonutil.DecodeWithNumber(strings.NewReader(parts[1]), &value); err != nil {
-				if s.Typed {
-					return fmt.Errorf("failed to parse JSON: %w", err)
-				}
-
-				// Not valid JSON-- just save the string as-is.
-				value = parts[1]
-			}
-		}
-
-		tr.Set(s.context().InstanceName(), key, value)
 	}
 
 	return nil
 }
 
-func setInterfaceAttribute(context *hookstate.Context, staticAttrs map[string]interface{}, dynamicAttrs map[string]interface{}, key string, value interface{}) error {
+func setInterfaceAttribute(context *hookstate.Context, staticAttrs map[string]any, dynamicAttrs map[string]any, key string, value any) error {
 	data, err := json.Marshal(value)
 	if err != nil {
 		return fmt.Errorf("cannot marshal snap %q option %q: %s", context.InstanceName(), key, err)
@@ -157,8 +190,8 @@ func setInterfaceAttribute(context *hookstate.Context, staticAttrs map[string]in
 	if len(subkeys) == 0 {
 		return fmt.Errorf("internal error: unexpected empty subkeys for key %q", key)
 	}
-	var existing interface{}
-	err = getAttribute(context.InstanceName(), subkeys[:1], 0, staticAttrs, &existing)
+	var existing any
+	err = getAttribute(context.InstanceName().String(), subkeys[:1], 0, staticAttrs, &existing)
 	if err == nil {
 		return fmt.Errorf(i18n.G("attribute %q cannot be overwritten"), key)
 	}
@@ -167,7 +200,7 @@ func setInterfaceAttribute(context *hookstate.Context, staticAttrs map[string]in
 		return err
 	}
 
-	_, err = config.PatchConfig(context.InstanceName(), subkeys, 0, dynamicAttrs, &raw)
+	_, err = config.PatchConfig(context.InstanceName().String(), subkeys, 0, dynamicAttrs, &raw)
 	return err
 }
 
@@ -175,7 +208,7 @@ func (s *setCommand) setInterfaceSetting(context *hookstate.Context, plugOrSlot 
 	// Make sure set :<plug|slot> is only supported during the execution of prepare-[plug|slot] hooks
 	hookType, _ := interfaceHookType(context.HookName())
 	if hookType != preparePlugHook && hookType != prepareSlotHook {
-		return fmt.Errorf(i18n.G("interface attributes can only be set during the execution of prepare hooks"))
+		return errors.New(i18n.G("interface attributes can only be set during the execution of prepare hooks"))
 	}
 
 	attrsTask, err := attributesTask(context)
@@ -198,7 +231,7 @@ func (s *setCommand) setInterfaceSetting(context *hookstate.Context, plugOrSlot 
 	context.Lock()
 	defer context.Unlock()
 
-	var staticAttrs, dynamicAttrs map[string]interface{}
+	var staticAttrs, dynamicAttrs map[string]any
 	if err = attrsTask.Get(which+"-static", &staticAttrs); err != nil {
 		return fmt.Errorf(i18n.G("internal error: cannot get %s from appropriate task, %s"), which, err)
 	}
@@ -214,7 +247,7 @@ func (s *setCommand) setInterfaceSetting(context *hookstate.Context, plugOrSlot 
 			return fmt.Errorf(i18n.G("invalid parameter: %q (want key=value)"), attrValue)
 		}
 
-		var value interface{}
+		var value any
 		if err := jsonutil.DecodeWithNumber(strings.NewReader(parts[1]), &value); err != nil {
 			// Not valid JSON, save the string as-is
 			value = parts[1]
@@ -227,4 +260,30 @@ func (s *setCommand) setInterfaceSetting(context *hookstate.Context, plugOrSlot 
 
 	attrsTask.Set(dynKey, dynamicAttrs)
 	return nil
+}
+
+func setConfdbValues(ctx *hookstate.Context, plugName string, values map[string]any, opts *client.ConfdbOptions) error {
+	ctx.Lock()
+	defer ctx.Unlock()
+
+	plug, err := checkConfdbPlugConnection(ctx, plugName)
+	if err != nil {
+		return err
+	}
+
+	account, dbSchemaName, viewName, err := snap.ConfdbPlugAttrs(plug)
+	if err != nil {
+		return fmt.Errorf(i18n.G("invalid plug :%s: %w"), plugName, err)
+	}
+
+	view, err := confdbstateGetView(ctx.State(), account, dbSchemaName, viewName)
+	if err != nil {
+		return err
+	}
+
+	if confdbstate.IsConfdbHookCtx(ctx) && !confdbstate.CanHookSetConfdb(ctx) {
+		return fmt.Errorf("cannot modify confdb in %q hook", ctx.HookName())
+	}
+
+	return confdbstateWriteConfdb(ctx, view, values, opts)
 }

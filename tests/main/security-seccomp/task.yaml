@@ -28,6 +28,10 @@ environment:
     BIN: /var/lib/snapd/seccomp/bpf/snap.test-snapd-setpriority.test-snapd-setpriority.bin2
     AAP: /var/lib/snapd/apparmor/profiles/snap.test-snapd-setpriority.test-snapd-setpriority
 
+skip:
+    - reason: seccomp doesn't support BPF argument filtering in this system
+      if: not snap debug sandbox-features --required seccomp:bpf-argument-filtering
+
 prepare: |
     echo "Install a helper snap with default confinement"
     snap install test-snapd-setpriority
@@ -42,7 +46,7 @@ prepare: |
         # ensure the right apparmor_parser is used
         APPARMOR_PARSER="apparmor_parser"
         if snap debug sandbox-features --required apparmor:parser:snapd-internal; then
-          APPARMOR_PARSER="/snap/snapd/current/usr/lib/snapd/apparmor_parser --config-file /snap/snapd/current/usr/lib/snapd/apparmor/parser.conf -b /snap/snapd/current/usr/lib/snapd/apparmor.d --policy-features /snap/snapd/current/usr/lib/snapd/apparmor.d/abi/3.0"
+          APPARMOR_PARSER="/snap/snapd/current/usr/lib/snapd/apparmor_parser --config-file /snap/snapd/current/usr/lib/snapd/apparmor/parser.conf -b /snap/snapd/current/usr/lib/snapd/apparmor.d --policy-features /snap/snapd/current/usr/lib/snapd/apparmor.d/abi/4.0"
         fi
         $APPARMOR_PARSER -K -r "$AAP"
     fi
@@ -57,18 +61,12 @@ restore: |
         # ensure the right apparmor_parser is used
         APPARMOR_PARSER="apparmor_parser"
         if snap debug sandbox-features --required apparmor:parser:snapd-internal; then
-          APPARMOR_PARSER="/snap/snapd/current/usr/lib/snapd/apparmor_parser --config-file /snap/snapd/current/usr/lib/snapd/apparmor/parser.conf -b /snap/snapd/current/usr/lib/snapd/apparmor.d --policy-features /snap/snapd/current/usr/lib/snapd/apparmor.d/abi/3.0"
+          APPARMOR_PARSER="/snap/snapd/current/usr/lib/snapd/apparmor_parser --config-file /snap/snapd/current/usr/lib/snapd/apparmor/parser.conf -b /snap/snapd/current/usr/lib/snapd/apparmor.d --policy-features /snap/snapd/current/usr/lib/snapd/apparmor.d/abi/4.0"
         fi
         $APPARMOR_PARSER -K -r "$AAP"
     fi
 
 execute: |
-    # other tests ensure seccomp is available so we can skip any systems that
-    # don't have it
-    if ! snap debug sandbox-features --required seccomp:bpf-argument-filtering ; then
-        exit 0
-    fi
-
     echo "Remove any setpriority rules from the filter"
     sed 's/^\(setpriority.*\)/#SPREAD: \1/g' "$SRC".orig > "$SRC"
     snapd.tool exec snap-seccomp compile "$SRC" "$BIN"

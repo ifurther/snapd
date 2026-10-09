@@ -56,12 +56,15 @@ struct sc_device_cgroup {
         struct {
             sc_cgroup_fds fds;
         } v1;
+#ifdef ENABLE_BPF
         struct {
             int devmap_fd;
             int prog_fd;
             char *tag;
+            char pretty_name[BPF_OBJ_NAME_LEN]; /* only for presentation */
             struct rlimit old_limit;
         } v2;
+#endif
     };
 };
 
@@ -149,7 +152,7 @@ typedef struct sc_cgroup_v2_device_key sc_cgroup_v2_device_key;
 typedef uint8_t sc_cgroup_v2_device_value;
 
 #ifdef ENABLE_BPF
-static int load_devcgroup_prog(int map_fd) {
+static int load_devcgroup_prog(int map_fd, const char *name) {
     /* Basic rules about registers:
      * r0    - return value of built in functions and exit code of the program
      * r1-r5 - respective arguments to built in functions, clobbered by calls
@@ -237,12 +240,13 @@ static int load_devcgroup_prog(int map_fd) {
         BPF_EXIT_INSN(),
     };
 
-    char log_buf[4096] = {0};
+    /* 32kB, should be more than enough to store verifier logs if program
+       loading fails */
+    char log_buf[32768] = {0};
 
-    int prog_fd =
-        bpf_load_prog(BPF_PROG_TYPE_CGROUP_DEVICE, prog, sizeof(prog) / sizeof(prog[0]), log_buf, sizeof(log_buf));
+    int prog_fd = bpf_load_prog(BPF_PROG_TYPE_CGROUP_DEVICE, prog, SC_ARRAY_SIZE(prog), log_buf, sizeof(log_buf), name);
     if (prog_fd < 0) {
-        die("cannot load program:\n%s\n", log_buf);
+        die("cannot load program, verifier output:\n%s\n", log_buf);
     }
     return prog_fd;
 }
@@ -293,17 +297,28 @@ static struct rlimit _sc_cgroup_v2_adjust_memlock_limit(void) {
     return old_limit;
 }
 
-static bool _sc_is_snap_cgroup(const char *group) {
+// _sc_is_snap_cgroup checks that the cgroup looks like a snap specific one and
+// matches the snap's expected cgroup name.
+static bool _sc_is_snap_cgroup(const char *group, const char *expected_group_name) {
     /* make a copy as basename may modify its input */
     char copy[PATH_MAX] = {0};
     strncpy(copy, group, sizeof(copy) - 1);
     char *leaf = basename(copy);
-    if (!sc_startswith(leaf, "snap.")) {
+    /* expecting: snap.foo.bar-<uuid>.scope or snap.foo.bar.service, where
+       snap.foo.bar is the group name derived from security tag */
+    if (!sc_startswith(leaf, expected_group_name)) {
         return false;
     }
     if (!sc_endswith(leaf, ".service") && !sc_endswith(leaf, ".scope")) {
         return false;
     }
+    /* we already know that the string is longer than the group name as it at
+       least ends with .service or .scope */
+    char uuid_or_svc_sep = leaf[strlen(expected_group_name)];
+    if (uuid_or_svc_sep != '-' && uuid_or_svc_sep != '.') {
+        return false;
+    }
+
     return true;
 }
 
@@ -321,6 +336,30 @@ static int _sc_cgroup_v2_init_bpf(sc_device_cgroup *self, int flags) {
     for (char *c = strchr(self->v2.tag, '.'); c != NULL; c = strchr(c, '.')) {
         *c = '_';
     }
+
+    /* Build a pretty name that is presented to the user when listing BPF
+     * objects. Names of BPF objects have a length limit of BPF_OBJ_NAME_LEN,
+     * which most of the time is too short to include the whole security tag, so
+     * attach a `s_` prefix and then best effort copy of what fits in the name
+     * from the part of security tag that follows the `snap_` prefix */
+    /* note the tag is valid */
+    const char *pref_end = strchr(self->v2.tag, '_');
+    if (pref_end == NULL) {
+        die("invalid position of separator in a valid tag");
+    }
+    /* this is where the name starts after snap_ */
+    const char *snap_name_start = pref_end + 1;
+
+    sc_must_snprintf(self->v2.pretty_name, sizeof(self->v2.pretty_name), "s_");
+    /* copy what fits into BPF_OBJ_NAME_LEN-2 ('s_' prefix) and truncate the
+       rest */
+    strncpy(self->v2.pretty_name + 2, snap_name_start, sizeof(self->v2.pretty_name) - 2 - 1);
+    /* Security tags may contain '+' and '-' characters that are not
+     * valid for use in BPF object names. */
+    for (char *c = self->v2.pretty_name; *c != '\0'; c++)
+        if ((*c == '-') || (*c == '+')) *c = '_';
+
+    debug("bpf fs tag: %s, object name: %s", self->v2.tag, self->v2.pretty_name);
 
     char path[PATH_MAX] = {0};
     static const char bpf_base[] = "/sys/fs/bpf";
@@ -344,20 +383,7 @@ static int _sc_cgroup_v2_init_bpf(sc_device_cgroup *self, int flags) {
         die("cannot open %s", bpf_base);
     }
 
-    if (mkdirat(bpf_fd, "snap", 0000) == 0) {
-        /* the new directory must be owned by root:root. */
-        if (fchownat(bpf_fd, "snap", 0, 0, AT_SYMLINK_NOFOLLOW) < 0) {
-            die("cannot set root ownership on %s/snap directory", bpf_base);
-        }
-        if (fchmodat(bpf_fd, "snap", 0700, AT_SYMLINK_NOFOLLOW) < 0) {
-            /* On Debian, this fails with "operation not supported. But it
-             * should not be a critical error, we can also leave with 0000
-             * permissions. */
-            if (errno != ENOTSUP) {
-                die("cannot set 0700 permissions on %s/snap directory", bpf_base);
-            }
-        }
-    } else if (errno != EEXIST) {
+    if (sc_ensure_mkdirat(bpf_fd, "snap", 0700, 0, 0) != 0) {
         die("cannot create %s/snap directory", bpf_base);
     }
     close(bpf_fd);
@@ -366,8 +392,14 @@ static int _sc_cgroup_v2_init_bpf(sc_device_cgroup *self, int flags) {
     int devmap_fd = bpf_get_by_path(path);
     /* keep a copy of errno in case it gets clobbered */
     int get_by_path_errno = errno;
-    /* XXX: this should be more than enough keys */
-    const size_t max_entries = 500;
+    /* This used to be 500 (using ~47kB of kernel mem), but got bumped to 1000
+       (~89kB of kernel mem) due to LP#2139099. Should be more than enough keys
+       now. */
+    /* TODO: make this configurable or proportional to number of
+       interfaces/potentially matching devices, system memory size or see
+       whether we can maybe use a 2 stage combination of
+       BPF_MAP_TYPE_BLOOM_FILTER & BPF_MAP_TYPE_HASH */
+    const size_t max_entries = 1000;
     if (devmap_fd < 0) {
         if (get_by_path_errno != ENOENT) {
             die("cannot get existing device map");
@@ -386,7 +418,8 @@ static int _sc_cgroup_v2_init_bpf(sc_device_cgroup *self, int flags) {
          * thus on older kernels (seen on 5.10), the map effectively locks 11
          * pages (45k) of memlock memory, while on newer kernels (5.11+) only 2 (8k) */
         /* NOTE: the new file map must be owned by root:root. */
-        devmap_fd = bpf_create_map(BPF_MAP_TYPE_HASH, sizeof(struct sc_cgroup_v2_device_key), value_size, max_entries);
+        devmap_fd = bpf_create_map(BPF_MAP_TYPE_HASH, sizeof(struct sc_cgroup_v2_device_key), value_size, max_entries,
+                                   self->v2.pretty_name);
         if (devmap_fd < 0) {
             die("cannot create bpf map");
         }
@@ -402,6 +435,10 @@ static int _sc_cgroup_v2_init_bpf(sc_device_cgroup *self, int flags) {
         if (bpf_pin_to_path(devmap_fd, path) < 0) {
             /* we checked that the map did not exist, so fail on EEXIST too */
             die("cannot pin map to %s", path);
+        }
+        /* make sure it's owned by root */
+        if (chown(path, 0, 0) != 0) {
+            die("cannot chmod BPF map");
         }
     } else if (!from_existing) {
         /* the devices access map exists, and we have been asked to setup a
@@ -467,7 +504,7 @@ static int _sc_cgroup_v2_init_bpf(sc_device_cgroup *self, int flags) {
 
     if (!from_existing) {
         /* load and attach the BPF program */
-        int prog_fd = load_devcgroup_prog(devmap_fd);
+        int prog_fd = load_devcgroup_prog(devmap_fd, self->v2.pretty_name);
         /* keep track of the program */
         self->v2.prog_fd = prog_fd;
     }
@@ -528,12 +565,13 @@ static void _sc_cgroup_v2_attach_pid_bpf(sc_device_cgroup *self, pid_t pid) {
     }
     debug("process in cgroup %s", own_group);
 
-    if (!_sc_is_snap_cgroup(own_group)) {
+    char *expected_unit_name SC_CLEANUP(sc_cleanup_string) = sc_security_tag_to_unit_name(self->security_tag);
+    if (!_sc_is_snap_cgroup(own_group, expected_unit_name)) {
         /* we cannot proceed to install a device filtering program when the
          * process is not in a snap specific cgroup, as we would effectively
          * lock down the group that can be shared with other processes or even
          * the whole desktop session */
-        die("%s is not a snap cgroup", own_group);
+        die("%s is not a snap cgroup for tag %s", own_group, self->security_tag);
     }
 
     char own_group_full_path[PATH_MAX] = {0};
@@ -708,19 +746,8 @@ static int sc_udev_open_cgroup_v1(const char *security_tag, int flags, sc_cgroup
 
     const char *security_tag_relpath = security_tag;
     if (!from_existing) {
-        /* Open snap.$SNAP_NAME.$APP_NAME relative to /sys/fs/cgroup/devices,
-         * creating the directory if necessary.
-         * Using 0000 permissions to avoid a race condition; we'll set the
-         * right permissions after chmod. */
-        if (mkdirat(devices_fd, security_tag_relpath, 0000) == 0) {
-            /* the new directory must be owned by root:root. */
-            if (fchownat(devices_fd, security_tag_relpath, 0, 0, AT_SYMLINK_NOFOLLOW) < 0) {
-                die("cannot set root ownership on %s/%s/%s", cgroup_path, devices_relpath, security_tag_relpath);
-            }
-            if (fchmodat(devices_fd, security_tag_relpath, 0755, 0) < 0) {
-                die("cannot set 0755 permissions on %s/%s/%s", cgroup_path, devices_relpath, security_tag_relpath);
-            }
-        } else if (errno != EEXIST) {
+        /* Create snap.$SNAP_NAME.$APP_NAME relative to /sys/fs/cgroup/devices */
+        if (sc_ensure_mkdirat(devices_fd, security_tag_relpath, 0700, 0, 0) != 0) {
             die("cannot create directory %s/%s/%s", cgroup_path, devices_relpath, security_tag_relpath);
         }
     }

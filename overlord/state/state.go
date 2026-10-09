@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/snapcore/snapd/logger"
+	"github.com/snapcore/snapd/osutil"
 )
 
 // A Backend is used by State to checkpoint on every unlock operation
@@ -43,7 +44,7 @@ type Backend interface {
 
 type customData map[string]*json.RawMessage
 
-func (data customData) get(key string, value interface{}) error {
+func (data customData) get(key string, value any) error {
 	entryJSON := data[key]
 	if entryJSON == nil {
 		return &NoStateError{Key: key}
@@ -59,7 +60,7 @@ func (data customData) has(key string) bool {
 	return data[key] != nil
 }
 
-func (data customData) set(key string, value interface{}) {
+func (data customData) set(key string, value any) {
 	if value == nil {
 		delete(data, key)
 		return
@@ -92,24 +93,45 @@ type State struct {
 	// for registering runtime callbacks
 	lastHandlerId int
 
-	backend  Backend
-	data     customData
-	changes  map[string]*Change
-	tasks    map[string]*Task
-	warnings map[string]*Warning
-	notices  map[noticeKey]*Notice
+	// lastNoticeTimestamp is protected by a mutex, and is unique and
+	// monotonically increasing timestamp. It is still saved to disk for
+	// backwards compatibility, but getting a timestamp does not require
+	// holding state lock, so the it is only saved to disk if the caller or
+	// some subsequent operation holds the state lock for writing. As such, the
+	// lastNoticeTimestamp on disk should not be relied upon to be correct for
+	// any notice which is not stored in state. Notice backends outside of
+	// state should adjust this value during startup.
+	lastNoticeTimestampMu sync.Mutex
+	lastNoticeTimestamp   time.Time
 
+	backend Backend
+	data    customData
+	changes map[string]*Change
+	tasks   map[string]*Task
+
+	// warningsMu allows warnings to be read without requiring the state lock
+	// to be held. Any modification to warnings requires the state lock as well.
+	warningsMu sync.RWMutex
+	warnings   map[string]*Warning
+
+	// noticesMu allows notices to be read without requiring the state lock to
+	// be held. Any modifications to notices requires the state lock as well.
+	noticesMu  sync.RWMutex
+	notices    map[noticeKey]*Notice
 	noticeCond *sync.Cond
 
 	modified bool
 
-	cache map[interface{}]interface{}
+	cache map[any]any
 
 	pendingChangeByAttr map[string]func(*Change) bool
 
 	// task/changes observing
-	taskHandlers   map[int]func(t *Task, old, new Status)
+	taskHandlers   map[int]func(t *Task, old, new Status) (remove bool)
 	changeHandlers map[int]func(chg *Change, old, new Status)
+
+	lockWaitStart int64
+	lockHoldStart int64
 }
 
 // New returns a new empty state.
@@ -122,12 +144,14 @@ func New(backend Backend) *State {
 		warnings:            make(map[string]*Warning),
 		notices:             make(map[noticeKey]*Notice),
 		modified:            true,
-		cache:               make(map[interface{}]interface{}),
+		cache:               make(map[any]any),
 		pendingChangeByAttr: make(map[string]func(*Change) bool),
-		taskHandlers:        make(map[int]func(t *Task, old Status, new Status)),
+		taskHandlers:        make(map[int]func(t *Task, old Status, new Status) bool),
 		changeHandlers:      make(map[int]func(chg *Change, old Status, new Status)),
 	}
-	st.noticeCond = sync.NewCond(st) // use State.Lock and State.Unlock
+	// The noticeCond.L must be the same as the lock which is held during
+	// WaitNotices, since noticeCond.Wait() will unlock noticeCond.L.
+	st.noticeCond = sync.NewCond(st.noticesMu.RLocker())
 	return st
 }
 
@@ -138,8 +162,11 @@ func (s *State) Modified() bool {
 
 // Lock acquires the state lock.
 func (s *State) Lock() {
+	lockWait := lockTimestamp()
 	s.mu.Lock()
 	atomic.AddInt32(&s.muC, 1)
+	s.lockWaitStart = lockWait
+	s.lockHoldStart = lockTimestamp()
 }
 
 func (s *State) reading() {
@@ -157,7 +184,11 @@ func (s *State) writing() {
 
 func (s *State) unlock() {
 	atomic.AddInt32(&s.muC, -1)
+	lockWaitStart, lockHoldStart := s.lockWaitStart, s.lockHoldStart
+	s.lockWaitStart, s.lockHoldStart = 0, 0
+	lockHoldEnd := lockTimestamp()
 	s.mu.Unlock()
+	maybeSaveLockTime(lockWaitStart, lockHoldStart, lockHoldEnd)
 }
 
 type marshalledState struct {
@@ -171,6 +202,8 @@ type marshalledState struct {
 	LastTaskId   int `json:"last-task-id"`
 	LastLaneId   int `json:"last-lane-id"`
 	LastNoticeId int `json:"last-notice-id"`
+
+	LastNoticeTimestamp time.Time `json:"last-notice-timestamp,omitzero"`
 }
 
 // MarshalJSON makes State a json.Marshaller
@@ -181,12 +214,14 @@ func (s *State) MarshalJSON() ([]byte, error) {
 		Changes:  s.changes,
 		Tasks:    s.tasks,
 		Warnings: s.flattenWarnings(),
-		Notices:  s.flattenNotices(nil),
+		Notices:  s.flattenNotices(),
 
 		LastTaskId:   s.lastTaskId,
 		LastChangeId: s.lastChangeId,
 		LastLaneId:   s.lastLaneId,
 		LastNoticeId: s.lastNoticeId,
+
+		LastNoticeTimestamp: s.getLastNoticeTimestamp(),
 	})
 }
 
@@ -207,6 +242,17 @@ func (s *State) UnmarshalJSON(data []byte) error {
 	s.lastTaskId = unmarshalled.LastTaskId
 	s.lastLaneId = unmarshalled.LastLaneId
 	s.lastNoticeId = unmarshalled.LastNoticeId
+	// Update the last notice timestamp if the one saved to disk is later.
+	// The timestamp on disk is only guaranteed to reflect the most recent
+	// timestamp of notices which are stored in state, since state lock was
+	// held for writing when adding those notices. Notices from backends
+	// outside state do not hold state lock while getting a timestamp from
+	// state, so it's possible snapd was terminated without later marshalling
+	// state to disk, causing the last notice timestamp on disk to be stale.
+	// Thus, other notice backends should update the last notice timestamp
+	// during startup to ensure it reflects the last timestamp across all
+	// notices in all backends.
+	s.HandleReportedLastNoticeTimestamp(unmarshalled.LastNoticeTimestamp)
 	// backlink state again
 	for _, t := range s.tasks {
 		t.state = s
@@ -300,7 +346,7 @@ func (e *NoStateError) Is(err error) bool {
 // Get unmarshals the stored value associated with the provided key
 // into the value parameter.
 // It returns ErrNoState if there is no entry for key.
-func (s *State) Get(key string, value interface{}) error {
+func (s *State) Get(key string, value any) error {
 	s.reading()
 	return s.data.get(key, value)
 }
@@ -313,21 +359,21 @@ func (s *State) Has(key string) bool {
 
 // Set associates value with key for future consulting by managers.
 // The provided value must properly marshal and unmarshal with encoding/json.
-func (s *State) Set(key string, value interface{}) {
+func (s *State) Set(key string, value any) {
 	s.writing()
 	s.data.set(key, value)
 }
 
 // Cached returns the cached value associated with the provided key.
 // It returns nil if there is no entry for key.
-func (s *State) Cached(key interface{}) interface{} {
+func (s *State) Cached(key any) any {
 	s.reading()
 	return s.cache[key]
 }
 
 // Cache associates value with key for future consulting by managers.
 // The cached value is not persisted.
-func (s *State) Cache(key, value interface{}) {
+func (s *State) Cache(key, value any) {
 	s.reading() // Doesn't touch persisted data.
 	if value == nil {
 		delete(s.cache, key)
@@ -399,6 +445,21 @@ func (s *State) Tasks() []*Task {
 	return res
 }
 
+// AllTasksForTests returns all tasks currently known to the state,
+// including tasks not linked to any change.
+//
+// This method exists for unit tests that build task graphs directly
+// without creating changes.
+func (s *State) AllTasksForTests() []*Task {
+	osutil.MustBeTestBinary("State.AllTasksForTests can only be used from tests")
+	s.reading()
+	res := make([]*Task, 0, len(s.tasks))
+	for _, t := range s.tasks {
+		res = append(res, t)
+	}
+	return res
+}
+
 // Task returns the task for the given ID if the task has been linked to a change.
 func (s *State) Task(id string) *Task {
 	s.reading()
@@ -463,17 +524,9 @@ func (s *State) Prune(startOfOperation time.Time, pruneWait, abortWait time.Dura
 		readyChangesCount++
 	}
 
-	for k, w := range s.warnings {
-		if w.ExpiredBefore(now) {
-			delete(s.warnings, k)
-		}
-	}
+	s.pruneWarnings(now)
 
-	for k, n := range s.notices {
-		if n.expired(now) {
-			delete(s.notices, k)
-		}
-	}
+	s.pruneNotices(now)
 
 NextChange:
 	for _, chg := range changes {
@@ -516,8 +569,28 @@ NextChange:
 	}
 }
 
+func (s *State) pruneWarnings(now time.Time) {
+	s.warningsMu.Lock()
+	defer s.warningsMu.Unlock()
+	for k, w := range s.warnings {
+		if w.ExpiredBefore(now) {
+			delete(s.warnings, k)
+		}
+	}
+}
+
+func (s *State) pruneNotices(now time.Time) {
+	s.noticesMu.Lock()
+	defer s.noticesMu.Unlock()
+	for k, n := range s.notices {
+		if n.Expired(now) {
+			delete(s.notices, k)
+		}
+	}
+}
+
 // GetMaybeTimings implements timings.GetSaver
-func (s *State) GetMaybeTimings(timings interface{}) error {
+func (s *State) GetMaybeTimings(timings any) error {
 	if err := s.Get("timings", timings); err != nil && !errors.Is(err, ErrNoState) {
 		return err
 	}
@@ -530,7 +603,7 @@ func (s *State) GetMaybeTimings(timings interface{}) error {
 // of the taskrunner, so the callbacks should be as simple as possible, and return
 // as quickly as possible, and should avoid the use of i/o code or blocking, as this
 // will stop the entire task system.
-func (s *State) AddTaskStatusChangedHandler(f func(t *Task, old, new Status)) (id int) {
+func (s *State) AddTaskStatusChangedHandler(f func(t *Task, old, new Status) (remove bool)) (id int) {
 	// We are reading here as we want to ensure access to the state is serialized,
 	// and not writing as we are not changing the part of state that goes on the disk.
 	s.reading()
@@ -547,8 +620,10 @@ func (s *State) RemoveTaskStatusChangedHandler(id int) {
 
 func (s *State) notifyTaskStatusChangedHandlers(t *Task, old, new Status) {
 	s.reading()
-	for _, f := range s.taskHandlers {
-		f(t, old, new)
+	for id, f := range s.taskHandlers {
+		if remove := f(t, old, new); remove {
+			s.RemoveTaskStatusChangedHandler(id)
+		}
 	}
 }
 
@@ -581,7 +656,7 @@ func (s *State) notifyChangeStatusChangedHandlers(chg *Change, old, new Status) 
 }
 
 // SaveTimings implements timings.GetSaver
-func (s *State) SaveTimings(timings interface{}) {
+func (s *State) SaveTimings(timings any) {
 	s.Set("timings", timings)
 }
 
@@ -596,11 +671,11 @@ func ReadState(backend Backend, r io.Reader) (*State, error) {
 		return nil, fmt.Errorf("cannot read state: %s", err)
 	}
 	s.backend = backend
-	s.noticeCond = sync.NewCond(s)
+	s.noticeCond = sync.NewCond(s.noticesMu.RLocker())
 	s.modified = false
-	s.cache = make(map[interface{}]interface{})
+	s.cache = make(map[any]any)
 	s.pendingChangeByAttr = make(map[string]func(*Change) bool)
 	s.changeHandlers = make(map[int]func(chg *Change, old Status, new Status))
-	s.taskHandlers = make(map[int]func(t *Task, old Status, new Status))
+	s.taskHandlers = make(map[int]func(t *Task, old Status, new Status) bool)
 	return s, err
 }

@@ -27,7 +27,6 @@ import (
 	"github.com/snapcore/snapd/interfaces/builtin"
 	"github.com/snapcore/snapd/interfaces/seccomp"
 	"github.com/snapcore/snapd/snap"
-	"github.com/snapcore/snapd/snap/snaptest"
 	"github.com/snapcore/snapd/testutil"
 )
 
@@ -47,20 +46,21 @@ apps:
   plugs: [classic-support]
 `
 
+const classicSupportMockSlotSnapInfoYaml = `name: core
+version: 1.0
+type: os
+slots:
+ classic-support:
+  interface: classic-support
+`
+
 var _ = Suite(&ClassicSupportInterfaceSuite{
 	iface: builtin.MustInterface("classic-support"),
 })
 
 func (s *ClassicSupportInterfaceSuite) SetUpTest(c *C) {
-	s.slotInfo = &snap.SlotInfo{
-		Snap:      &snap.Info{SuggestedName: "core", SnapType: snap.TypeOS},
-		Name:      "classic-support",
-		Interface: "classic-support",
-	}
-	s.slot = interfaces.NewConnectedSlot(s.slotInfo, nil, nil)
-	plugSnap := snaptest.MockInfo(c, classicSupportMockPlugSnapInfoYaml, nil)
-	s.plugInfo = plugSnap.Plugs["classic-support"]
-	s.plug = interfaces.NewConnectedPlug(s.plugInfo, nil, nil)
+	s.slot, s.slotInfo = MockConnectedSlot(c, classicSupportMockSlotSnapInfoYaml, nil, "classic-support")
+	s.plug, s.plugInfo = MockConnectedPlug(c, classicSupportMockPlugSnapInfoYaml, nil, "classic-support")
 }
 
 func (s *ClassicSupportInterfaceSuite) TestName(c *C) {
@@ -77,7 +77,7 @@ func (s *ClassicSupportInterfaceSuite) TestSanitizePlug(c *C) {
 
 func (s *ClassicSupportInterfaceSuite) TestUsedSecuritySystems(c *C) {
 	// connected plugs have a non-nil security snippet for apparmor
-	apparmorSpec := apparmor.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	apparmorSpec := apparmor.NewSpecification(s.plug.AppSet())
 	err := apparmorSpec.AddConnectedPlug(s.iface, s.plug, s.slot)
 	c.Assert(err, IsNil)
 	c.Assert(apparmorSpec.SecurityTags(), DeepEquals, []string{"snap.other.app"})
@@ -86,7 +86,7 @@ func (s *ClassicSupportInterfaceSuite) TestUsedSecuritySystems(c *C) {
 	c.Check(string(snippet), testutil.Contains, "/bin/systemctl Uxr,\n")
 
 	// connected plugs have a non-nil security snippet for seccomp
-	seccompSpec := seccomp.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	seccompSpec := seccomp.NewSpecification(s.plug.AppSet())
 	err = seccompSpec.AddConnectedPlug(s.iface, s.plug, s.slot)
 	c.Assert(err, IsNil)
 	c.Assert(seccompSpec.SecurityTags(), DeepEquals, []string{"snap.other.app"})
@@ -95,4 +95,29 @@ func (s *ClassicSupportInterfaceSuite) TestUsedSecuritySystems(c *C) {
 
 func (s *ClassicSupportInterfaceSuite) TestInterfaces(c *C) {
 	c.Check(builtin.Interfaces(), testutil.DeepContains, s.iface)
+}
+
+func (s *ClassicSupportInterfaceSuite) TestPrioritizedSnippetMountInfo(c *C) {
+	spec := apparmor.NewSpecification(s.plug.AppSet())
+	spec.AddBasePrioritizedSnippet(`
+deny @{PROC}/self/mountinfo r,
+deny @{PROC}/@{pid}/mountinfo r,
+`, apparmor.MountInfoKey)
+
+	snippet := spec.SnippetForTag("snap.other.app")
+	// contains the denials but not the allows
+	c.Assert(snippet, testutil.Contains, "deny @{PROC}/@{pid}/mountinfo r,")
+	c.Assert(snippet, testutil.Contains, "deny @{PROC}/self/mountinfo r,")
+	c.Assert(snippet, Not(testutil.Contains), "owner @{PROC}/@{pid}/mountinfo r,")
+	c.Assert(snippet, Not(testutil.Contains), "owner @{PROC}/self/mountinfo r,")
+
+	err := spec.AddConnectedPlug(s.iface, s.plug, s.slot)
+	c.Assert(err, IsNil)
+
+	snippet = spec.SnippetForTag("snap.other.app")
+	// contains the allows but not the denials
+	c.Assert(snippet, testutil.Contains, "owner @{PROC}/@{pid}/mountinfo r,")
+	c.Assert(snippet, testutil.Contains, "owner @{PROC}/self/mountinfo r,")
+	c.Assert(snippet, Not(Matches), "(?s).*\ndeny [^\n]*/mountinfo [^\n]*.*")
+	c.Assert(snippet, Not(Matches), "(?s).*\ndeny [^\n]*/mountinfo [^\n]*.*")
 }

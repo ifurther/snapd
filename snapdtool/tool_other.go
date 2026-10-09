@@ -22,6 +22,10 @@ package snapdtool
 
 import (
 	"errors"
+	"fmt"
+
+	"github.com/snapcore/snapd/dirs"
+	"github.com/snapcore/snapd/osutil"
 )
 
 var errUnsupported = errors.New("unsupported on non-Linux systems")
@@ -31,6 +35,17 @@ var errUnsupported = errors.New("unsupported on non-Linux systems")
 // On this OS this is a stub.
 func ExecInSnapdOrCoreSnap() {
 	return
+}
+
+// InternalLibExecDir returns the libexec directory for the currently executing
+// process.
+//
+// On this OS this falls back to the distro libexec directory.
+func InternalLibExecDir() (string, error) {
+	if osutil.IsDirectory(dirs.DistroLibExecDir) {
+		return dirs.DistroLibExecDir, nil
+	}
+	return "", fmt.Errorf("cannot find internal libexec directory")
 }
 
 // InternalToolPath returns the path of an internal snapd tool. The tool
@@ -46,4 +61,34 @@ func InternalToolPath(tool string) (string, error) {
 // On this OS this is a stub and always returns an error.
 func IsReexecd() (bool, error) {
 	return false, errUnsupported
+}
+
+// DistroSupportsReExec returns true if the distribution we are running on can use re-exec.
+//
+// On this OS this is a stub and always returns false.
+func DistroSupportsReExec() bool {
+	return false
+}
+
+// IsReexecEnabled checks the environment and configuration to assert whether
+// reexec has been explicitly enabled/disabled.
+//
+// On this OS this is a stub and always returns false.
+func IsReexecEnabled() bool {
+	return false
+}
+
+// IsReexecExplicitlyEnabled is a stronger check than IsReexecEnabled as it
+// really expects the relevant environment variable to be set.
+//
+// On this OS this is a stub and always returns false.
+func IsReexecExplicitlyEnabled() bool {
+	return false
+}
+
+// IsReexecForced returns true if reexec is explicitly forced.
+//
+// On this OS this is a stub and always returns false.
+func IsReexecForced() bool {
+	return false
 }

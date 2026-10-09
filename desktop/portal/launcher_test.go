@@ -27,7 +27,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/godbus/dbus"
+	"github.com/godbus/dbus/v5"
 	. "gopkg.in/check.v1"
 
 	"github.com/snapcore/snapd/desktop/portal"
@@ -158,6 +158,9 @@ func (s *portalSuite) TestOpenMissingFile(c *C) {
 }
 
 func (s *portalSuite) TestOpenUnreadableFile(c *C) {
+	if os.Geteuid() == 0 {
+		c.Skip("this test cannot run as root (root can read files regardless of mode)")
+	}
 	path := filepath.Join(c.MkDir(), "test.txt")
 	c.Assert(os.WriteFile(path, []byte("hello world"), 0644), IsNil)
 	c.Assert(os.Chmod(path, 0), IsNil)

@@ -19,6 +19,13 @@ run_muinstaller() {
     local kernel_assertion="${6}"
     local label="${7}"
     local disk="${8}"
+    local kern_mods_comp="${9}"
+    local passphrase="${10}"
+    local pin="${11}"
+    local recovery_key_out="${12}"
+    local exit_at_preinstall="${13}"
+    shift 13
+    local extra_muinstaller_args=("${@}")
 
     # ack the needed assertions
     snap ack "${kernel_assertion}"
@@ -36,32 +43,40 @@ run_muinstaller() {
     tests.nested secboot-sign gadget pc-gadget "${snakeoil_key}" "${snakeoil_cert}"
     snap pack --filename=pc.snap pc-gadget/
 
+    build_snapd_snap .
+    mv snapd_*.snap snapd.snap
+
     # prepare a classic seed
-    # TODO:
-    # - repacked snapd snap
+    kmodsarg=""
+    if [ -n "$kern_mods_comp" ]
+    then kmodsarg="--comp $kern_mods_comp"
+    fi
+    # shellcheck disable=SC2086
     snap prepare-image --classic \
         --channel=edge \
         --snap "${kernel_snap}" \
+        $kmodsarg \
         --snap pc.snap \
+        --snap snapd.snap \
         "${model_assertion}" \
         ./classic-seed
 
     mv ./classic-seed/system-seed/systems/* "./classic-seed/system-seed/systems/${label}"
-    cp -a ./classic-seed/system-seed/ /var/lib/snapd/seed
 
     if [ -n "${store_dir}" ]; then
         # if we have a store setup, then we should take it down for now
         "${TESTSTOOLS}/store-state" teardown-fake-store "${store_dir}"
     fi
 
-    # build the muinstaller snap
-    # TODO: Consider reverting to latest/candidate when Snapcraft 8.0.5, which includes the fix to deal with LXD 5.21.0 version naming change, becomes available
-    snap install snapcraft --edge --classic
-    "${TESTSTOOLS}/lxd-state" prepare-snap
-    (cd "${TESTSLIB}/muinstaller" && snapcraft)
-
     local muinstaller_snap
-    muinstaller_snap="$(find "${TESTSLIB}/muinstaller/" -maxdepth 1 -name '*.snap')"
+    muinstaller_snap="${PWD}/muinstaller.snap"
+
+    # build the muinstaller snap
+    (
+        cd "${TESTSLIB}/muinstaller"
+        CGO_ENABLED=0 go build -o bin/muinstaller .
+        snap pack --filename="${muinstaller_snap}" .
+    )
 
     # create a VM and mount a cloud image
     tests.nested build-image classic
@@ -91,11 +106,13 @@ run_muinstaller() {
     done
 
     remote.exec "sudo sh -c 'echo SNAPD_DEBUG=1 >> /etc/environment'"
+    remote.exec "sudo sh -c 'echo SNAPPY_TESTING=1 >> /etc/environment'"
+
     # push our snap down
     # TODO: this abuses /var/lib/snapd to store the deb so that mk-initramfs-classic
     # can pick it up. the real installer will also need a very recent snapd
     # in its on disk-image to support seeding
-    remote.push "${SPREAD_PATH}"/../snapd_*.deb
+    remote.push "${GOHOME}"/snapd_*.deb
     remote.exec "sudo mv snapd_*.deb /var/lib/snapd/"
     remote.exec "sudo apt install -y /var/lib/snapd/snapd_*.deb"
 
@@ -113,15 +130,8 @@ run_muinstaller() {
     tests.nested vm stop
     sync
 
-    # HACK: convert "classic" qcow2 to raw "core" image because we need
-    # to boot with OVMF we really should fix this so that classic and
-    # core VMs are more similar
-    qemu-img convert -f qcow2 -O raw \
-        "${NESTED_IMAGES_DIR}/$(nested_get_image_name classic)" \
-        "${NESTED_IMAGES_DIR}/$(nested_get_image_name core)"
-    # and we don't need the classic image anymore
-    # TODO: uncomment
-    # rm -f  "$NESTED_IMAGES_DIR/$(nested_get_image_name classic)"
+    mv "$NESTED_IMAGES_DIR/$(nested_get_image_name classic)" \
+        "$NESTED_IMAGES_DIR/$(nested_get_image_name core)"
     # TODO: this prevents "nested_prepare_ssh" inside nested_start_core_vm
     #       from running, we already have a user so this is not needed
     local image_name
@@ -130,7 +140,14 @@ run_muinstaller() {
     tests.nested create-vm core --extra-param "${NESTED_PARAM_EXTRA}"
 
     # bind mount new seed
+    remote.exec "sudo mkdir -p /var/lib/snapd/seed"
     remote.exec "sudo mount -o bind /var/lib/snapd/install-seed /var/lib/snapd/seed"
+
+    # when only interested in preinstall environment exit here
+    if [ "$exit_at_preinstall" = "true" ]; then
+        return 0
+    fi
+
     # push and install muinstaller
     remote.push "${muinstaller_snap}"
     remote.exec "sudo snap install --classic --dangerous $(basename "${muinstaller_snap}")"
@@ -138,8 +155,48 @@ run_muinstaller() {
     # run installation
     local install_disk
     install_disk=$(remote.exec "readlink -f /dev/disk/by-id/virtio-target")
-    remote.exec "sudo muinstaller ${label} \
-        ${install_disk} /snap/muinstaller/current/bin/mk-classic-rootfs.sh"
+
+    if [ -n "${HYBRID_SYSTEM_MK_ROOT_FS-}" ]; then
+        remote.push "${HYBRID_SYSTEM_MK_ROOT_FS}" /home/user1/custom-rootfs.sh
+        remote.exec "chmod +x /home/user1/custom-rootfs.sh"
+    fi
+    remote.exec "tee /home/user1/mk-classic-rootfs-wrapper.sh" <<\EOF
+#!/bin/bash
+set -eu
+/snap/muinstaller/current/bin/mk-classic-rootfs.sh "$@"
+if [ -x /home/user1/custom-rootfs.sh ]; then
+  /home/user1/custom-rootfs.sh "$@"
+fi
+EOF
+    remote.exec "chmod +x /home/user1/mk-classic-rootfs-wrapper.sh"
+
+    # This is where the installer expects assets to be to run the
+    # pre-install checks.
+    remote.exec "sudo mkdir -p /cdrom/EFI/boot/"
+    remote.exec "sudo cp /boot/efi/EFI/ubuntu/shimx64.efi /cdrom/EFI/boot/bootx64.efi"
+    remote.exec "sudo cp /boot/efi/EFI/ubuntu/grubx64.efi /cdrom/EFI/boot/grubx64.efi"
+    remote.exec "sudo mkdir -p /cdrom/casper"
+    remote.exec "sudo cp /boot/vmlinuz /cdrom/casper/vmlinuz"
+
+    muinstaller_args=()
+    muinstaller_args+=("-label" "$label")
+    muinstaller_args+=("-device" "$install_disk")
+    muinstaller_args+=("-rootfs-creator" "/home/user1/mk-classic-rootfs-wrapper.sh")
+    if [ -n "$passphrase" ]; then
+        muinstaller_args+=("-passphrase" "\"$passphrase\"")
+    fi
+    if [ -n "$pin" ]; then
+        muinstaller_args+=("-pin" "\"$pin\"")
+    fi
+    if [ -n "$recovery_key_out" ]; then
+        muinstaller_args+=("-recovery-key-out" "/tmp/rkey.out")
+    fi
+    muinstaller_args+=("${extra_muinstaller_args[@]}")
+    remote.exec sudo muinstaller "${muinstaller_args[@]}"
+
+    if [ -n "$recovery_key_out" ]; then
+        remote.pull "/tmp/rkey.out" "$recovery_key_out"
+    fi
 
     remote.exec "sudo sync"
 
@@ -154,9 +211,13 @@ run_muinstaller() {
 
     # Change seed part label to capitals so we cover that use case
     image_path="${NESTED_IMAGES_DIR}/${image_name}"
-    kpartx -asv "${image_path}"
+    kpartx -asv "$image_path"
     fatlabel /dev/disk/by-label/ubuntu-seed UBUNTU-SEED
-    kpartx -d "${image_path}"
+    if ! kpartx -d "${image_path}"; then
+        # Sometimes there are random failures, let's wait and re-try
+        sleep 1
+        kpartx -d "$image_path" 2>&1 | grep -v 'LOOP_CLR_FD' || true
+    fi
 
     if [ -n "${store_dir}" ]; then
         # if we had a store setup, then we should bring it back up
@@ -164,7 +225,13 @@ run_muinstaller() {
     fi
 
     # Start installed image
-    tests.nested create-vm core --tpm-no-restart
+    if [ -n "$passphrase" ]; then
+        tests.nested create-vm core --keep-firmware-state --passphrase "$passphrase"
+    elif [ -n "$pin" ]; then
+        tests.nested create-vm core --keep-firmware-state --passphrase "$pin"
+    else
+        tests.nested create-vm core --keep-firmware-state
+    fi
 }
 
 main() {
@@ -176,6 +243,12 @@ main() {
     local kernel_assertion=""
     local label="classic"
     local disk=""
+    local kern_mods_comp=""
+    local passphrase=""
+    local pin=""
+    local recovery_key_out=""
+    local exit_at_preinstall=""
+    local extra_muinstaller_args=()
     while [ $# -gt 0 ]; do
         case "$1" in
             --model)
@@ -209,6 +282,39 @@ main() {
             --disk)
                 disk="${2}"
                 shift 2
+                ;;
+            --kmods-comp)
+                # Only on kernel-modules component supported atm
+                kern_mods_comp="${2}"
+                shift 2
+                ;;
+            --passphrase)
+                passphrase="${2}"
+                shift 2
+                ;;
+            --pin)
+                pin="${2}"
+                shift 2
+                ;;
+            --recovery-key-out)
+                recovery_key_out="${2}"
+                shift 2
+                ;;
+            --exit-at-preinstall)
+                exit_at_preinstall="true"
+                shift 1
+                ;;
+            --extra-muinstaller-arg)
+                extra_muinstaller_args+=("${2}")
+                shift 2
+                ;;
+            --keyboard-config)
+                extra_muinstaller_args+=("-keyboard-config" "${2}")
+                shift 2
+                ;;
+            --preseed-rootfs)
+                extra_muinstaller_args+=("-preseed-rootfs")
+                shift
                 ;;
             --*|-*)
                 echo "Unknown option ${1}"
@@ -245,6 +351,11 @@ main() {
         exit 1
     fi
 
+    if [ -n "${passphrase}" ] && [ -n "${pin}" ]; then
+        echo "--passphrase and --pin cannot be used together"
+        exit 1
+    fi
+
     # since we change directories below, we need to make sure we have absolute
     # paths for all inputs
     model_assertion="$(realpath "${model_assertion}")"
@@ -267,37 +378,41 @@ main() {
         kernel_assertion="$(realpath "${kernel_assertion}")"
     fi
 
+    if [ -n "${kern_mods_comp}" ]; then
+        kern_mods_comp="$(realpath "${kern_mods_comp}")"
+    fi
+
     # start a subshell and change directories so that we can change directories
     # to keep all of our generated files together
     (
-    cd "$(mktemp -d --tmpdir="${PWD}")"
+        cd "$(mktemp -d --tmpdir="${PWD}")"
 
-    # create new disk (if the caller didn't provide one) for the installer to
-    # work on and attach to the VM
-    if [ -z "${disk}" ]; then
-        disk="${PWD}/disk.img"
-        truncate --size=6G "${disk}"
-    fi
+        # create new disk (if the caller didn't provide one) for the installer to
+        # work on and attach to the VM
+        if [ -z "${disk}" ]; then
+            disk="${PWD}/disk.img"
+            truncate --size=8G "${disk}"
+        fi
 
-    # if a gadget wasn't provided, download one we know should work for hybrid
-    # systems
-    if [ -z "${gadget_snap}" ]; then
-        snap download --channel="classic-23.10/stable" --basename=pc pc
-        gadget_snap="${PWD}/pc.snap"
-        gadget_assertion="${PWD}/pc.assert"
-    fi
+        # if a gadget wasn't provided, download one we know should work for hybrid
+        # systems
+        if [ -z "${gadget_snap}" ]; then
+            snap download --channel="classic-23.10/stable" --basename=pc pc
+            gadget_snap="${PWD}/pc.snap"
+            gadget_assertion="${PWD}/pc.assert"
+        fi
 
-    # if a kernel wasn't provided, download one
-    if [ -z "${kernel_snap}" ]; then
-        snap download --channel="23.10/stable" --basename=pc-kernel pc-kernel
-        kernel_snap="${PWD}/pc-kernel.snap"
-        kernel_assertion="${PWD}/pc-kernel.assert"
-    fi
+        # if a kernel wasn't provided, download one
+        if [ -z "${kernel_snap}" ]; then
+            "$TESTSTOOLS"/repack-kernel --mode download --kernel-branch 23.10 --kernel-channel stable --output-snap "${PWD}/pc-kernel.snap"
+            kernel_snap="${PWD}/pc-kernel.snap"
+            kernel_assertion="${PWD}/pc-kernel.assert"
+        fi
 
-    run_muinstaller "${model_assertion}" "${store_dir}" "${gadget_snap}" \
-        "${gadget_assertion}" "${kernel_snap}" "${kernel_assertion}" "${label}" \
-        "${disk}"
-
+        run_muinstaller "${model_assertion}" "${store_dir}" "${gadget_snap}" "${gadget_assertion}" \
+                        "${kernel_snap}" "${kernel_assertion}" "${label}" "${disk}" "${kern_mods_comp}" \
+                        "${passphrase}" "${pin}" "${recovery_key_out}" "${exit_at_preinstall}" \
+                        "${extra_muinstaller_args[@]}"
     )
 }
 

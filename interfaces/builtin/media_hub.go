@@ -172,7 +172,7 @@ func (iface *mediaHubInterface) StaticInfo() interfaces.StaticInfo {
 
 func (iface *mediaHubInterface) AppArmorConnectedPlug(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	old := "###SLOT_SECURITY_TAGS###"
-	new := spec.SnapAppSet().SlotLabelExpression(slot)
+	new := slot.LabelExpression()
 	spec.AddSnippet(strings.Replace(mediaHubConnectedPlugAppArmor, old, new, -1))
 	return nil
 }
@@ -184,7 +184,7 @@ func (iface *mediaHubInterface) AppArmorPermanentSlot(spec *apparmor.Specificati
 
 func (iface *mediaHubInterface) AppArmorConnectedSlot(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	old := "###PLUG_SECURITY_TAGS###"
-	new := spec.SnapAppSet().PlugLabelExpression(plug)
+	new := plug.LabelExpression()
 	spec.AddSnippet(strings.Replace(mediaHubConnectedSlotAppArmor, old, new, -1))
 	return nil
 }
@@ -197,6 +197,12 @@ func (iface *mediaHubInterface) SecCompPermanentSlot(spec *seccomp.Specification
 func (iface *mediaHubInterface) AutoConnect(*snap.PlugInfo, *snap.SlotInfo) bool {
 	// allow what declarations allowed
 	return true
+}
+
+func (iface *mediaHubInterface) ParallelInstancesSupportedForSlot(_ *snap.SlotInfo) error {
+	// media-hub owns the well-known bus name core.ubuntu.media.Service on
+	// the session bus; only one snap instance can hold it at a time.
+	return errParallelInstancesUniqueResourceOwner
 }
 
 func init() {

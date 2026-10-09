@@ -31,7 +31,7 @@ var validAccountKeyName = regexp.MustCompile(`^(?:[a-z0-9]+-?)*[a-z](?:-?[a-z0-9
 // AccountKey holds an account-key assertion, asserting a public key
 // belonging to the account.
 type AccountKey struct {
-	assertionBase
+	AssertionBase
 	sinceUntil
 	constraintMatchers []attrMatcher
 	pubKey             PublicKey
@@ -42,7 +42,7 @@ type sinceUntil struct {
 	until time.Time
 }
 
-func checkSinceUntilWhat(m map[string]interface{}, what string) (*sinceUntil, error) {
+func checkSinceUntilWhat(m map[string]any, what string) (*sinceUntil, error) {
 	since, err := checkRFC3339DateWhat(m, "since", what)
 	if err != nil {
 		return nil, err
@@ -130,7 +130,7 @@ func (ak *AccountKey) publicKey() PublicKey {
 }
 
 // ConstraintsPrecheck checks whether the given type and headers match the signing constraints of the account key.
-func (ak *AccountKey) ConstraintsPrecheck(assertType *AssertionType, headers map[string]interface{}) error {
+func (ak *AccountKey) ConstraintsPrecheck(assertType *AssertionType, headers map[string]any) error {
 	headersWithType := copyHeaders(headers)
 	headersWithType["type"] = assertType.Name
 	if !ak.matchAgainstConstraints(headersWithType) {
@@ -139,7 +139,7 @@ func (ak *AccountKey) ConstraintsPrecheck(assertType *AssertionType, headers map
 	return nil
 }
 
-func (ak *AccountKey) matchAgainstConstraints(headers map[string]interface{}) bool {
+func (ak *AccountKey) matchAgainstConstraints(headers map[string]any) bool {
 	matchers := ak.constraintMatchers
 	// no constraints, everything is allowed
 	if len(matchers) == 0 {
@@ -160,7 +160,7 @@ func (ak *AccountKey) canSign(a Assertion) bool {
 	return ak.matchAgainstConstraints(a.Headers())
 }
 
-func checkPublicKey(ab *assertionBase, keyIDName string) (PublicKey, error) {
+func checkPublicKey(ab *AssertionBase, keyIDName string) (PublicKey, error) {
 	pubKey, err := DecodePublicKey(ab.Body())
 	if err != nil {
 		return nil, err
@@ -175,8 +175,8 @@ func checkPublicKey(ab *assertionBase, keyIDName string) (PublicKey, error) {
 	return pubKey, nil
 }
 
-// Implement further consistency checks.
-func (ak *AccountKey) checkConsistency(db RODatabase, acck *AccountKey) error {
+// CheckConsistency performs further checks using the assertion database.
+func (ak *AccountKey) CheckConsistency(db RODatabase, acck *AccountKey) error {
 	if !db.IsTrustedAccount(ak.AuthorityID()) {
 		return fmt.Errorf("account-key assertion for %q is not signed by a directly trusted authority: %s", ak.AccountID(), ak.AuthorityID())
 	}
@@ -214,7 +214,7 @@ func (ak *AccountKey) checkConsistency(db RODatabase, acck *AccountKey) error {
 }
 
 // expected interface is implemented
-var _ consistencyChecker = (*AccountKey)(nil)
+var _ ConsistencyChecker = (*AccountKey)(nil)
 
 // Prerequisites returns references to this account-key's prerequisite assertions.
 func (ak *AccountKey) Prerequisites() []*Ref {
@@ -223,7 +223,7 @@ func (ak *AccountKey) Prerequisites() []*Ref {
 	}
 }
 
-func assembleAccountKey(assert assertionBase) (Assertion, error) {
+func assembleAccountKey(assert AssertionBase) (Assertion, error) {
 	_, err := checkNotEmptyString(assert.headers, "account-id")
 	if err != nil {
 		return nil, err
@@ -258,15 +258,15 @@ func assembleAccountKey(assert assertionBase) (Assertion, error) {
 
 	// ignore extra headers for future compatibility
 	return &AccountKey{
-		assertionBase:      assert,
+		AssertionBase:      assert,
 		sinceUntil:         *sinceUntil,
 		constraintMatchers: matchers,
 		pubKey:             pubk,
 	}, nil
 }
 
-func checkAKConstraints(cs interface{}) ([]attrMatcher, error) {
-	csmaps, ok := cs.([]interface{})
+func checkAKConstraints(cs any) ([]attrMatcher, error) {
+	csmaps, ok := cs.([]any)
 	if !ok {
 		return nil, fmt.Errorf("assertions constraints must be a list of maps")
 	}
@@ -276,7 +276,7 @@ func checkAKConstraints(cs interface{}) ([]attrMatcher, error) {
 	}
 	matchers := make([]attrMatcher, 0, len(csmaps))
 	for _, csmap := range csmaps {
-		m, ok := csmap.(map[string]interface{})
+		m, ok := csmap.(map[string]any)
 		if !ok {
 			return nil, fmt.Errorf("assertions constraints must be a list of maps")
 		}
@@ -310,7 +310,7 @@ func checkAKConstraints(cs interface{}) ([]attrMatcher, error) {
 	return matchers, nil
 }
 
-func accountKeyFormatAnalyze(headers map[string]interface{}, body []byte) (formatnum int, err error) {
+func accountKeyFormatAnalyze(headers map[string]any, body []byte) (formatnum int, err error) {
 	formatnum = 0
 	if _, ok := headers["constraints"]; ok {
 		formatnum = 1
@@ -320,7 +320,7 @@ func accountKeyFormatAnalyze(headers map[string]interface{}, body []byte) (forma
 
 // AccountKeyRequest holds an account-key-request assertion, which is a self-signed request to prove that the requester holds the private key and wishes to create an account-key assertion for it.
 type AccountKeyRequest struct {
-	assertionBase
+	AssertionBase
 	sinceUntil
 	pubKey PublicKey
 }
@@ -351,12 +351,12 @@ func (akr *AccountKeyRequest) PublicKeyID() string {
 }
 
 // signKey returns the underlying public key of the requested account key.
-func (akr *AccountKeyRequest) signKey() PublicKey {
-	return akr.pubKey
+func (akr *AccountKeyRequest) signKey(db RODatabase) (PublicKey, error) {
+	return akr.pubKey, nil
 }
 
-// Implement further consistency checks.
-func (akr *AccountKeyRequest) checkConsistency(db RODatabase, acck *AccountKey) error {
+// CheckConsistency performs further checks using the assertion database.
+func (akr *AccountKeyRequest) CheckConsistency(db RODatabase, acck *AccountKey) error {
 	_, err := db.Find(AccountType, map[string]string{
 		"account-id": akr.AccountID(),
 	})
@@ -371,7 +371,7 @@ func (akr *AccountKeyRequest) checkConsistency(db RODatabase, acck *AccountKey) 
 
 // expected interfaces are implemented
 var (
-	_ consistencyChecker = (*AccountKeyRequest)(nil)
+	_ ConsistencyChecker = (*AccountKeyRequest)(nil)
 	_ customSigner       = (*AccountKeyRequest)(nil)
 )
 
@@ -382,7 +382,7 @@ func (akr *AccountKeyRequest) Prerequisites() []*Ref {
 	}
 }
 
-func assembleAccountKeyRequest(assert assertionBase) (Assertion, error) {
+func assembleAccountKeyRequest(assert AssertionBase) (Assertion, error) {
 	_, err := checkNotEmptyString(assert.headers, "account-id")
 	if err != nil {
 		return nil, err
@@ -408,7 +408,7 @@ func assembleAccountKeyRequest(assert assertionBase) (Assertion, error) {
 
 	// ignore extra headers for future compatibility
 	return &AccountKeyRequest{
-		assertionBase: assert,
+		AssertionBase: assert,
 		sinceUntil:    *sinceUntil,
 		pubKey:        pubk,
 	}, nil

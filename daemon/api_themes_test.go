@@ -353,7 +353,7 @@ func (s *themesSuite) TestThemesCmdGet(c *C) {
 	}
 
 	req := httptest.NewRequest("GET", "/v2/accessories/themes?gtk-theme=Foo-gtk&gtk-theme=Bar&icon-theme=Foo-icons&sound-theme=Foo-sounds", nil)
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 
 	c.Check(rsp.Type, Equals, daemon.ResponseTypeSync)
 	c.Check(rsp.Status, Equals, 200)
@@ -380,7 +380,7 @@ func (s *themesSuite) daemonWithIfaceMgr(c *C) *daemon.Daemon {
 	hookMgr, err := hookstate.Manager(st, runner)
 	c.Assert(err, IsNil)
 	overlord.AddManager(hookMgr)
-	ifaceMgr, err := ifacestate.Manager(st, hookMgr, runner, nil, nil)
+	ifaceMgr, err := ifacestate.Manager(st, hookMgr, nil, runner, nil, nil)
 	c.Assert(err, IsNil)
 	overlord.AddManager(ifaceMgr)
 	overlord.AddManager(runner)
@@ -416,15 +416,19 @@ func (s *themesSuite) TestThemesCmdPost(c *C) {
 			},
 		},
 	}
-	restore := daemon.MockSnapstateInstallMany(func(s *state.State, names []string, _ []*snapstate.RevisionOptions, _ int, _ *snapstate.Flags) ([]string, []*state.TaskSet, error) {
-		t := s.NewTask("fake-theme-install", "Theme install")
-		return names, []*state.TaskSet{state.NewTaskSet(t)}, nil
+	restore := daemon.MockSnapstateInstallWithGoal(func(ctx context.Context, st *state.State, g snapstate.InstallGoal, opts snapstate.Options) ([]*snap.Info, []*state.TaskSet, error) {
+		goal, ok := g.(*storeInstallGoalRecorder)
+		c.Assert(ok, Equals, true, Commentf("unexpected InstallGoal type %T", g))
+		c.Assert(goal.snaps, HasLen, 3)
+
+		t := st.NewTask("fake-theme-install", "Theme install")
+		return storeSnapInfos(goal.snaps), []*state.TaskSet{state.NewTaskSet(t)}, nil
 	})
 	defer restore()
 
 	buf := bytes.NewBufferString(`{"gtk-themes":["Foo-gtk"],"icon-themes":["Foo-icons"],"sound-themes":["Foo-sounds"]}`)
 	req := httptest.NewRequest("POST", "/v2/accessories/themes", buf)
-	rsp := s.asyncReq(c, req, nil)
+	rsp := s.asyncReq(c, req, nil, actionIsExpected)
 	c.Check(rsp.Status, Equals, 202)
 
 	st := s.d.Overlord().State()

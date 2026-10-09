@@ -25,6 +25,7 @@ import (
 	"strings"
 
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 )
 
 // BeforePreparePlug sanitizes a plug with a given snapd interface.
@@ -61,8 +62,8 @@ var ByName = func(name string) (iface Interface, err error) {
 
 // PlugRef is a reference to a plug.
 type PlugRef struct {
-	Snap string `json:"snap"`
-	Name string `json:"plug"`
+	Snap naming.InstanceName `json:"snap"`
+	Name string              `json:"plug"`
 }
 
 // String returns the "snap:plug" representation of a plug reference.
@@ -93,8 +94,8 @@ func BeforePrepareSlot(iface Interface, slotInfo *snap.SlotInfo) error {
 
 // SlotRef is a reference to a slot.
 type SlotRef struct {
-	Snap string `json:"snap"`
-	Name string `json:"slot"`
+	Snap naming.InstanceName `json:"snap"`
+	Name string              `json:"slot"`
 }
 
 // String returns the "snap:slot" representation of a slot reference.
@@ -165,9 +166,9 @@ func ParseConnRef(id string) (*ConnRef, error) {
 	if len(plugParts) != 2 || len(slotParts) != 2 {
 		return nil, fmt.Errorf("malformed connection identifier: %q", id)
 	}
-	conn.PlugRef.Snap = plugParts[0]
+	conn.PlugRef.Snap = naming.InstanceName(plugParts[0])
 	conn.PlugRef.Name = plugParts[1]
-	conn.SlotRef.Snap = slotParts[0]
+	conn.SlotRef.Snap = naming.InstanceName(slotParts[0])
 	conn.SlotRef.Name = slotParts[1]
 	return &conn, nil
 }
@@ -202,19 +203,92 @@ type SlotSanitizer interface {
 	BeforePrepareSlot(slot *snap.SlotInfo) error
 }
 
+// ConfigfilesUser must be implemented by Interfaces that use the configfiles backend.
+type ConfigfilesUser interface {
+	// PathPatterns is a list of globs for files that are under control of
+	// the interface. These globs apply to either the rootfs or to the
+	// mount namespace of a snap (TODO). AddPathContent from the backend is
+	// called to add files that match the pattern and that must be created.
+	// Other matching files will be removed if found.
+	//
+	// TODO it is possible that we might want to use different paths in the
+	// classic rootfs and in the mount namespace of a snap so the string
+	// could evolve to a type with path + rootfs type.
+	PathPatterns() []string
+}
+
+// SymlinksUser must be implemented by Interfaces that use the symlinks backend.
+type SymlinksUser interface {
+	// TrackedDirectories returns a list of directories that might contain
+	// symlinks under control of snapd. They are understood to be in that
+	// situation if they point to inside snap content or data. These
+	// directories apply to either the rootfs or to the mount namespace of
+	// a snap (the latter is a TODO). AddSymlink from the backend is called
+	// to register symlinks that must be created in these directories.
+	// Non-registered symlinks found in these directories that point to a
+	// snap are removed.
+	//
+	// IMPORTANT when registering directories here from an interface,
+	// remember to also remove them from the snap-mgmt.sh.in script so
+	// removing the snapd package with apt cleans up everything.
+	//
+	// TODO it is possible that we might want to use different paths in the
+	// classic rootfs and in the mount namespace of a snap so the string
+	// could evolve to a type with path + rootfs type.
+	TrackedDirectories() []string
+}
+
+// ConflictingConnectedInterfacesDefiner must be implemented by Interfaces
+// that conflicts with other connected interfaces.
+type ConflictingConnectedInterfacesDefiner interface {
+	// ConflictsWithOtherConnectedInterfaces returns a list of interface names
+	// that conflict with this interface on connection.
+	//
+	// The mutually exclusive connection relation is bi-directional, so if any
+	// of the conflicting interfaces has an active connection then this interface
+	// cannot be connected, and if this interface has an active connection then
+	// non of the conflicting interfaces can be connected.
+	ConflictsWithOtherConnectedInterfaces() []string
+}
+
+// ParallelInstancesPlugDefiner can be implemented by Interfaces to declare
+// whether they support plugs on snaps installed as parallel instances.
+// Interfaces not implementing this are assumed to support parallel instances.
+type ParallelInstancesPlugDefiner interface {
+	// ParallelInstancesSupportedForPlug returns nil if the interface
+	// supports being plugged by a snap installed as a parallel instance,
+	// or an error explaining why it does not otherwise.
+	ParallelInstancesSupportedForPlug(plug *snap.PlugInfo) error
+}
+
+// ParallelInstancesSlotDefiner can be implemented by Interfaces to declare
+// whether they support slots on snaps installed as parallel instances.
+// Interfaces not implementing this are assumed to support parallel instances.
+type ParallelInstancesSlotDefiner interface {
+	// ParallelInstancesSupportedForSlot returns nil if the interface
+	// supports being slotted by a snap installed as a parallel instance,
+	// or an error explaining why it does not otherwise.
+	ParallelInstancesSupportedForSlot(slot *snap.SlotInfo) error
+}
+
 // StaticInfo describes various static-info of a given interface.
 //
 // The Summary must be a one-line string of length suitable for listing views.
 // The DocURL can point to website (e.g. a forum thread) that goes into more
 // depth and documents the interface in detail.
 type StaticInfo struct {
-	Summary string `json:"summary,omitempty"`
-	DocURL  string `json:"doc-url,omitempty"`
+	Summary string
+	DocURL  string
 
 	// ImplicitOnCore controls if a slot is automatically added to core (non-classic) systems.
-	ImplicitOnCore bool `json:"implicit-on-core,omitempty"`
+	ImplicitOnCore bool
 	// ImplicitOnClassic controls if a slot is automatically added to classic systems.
-	ImplicitOnClassic bool `json:"implicit-on-classic,omitempty"`
+	ImplicitOnClassic bool
+
+	// ImplicitOnCore controls if a plug is automatically added to core (non-classic) systems.
+	ImplicitPlugOnCore bool
+	// ImplicitOnClassic controls if a plug is automatically added to classic systems.
+	ImplicitPlugOnClassic bool
 
 	// AffectsPlugOnRefresh tells if refreshing of a snap with a slot of this interface
 	// is disruptive for the snap on the plug side (when the interface is connected),
@@ -225,7 +299,7 @@ type StaticInfo struct {
 	// TODO: if we change the snap-update-ns logic to avoid the freezeing/thawing
 	// if there are no changes, there are interfaces like appstream-metadata or
 	// system-packages-doc that could get the flag set back to false.
-	AffectsPlugOnRefresh bool `json:"affects-plug-on-refresh,omitempty"`
+	AffectsPlugOnRefresh bool
 
 	// BaseDeclarationPlugs defines optional plug-side rules in the
 	// base-declaration assertion relevant for this interface. See
@@ -240,18 +314,61 @@ type StaticInfo struct {
 
 	// AppArmorUnconfinedPlugs results in the snap that plugs this interface
 	// being granted the AppArmor unconfined profile mode
-	AppArmorUnconfinedPlugs bool `json:"apparmor-unconfined-plugs,omitempty"`
+	AppArmorUnconfinedPlugs bool
 	// Similarly, AppArmorUnconfinedSlots results in the snap that slots this interface
 	// being granted the AppArmor unconfined profile mode
-	AppArmorUnconfinedSlots bool `json:"apparmor-unconfined-slots,omitempty"`
+	AppArmorUnconfinedSlots bool
 }
+
+// PlugServicesSnippetSection is the target systemd unit section for
+// a plug service snippet.
+type PlugServicesSnippetSection string
+
+const (
+	// PlugServicesSnippetUnitSection indicates that the target systemd
+	// unit section for a plug service snippet is [Unit].
+	PlugServicesSnippetUnitSection PlugServicesSnippetSection = "Unit"
+	// PlugServicesSnippetServiceSection indicates that the target systemd
+	// unit section for a plug service snippet is [Service].
+	PlugServicesSnippetServiceSection PlugServicesSnippetSection = "Service"
+)
+
+// PlugServiceSnippet describes a systemd service snippet to be generated
+// for a snap with a plug whose interface implements ServicePermanentPlug.
+type PlugServicesSnippet interface {
+	// SystemdConfSection is the target unit file section for the snippet to be
+	// injected in (i.e. [Unit], [Service]).
+	SystemdConfSection() PlugServicesSnippetSection
+	// This is the actual snippet content to be injected.
+	String() string
+}
+
+// PlugServicesUnitSectionSnippet describes a systemd service snippet to be
+// generated under the [Unit] section for a snap with a plug whose interface
+// implements ServicePermanentPlug.
+type PlugServicesUnitSectionSnippet string
+
+func (s PlugServicesUnitSectionSnippet) SystemdConfSection() PlugServicesSnippetSection {
+	return PlugServicesSnippetUnitSection
+}
+func (s PlugServicesUnitSectionSnippet) String() string { return string(s) }
+
+// PlugServicesUnitSectionSnippet describes a systemd service snippet to be
+// generated under the [Service] section for a snap with a plug whose interface
+// implements ServicePermanentPlug.
+type PlugServicesServiceSectionSnippet string
+
+func (s PlugServicesServiceSectionSnippet) SystemdConfSection() PlugServicesSnippetSection {
+	return PlugServicesSnippetServiceSection
+}
+func (s PlugServicesServiceSectionSnippet) String() string { return string(s) }
 
 // PermanentPlugServiceSnippets will return the set of snippets for the systemd
 // service unit that should be generated for a snap with the specified plug.
 // The list returned is not unique, callers must de-duplicate themselves.
 // The plug is provided because the snippet may depend on plug attributes for
 // example. The plug is sanitized before the snippets are returned.
-func PermanentPlugServiceSnippets(iface Interface, plug *snap.PlugInfo) (snips []string, err error) {
+func PermanentPlugServiceSnippets(iface Interface, plug *snap.PlugInfo) (snips []PlugServicesSnippet, err error) {
 	// sanitize the plug first
 	err = BeforePreparePlug(iface, plug)
 	if err != nil {
@@ -259,7 +376,7 @@ func PermanentPlugServiceSnippets(iface Interface, plug *snap.PlugInfo) (snips [
 	}
 
 	type serviceSnippetPlugger interface {
-		ServicePermanentPlug(plug *snap.PlugInfo) []string
+		ServicePermanentPlug(plug *snap.PlugInfo) []PlugServicesSnippet
 	}
 	if iface, ok := iface.(serviceSnippetPlugger); ok {
 		snips = iface.ServicePermanentPlug(plug)
@@ -310,6 +427,12 @@ const (
 	SecuritySystemd SecuritySystem = "systemd"
 	// SecurityPolkit identifies the polkit security system.
 	SecurityPolkit SecuritySystem = "polkit"
+	// SecurityLdconfig identifies the ldconfig security system.
+	SecurityLdconfig SecuritySystem = "ldconfig"
+	// SecurityConfigfiles identifies the configfiles security system.
+	SecurityConfigfiles SecuritySystem = "configfiles"
+	// SecuritySymlinks identifies the symlinks security system.
+	SecuritySymlinks SecuritySystem = "symlinks"
 )
 
 var isValidBusName = regexp.MustCompile(`^[a-zA-Z_-][a-zA-Z0-9_-]*(\.[a-zA-Z_-][a-zA-Z0-9_-]*)+$`).MatchString

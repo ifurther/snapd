@@ -1,8 +1,15 @@
-summary: smoke test for the remote.wait-for tool
+summary: smoke test for the remote.refresh tool
 
-backends: [google-nested]
+details: |
+    Check the remote.refresh tool properly handles refreshes in
+    the remote instance including the refresh for several snaps
+    which trigger reboots
 
-systems: [ubuntu-20.04-64]
+backends: [openstack-ext]
+
+systems: [ubuntu-22.04-64]
+
+manual: true
 
 environment:
     user: test
@@ -10,14 +17,11 @@ environment:
     host: localhost
     port: 8022
     unit: nested-vm
-    TARGET/xenial: xenial
-    TARGET/bionic: bionic
+    TARGET: xenial
 
 prepare: |
     if [ "$TARGET" = xenial ]; then
         wget -O pc.img.xz https://storage.googleapis.com/snapd-spread-tests/images/booted/pc-amd64-16-stable-core_beta_2.56.2.img.xz
-    elif [ "$TARGET" = bionic ]; then
-        wget -O pc.img.xz https://storage.googleapis.com/snapd-spread-tests/images/booted/pc-amd64-18-stable-snapd_beta_2.56.2.img.xz
     fi
     unxz pc.img.xz
 

@@ -21,6 +21,7 @@ package main_test
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 
@@ -31,7 +32,6 @@ import (
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/sandbox/cgroup"
-	"github.com/snapcore/snapd/testutil"
 )
 
 type commonSuite struct {
@@ -55,7 +55,7 @@ func (s *commonSuite) TestInstanceName(c *C) {
 func (s *commonSuite) TestLock(c *C) {
 	// Mock away real freezer code, allowing test code to return an error when freezing.
 	var freezingError error
-	restore := cgroup.MockFreezing(func(string) error { return freezingError }, func(string) error { return nil })
+	restore := cgroup.MockFreezing(func(context.Context, string) error { return freezingError }, func(string) error { return nil })
 	defer restore()
 	// Mock system directories, we use the lock directory.
 	dirs.SetRootDir(s.dir)
@@ -155,21 +155,4 @@ func (s *commonSuite) TestLoadCurrentProfile(c *C) {
 
 	// The profile is returned unchanged.
 	c.Check(builder.String(), Equals, text)
-}
-
-func (s *commonSuite) TestSaveCurrentProfile(c *C) {
-	upCtx := s.upCtx
-	text := "tmpfs /tmp tmpfs defaults 0 0\n"
-
-	// Prepare a mount profile to be saved.
-	profile, err := osutil.LoadMountProfileText(text)
-	c.Assert(err, IsNil)
-
-	// Prepare the directory for saving the profile.
-	path := upCtx.CurrentProfilePath()
-	c.Assert(os.MkdirAll(filepath.Dir(path), 0755), IsNil)
-
-	// Ask the common profile update to write the current profile.
-	c.Assert(upCtx.SaveCurrentProfile(profile), IsNil)
-	c.Check(path, testutil.FileEquals, text)
 }

@@ -31,11 +31,11 @@ import (
 
 // common checks used when decoding/assembling assertions
 
-func checkExistsString(headers map[string]interface{}, name string) (string, error) {
+func checkExistsString(headers map[string]any, name string) (string, error) {
 	return checkExistsStringWhat(headers, name, "header")
 }
 
-func checkExistsStringWhat(m map[string]interface{}, name, what string) (string, error) {
+func checkExistsStringWhat(m map[string]any, name, what string) (string, error) {
 	value, ok := m[name]
 	if !ok {
 		return "", fmt.Errorf("%q %s is mandatory", name, what)
@@ -47,11 +47,11 @@ func checkExistsStringWhat(m map[string]interface{}, name, what string) (string,
 	return s, nil
 }
 
-func checkNotEmptyString(headers map[string]interface{}, name string) (string, error) {
+func checkNotEmptyString(headers map[string]any, name string) (string, error) {
 	return checkNotEmptyStringWhat(headers, name, "header")
 }
 
-func checkNotEmptyStringWhat(m map[string]interface{}, name, what string) (string, error) {
+func checkNotEmptyStringWhat(m map[string]any, name, what string) (string, error) {
 	s, err := checkExistsStringWhat(m, name, what)
 	if err != nil {
 		return "", err
@@ -62,7 +62,7 @@ func checkNotEmptyStringWhat(m map[string]interface{}, name, what string) (strin
 	return s, nil
 }
 
-func checkOptionalStringWhat(headers map[string]interface{}, name, what string) (string, error) {
+func checkOptionalStringWhat(headers map[string]any, name, what string) (string, error) {
 	value, ok := headers[name]
 	if !ok {
 		return "", nil
@@ -74,11 +74,11 @@ func checkOptionalStringWhat(headers map[string]interface{}, name, what string) 
 	return s, nil
 }
 
-func checkOptionalString(headers map[string]interface{}, name string) (string, error) {
+func checkOptionalString(headers map[string]any, name string) (string, error) {
 	return checkOptionalStringWhat(headers, name, "header")
 }
 
-func checkPrimaryKey(headers map[string]interface{}, primKey string) (string, error) {
+func checkPrimaryKey(headers map[string]any, primKey string) (string, error) {
 	value, err := checkNotEmptyString(headers, primKey)
 	if err != nil {
 		return "", err
@@ -107,7 +107,7 @@ func checkAssertType(assertType *AssertionType) error {
 }
 
 // use 'defl' default if missing
-func checkIntWithDefault(headers map[string]interface{}, name string, defl int) (int, error) {
+func checkIntWithDefault(headers map[string]any, name string, defl int) (int, error) {
 	value, ok := headers[name]
 	if !ok {
 		return defl, nil
@@ -123,11 +123,11 @@ func checkIntWithDefault(headers map[string]interface{}, name string, defl int) 
 	return m, nil
 }
 
-func checkInt(headers map[string]interface{}, name string) (int, error) {
+func checkInt(headers map[string]any, name string) (int, error) {
 	return checkIntWhat(headers, name, "header")
 }
 
-func checkIntWhat(headers map[string]interface{}, name, what string) (int, error) {
+func checkIntWhat(headers map[string]any, name, what string) (int, error) {
 	valueStr, err := checkNotEmptyStringWhat(headers, name, what)
 	if err != nil {
 		return -1, err
@@ -145,7 +145,7 @@ func (e intSyntaxError) Error() string {
 	return string(e)
 }
 
-func atoi(valueStr, whichFmt string, whichArgs ...interface{}) (int, error) {
+func atoi(valueStr, whichFmt string, whichArgs ...any) (int, error) {
 	value, err := strconv.Atoi(valueStr)
 	if err != nil {
 		which := fmt.Sprintf(whichFmt, whichArgs...)
@@ -164,11 +164,11 @@ func prefixZeros(s string) bool {
 	return strings.HasPrefix(s, "0") && s != "0"
 }
 
-func checkRFC3339Date(headers map[string]interface{}, name string) (time.Time, error) {
+func checkRFC3339Date(headers map[string]any, name string) (time.Time, error) {
 	return checkRFC3339DateWhat(headers, name, "header")
 }
 
-func checkRFC3339DateWhat(m map[string]interface{}, name, what string) (time.Time, error) {
+func checkRFC3339DateWhat(m map[string]any, name, what string) (time.Time, error) {
 	dateStr, err := checkNotEmptyStringWhat(m, name, what)
 	if err != nil {
 		return time.Time{}, err
@@ -180,7 +180,7 @@ func checkRFC3339DateWhat(m map[string]interface{}, name, what string) (time.Tim
 	return date, nil
 }
 
-func checkRFC3339DateWithDefaultWhat(m map[string]interface{}, name, what string, defl time.Time) (time.Time, error) {
+func checkRFC3339DateWithDefaultWhat(m map[string]any, name, what string, defl time.Time) (time.Time, error) {
 	value, ok := m[name]
 	if !ok {
 		return defl, nil
@@ -196,11 +196,11 @@ func checkRFC3339DateWithDefaultWhat(m map[string]interface{}, name, what string
 	return date, nil
 }
 
-func checkUint(headers map[string]interface{}, name string, bitSize int) (uint64, error) {
+func checkUint(headers map[string]any, name string, bitSize int) (uint64, error) {
 	return checkUintWhat(headers, name, bitSize, "header")
 }
 
-func checkUintWhat(headers map[string]interface{}, name string, bitSize int, what string) (uint64, error) {
+func checkUintWhat(headers map[string]any, name string, bitSize int, what string) (uint64, error) {
 	valueStr, err := checkNotEmptyStringWhat(headers, name, what)
 	if err != nil {
 		return 0, err
@@ -218,36 +218,36 @@ func checkUintWhat(headers map[string]interface{}, name string, bitSize int, wha
 	return value, nil
 }
 
-func checkDigest(headers map[string]interface{}, name string, h crypto.Hash) ([]byte, error) {
-	return checkDigestWhat(headers, name, h, "header")
+func checkDigest(headers map[string]any, name string, h crypto.Hash) (string, error) {
+	return checkDigestDecWhat(headers, name, h, base64.RawURLEncoding.DecodeString, "header")
 }
 
-func checkDigestWhat(headers map[string]interface{}, name string, h crypto.Hash, what string) ([]byte, error) {
+func checkDigestDecWhat(headers map[string]any, name string, h crypto.Hash, decode func(string) ([]byte, error), what string) (string, error) {
 	digestStr, err := checkNotEmptyStringWhat(headers, name, what)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	b, err := base64.RawURLEncoding.DecodeString(digestStr)
+	b, err := decode(digestStr)
 	if err != nil {
-		return nil, fmt.Errorf("%q %s cannot be decoded: %v", name, what, err)
+		return "", fmt.Errorf("%q %s cannot be decoded: %v", name, what, err)
 	}
 	if len(b) != h.Size() {
-		return nil, fmt.Errorf("%q %s does not have the expected bit length: %d", name, what, len(b)*8)
+		return "", fmt.Errorf("%q %s does not have the expected bit length: %d", name, what, len(b)*8)
 	}
 
-	return b, nil
+	return digestStr, nil
 }
 
 // checkStringListInMap returns the `name` entry in the `m` map as a (possibly nil) `[]string`
 // if `m` has an entry for `name` and it isn't a `[]string`, an error is returned
 // if pattern is not nil, all the strings must match that pattern, otherwise an error is returned
 // `what` is a descriptor, used for error messages
-func checkStringListInMap(m map[string]interface{}, name, what string, pattern *regexp.Regexp) ([]string, error) {
+func checkStringListInMap(m map[string]any, name, what string, pattern *regexp.Regexp) ([]string, error) {
 	value, ok := m[name]
 	if !ok {
 		return nil, nil
 	}
-	lst, ok := value.([]interface{})
+	lst, ok := value.([]any)
 	if !ok {
 		return nil, fmt.Errorf("%s must be a list of strings", what)
 	}
@@ -268,19 +268,19 @@ func checkStringListInMap(m map[string]interface{}, name, what string, pattern *
 	return res, nil
 }
 
-func checkStringList(headers map[string]interface{}, name string) ([]string, error) {
+func checkStringList(headers map[string]any, name string) ([]string, error) {
 	return checkStringListMatches(headers, name, nil)
 }
 
-func checkStringListMatches(headers map[string]interface{}, name string, pattern *regexp.Regexp) ([]string, error) {
+func checkStringListMatches(headers map[string]any, name string, pattern *regexp.Regexp) ([]string, error) {
 	return checkStringListInMap(headers, name, fmt.Sprintf("%q header", name), pattern)
 }
 
-func checkStringMatches(headers map[string]interface{}, name string, pattern *regexp.Regexp) (string, error) {
+func checkStringMatches(headers map[string]any, name string, pattern *regexp.Regexp) (string, error) {
 	return checkStringMatchesWhat(headers, name, "header", pattern)
 }
 
-func checkStringMatchesWhat(headers map[string]interface{}, name, what string, pattern *regexp.Regexp) (string, error) {
+func checkStringMatchesWhat(headers map[string]any, name, what string, pattern *regexp.Regexp) (string, error) {
 	s, err := checkNotEmptyStringWhat(headers, name, what)
 	if err != nil {
 		return "", err
@@ -291,11 +291,59 @@ func checkStringMatchesWhat(headers map[string]interface{}, name, what string, p
 	return s, nil
 }
 
-func checkOptionalBool(headers map[string]interface{}, name string) (bool, error) {
+func checkOptionalBool(headers map[string]any, name string) (bool, error) {
 	return checkOptionalBoolWhat(headers, name, "header")
 }
 
-func checkOptionalBoolWhat(headers map[string]interface{}, name, what string) (bool, error) {
+// TODO:XPROJASSERTS: Consider moving the exported checks to a separate file and
+// making them the primary implementations where practical, retaining map-based
+// helpers for checks on nested header values.
+
+// CheckRevision checks and returns the named mandatory header as an integer
+// >= 1, following the rules for snap-revision and resource-revision headers.
+// These rules differ from those for an assertion's own revision header,
+// which allows zero.
+func CheckRevision(assert AssertionBase, name string) (int, error) {
+	return checkSnapRevisionWhat(assert.headers, name, "header")
+}
+
+// CheckIntegrity checks and returns the optional integrity header using the
+// same format and validation rules as snap-revision and
+// snap-resource-revision assertions. It returns nil, nil if the header is
+// absent or an empty list. It does not verify the artifact's contents.
+func CheckIntegrity(assert AssertionBase) ([]IntegrityData, error) {
+	return checkSnapIntegrity(assert.headers)
+}
+
+// CheckNotEmptyString checks that the named header is a non-empty string.
+func CheckNotEmptyString(assert AssertionBase, name string) (string, error) {
+	return checkNotEmptyString(assert.headers, name)
+}
+
+// CheckRFC3339Date checks that the named header is a valid RFC 3339 date.
+func CheckRFC3339Date(assert AssertionBase, name string) (time.Time, error) {
+	return checkRFC3339Date(assert.headers, name)
+}
+
+// CheckUint checks that the named header is an unsigned integer with at most
+// the given bit size.
+func CheckUint(assert AssertionBase, name string, bitSize int) (uint64, error) {
+	return checkUint(assert.headers, name, bitSize)
+}
+
+// CheckDigest checks that the named header is a valid digest for the given
+// hash algorithm.
+func CheckDigest(assert AssertionBase, name string, hash crypto.Hash) (string, error) {
+	return checkDigest(assert.headers, name, hash)
+}
+
+// CheckOptionalBool checks that the named optional header, if present, is a
+// valid boolean string.
+func CheckOptionalBool(assert AssertionBase, name string) (bool, error) {
+	return checkOptionalBool(assert.headers, name)
+}
+
+func checkOptionalBoolWhat(headers map[string]any, name, what string) (bool, error) {
 	value, ok := headers[name]
 	if !ok {
 		return false, nil
@@ -307,18 +355,35 @@ func checkOptionalBoolWhat(headers map[string]interface{}, name, what string) (b
 	return s == "true", nil
 }
 
-func checkMap(headers map[string]interface{}, name string) (map[string]interface{}, error) {
+func checkMap(headers map[string]any, name string) (map[string]any, error) {
 	return checkMapWhat(headers, name, "header")
 }
 
-func checkMapWhat(m map[string]interface{}, name, what string) (map[string]interface{}, error) {
+func checkMapWhat(m map[string]any, name, what string) (map[string]any, error) {
 	value, ok := m[name]
 	if !ok {
 		return nil, nil
 	}
-	mv, ok := value.(map[string]interface{})
+	mv, ok := value.(map[string]any)
 	if !ok {
 		return nil, fmt.Errorf("%q %s must be a map", name, what)
 	}
 	return mv, nil
+}
+
+func checkList(headers map[string]any, name string) ([]any, error) {
+	return checkListWhat(headers, name, "header")
+}
+
+func checkListWhat(m map[string]any, name, what string) ([]any, error) {
+	value, ok := m[name]
+	if !ok {
+		return nil, nil
+	}
+
+	list, ok := value.([]any)
+	if !ok {
+		return nil, fmt.Errorf("%q %s must be a list", name, what)
+	}
+	return list, nil
 }

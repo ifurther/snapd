@@ -96,7 +96,6 @@ const fwupdPermanentSlotAppArmor = `
   /run/udev/data/* r,
   /run/mount/utab r,
 
-  owner @{PROC}/@{pid}/mountinfo r,
   owner @{PROC}/@{pid}/mounts r,
 
   /dev/tpm* rw,
@@ -117,6 +116,10 @@ const fwupdPermanentSlotAppArmor = `
   /dev/i2c-[0-9]* rw,
   # Redfish plugin
   /dev/ipmi* rwk,
+  # Modem Manager plugin
+  /dev/tty[^0-9]* rw,
+  /dev/cdc-* rw,
+  /dev/wwan[0-9]* rw,
 
   # MMC boot partitions
   /dev/mmcblk[0-9]{,[0-9],[0-9][0-9]}boot[0-9]* rwk,
@@ -126,9 +129,17 @@ const fwupdPermanentSlotAppArmor = `
   /boot/efi/{,**/} r,
   # allow access to fwupd* and fw/ under boot/ for core systems
   /boot/efi/EFI/*/fwupd*.efi* rw,
+  # there's a naming convention listed in UEFI 2.11, 3.5 Boot Mechanisms,
+  # the reality of VFAT and everyone having a different idea of what the name should be
+  # and lastly the UEFI 2.11, 13.3.1.2 File Names mentions that names are case insensitive,
+  # which means we need to handle all variations of the EFI/BOOT/BOOT*.EFI as well as
+  # the shim and grub efi binaries
+  /boot/efi/EFI/{,**} r,
   /boot/efi/EFI/*/ rw,
   /boot/efi/EFI/*/fw/ rw,
   /boot/efi/EFI/*/fw/** rw,
+  /boot/efi/EFI/dell/bios/recovery/ rw,
+  /boot/efi/EFI/dell/bios/recovery/** rw,
   /boot/efi/EFI/fwupd/ rw,
   /boot/efi/EFI/fwupd/** rw,
   /boot/efi/EFI/UpdateCapsule/ rw,
@@ -153,6 +164,18 @@ const fwupdPermanentSlotAppArmor = `
   # Required by plugin amdgpu
   /sys/devices/**/psp_vbflash rw,
   /sys/devices/**/psp_vbflash_status r,
+
+  # Required by plugin thunderbolt
+  /sys/devices/**/nvm_non_active*/nvmem a,
+  /sys/devices/**/nvm_active*/nvmem r,
+
+  # Required by plugin intel-cvs
+  /sys/devices/**/cvs_ctrl_data_fwupd r,
+  /sys/devices/**/cvs_ctrl_data_pre rw,
+
+  # Needed for reboot notification, both reboot-required and reboot-required.pkgs.
+  # As well as temporary files for atomic write.
+  /run/reboot-required* rw,
 
   # DBus accesses
   #include <abstractions/dbus-strict>
@@ -398,6 +421,7 @@ func (iface *fwupdInterface) UDevPermanentSlot(spec *udev.Specification, slot *s
 		spec.TagDevice(`KERNEL=="video[0-9]*"`)
 		spec.TagDevice(`KERNEL=="wmi/dell-smbios"`)
 		spec.TagDevice(`SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device"`)
+		spec.TagDevice(`SUBSYSTEM=="wwan", ENV{DEVTYPE}=="wwan_port"`)
 	}
 
 	return nil
@@ -416,10 +440,11 @@ func (iface *fwupdInterface) AppArmorConnectedPlug(spec *apparmor.Specification,
 	if implicitSystemConnectedSlot(slot) {
 		new = "unconfined"
 	} else {
-		new = spec.SnapAppSet().SlotLabelExpression(slot)
+		new = slot.LabelExpression()
 	}
 	snippet := strings.Replace(fwupdConnectedPlugAppArmor, old, new, -1)
 	spec.AddSnippet(snippet)
+	spec.AddPrioritizedSnippet(mountInfoSnippet, apparmor.MountInfoKey, mountInfoPriority)
 	return nil
 }
 
@@ -460,7 +485,7 @@ func (iface *fwupdInterface) MountPermanentSlot(spec *mount.Specification, slot 
 func (iface *fwupdInterface) AppArmorConnectedSlot(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	if !implicitSystemConnectedSlot(slot) {
 		old := "###PLUG_SECURITY_TAGS###"
-		new := spec.SnapAppSet().PlugLabelExpression(plug)
+		new := plug.LabelExpression()
 		snippet := strings.Replace(fwupdConnectedSlotAppArmor, old, new, -1)
 		spec.AddSnippet(snippet)
 	}
@@ -482,6 +507,12 @@ func (iface *fwupdInterface) SecCompPermanentSlot(spec *seccomp.Specification, s
 func (iface *fwupdInterface) AutoConnect(*snap.PlugInfo, *snap.SlotInfo) bool {
 	// allow what declarations allowed
 	return true
+}
+
+func (iface *fwupdInterface) ParallelInstancesSupportedForSlot(_ *snap.SlotInfo) error {
+	// fwupd owns the well-known bus name org.freedesktop.fwupd on the system
+	// bus; only one snap instance can hold it at a time.
+	return errParallelInstancesUniqueResourceOwner
 }
 
 func init() {

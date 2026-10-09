@@ -29,7 +29,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/godbus/dbus"
+	"github.com/godbus/dbus/v5"
 
 	"github.com/snapcore/snapd/i18n"
 	"github.com/snapcore/snapd/logger"
@@ -146,7 +146,7 @@ func (s *Launcher) IntrospectionData() string {
 func makeAccessDeniedError(err error) *dbus.Error {
 	return &dbus.Error{
 		Name: "org.freedesktop.DBus.Error.AccessDenied",
-		Body: []interface{}{err.Error()},
+		Body: []any{err.Error()},
 	}
 }
 

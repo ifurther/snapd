@@ -111,7 +111,6 @@ capability sys_admin,
 capability dac_override,  # for various overlayfs accesses
 
 # for setting up mounts
-@{PROC}/[0-9]*/mountinfo r,
 @{PROC}/filesystems r,
 
 # runc needs this
@@ -400,7 +399,7 @@ mknod - |S_IFCHR -
 mknodat - - |S_IFCHR -
 `
 
-func (iface *greengrassSupportInterface) ServicePermanentPlug(plug *snap.PlugInfo) []string {
+func (iface *greengrassSupportInterface) ServicePermanentPlug(plug *snap.PlugInfo) []interfaces.PlugServicesSnippet {
 	var flavor string
 	_ = plug.Attr("flavor", &flavor)
 
@@ -412,7 +411,9 @@ func (iface *greengrassSupportInterface) ServicePermanentPlug(plug *snap.PlugInf
 		return nil
 	}
 
-	return []string{"Delegate=true"}
+	return []interfaces.PlugServicesSnippet{
+		interfaces.PlugServicesServiceSectionSnippet("Delegate=true"),
+	}
 }
 
 func (iface *greengrassSupportInterface) AppArmorConnectedPlug(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
@@ -446,6 +447,7 @@ func (iface *greengrassSupportInterface) AppArmorConnectedPlug(spec *apparmor.Sp
 		spec.AddSnippet(greengrassSupportProcessModeConnectedPlugAppArmor)
 	}
 
+	spec.AddPrioritizedSnippet(mountInfoSnippet, apparmor.MountInfoKey, mountInfoPriority)
 	return nil
 }
 
@@ -483,11 +485,13 @@ type greengrassSupportInterface struct {
 
 func init() {
 	registerIface(&greengrassSupportInterface{commonInterface{
-		name:                 "greengrass-support",
-		summary:              greengrassSupportSummary,
-		implicitOnCore:       true,
-		implicitOnClassic:    true,
-		baseDeclarationSlots: greengrassSupportBaseDeclarationSlots,
-		baseDeclarationPlugs: greengrassSupportBaseDeclarationPlugs,
+		name:                     "greengrass-support",
+		summary:                  greengrassSupportSummary,
+		implicitOnCore:           true,
+		implicitOnClassic:        true,
+		baseDeclarationSlots:     greengrassSupportBaseDeclarationSlots,
+		baseDeclarationPlugs:     greengrassSupportBaseDeclarationPlugs,
+		parallelInstancesPlugErr: errParallelInstancesSharedResources,
+		parallelInstancesSlotErr: errParallelInstancesSystemSlot,
 	}})
 }

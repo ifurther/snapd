@@ -232,7 +232,7 @@ func (iface *x11Interface) AppArmorConnectedPlug(spec *apparmor.Specification, p
 func (iface *x11Interface) AppArmorConnectedSlot(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	if !implicitSystemConnectedSlot(slot) {
 		old := "###PLUG_SECURITY_TAGS###"
-		new := spec.SnapAppSet().PlugLabelExpression(plug)
+		new := plug.LabelExpression()
 		snippet := strings.Replace(x11ConnectedSlotAppArmor, old, new, -1)
 		spec.AddSnippet(snippet)
 	}
@@ -275,5 +275,8 @@ func init() {
 		connectedPlugSecComp:  x11ConnectedPlugSecComp,
 		// affects the plug snap because of mount backend
 		affectsPlugOnRefresh: true,
+		// the X server owns the well-known socket /tmp/.X11-unix/X0; only one
+		// snap instance can hold it at a time.
+		parallelInstancesSlotErr: errParallelInstancesUniqueResourceOwner,
 	}})
 }

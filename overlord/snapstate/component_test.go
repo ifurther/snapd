@@ -22,20 +22,28 @@ package snapstate_test
 import (
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/snapcore/snapd/asserts"
+	"github.com/snapcore/snapd/asserts/assertstest"
+	"github.com/snapcore/snapd/asserts/snapasserts"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/snapstate/sequence"
 	"github.com/snapcore/snapd/overlord/snapstate/snapstatetest"
+	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/snap/naming"
+	"github.com/snapcore/snapd/snap/snaptest"
+	"github.com/snapcore/snapd/testutil"
 	. "gopkg.in/check.v1"
+	"gopkg.in/yaml.v2"
 )
 
 func (s *snapmgrTestSuite) mockComponentInfos(c *C, snapName string, compNames []string, compRevs []snap.Revision) {
 	cis := make([]*snap.ComponentInfo, len(compNames))
 	for i, comp := range compNames {
 		componentYaml := fmt.Sprintf(`component: %s+%s
-type: test
+type: standard
 version: 1.0
 `, snapName, comp)
 		ci, err := snap.InfoFromComponentYaml([]byte(componentYaml))
@@ -44,10 +52,13 @@ version: 1.0
 	}
 
 	s.AddCleanup(snapstate.MockReadComponentInfo(func(
-		compMntDir string, snapInfo *snap.Info,
+		compMntDir string, snapInfo *snap.Info, csi *snap.ComponentSideInfo,
 	) (*snap.ComponentInfo, error) {
 		for i, ci := range cis {
 			if strings.HasSuffix(compMntDir, "/"+ci.Component.ComponentName+"/"+compRevs[i].String()) {
+				if csi != nil {
+					ci.ComponentSideInfo = *csi
+				}
 				return ci, nil
 			}
 		}
@@ -56,6 +67,8 @@ version: 1.0
 }
 
 func (s *snapmgrTestSuite) TestComponentHelpers(c *C) {
+	defer snapstate.MockSnapReadInfo(snap.ReadInfo)()
+
 	const snapName = "mysnap"
 	const compName = "mycomp"
 	const compName2 = "mycomp2"
@@ -65,6 +78,15 @@ func (s *snapmgrTestSuite) TestComponentHelpers(c *C) {
 
 	s.state.Lock()
 	defer s.state.Unlock()
+
+	const snapYaml = `name: mysnap
+version: 1
+components:
+  mycomp:
+    type: standard
+  mycomp2:
+    type: standard
+`
 
 	ssi := &snap.SideInfo{RealName: snapName, Revision: snapRev,
 		SnapID: "some-snap-id"}
@@ -82,12 +104,15 @@ func (s *snapmgrTestSuite) TestComponentHelpers(c *C) {
 		Sequence: snapstatetest.NewSequenceFromRevisionSideInfos(
 			[]*sequence.RevisionSideState{
 				sequence.NewRevisionSideState(ssi,
-					[]*sequence.ComponentState{sequence.NewComponentState(csi2, snap.TestComponent), sequence.NewComponentState(csi, snap.TestComponent)})}),
+					[]*sequence.ComponentState{sequence.NewComponentState(csi2, snap.StandardComponent), sequence.NewComponentState(csi, snap.StandardComponent)})}),
 		Current: snapRev,
 	}
+	snaptest.MockSnap(c, snapYaml, ssi)
+	snaptest.MockSnap(c, snapYaml, ssi2)
 	snapstate.Set(s.state, snapName, snapSt)
 
 	c.Check(snapSt.IsComponentInCurrentSeq(cref), Equals, true)
+	c.Check(snapSt.IsCurrentComponentRevInAnyNonCurrentSeq(cref), Equals, false)
 	c.Check(snapSt.IsComponentRevPresent(csi), Equals, true)
 	foundCsi := snapSt.CurrentComponentSideInfo(cref)
 	c.Check(foundCsi, DeepEquals, csi)
@@ -99,25 +124,42 @@ func (s *snapmgrTestSuite) TestComponentHelpers(c *C) {
 	foundCi2, err := snapSt.CurrentComponentInfo(cref2)
 	c.Check(err, IsNil)
 	c.Check(foundCi2, NotNil)
+	c.Check(snapSt.CurrentComponentSideInfos(), DeepEquals, []*snap.ComponentSideInfo{csi2, csi})
+
+	comps, err := snapSt.CurrentComponentInfos()
+	c.Assert(err, IsNil)
+	c.Check(comps, testutil.DeepUnsortedMatches, []*snap.ComponentInfo{foundCi, foundCi2})
+	c.Check(snapSt.HasActiveComponents(), Equals, true)
 
 	snapSt = &snapstate.SnapState{
 		Active: true,
 		Sequence: snapstatetest.NewSequenceFromRevisionSideInfos(
 			[]*sequence.RevisionSideState{
 				sequence.NewRevisionSideState(ssi2, nil),
-				sequence.NewRevisionSideState(ssi, []*sequence.ComponentState{sequence.NewComponentState(csi, snap.TestComponent)}),
+				sequence.NewRevisionSideState(ssi, []*sequence.ComponentState{sequence.NewComponentState(csi, snap.StandardComponent)}),
 			}),
 		Current: snapRev2,
 	}
 	snapstate.Set(s.state, snapName, snapSt)
 
 	c.Check(snapSt.IsComponentInCurrentSeq(cref), Equals, false)
+	c.Check(snapSt.IsCurrentComponentRevInAnyNonCurrentSeq(cref), Equals, false)
 	c.Check(snapSt.IsComponentRevPresent(csi), Equals, true)
 	c.Check(snapSt.CurrentComponentSideInfo(cref), IsNil)
 	c.Check(snapSt.CurrentComponentSideInfo(cref2), IsNil)
 	foundCi, err = snapSt.CurrentComponentInfo(cref)
 	c.Check(err, ErrorMatches, "snap has no current revision")
 	c.Check(foundCi, IsNil)
+
+	comps, err = snapSt.CurrentComponentInfos()
+	c.Assert(err, IsNil)
+	c.Check(comps, HasLen, 0)
+	c.Check(snapSt.CurrentComponentSideInfos(), HasLen, 0)
+
+	comps, err = snapSt.ComponentInfosForRevision(ssi2.Revision)
+	c.Assert(err, IsNil)
+	c.Check(comps, HasLen, 0)
+	c.Check(snapSt.HasActiveComponents(), Equals, false)
 
 	snapSt = &snapstate.SnapState{
 		Active: true,
@@ -131,7 +173,200 @@ func (s *snapmgrTestSuite) TestComponentHelpers(c *C) {
 	snapstate.Set(s.state, snapName, snapSt)
 
 	c.Check(snapSt.IsComponentInCurrentSeq(cref), Equals, false)
+	c.Check(snapSt.IsCurrentComponentRevInAnyNonCurrentSeq(cref), Equals, false)
 	c.Check(snapSt.IsComponentRevPresent(csi), Equals, false)
 	c.Check(snapSt.CurrentComponentSideInfo(cref), IsNil)
 	c.Check(snapSt.CurrentComponentSideInfo(cref2), IsNil)
+
+	comps, err = snapSt.CurrentComponentInfos()
+	c.Assert(err, IsNil)
+	c.Check(comps, HasLen, 0)
+	c.Check(snapSt.CurrentComponentSideInfos(), HasLen, 0)
+
+	snapSt = &snapstate.SnapState{
+		Active: true,
+		Sequence: snapstatetest.NewSequenceFromRevisionSideInfos(
+			[]*sequence.RevisionSideState{
+				sequence.NewRevisionSideState(ssi2, []*sequence.ComponentState{sequence.NewComponentState(csi2, snap.StandardComponent)}),
+				sequence.NewRevisionSideState(ssi, []*sequence.ComponentState{sequence.NewComponentState(csi, snap.StandardComponent)}),
+			}),
+		Current: snapRev,
+	}
+	snapstate.Set(s.state, snapName, snapSt)
+
+	c.Check(snapSt.IsCurrentComponentRevInAnyNonCurrentSeq(cref), Equals, false)
+
+	foundCi, err = snapSt.CurrentComponentInfo(cref)
+	c.Check(err, IsNil)
+
+	snapSt.Current = snapRev2
+	foundCi2, err = snapSt.CurrentComponentInfo(cref2)
+	c.Check(err, IsNil)
+
+	snapSt.Current = snapRev
+
+	comps, err = snapSt.CurrentComponentInfos()
+	c.Assert(err, IsNil)
+	c.Check(comps, testutil.DeepUnsortedMatches, []*snap.ComponentInfo{foundCi})
+	c.Check(snapSt.CurrentComponentSideInfos(), DeepEquals, []*snap.ComponentSideInfo{csi})
+
+	comps, err = snapSt.ComponentInfosForRevision(snapRev2)
+	c.Assert(err, IsNil)
+	c.Check(comps, testutil.DeepUnsortedMatches, []*snap.ComponentInfo{foundCi2})
+
+	snapSt = &snapstate.SnapState{}
+
+	_, err = snapSt.CurrentComponentInfos()
+	c.Assert(err, testutil.ErrorIs, snapstate.ErrNoCurrent)
+
+	snapSt = &snapstate.SnapState{
+		Active: true,
+		Sequence: snapstatetest.NewSequenceFromRevisionSideInfos(
+			[]*sequence.RevisionSideState{
+				sequence.NewRevisionSideState(ssi2, []*sequence.ComponentState{sequence.NewComponentState(csi, snap.StandardComponent)}),
+				sequence.NewRevisionSideState(ssi, []*sequence.ComponentState{sequence.NewComponentState(csi, snap.StandardComponent)}),
+			}),
+		Current: snapRev,
+	}
+	snapstate.Set(s.state, snapName, snapSt)
+
+	c.Check(snapSt.IsCurrentComponentRevInAnyNonCurrentSeq(cref), Equals, true)
+}
+
+func (s *snapmgrTestSuite) TestComponentEnforcedValidationSet(c *C) {
+	expectedErr := `cannot remove component "mysnap+mycomp" as it is required by an enforcing validation set`
+	s.testComponentRemoveValidationSet(c, "mysnap", "mycomp", "3wdHCAVyZEmYsCMFDE9qt92UV8rC8Wdk", expectedErr)
+}
+
+func (s *snapmgrTestSuite) TestComponentEnforcedValidationSetOptionalComponent(c *C) {
+	// "mysnap" is enforced by the validation set, but "othercomp2" is explicitly
+	// marked as PresenceOptional in the mock headers.
+	// We expect no error ("") when attempting to remove it.
+	s.testComponentRemoveValidationSet(c, "mysnap", "othercomp2", "3wdHCAVyZEmYsCMFDE9qt92UV8rC8Wdk", "")
+}
+
+func (s *snapmgrTestSuite) TestComponentUnenforcedValidationSet(c *C) {
+	s.testComponentRemoveValidationSet(c, "othersnap", "othercomp", "otherIDVyZEmYsCMFDE9qt92UV8rC8Wdk", "")
+}
+
+func (s *snapmgrTestSuite) testComponentRemoveValidationSet(c *C, targetSnapName, targetCompName, targetSnapID, expectedErrorMsg string) {
+	defer snapstate.MockSnapReadInfo(snap.ReadInfo)()
+
+	snapRev := snap.R(1)
+	compRev := snap.R(33)
+
+	const optionalCompName = "othercomp2"
+
+	ssi := &snap.SideInfo{RealName: targetSnapName, Revision: snapRev, SnapID: targetSnapID}
+	cref := naming.NewComponentRef(naming.SnapName(targetSnapName), targetCompName)
+	csi := snap.NewComponentSideInfo(cref, compRev)
+
+	otherCref := naming.NewComponentRef(naming.SnapName(targetSnapName), optionalCompName)
+	otherCsi := snap.NewComponentSideInfo(otherCref, compRev)
+
+	componentsMap := map[string]any{
+		targetCompName: map[string]any{
+			"type": "standard",
+		},
+	}
+
+	var compStates []*sequence.ComponentState
+	compStates = append(compStates, sequence.NewComponentState(csi, snap.StandardComponent))
+
+	var snapYaml string
+
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	s.mockComponentInfos(c, targetSnapName, []string{targetCompName}, []snap.Revision{compRev})
+
+	if targetCompName != optionalCompName {
+		compStates = append(compStates, sequence.NewComponentState(otherCsi, snap.StandardComponent))
+		s.mockComponentInfos(c, targetSnapName, []string{optionalCompName}, []snap.Revision{compRev})
+
+		componentsMap[optionalCompName] = map[string]any{
+			"type": "standard",
+		}
+	}
+
+	snapYamlObj := map[string]any{
+		"name":       targetSnapName,
+		"version":    1,
+		"components": componentsMap,
+	}
+
+	yamlBytes, err := yaml.Marshal(snapYamlObj)
+	c.Assert(err, IsNil)
+	snapYaml = string(yamlBytes)
+
+	snapSt := &snapstate.SnapState{
+		Active: true,
+		Sequence: snapstatetest.NewSequenceFromRevisionSideInfos(
+			[]*sequence.RevisionSideState{
+				sequence.NewRevisionSideState(ssi, compStates)}),
+		Current: snapRev,
+	}
+	compSt := snapSt.CurrentComponentState(cref)
+
+	snaptest.MockSnap(c, snapYaml, ssi)
+	snapstate.Set(s.state, targetSnapName, snapSt)
+
+	// Validation set configuration
+	const enforcedSnapName = "mysnap"
+	const enforcedCompName = "mycomp"
+	const enforcedSnapID = "3wdHCAVyZEmYsCMFDE9qt92UV8rC8Wdk"
+
+	headers := map[string]any{
+		"series":     "16",
+		"account-id": "developer",
+		"name":       "my-set",
+		"sequence":   "1",
+		"timestamp":  time.Now().Format(time.RFC3339),
+		"snaps": []any{
+			map[string]any{
+				"name":     enforcedSnapName,
+				"id":       enforcedSnapID,
+				"presence": string(asserts.PresenceRequired),
+				"components": map[string]any{
+					enforcedCompName: map[string]any{
+						"presence": string(asserts.PresenceRequired),
+					},
+					optionalCompName: map[string]any{
+						"presence": string(asserts.PresenceOptional),
+					},
+				},
+			},
+		},
+	}
+
+	privKey, _ := assertstest.GenerateKey(1024)
+	signingDB := assertstest.NewSigningDB("developer", privKey)
+	assertion, err := signingDB.Sign(asserts.ValidationSetType, headers, nil, "")
+	c.Assert(err, IsNil)
+
+	validSet := assertion.(*asserts.ValidationSet)
+
+	info, err := snap.InfoFromSnapYaml([]byte(snapYaml))
+	c.Assert(err, IsNil)
+	info.SideInfo = *ssi
+
+	snapstate.MockEnforcedValidationSets(func(st *state.State, vs ...*asserts.ValidationSet) (*snapasserts.ValidationSets, error) {
+		vss := snapasserts.NewValidationSets()
+
+		err := vss.Add(validSet)
+		if err != nil {
+			return nil, err
+		}
+
+		return vss, nil
+	})
+
+	_, err = snapstate.RemoveComponentTasks(s.state, snapSt, compSt, info, nil, snapstate.ConflictOptions{})
+
+	if expectedErrorMsg != "" {
+		c.Assert(err, NotNil)
+		c.Assert(err.Error(), Equals, expectedErrorMsg)
+	} else {
+		c.Assert(err, IsNil)
+	}
 }

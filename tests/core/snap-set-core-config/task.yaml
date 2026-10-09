@@ -1,5 +1,12 @@
 summary: Ensure "snap set core" works
 
+details: |
+    Check that through the command `snap set core` the config
+    "service.rsyslog.disable" can be used to enable and disable the
+    systemd rsyslog service. Also verify that work the configs
+    system.power-key-action, ctrl-alt-del-action and
+    proxy.${proto} among others
+
 systems: [ubuntu-core-*]
 
 # TODO: use `snap set system` instead of `snap set core`
@@ -33,6 +40,8 @@ restore: |
     rm -f /etc/systemd/login.conf.d/00-snap-core.conf
     # restore hostname
     hostnamectl set-hostname "$(cat hostname)"
+    rm -f "$HOME"/.ssh/id_rsa*
+    printf "" > /home/ubuntu/.ssh/authorized_keys
 
 execute: |
     echo "Check that service disable works"
@@ -54,11 +63,11 @@ execute: |
 
     echo "Check that ctrl-alt-del-action=none works"
     snap set core system.ctrl-alt-del-action=none
-    systemctl show --property=LoadState ctrl-alt-del.target | MATCH "LoadState=masked"
+    systemctl show --property=LoadState ctrl-alt-del.target | MATCH '^LoadState=masked$'
     echo "Check that ctrl-alt-del-action=reboot works"
     snap set core system.ctrl-alt-del-action=reboot
-    systemctl show --property=UnitFileState ctrl-alt-del.target | MATCH "UnitFileState=disabled"
-    systemctl show --property=LoadState ctrl-alt-del.target | MATCH "LoadState=loaded"
+    systemctl show --property=UnitFileState ctrl-alt-del.target | MATCH '^UnitFileState=disabled$'
+    systemctl show --property=LoadState ctrl-alt-del.target | MATCH '^LoadState=loaded$'
 
     echo "Check that pi config handline works"
     if [ -e /boot/uboot/config.txt ]; then
@@ -70,7 +79,9 @@ execute: |
         MATCH ^#hdmi_mode=1 < /boot/uboot/config.txt
 
         echo "Ensure the config.txt are fully undo when an option is unset"
-        if ! diff -u /boot/uboot/config.txt config.txt.save; then
+        # The diff ignores the line with the hdmi_mode setting, as it is expected
+        # to be changed by the test, but any other change would be unexpected.
+        if ! diff -u -I '^#hdmi_mode=1$' /boot/uboot/config.txt config.txt.save; then
             echo "error: unexpected diff in /boot/uboot/config.txt"
             exit 1
         fi
@@ -131,19 +142,17 @@ execute: |
     sysctl -n kernel.printk|MATCH "^4\s+"
 
     echo "setting the timezone works"
-    tests.cleanup defer timedatectl set-timezone "$(cat /etc/timezone)"
+    tests.cleanup defer timedatectl set-timezone "$("${TESTSLIB}"/get-timezone.sh)"
     snap set system system.timezone=Europe/Malta
-    MATCH "Europe/Malta" < /etc/timezone
     test "$(readlink -f /etc/localtime)" = "/usr/share/zoneinfo/Europe/Malta"
 
     echo "and timezone setting shows up in the document"
     snap get system -d | MATCH "Europe/Malta"
     echo "but the timezone is not stored in the config state"
-    python3 -c 'import json,sys; j=json.loads(sys.stdin.read()); print(j["data"]["config"]);' < /var/lib/snapd/state.json | NOMATCH Europe/Malta
+    gojq -r '.data.config' < /var/lib/snapd/state.json | NOMATCH Europe/Malta
 
     echo "and setting it again in snapd also works"
     snap set system system.timezone=America/Lima
-    MATCH "America/Lima" < /etc/timezone
     test "$(readlink -f /etc/localtime)" = "/usr/share/zoneinfo/America/Lima"
     
     echo "and setting the timezone outside of snapd is reflected by snap get"
@@ -157,3 +166,57 @@ execute: |
     hostname | MATCH foo
     snap set system system.hostname=F00
     hostnamectl status | MATCH F00
+
+    if os.query is-core-lt 24; then
+        echo "on pre-core24 the motd system option is not supported, so setting it should return an error"
+        not snap set system system.motd="Test MOTD" 2>stderr
+        MATCH "cannot set message of the day: unsupported on this system, requires UC24+" < stderr
+    else
+        echo "setting the motd works"
+        snap set system system.motd="Test MOTD"
+        MATCH "Test MOTD" < /etc/motd.d/50-default
+        snap get system system.motd | MATCH "Test MOTD"
+        snap get system -d | MATCH "Test MOTD"
+
+        echo "but the motd is not stored in the config state"
+        gojq -r '.data.config' < /var/lib/snapd/state.json | NOMATCH "Test MOTD"
+
+        echo "setting the motd to empty string resets to the default motd"
+        snap set system system.motd=""
+        not test -e /etc/motd.d/50-default
+        # /usr/lib/motd.d/50-default is readonly, so it should always be there
+        test -e /usr/lib/motd.d/50-default
+
+        echo "unsetting the motd also resets to the default motd"
+        # but first set it to something else to ensure that the unset is actually doing something
+        snap set system system.motd="Another MOTD"
+        snap get system system.motd | MATCH "Another MOTD"
+        MATCH "Another MOTD" < /etc/motd.d/50-default
+        # and now unset it
+        snap unset system system.motd
+        not test -e /etc/motd.d/50-default
+        # /usr/lib/motd.d/50-default is readonly, so it should always be there
+        test -e /usr/lib/motd.d/50-default
+    fi
+
+    echo "configuring ssh access"
+    ssh-keygen -t rsa -N "" -f "$HOME"/.ssh/id_rsa
+    mkdir -p /home/ubuntu/.ssh
+    chmod 700 /home/ubuntu/.ssh
+    cat "$HOME"/.ssh/id_rsa.pub >> /home/ubuntu/.ssh/authorized_keys
+    # If the .ssh directory didn't exist, then the .ssh
+    # directory is now owned by root. Change owner to ubuntu
+    chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+    # For some reason this directory has the wrong user on UC18
+    chown ubuntu:ubuntu /home/ubuntu
+
+    echo "ssh is enabled and works by default"
+    ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no ubuntu@localhost pwd
+    echo "ssh can be disabled"
+    snap set system service.ssh.disable=true
+    not ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no ubuntu@localhost pwd
+    echo "ssh can be re-enabled"
+    # TODO "snap set system service.ssh.disable!" does not seem to remove
+    # the /etc/ssh/sshd_not_to_be_run file
+    snap set system service.ssh.disable=false
+    ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no ubuntu@localhost pwd

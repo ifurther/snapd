@@ -84,6 +84,10 @@ const audioPlaybackConnectedPlugAppArmorCore = `
 owner /run/user/[0-9]*/###SLOT_SECURITY_TAGS###/pulse/ r,
 owner /run/user/[0-9]*/###SLOT_SECURITY_TAGS###/pulse/native rwk,
 owner /run/user/[0-9]*/###SLOT_SECURITY_TAGS###/pulse/pid r,
+# To allow to use pipewire-pulse in system mode, instead of user mode
+owner /var/snap/###SLOT_INSTANCE_NAME###/common/pulse/ r,
+owner /var/snap/###SLOT_INSTANCE_NAME###/common/pulse/native rwk,
+owner /var/snap/###SLOT_INSTANCE_NAME###/common/pulse/pid r,
 `
 
 const audioPlaybackConnectedPlugSecComp = `
@@ -116,9 +120,7 @@ owner /{,var/}run/pulse/** rwk,
 
 owner /run/user/[0-9]*/ r,
 owner /run/user/[0-9]*/pulse/ rw,
-
-# This allows to share screen in Core Desktop
-owner /run/user/[0-9]*/pipewire-[0-9] rwk,
+owner /run/user/[0-9]*/pulse/** rw,
 
 # This allows wireplumber to read the pulseaudio
 # configuration if pipewire runs inside a container
@@ -164,8 +166,11 @@ func (iface *audioPlaybackInterface) AppArmorConnectedPlug(spec *apparmor.Specif
 	}
 	if !implicitSystemConnectedSlot(slot) {
 		old := "###SLOT_SECURITY_TAGS###"
-		new := "snap." + slot.Snap().InstanceName() // forms the snap-instance-specific subdirectory name of /run/user/*/ used for XDG_RUNTIME_DIR
+		new := "snap." + slot.Snap().InstanceName().String() // forms the snap-instance-specific subdirectory name of /run/user/*/ used for XDG_RUNTIME_DIR
 		snippet := strings.Replace(audioPlaybackConnectedPlugAppArmorCore, old, new, -1)
+		old2 := "###SLOT_INSTANCE_NAME###"
+		new2 := slot.Snap().InstanceName().String() // forms the snap-instance-specific subdirectory name of /var/snap/*/common used for SNAP_COMMON
+		snippet = strings.Replace(snippet, old2, new2, -1)
 		spec.AddSnippet(snippet)
 	}
 	return nil
@@ -195,6 +200,12 @@ func (iface *audioPlaybackInterface) SecCompPermanentSlot(spec *seccomp.Specific
 
 func (iface *audioPlaybackInterface) AutoConnect(*snap.PlugInfo, *snap.SlotInfo) bool {
 	return true
+}
+
+func (iface *audioPlaybackInterface) ParallelInstancesSupportedForSlot(_ *snap.SlotInfo) error {
+	// the audio server owns the well-known /run/pulse/native (or per-user
+	// /run/user/*/pulse/native) socket; only one snap instance can hold it.
+	return errParallelInstancesUniqueResourceOwner
 }
 
 func init() {

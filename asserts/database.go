@@ -196,6 +196,10 @@ func IsUnaccceptedUpdate(err error) bool {
 type RODatabase interface {
 	// IsTrustedAccount returns whether the account is part of the trusted set.
 	IsTrustedAccount(accountID string) bool
+	// WithStackedBackstore returns a database view that layers the provided
+	// backstore on top of the current one while preserving read-only access to
+	// existing assertions.
+	WithStackedBackstore(backstore Backstore) *Database
 	// Find an assertion based on arbitrary headers.
 	// Provided headers must contain the primary key for the assertion type.
 	// Optional primary key headers can be omitted in which case
@@ -383,7 +387,7 @@ func (db *Database) PublicKey(keyID string) (PublicKey, error) {
 
 // Sign assembles an assertion with the provided information and signs it
 // with the private key from `headers["authority-id"]` that has the provided key id.
-func (db *Database) Sign(assertType *AssertionType, headers map[string]interface{}, body []byte, keyID string) (Assertion, error) {
+func (db *Database) Sign(assertType *AssertionType, headers map[string]any, body []byte, keyID string) (Assertion, error) {
 	privKey, err := db.safeGetPrivateKey(keyID)
 	if err != nil {
 		return nil, err
@@ -783,8 +787,13 @@ func CheckSignature(assert Assertion, signingKey *AccountKey, roDB RODatabase, c
 		if !ok {
 			return fmt.Errorf("cannot check no-authority assertion type %q", assert.Type().Name)
 		}
-		pubKey = custom.signKey()
+
+		pubKey, err = custom.signKey(roDB)
+		if err != nil {
+			return fmt.Errorf("cannot check no-authority assertion type %q: %w", assert.Type().Name, err)
+		}
 	}
+
 	content, encSig := assert.Signature()
 	signature, err := decodeSignature(encSig)
 	if err != nil {
@@ -825,17 +834,16 @@ func CheckTimestampVsSigningKeyValidity(assert Assertion, signingKey *AccountKey
 	return nil
 }
 
-// A consistencyChecker performs further checks based on the full
-// assertion database knowledge and its own signing key.
-type consistencyChecker interface {
-	checkConsistency(roDB RODatabase, signingKey *AccountKey) error
+// A ConsistencyChecker performs further checks based on the full assertion
+// database knowledge and its own signing key.
+type ConsistencyChecker interface {
+	CheckConsistency(roDB RODatabase, signingKey *AccountKey) error
 }
 
 // CheckCrossConsistency verifies that the assertion is consistent with the other statements in the database.
 func CheckCrossConsistency(assert Assertion, signingKey *AccountKey, roDB RODatabase, checkTimeEarliest, checkTimeLatest time.Time) error {
-	// see if the assertion requires further checks
-	if checker, ok := assert.(consistencyChecker); ok {
-		return checker.checkConsistency(roDB, signingKey)
+	if checker, ok := assert.(ConsistencyChecker); ok {
+		return checker.CheckConsistency(roDB, signingKey)
 	}
 	return nil
 }

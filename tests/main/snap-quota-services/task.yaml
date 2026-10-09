@@ -1,26 +1,25 @@
 summary: Test for per-service quota-related snap functionality.
 
-# memory cgroup is disabled on external devices like rpi3
-backends:
-  - -external
+details: |
+  Check that memory, CPU and journal size quotas can be set for groups with many
+  snap services but that journal size quotas cannot be imposed on groups with a
+  single service. Check that systemd reports the services as belonging to the
+  expected slices.
 
 # these systems do not support journal quota groups due to their old systemd versions.
 # requires systemd v245+
+# memory cgroup is disabled on arm devices like rpi3
 systems:
-  - -amazon-linux-2-*
-  - -centos-7-*
-  - -centos-8-*
   - -ubuntu-14.04-*
   - -ubuntu-16.04-*
   - -ubuntu-18.04-*
   - -ubuntu-core-16-*
   - -ubuntu-core-18-*
+  - -ubuntu-core-*-arm-*
 
 prepare: |
   snap install test-snapd-stressd --edge --devmode
   tests.cleanup defer snap remove --purge test-snapd-stressd
-  snap set system experimental.quota-groups=true
-  tests.cleanup defer snap unset system experimental.quota-groups
 
 execute: |
   # Create the top level snap group with a memory limit. test-snapd-stressd
@@ -70,4 +69,4 @@ execute: |
   systemctl show --property=Slice snap.test-snapd-stressd.stress-sc.service | grep -F "Slice=$SUB_SLICENAME"
 
   echo "Verify that stress-sc service mention the journal namespace"
-  systemctl show --property=LogNamespace snap.test-snapd-stressd.stress-sc.service | MATCH "LogNamespace=snap-test-top"
+  MATCH "Environment=SNAPD_LOG_NAMESPACE=snap-test-top" < /etc/systemd/system/snap.test-snapd-stressd.stress-sc.service

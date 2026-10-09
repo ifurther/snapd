@@ -1,6 +1,10 @@
 summary: smoke test for the retry tool
 
-backends: [google]
+details: |
+    Check the retry tool allows retrying a command. Verify that on
+    failure the exit code from the final attempt is returned
+
+backends: [openstack*]
 
 execute: |
     # Retry runs the command that was passed as argument and returns the exit

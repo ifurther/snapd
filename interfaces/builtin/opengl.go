@@ -48,6 +48,9 @@ const openglConnectedPlugAppArmor = `
 # libdrm data files
 /usr/share/libdrm/amdgpu.ids r,
 
+# The nvidia container toolkit needs to traverse the top level libs directory
+# in order to discover the libraries and generate a CDI config
+/var/lib/snapd/hostfs/{,usr/}lib{,32,64,x32}/{,@{multiarch}/} r,
 # Bi-arch distribution nvidia support
 /var/lib/snapd/hostfs/{,usr/}lib{,32,64,x32}/{,@{multiarch}/}libcuda*.so{,.*} rm,
 /var/lib/snapd/hostfs/{,usr/}lib{,32,64,x32}/{,@{multiarch}/}libnvidia*.so{,.*} rm,
@@ -58,6 +61,8 @@ const openglConnectedPlugAppArmor = `
 /var/lib/snapd/hostfs/{,usr/}lib{,32,64,x32}/{,@{multiarch}/}libGLdispatch.so{,.*} rm,
 /var/lib/snapd/hostfs/{,usr/}lib{,32,64,x32}/{,@{multiarch}/}vdpau/libvdpau_nvidia.so{,.*} rm,
 /var/lib/snapd/hostfs/{,usr/}lib{,32,64,x32}/{,@{multiarch}/}libnv{rm,dc,imp,os}*.so{,.*} rm,
+/var/lib/snapd/hostfs/{,usr/}lib{,32,64,x32}/{,@{multiarch}/}gbm/nvidia-drm_gbm.so{,.*} rm,
+
 # CUDA libs
 /var/lib/snapd/hostfs/{,usr/}lib{,32,64,x32}/{,@{multiarch}/}libnpp{c,ig,ial,icc,idei,ist,if,im,itc}*.so{,.*} rm,
 /var/lib/snapd/hostfs/{,usr/}lib{,32,64,x32}/{,@{multiarch}/}libcublas{,Lt}*.so{,.*} rm,
@@ -88,6 +93,14 @@ const openglConnectedPlugAppArmor = `
 # Main bi-arch GL libraries
 /var/lib/snapd/hostfs/{,usr/}lib{,32,64,x32}/{,@{multiarch}/}{,nvidia*/}lib{OpenGL,GL,GLU,GLESv1_CM,GLESv2,EGL,GLX}.so{,.*} rm,
 
+# GPU libraries exported by a snap. These directories are filled by
+# sc_mount_exported_paths() in mount-support-nvidia.c. See also creation
+# of *.library-source files in *-driver-libs.
+/var/lib/snapd/lib/system/gpu/{,**} rm,
+
+# GPU libraries exported by WSL2
+/usr/lib/wsl/{,**} rm,
+
 # Allow access to all cards since a) this is common on hybrid systems, b) ARM
 # devices commonly have two devices (such as on the Raspberry Pi 4, one for KMS
 # and another that does not) and c) there is nothing saying that /dev/dri/card0
@@ -98,9 +111,15 @@ const openglConnectedPlugAppArmor = `
 # nvidia
 /etc/vdpau_wrapper.cfg r,
 @{PROC}/driver/nvidia/params r,
+@{PROC}/driver/nvidia/gpus/*/information r,
+@{PROC}/driver/nvidia/capabilities/mig/monitor r,
 @{PROC}/modules r,
 /dev/nvidia* rw,
 unix (send, receive) type=dgram peer=(addr="@nvidia[0-9a-f]*"),
+# A socketpair with the NVIDIA DDX is needed for GLX.
+# When Xorg is not confined, then a special-case object delegation allows this automatically.
+# When Xorg is confined, object delegation is not implemented yet and we need a rule on our side to allow this.
+unix (send, receive) type=stream peer=(label="Xorg"),
 # driver profiles
 /usr/share/nvidia/ r,
 /usr/share/nvidia/** r,
@@ -183,6 +202,22 @@ unix (bind,listen) type=seqpacket addr="@cuda-uvmfd-[0-9a-f]*",
 # From https://bugs.launchpad.net/snapd/+bug/1862832
 /run/nvidia-xdriver-* rw,
 unix (send, receive) type=dgram peer=(addr="@var/run/nvidia-xdriver-*"),
+
+/dev/nvgpu/igpu[0-9]*/power rw,
+/dev/nvgpu/igpu[0-9]*/ctrl rw,
+/dev/nvgpu/igpu[0-9]*/prof rw,
+/dev/host1x-fence rw,
+
+# Kernel Fusion Driver for AMD GPUs
+/dev/kfd rw,
+/sys/module/amdgpu/initstate r,
+/sys/devices/virtual/kfd/kfd/dev r,
+/sys/devices/virtual/kfd/kfd/uevent r,
+/sys/devices/virtual/kfd/kfd/topology/{,generation_id,system_properties} r,
+/sys/devices/virtual/kfd/kfd/topology/nodes/[0-9]*/{,gpu_id,properties,io_links/[0-9]*/properties,caches/[0-9]*/properties,mem_banks/[0-9]*/properties} r,
+
+# DCGM keeps GPU driver initialized and handles client communication for persistence mode
+/run/nvidia-persistenced/socket rw,
 `
 
 type openglInterface struct {
@@ -206,53 +241,93 @@ var openglConnectedPlugUDev = []string{
 	`KERNEL=="mali[0-9]*"`,
 	`KERNEL=="dma_buf_te"`,
 	`KERNEL=="galcore"`,
+
+	//iGPU device nodes
+	`SUBSYSTEM=="nvidia-gpu-v2-power" KERNEL=="power"`,
+	`SUBSYSTEM=="nvidia-gpu-v2" KERNEL=="ctrl"`,
+	`SUBSYSTEM=="nvidia-gpu-v2" KERNEL=="prof"`,
+
+	// Nvidia dma barrier
+	`SUBSYSTEM=="host1x-fence"`,
+
+	// Kernel Fusion Driver
+	`SUBSYSTEM=="kfd", KERNEL=="kfd"`,
 }
 
-// Those two are the same, but in theory they are separate and can move (or
-// could move) dependently. The first path is as seen on the initial mount
-// namespace of the host. The second path is as seen inside the per-snap mount
-// namespace.
+// The paths in the host namespace and the mount namespace are the same,
+// but in theory they are separate and can move (or could move) independently.
+// The first path is as seen on the initial mount namespace of the host.
+// The second path is as seen inside the per-snap mount namespace.
 const (
 	nvProfilesDirInHostNs  = "/usr/share/nvidia"
 	nvProfilesDirInMountNs = "/usr/share/nvidia"
+	wslDirInHostNs         = "/usr/lib/wsl"
+	wslDirInMountNs        = "/usr/lib/wsl"
 )
 
 func (iface *openglInterface) AppArmorConnectedPlug(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	spec.AddSnippet(openglConnectedPlugAppArmor)
 
-	// Allow mounting the Nvidia driver profiles directory
+	// Allow bind mounting the Nvidia driver profiles directory
 	hostNvProfilesDir := filepath.Join(dirs.GlobalRootDir, nvProfilesDirInHostNs)
-	if !osutil.IsDirectory(hostNvProfilesDir) {
-		return nil
-	}
+	if osutil.IsDirectory(hostNvProfilesDir) {
 
-	spec.AddUpdateNSf(`	# Read-only access to Nvidia driver profiles in %[2]s
+		spec.AddUpdateNSf(`	# Read-only access to Nvidia driver profiles in %[2]s
 	mount options=(bind) /var/lib/snapd/hostfs%[1]s/ -> %[2]s/,
 	remount options=(bind, ro) %[2]s/,
 	umount %[2]s/,
 `, hostNvProfilesDir, nvProfilesDirInMountNs)
 
-	apparmor.GenWritableProfile(
-		spec.AddUpdateNSf,
-		nvProfilesDirInMountNs,
-		3,
-	)
+		apparmor.GenWritableProfile(
+			spec.AddUpdateNSf,
+			nvProfilesDirInMountNs,
+			3,
+		)
+	}
+
+	// Allow recursively bind mounting the wsl directory
+	hostWslDir := filepath.Join(dirs.GlobalRootDir, wslDirInHostNs)
+	if osutil.IsDirectory(hostWslDir) {
+		spec.AddUpdateNSf(`	# Access to WSL libs in %[2]s
+	mount options=(rbind) /var/lib/snapd/hostfs%[1]s/ -> %[2]s/,
+	umount %[2]s/,
+`, hostWslDir, wslDirInMountNs)
+
+		apparmor.GenWritableProfile(
+			spec.AddUpdateNSf,
+			wslDirInMountNs,
+			3,
+		)
+	}
 
 	return nil
 }
 
 func (iface *openglInterface) MountConnectedPlug(spec *mount.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
-	// Do nothing if this doesn't exist on the host
+
+	// Bind mount the nvidia driver profiles directory
 	hostNvProfilesDir := filepath.Join(dirs.GlobalRootDir, nvProfilesDirInHostNs)
-	if !osutil.IsDirectory(hostNvProfilesDir) {
-		return nil
+	if osutil.IsDirectory(hostNvProfilesDir) {
+		spec.AddMountEntry(osutil.MountEntry{
+			Name:    filepath.Join("/var/lib/snapd/hostfs", hostNvProfilesDir),
+			Dir:     nvProfilesDirInMountNs,
+			Options: []string{"bind", "ro"},
+		})
 	}
 
-	spec.AddMountEntry(osutil.MountEntry{
-		Name:    filepath.Join("/var/lib/snapd/hostfs", hostNvProfilesDir),
-		Dir:     nvProfilesDirInMountNs,
-		Options: []string{"bind", "ro"},
-	})
+	/*
+		A recursive bind mount is required here because the wsl directory itself contains additional mounts.
+		The `ro` option can not be specified along with the `rbind` option, and is therefore omitted.
+		AppArmor should limit the directory to read-only, but AppArmor is not currently active on wsl2.
+	*/
+	hostWslDir := filepath.Join(dirs.GlobalRootDir, wslDirInHostNs)
+	if osutil.IsDirectory(hostWslDir) {
+		spec.AddMountEntry(osutil.MountEntry{
+			Name:    filepath.Join("/var/lib/snapd/hostfs", hostWslDir),
+			Dir:     wslDirInMountNs,
+			Options: []string{"rbind"},
+		})
+	}
 
 	return nil
 }
@@ -260,12 +335,13 @@ func (iface *openglInterface) MountConnectedPlug(spec *mount.Specification, plug
 func init() {
 	registerIface(&openglInterface{
 		commonInterface: commonInterface{
-			name:                 "opengl",
-			summary:              openglSummary,
-			implicitOnCore:       true,
-			implicitOnClassic:    true,
-			baseDeclarationSlots: openglBaseDeclarationSlots,
-			connectedPlugUDev:    openglConnectedPlugUDev,
+			name:                     "opengl",
+			summary:                  openglSummary,
+			implicitOnCore:           true,
+			implicitOnClassic:        true,
+			baseDeclarationSlots:     openglBaseDeclarationSlots,
+			connectedPlugUDev:        openglConnectedPlugUDev,
+			parallelInstancesSlotErr: errParallelInstancesSystemSlot,
 		},
 	})
 }

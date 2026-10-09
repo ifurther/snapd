@@ -130,7 +130,7 @@ func (iface *unity8PimCommonInterface) DBusPermanentSlot(spec *dbus.Specificatio
 
 func (iface *unity8PimCommonInterface) AppArmorConnectedPlug(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	old := "###SLOT_SECURITY_TAGS###"
-	new := spec.SnapAppSet().SlotLabelExpression(slot)
+	new := slot.LabelExpression()
 
 	originalSnippet := unity8PimCommonConnectedPlugAppArmor + "\n" + iface.connectedPlugAppArmor
 	spec.AddSnippet(strings.Replace(originalSnippet, old, new, -1))
@@ -152,7 +152,7 @@ func (iface *unity8PimCommonInterface) AppArmorPermanentSlot(spec *apparmor.Spec
 
 func (iface *unity8PimCommonInterface) AppArmorConnectedSlot(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	old := "###PLUG_SECURITY_TAGS###"
-	new := spec.SnapAppSet().PlugLabelExpression(plug)
+	new := plug.LabelExpression()
 	snippet := unity8PimCommonConnectedSlotAppArmor
 	snippet += "\n" + iface.connectedSlotAppArmor
 	snippet = strings.Replace(snippet, old, new, -1)
@@ -163,6 +163,13 @@ func (iface *unity8PimCommonInterface) AppArmorConnectedSlot(spec *apparmor.Spec
 func (iface *unity8PimCommonInterface) SecCompPermanentSlot(spec *seccomp.Specification, slot *snap.SlotInfo) error {
 	spec.AddSnippet(unity8PimCommonPermanentSlotSecComp)
 	return nil
+}
+
+func (iface *unity8PimCommonInterface) ParallelInstancesSupportedForSlot(_ *snap.SlotInfo) error {
+	// the EDS service owns a well-known bus name on the session bus (e.g.
+	// org.gnome.evolution.dataserver.Sources5 plus a per-service name like
+	// Calendar7/AddressBook9); only one snap instance can hold it at a time.
+	return errParallelInstancesUniqueResourceOwner
 }
 
 func (iface *unity8PimCommonInterface) AutoConnect(*snap.PlugInfo, *snap.SlotInfo) bool {

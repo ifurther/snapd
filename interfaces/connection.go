@@ -37,28 +37,58 @@ type Connection struct {
 // ConnectedPlug represents a plug that is connected to a slot.
 type ConnectedPlug struct {
 	plugInfo     *snap.PlugInfo
-	staticAttrs  map[string]interface{}
-	dynamicAttrs map[string]interface{}
+	appSet       *SnapAppSet
+	staticAttrs  map[string]any
+	dynamicAttrs map[string]any
+}
+
+// LabelExpression returns the label expression for the given plug. It is
+// constructed from the apps and hooks that are associated with the plug.
+func (plug *ConnectedPlug) LabelExpression() string {
+	return labelExpr(plug)
 }
 
 // ConnectedSlot represents a slot that is connected to a plug.
 type ConnectedSlot struct {
 	slotInfo     *snap.SlotInfo
-	staticAttrs  map[string]interface{}
-	dynamicAttrs map[string]interface{}
+	appSet       *SnapAppSet
+	staticAttrs  map[string]any
+	dynamicAttrs map[string]any
+}
+
+// AppSet return the app set that this slot is associated with.
+func (slot *ConnectedSlot) AppSet() *SnapAppSet {
+	return slot.appSet
+}
+
+// Runnables returns a list of all runnables that should be connected to the
+// given slot.
+func (slot *ConnectedSlot) Runnables() []snap.Runnable {
+	apps := slot.appSet.info.AppsForSlot(slot.slotInfo)
+	hooks := slot.appSet.info.HooksForSlot(slot.slotInfo)
+
+	// TODO: if components ever get slots, they will need to be considered here
+
+	return appAndHookRunnables(apps, hooks)
+}
+
+// LabelExpression returns the label expression for the given slot. It is
+// constructed from the apps and hooks that are associated with the slot.
+func (slot *ConnectedSlot) LabelExpression() string {
+	return labelExpr(slot)
 }
 
 // Attrer is an interface with Attr getter method common
 // to ConnectedSlot, ConnectedPlug, PlugInfo and SlotInfo types.
 type Attrer interface {
 	// Attr returns attribute value for given path, or an error. Dotted paths are supported.
-	Attr(path string, value interface{}) error
+	Attr(path string, value any) error
 	// Lookup returns attribute value for given path, or false. Dotted paths are supported.
-	Lookup(path string) (value interface{}, ok bool)
+	Lookup(path string) (value any, ok bool)
 }
 
-func lookupAttr(staticAttrs map[string]interface{}, dynamicAttrs map[string]interface{}, path string) (interface{}, bool) {
-	var v interface{}
+func lookupAttr(staticAttrs map[string]any, dynamicAttrs map[string]any, path string) (any, bool) {
+	var v any
 	comps := strings.FieldsFunc(path, func(r rune) bool { return r == '.' })
 	if len(comps) == 0 {
 		return nil, false
@@ -70,7 +100,7 @@ func lookupAttr(staticAttrs map[string]interface{}, dynamicAttrs map[string]inte
 	}
 
 	for _, comp := range comps {
-		m, ok := v.(map[string]interface{})
+		m, ok := v.(map[string]any)
 		if !ok {
 			return nil, false
 		}
@@ -83,7 +113,7 @@ func lookupAttr(staticAttrs map[string]interface{}, dynamicAttrs map[string]inte
 	return v, true
 }
 
-func getAttribute(snapName string, ifaceName string, staticAttrs map[string]interface{}, dynamicAttrs map[string]interface{}, path string, val interface{}) error {
+func getAttribute(snapName string, ifaceName string, staticAttrs map[string]any, dynamicAttrs map[string]any, path string, val any) error {
 	v, ok := lookupAttr(staticAttrs, dynamicAttrs, path)
 	if !ok {
 		err := fmt.Errorf("snap %q does not have attribute %q for interface %q", snapName, path, ifaceName)
@@ -94,8 +124,12 @@ func getAttribute(snapName string, ifaceName string, staticAttrs map[string]inte
 }
 
 // NewConnectedSlot creates an object representing a connected slot.
-func NewConnectedSlot(slot *snap.SlotInfo, staticAttrs, dynamicAttrs map[string]interface{}) *ConnectedSlot {
-	var static map[string]interface{}
+func NewConnectedSlot(slot *snap.SlotInfo, appSet *SnapAppSet, staticAttrs, dynamicAttrs map[string]any) *ConnectedSlot {
+	if slot.Snap.InstanceName() != appSet.Info().InstanceName() {
+		panic(fmt.Sprintf("internal error: slot must be from the same snap as the app set: %s != %s", slot.Snap.InstanceName(), appSet.Info().InstanceName()))
+	}
+
+	var static map[string]any
 	if staticAttrs != nil {
 		static = staticAttrs
 	} else {
@@ -103,14 +137,19 @@ func NewConnectedSlot(slot *snap.SlotInfo, staticAttrs, dynamicAttrs map[string]
 	}
 	return &ConnectedSlot{
 		slotInfo:     slot,
+		appSet:       appSet,
 		staticAttrs:  utils.CopyAttributes(static),
-		dynamicAttrs: utils.NormalizeInterfaceAttributes(dynamicAttrs).(map[string]interface{}),
+		dynamicAttrs: utils.NormalizeInterfaceAttributes(dynamicAttrs).(map[string]any),
 	}
 }
 
 // NewConnectedPlug creates an object representing a connected plug.
-func NewConnectedPlug(plug *snap.PlugInfo, staticAttrs, dynamicAttrs map[string]interface{}) *ConnectedPlug {
-	var static map[string]interface{}
+func NewConnectedPlug(plug *snap.PlugInfo, appSet *SnapAppSet, staticAttrs, dynamicAttrs map[string]any) *ConnectedPlug {
+	if plug.Snap.InstanceName() != appSet.Info().InstanceName() {
+		panic(fmt.Sprintf("internal error: plug must be from the same snap as the app set: %s != %s", plug.Snap.InstanceName(), appSet.Info().InstanceName()))
+	}
+
+	var static map[string]any
 	if staticAttrs != nil {
 		static = staticAttrs
 	} else {
@@ -118,8 +157,9 @@ func NewConnectedPlug(plug *snap.PlugInfo, staticAttrs, dynamicAttrs map[string]
 	}
 	return &ConnectedPlug{
 		plugInfo:     plug,
+		appSet:       appSet,
 		staticAttrs:  utils.CopyAttributes(static),
-		dynamicAttrs: utils.NormalizeInterfaceAttributes(dynamicAttrs).(map[string]interface{}),
+		dynamicAttrs: utils.NormalizeInterfaceAttributes(dynamicAttrs).(map[string]any),
 	}
 }
 
@@ -138,44 +178,69 @@ func (plug *ConnectedPlug) Snap() *snap.Info {
 	return plug.plugInfo.Snap
 }
 
-// Apps returns all the apps associated with this plug.
-func (plug *ConnectedPlug) Apps() map[string]*snap.AppInfo {
-	return plug.plugInfo.Apps
+// AppSet return the app set that this plug is associated with.
+func (plug *ConnectedPlug) AppSet() *SnapAppSet {
+	return plug.appSet
+}
+
+// Runnables returns a list of all runnables that should be connected to the
+// given plug.
+func (plug *ConnectedPlug) Runnables() []snap.Runnable {
+	apps := plug.appSet.info.AppsForPlug(plug.plugInfo)
+	hooks := plug.appSet.info.HooksForPlug(plug.plugInfo)
+	for _, component := range plug.appSet.components {
+		hooks = append(hooks, component.HooksForPlug(plug.plugInfo)...)
+	}
+
+	return appAndHookRunnables(apps, hooks)
+}
+
+func appAndHookRunnables(apps []*snap.AppInfo, hooks []*snap.HookInfo) []snap.Runnable {
+	runnables := make([]snap.Runnable, 0, len(apps)+len(hooks))
+	for _, app := range apps {
+		runnables = append(runnables, app.Runnable())
+	}
+
+	for _, hook := range hooks {
+		runnables = append(runnables, hook.Runnable())
+	}
+
+	return runnables
 }
 
 // StaticAttr returns a static attribute with the given key, or error if attribute doesn't exist.
-func (plug *ConnectedPlug) StaticAttr(key string, val interface{}) error {
-	return getAttribute(plug.Snap().InstanceName(), plug.Interface(), plug.staticAttrs, nil, key, val)
+func (plug *ConnectedPlug) StaticAttr(key string, val any) error {
+	return getAttribute(plug.Snap().InstanceName().String(), plug.Interface(), plug.staticAttrs, nil, key, val)
 }
 
 // StaticAttrs returns all static attributes.
-func (plug *ConnectedPlug) StaticAttrs() map[string]interface{} {
+func (plug *ConnectedPlug) StaticAttrs() map[string]any {
 	return utils.CopyAttributes(plug.staticAttrs)
 }
 
 // DynamicAttrs returns all dynamic attributes.
-func (plug *ConnectedPlug) DynamicAttrs() map[string]interface{} {
+func (plug *ConnectedPlug) DynamicAttrs() map[string]any {
 	return utils.CopyAttributes(plug.dynamicAttrs)
 }
 
 // Attr returns a dynamic attribute with the given name. It falls back to returning static
 // attribute if dynamic one doesn't exist. Error is returned if neither dynamic nor static
 // attribute exist.
-func (plug *ConnectedPlug) Attr(key string, val interface{}) error {
-	return getAttribute(plug.Snap().InstanceName(), plug.Interface(), plug.staticAttrs, plug.dynamicAttrs, key, val)
+func (plug *ConnectedPlug) Attr(key string, val any) error {
+	return getAttribute(plug.Snap().InstanceName().String(), plug.Interface(), plug.staticAttrs, plug.dynamicAttrs, key, val)
 }
 
-func (plug *ConnectedPlug) Lookup(path string) (interface{}, bool) {
+func (plug *ConnectedPlug) Lookup(path string) (any, bool) {
 	return lookupAttr(plug.staticAttrs, plug.dynamicAttrs, path)
 }
 
 // SetAttr sets the given dynamic attribute. Error is returned if the key is already used by a static attribute.
-func (plug *ConnectedPlug) SetAttr(key string, value interface{}) error {
+func (plug *ConnectedPlug) SetAttr(key string, value any) error {
 	if _, ok := plug.staticAttrs[key]; ok {
 		return fmt.Errorf("cannot change attribute %q as it was statically specified in the snap details", key)
 	}
 	if plug.dynamicAttrs == nil {
-		plug.dynamicAttrs = make(map[string]interface{})
+		plug.dynamicAttrs = make(map[string]any)
 	}
 	plug.dynamicAttrs[key] = utils.NormalizeInterfaceAttributes(value)
 	return nil
@@ -207,38 +272,38 @@ func (slot *ConnectedSlot) Apps() map[string]*snap.AppInfo {
 }
 
 // StaticAttr returns a static attribute with the given key, or error if attribute doesn't exist.
-func (slot *ConnectedSlot) StaticAttr(key string, val interface{}) error {
-	return getAttribute(slot.Snap().InstanceName(), slot.Interface(), slot.staticAttrs, nil, key, val)
+func (slot *ConnectedSlot) StaticAttr(key string, val any) error {
+	return getAttribute(slot.Snap().InstanceName().String(), slot.Interface(), slot.staticAttrs, nil, key, val)
 }
 
 // StaticAttrs returns all static attributes.
-func (slot *ConnectedSlot) StaticAttrs() map[string]interface{} {
+func (slot *ConnectedSlot) StaticAttrs() map[string]any {
 	return utils.CopyAttributes(slot.staticAttrs)
 }
 
 // DynamicAttrs returns all dynamic attributes.
-func (slot *ConnectedSlot) DynamicAttrs() map[string]interface{} {
+func (slot *ConnectedSlot) DynamicAttrs() map[string]any {
 	return utils.CopyAttributes(slot.dynamicAttrs)
 }
 
 // Attr returns a dynamic attribute with the given name. It falls back to returning static
 // attribute if dynamic one doesn't exist. Error is returned if neither dynamic nor static
 // attribute exist.
-func (slot *ConnectedSlot) Attr(key string, val interface{}) error {
-	return getAttribute(slot.Snap().InstanceName(), slot.Interface(), slot.staticAttrs, slot.dynamicAttrs, key, val)
+func (slot *ConnectedSlot) Attr(key string, val any) error {
+	return getAttribute(slot.Snap().InstanceName().String(), slot.Interface(), slot.staticAttrs, slot.dynamicAttrs, key, val)
 }
 
-func (slot *ConnectedSlot) Lookup(path string) (interface{}, bool) {
+func (slot *ConnectedSlot) Lookup(path string) (any, bool) {
 	return lookupAttr(slot.staticAttrs, slot.dynamicAttrs, path)
 }
 
 // SetAttr sets the given dynamic attribute. Error is returned if the key is already used by a static attribute.
-func (slot *ConnectedSlot) SetAttr(key string, value interface{}) error {
+func (slot *ConnectedSlot) SetAttr(key string, value any) error {
 	if _, ok := slot.staticAttrs[key]; ok {
 		return fmt.Errorf("cannot change attribute %q as it was statically specified in the snap details", key)
 	}
 	if slot.dynamicAttrs == nil {
-		slot.dynamicAttrs = make(map[string]interface{})
+		slot.dynamicAttrs = make(map[string]any)
 	}
 	slot.dynamicAttrs[key] = utils.NormalizeInterfaceAttributes(value)
 	return nil

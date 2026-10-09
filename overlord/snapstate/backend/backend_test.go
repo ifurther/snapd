@@ -71,7 +71,7 @@ apps:
 	c.Assert(err, IsNil)
 
 	c.Assert(snapf, FitsTypeOf, &squashfs.Snap{})
-	c.Check(info.InstanceName(), Equals, "hello")
+	c.Check(info.InstanceName().String(), Equals, "hello")
 }
 
 func (s *backendSuite) TestOpenSnapFilebSideInfo(c *C) {
@@ -92,7 +92,7 @@ slots:
 	c.Assert(err, IsNil)
 
 	// check side info
-	c.Check(info.InstanceName(), Equals, "blessed")
+	c.Check(info.InstanceName().String(), Equals, "blessed")
 	c.Check(info.Revision, Equals, snap.R(42))
 
 	c.Check(info.SideInfo, DeepEquals, si)
@@ -108,12 +108,12 @@ slots:
 
 func (s *backendSuite) TestOpenComponentFile(c *C) {
 	const componentYaml = `component: snap+comp
-type: test
+type: standard
 version: 33
 `
 
 	compPath := snaptest.MakeTestComponent(c, componentYaml)
-	compInfo, cont, err := backend.OpenComponentFile(compPath, nil)
+	compInfo, cont, err := backend.OpenComponentFile(compPath, nil, nil)
 	c.Assert(err, IsNil)
 
 	c.Assert(cont, FitsTypeOf, &squashfs.Snap{})

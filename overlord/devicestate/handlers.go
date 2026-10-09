@@ -21,13 +21,12 @@ package devicestate
 import (
 	"errors"
 	"fmt"
-	"os/exec"
 	"time"
 
 	"gopkg.in/tomb.v2"
 
+	"github.com/snapcore/snapd/boot"
 	"github.com/snapcore/snapd/interfaces"
-	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/overlord/restart"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
@@ -37,11 +36,6 @@ func (m *DeviceManager) doMarkPreseeded(t *state.Task, _ *tomb.Tomb) error {
 	st := t.State()
 	st.Lock()
 	defer st.Unlock()
-
-	snaps, err := snapstate.All(st)
-	if err != nil {
-		return err
-	}
 
 	systemKey, err := interfaces.RecordedSystemKey()
 	if err != nil {
@@ -61,17 +55,9 @@ func (m *DeviceManager) doMarkPreseeded(t *state.Task, _ *tomb.Tomb) error {
 		if !preseeded {
 			preseeded = true
 			t.Set("preseeded", preseeded)
-			// unmount all snaps
-			// TODO: move to snapstate.UnmountAllSnaps.
-			for _, snapSt := range snaps {
-				info, err := snapSt.CurrentInfo()
-				if err != nil {
-					return err
-				}
-				logger.Debugf("unmounting snap %s at %s", info.InstanceName(), info.MountDir())
-				if _, err := exec.Command("umount", "-d", "-l", info.MountDir()).CombinedOutput(); err != nil {
-					return err
-				}
+
+			if err := snapstate.UnmountAllSnaps(st); err != nil {
+				return err
 			}
 
 			st.Set("preseeded", preseeded)
@@ -80,7 +66,7 @@ func (m *DeviceManager) doMarkPreseeded(t *state.Task, _ *tomb.Tomb) error {
 
 			// do not mark this task done as this makes it racy against taskrunner tear down (the next task
 			// could start). Let this task finish after snapd restart when preseed mode is off.
-			restart.Request(st, restart.StopDaemon, nil)
+			restart.Request(st, restart.StopDaemon, nil, "")
 		}
 
 		return &state.Retry{Reason: "mark-preseeded will be marked done when snapd is executed in normal mode"}
@@ -109,6 +95,8 @@ type seededSystem struct {
 	Timestamp time.Time `json:"timestamp"`
 	// SeedTime holds the timestamp when the system was seeded
 	SeedTime time.Time `json:"seed-time"`
+	// SeedRefresh indicates whether this seed was created by seed-refresh mode.
+	SeedRefresh bool `json:"seed-refresh,omitempty"`
 }
 
 func (s *seededSystem) sameAs(other *seededSystem) bool {
@@ -139,6 +127,52 @@ func (m *DeviceManager) recordSeededSystem(st *state.State, whatSeeded *seededSy
 	return nil
 }
 
+// dropSeededSystemIf removes matching entries from seeded-systems.
+func dropSeededSystemIf(st *state.State, pred func(sys seededSystem) bool) error {
+	var seeded []seededSystem
+	if err := st.Get("seeded-systems", &seeded); err != nil {
+		if errors.Is(err, state.ErrNoState) {
+			return nil
+		}
+		return err
+	}
+
+	filtered := make([]seededSystem, 0, len(seeded))
+	for _, sys := range seeded {
+		if pred(sys) {
+			continue
+		}
+		filtered = append(filtered, sys)
+	}
+
+	if len(filtered) == len(seeded) {
+		return nil
+	}
+
+	st.Set("seeded-systems", filtered)
+	return nil
+}
+
+// dropSeededSystemIfSeedRefresh removes an older seed-refresh entry from
+// seeded-systems after its recovery system has been deleted.
+func dropSeededSystemIfSeedRefresh(st *state.State, systemLabel string) error {
+	return dropSeededSystemIf(st, func(sys seededSystem) bool {
+		return sys.System == systemLabel && sys.SeedRefresh
+	})
+}
+
+// dropExactSeededSystem removes dropped from the list of seeded-systems in the
+// state. This function requires an exact match between the systems, since it is
+// intended to be used to undo an update to the seeded-systems slice.
+func dropExactSeededSystem(st *state.State, dropped seededSystem) error {
+	return dropSeededSystemIf(st, func(sys seededSystem) bool {
+		return sys.sameAs(&dropped) &&
+			sys.Timestamp.Equal(dropped.Timestamp) &&
+			sys.SeedTime.Equal(dropped.SeedTime) &&
+			sys.SeedRefresh == dropped.SeedRefresh
+	})
+}
+
 func (m *DeviceManager) doMarkSeeded(t *state.Task, _ *tomb.Tomb) error {
 	st := t.State()
 	st.Lock()
@@ -154,8 +188,7 @@ func (m *DeviceManager) doMarkSeeded(t *state.Task, _ *tomb.Tomb) error {
 	}
 
 	if deviceCtx.HasModeenv() && deviceCtx.RunMode() {
-		// XXX make this a boot method
-		modeEnv, err := maybeReadModeenv()
+		modeEnv, err := boot.MaybeReadModeenv()
 		if err != nil {
 			return err
 		}

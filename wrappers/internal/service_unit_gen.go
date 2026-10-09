@@ -27,6 +27,7 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/interfaces"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/snap"
@@ -56,7 +57,7 @@ func serviceStopTimeout(app *snap.AppInfo) time.Duration {
 	if tout == 0 {
 		tout = timeout.DefaultTimeout
 	}
-	return time.Duration(tout)
+	return ensureMinSystemdDuration(app, tout, "stop-timeout")
 }
 
 func generateServiceNames(snap *snap.Info, appNames []string) []string {
@@ -68,6 +69,17 @@ func generateServiceNames(snap *snap.Info, appNames []string) []string {
 		}
 	}
 	return names
+}
+
+func ensureMinSystemdDuration(app *snap.AppInfo, in timeout.Timeout, field string) time.Duration {
+	// If 0, the field is not included in the unit, and the default systemd value is used
+	inDur := time.Duration(in)
+	if inDur > 0 && inDur < time.Microsecond {
+		// TODO maybe this should be a snapd warning to it is more noticeable
+		logger.Noticef("Warning: %s in service %s from snap %s set to 1us as it cannot be smaller than that", field, app.Name, app.Snap.SnapName())
+		return time.Microsecond
+	}
+	return inDur
 }
 
 func GenerateSnapServiceUnitFile(appInfo *snap.AppInfo, opts *SnapServicesUnitOptions) ([]byte, error) {
@@ -92,6 +104,7 @@ func GenerateSnapServiceUnitFile(appInfo *snap.AppInfo, opts *SnapServicesUnitOp
 	// value, but for some directives, systemd combines their values into a
 	// list.
 	ifaceServiceSnippets := &strutil.OrderedSet{}
+	ifaceUnitSnippets := &strutil.OrderedSet{}
 
 	for _, plug := range appInfo.Plugs {
 		iface, err := interfaces.ByName(plug.Interface)
@@ -103,20 +116,28 @@ func GenerateSnapServiceUnitFile(appInfo *snap.AppInfo, opts *SnapServicesUnitOp
 			return nil, fmt.Errorf("error processing plugs while generating service unit for %v: %v", appInfo.SecurityTag(), err)
 		}
 		for _, snip := range snips {
-			ifaceServiceSnippets.Put(snip)
+			switch snip.SystemdConfSection() {
+			case interfaces.PlugServicesSnippetUnitSection:
+				ifaceUnitSnippets.Put(snip.String())
+			case interfaces.PlugServicesSnippetServiceSection:
+				ifaceServiceSnippets.Put(snip.String())
+			default:
+				return nil, fmt.Errorf("internal error: unknown plug service snippet section %q", snip.SystemdConfSection())
+			}
 		}
 	}
 
 	// join the service snippets into one string to be included in the
 	// template
 	ifaceSpecifiedServiceSnippet := strings.Join(ifaceServiceSnippets.Items(), "\n")
+	ifaceSpecifiedUnitSnippet := strings.Join(ifaceUnitSnippets.Items(), "\n")
 
 	serviceTemplate := `[Unit]
 # Auto-generated, DO NOT EDIT
 Description=Service for snap application {{.App.Snap.InstanceName}}.{{.App.Name}}
-{{- if .MountUnit }}
-Requires={{.MountUnit}}
-{{- end }}
+{{- if .Requires}}
+Requires={{ stringsJoin .Requires " " }}
+{{- end}}
 {{- if .PrerequisiteTarget}}
 Wants={{.PrerequisiteTarget}}
 {{- end}}
@@ -130,15 +151,24 @@ Before={{ stringsJoin .Before " "}}
 Wants={{ stringsJoin .CoreMountedSnapdSnapDep " "}}
 After={{ stringsJoin .CoreMountedSnapdSnapDep " "}}
 {{- end}}
+{{- if .InterfaceUnitSnippets}}
+{{.InterfaceUnitSnippets}}
+{{- end}}
 X-Snappy=yes
 
 [Service]
 EnvironmentFile=-/etc/environment
+{{- if .LogNamespace}}
+Environment=SNAPD_LOG_NAMESPACE={{.LogNamespace}}
+{{- end}}
 ExecStart={{.App.LauncherCommand}}
 SyslogIdentifier={{.App.Snap.InstanceName}}.{{.App.Name}}
 Restart={{.Restart}}
 {{- if .App.RestartDelay}}
-RestartSec={{.App.RestartDelay.Seconds}}
+RestartSec={{.RestartDelay}}
+{{- end}}
+{{- if .SuccessExitStatus}}
+SuccessExitStatus={{ stringsJoin .SuccessExitStatus " " }}
 {{- end}}
 WorkingDirectory={{.WorkingDir}}
 {{- if .App.StopCommand}}
@@ -151,10 +181,10 @@ ExecReload={{.App.LauncherReloadCommand}}
 ExecStopPost={{.App.LauncherPostStopCommand}}
 {{- end}}
 {{- if .StopTimeout}}
-TimeoutStopSec={{.StopTimeout.Seconds}}
+TimeoutStopSec={{.StopTimeout}}
 {{- end}}
 {{- if .StartTimeout}}
-TimeoutStartSec={{.StartTimeout.Seconds}}
+TimeoutStartSec={{.StartTimeout}}
 {{- end}}
 Type={{.App.Daemon}}
 {{- if .Remain}}
@@ -164,7 +194,7 @@ RemainAfterExit={{.Remain}}
 BusName={{.BusName}}
 {{- end}}
 {{- if .App.WatchdogTimeout}}
-WatchdogSec={{.App.WatchdogTimeout.Seconds}}
+WatchdogSec={{.WatchdogTimeout}}
 {{- end}}
 {{- if .KillMode}}
 KillMode={{.KillMode}}
@@ -180,9 +210,6 @@ OOMScoreAdjust={{.OOMAdjustScore}}
 {{- end}}
 {{- if .SliceUnit}}
 Slice={{.SliceUnit}}
-{{- end}}
-{{- if .LogNamespace}}
-LogNamespace={{.LogNamespace}}
 {{- end}}
 {{- if not (or .App.Sockets .App.Timer .App.ActivatesOn) }}
 
@@ -244,6 +271,8 @@ WantedBy={{.ServicesTarget}}
 		WorkingDir               string
 		StopTimeout              time.Duration
 		StartTimeout             time.Duration
+		RestartDelay             time.Duration
+		WatchdogTimeout          time.Duration
 		ServicesTarget           string
 		PrerequisiteTarget       string
 		MountUnit                string
@@ -252,9 +281,12 @@ WantedBy={{.ServicesTarget}}
 		KillSignal               string
 		OOMAdjustScore           int
 		BusName                  string
+		SuccessExitStatus        []string
 		Before                   []string
 		After                    []string
+		Requires                 []string
 		InterfaceServiceSnippets string
+		InterfaceUnitSnippets    string
 		SliceUnit                string
 		LogNamespace             string
 
@@ -266,15 +298,26 @@ WantedBy={{.ServicesTarget}}
 		App: appInfo,
 
 		InterfaceServiceSnippets: ifaceSpecifiedServiceSnippet,
+		InterfaceUnitSnippets:    ifaceSpecifiedUnitSnippet,
+		Restart:                  restartCond,
 
-		Restart:        restartCond,
-		StopTimeout:    serviceStopTimeout(appInfo),
-		StartTimeout:   time.Duration(appInfo.StartTimeout),
-		Remain:         remain,
-		KillMode:       killMode,
-		KillSignal:     appInfo.StopMode.KillSignal(),
-		OOMAdjustScore: oomAdjustScore,
-		BusName:        busName,
+		// When converting a Duration to a string, Golang produces units "ns",
+		// "µs", "ms", "s", "m", and "h". These are understood by systemd (see
+		// systemd.time(7)). However, nanoseconds are not permitted for these 4
+		// properties, as they must be at least 1µs, so we ensure that minimum
+		// duration. We do not error out as snapd allowed to write units with such
+		// times in the past (systemd ignores such values).
+		StopTimeout:     serviceStopTimeout(appInfo),
+		StartTimeout:    ensureMinSystemdDuration(appInfo, appInfo.StartTimeout, "start-timeout"),
+		RestartDelay:    ensureMinSystemdDuration(appInfo, appInfo.RestartDelay, "restart-delay"),
+		WatchdogTimeout: ensureMinSystemdDuration(appInfo, appInfo.WatchdogTimeout, "watchdog-timeout"),
+
+		Remain:            remain,
+		KillMode:          killMode,
+		KillSignal:        appInfo.StopMode.KillSignal(),
+		OOMAdjustScore:    oomAdjustScore,
+		BusName:           busName,
+		SuccessExitStatus: appInfo.SuccessExitStatus,
 
 		Before: generateServiceNames(appInfo.Snap, appInfo.Before),
 		After:  generateServiceNames(appInfo.Snap, appInfo.After),
@@ -286,8 +329,9 @@ WantedBy={{.ServicesTarget}}
 	case snap.SystemDaemon:
 		wrapperData.ServicesTarget = systemd.ServicesTarget
 		wrapperData.PrerequisiteTarget = systemd.PrerequisiteTarget
-		wrapperData.MountUnit = filepath.Base(systemd.MountUnitPath(appInfo.Snap.MountDir()))
-		wrapperData.WorkingDir = appInfo.Snap.DataDir()
+		wrapperData.MountUnit = filepath.Base(systemd.MountUnitPath(dirs.StripRootDir(appInfo.Snap.MountDir())))
+		wrapperData.Requires = append(wrapperData.Requires, wrapperData.MountUnit)
+		wrapperData.WorkingDir = dirs.StripRootDir(appInfo.Snap.DataDir())
 		wrapperData.After = append(wrapperData.After, "snapd.apparmor.service")
 	case snap.UserDaemon:
 		wrapperData.ServicesTarget = systemd.UserServicesTarget
@@ -303,6 +347,8 @@ WantedBy={{.ServicesTarget}}
 		wrapperData.SliceUnit = opts.QuotaGroup.SliceFileName()
 		if opts.QuotaGroup.JournalQuotaSet() {
 			wrapperData.LogNamespace = opts.QuotaGroup.JournalNamespaceName()
+			wrapperData.Requires = append([]string{opts.QuotaGroup.JournalSocketName()}, wrapperData.Requires...)
+			wrapperData.After = append([]string{opts.QuotaGroup.JournalSocketName()}, wrapperData.After...)
 		}
 	}
 

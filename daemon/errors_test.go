@@ -120,9 +120,12 @@ func (e fakeNetError) Timeout() bool   { return e.timeout }
 func (e fakeNetError) Temporary() bool { return e.temporary }
 
 func (s *errorsSuite) TestErrToResponse(c *C) {
-	aie := &snap.AlreadyInstalledError{Snap: "foo"}
+	aieSnap := snap.NewAlreadyInstalledSnapsError([]string{"foo"})
+	aieSnaps := snap.NewAlreadyInstalledSnapsError([]string{"foo", "bar"})
+	aieComps := snap.NewAlreadyInstalledComponentsError("foo", []string{"comp1", "comp2"})
+	aieSnapsComps := snap.NewAlreadyInstalledError([]string{"foo", "bar"}, map[string][]string{"foo": {"comp1", "comp2"}})
 	nie := &snap.NotInstalledError{Snap: "foo"}
-	cce := &snapstate.ChangeConflictError{Snap: "foo"}
+	scce := &snapstate.ChangeConflictError{Snap: "foo"}
 	ndme := &snapstate.SnapNeedsDevModeError{Snap: "foo"}
 	nc := &snapstate.SnapNotClassicError{Snap: "foo"}
 	nce := &snapstate.SnapNeedsClassicError{Snap: "foo"}
@@ -142,7 +145,7 @@ func (s *errorsSuite) TestErrToResponse(c *C) {
 	// this one can't happen (but fun to test):
 	saXe := &store.SnapActionError{Refresh: map[string]error{"foo": sa1e}}
 
-	makeErrorRsp := func(kind client.ErrorKind, err error, value interface{}) *daemon.APIError {
+	makeErrorRsp := func(kind client.ErrorKind, err error, value any) *daemon.APIError {
 		return &daemon.APIError{
 			Status:  400,
 			Message: err.Error(),
@@ -159,13 +162,16 @@ func (s *errorsSuite) TestErrToResponse(c *C) {
 		{store.ErrSnapNotFound, daemon.SnapNotFound("foo", store.ErrSnapNotFound), false},
 		{store.ErrNoUpdateAvailable, makeErrorRsp(client.ErrorKindSnapNoUpdateAvailable, store.ErrNoUpdateAvailable, ""), false},
 		{store.ErrLocalSnap, makeErrorRsp(client.ErrorKindSnapLocal, store.ErrLocalSnap, ""), false},
-		{aie, makeErrorRsp(client.ErrorKindSnapAlreadyInstalled, aie, "foo"), false},
+		{aieSnap, daemon.AlreadyInstalled(aieSnap), false},
+		{aieSnaps, daemon.AlreadyInstalled(aieSnaps), false},
+		{aieComps, daemon.AlreadyInstalled(aieComps), false},
+		{aieSnapsComps, daemon.AlreadyInstalled(aieSnapsComps), false},
 		{nie, daemon.SnapNotInstalled("foo", nie), false},
 		{ndme, makeErrorRsp(client.ErrorKindSnapNeedsDevMode, ndme, "foo"), false},
 		{nc, makeErrorRsp(client.ErrorKindSnapNotClassic, nc, "foo"), false},
 		{nce, makeErrorRsp(client.ErrorKindSnapNeedsClassic, nce, "foo"), false},
 		{ncse, makeErrorRsp(client.ErrorKindSnapNeedsClassicSystem, ncse, "foo"), false},
-		{cce, daemon.SnapChangeConflict(cce), false},
+		{scce, daemon.SnapChangeConflict(scce), false},
 		{nettoute, makeErrorRsp(client.ErrorKindNetworkTimeout, nettoute, ""), false},
 		{netoe, daemon.BadRequest("ERR: %v", netoe), false},
 		{nettmpe, daemon.BadRequest("ERR: %v", nettmpe), false},
@@ -235,7 +241,7 @@ func (s *errorsSuite) TestErrToResponseInsufficentSpace(c *C) {
 		Status:  507,
 		Message: "specific error msg",
 		Kind:    client.ErrorKindInsufficientDiskSpace,
-		Value: map[string]interface{}{
+		Value: map[string]any{
 			"snap-names":  []string{"foo", "bar"},
 			"change-kind": "some-change",
 		},

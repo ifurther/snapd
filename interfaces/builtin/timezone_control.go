@@ -88,6 +88,9 @@ dbus (receive)
 # command.
 /usr/bin/timedatectl{,.real} ixr,
 
+# timedatectl needs to bind the client side of the socket
+unix (bind) type=stream addr="@*/bus/timedatectl*/system",
+
 # Silence this noisy denial. systemd utilities look at /proc/1/environ to see
 # if running in a container, but they will fallback gracefully. No other
 # interfaces allow this denial, so no problems with silencing it for now. Note
@@ -96,13 +99,22 @@ dbus (receive)
 deny @{PROC}/1/environ r,
 `
 
+const timezoneControlConnectedPlugSecComp = `
+# Description: Can manage timezones directly separate from config ubuntu-core.
+
+# timedatectl needs to bind the client side of the socket
+bind
+`
+
 func init() {
 	registerIface(&commonInterface{
-		name:                  "timezone-control",
-		summary:               timezoneControlSummary,
-		implicitOnCore:        true,
-		implicitOnClassic:     true,
-		baseDeclarationSlots:  timezoneControlBaseDeclarationSlots,
-		connectedPlugAppArmor: timezoneControlConnectedPlugAppArmor,
+		name:                     "timezone-control",
+		summary:                  timezoneControlSummary,
+		implicitOnCore:           true,
+		implicitOnClassic:        true,
+		baseDeclarationSlots:     timezoneControlBaseDeclarationSlots,
+		connectedPlugAppArmor:    timezoneControlConnectedPlugAppArmor,
+		connectedPlugSecComp:     timezoneControlConnectedPlugSecComp,
+		parallelInstancesSlotErr: errParallelInstancesSystemSlot,
 	})
 }

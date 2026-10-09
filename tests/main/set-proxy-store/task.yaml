@@ -1,5 +1,10 @@
 summary: Check that the setting proxy.store config works
 
+details: |
+    Check that through the proxy.store config it is possible to
+    point snapd to a different store. Also verify that it is allowed
+    to point to the main store.
+
 # ubuntu-14.04: systemd-run not supported
 systems: [-ubuntu-core-*, -ubuntu-14.04*]
 
@@ -8,12 +13,12 @@ environment:
     SNAP_VERSION_PATTERN: \d+\.\d+\+fake1
     BLOB_DIR: $(pwd)/fake-store-blobdir
 
-prepare: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
+skip:
+    - reason: This test needs test keys to be trusted
+      if: |
+        [ "$TRUST_TEST_KEYS" = "false" ]
 
+prepare: |
     echo "Given a snap is installed"
     snap install "$SNAP_NAME"
 
@@ -39,10 +44,6 @@ prepare: |
     "$TESTSTOOLS"/store-state init-fake-refreshes "$BLOB_DIR" "$SNAP_NAME"
 
 restore: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
     systemctl start snapd.socket
 
     snap set core proxy.store=
@@ -50,20 +51,15 @@ restore: |
     "$TESTSTOOLS"/store-state teardown-fake-store "$BLOB_DIR"
 
 execute: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
-
     echo "Configure to use the fakestore through store assertion and proxy.store"
     snap set core proxy.store=fake
 
     systemctl stop snapd snapd.socket
 
-    jq '.data.auth.device."session-macaroon"' /var/lib/snapd/state.json|MATCH null
+    gojq '.data.auth.device."session-macaroon"' /var/lib/snapd/state.json|MATCH null
 
     # XXX the fakestore currently does not support faking session creation
-    jq '.data.auth.device."session-macaroon"="fake-session"' /var/lib/snapd/state.json > /var/lib/snapd/state.json.new
+    gojq '.data.auth.device."session-macaroon"="fake-session"' /var/lib/snapd/state.json > /var/lib/snapd/state.json.new
     mv /var/lib/snapd/state.json.new /var/lib/snapd/state.json
     systemctl start snapd.socket
 
@@ -76,14 +72,14 @@ execute: |
     snap refresh --list | not grep -Pzq "$expected"
 
     echo "Ensure changing the proxy.store will clear out the session-macaroon"
-    jq '.data.auth.device."session-macaroon"' /var/lib/snapd/state.json|NOMATCH  fake-session
+    gojq '.data.auth.device."session-macaroon"' /var/lib/snapd/state.json|NOMATCH  fake-session
 
     echo "Configure back to use fakestore"
     snap set core proxy.store=fake
 
     # XXX the fakestore currently does not support faking session creation
     systemctl stop snapd snapd.socket
-    jq '.data.auth.device."session-macaroon"="fake-session"' /var/lib/snapd/state.json > /var/lib/snapd/state.json.new
+    gojq '.data.auth.device."session-macaroon"="fake-session"' /var/lib/snapd/state.json > /var/lib/snapd/state.json.new
     mv /var/lib/snapd/state.json.new /var/lib/snapd/state.json
     systemctl start snapd.socket
 

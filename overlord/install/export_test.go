@@ -23,12 +23,34 @@ import (
 	"time"
 
 	"github.com/snapcore/snapd/asserts"
+	"github.com/snapcore/snapd/boot"
+	"github.com/snapcore/snapd/bootloader"
+	"github.com/snapcore/snapd/secboot"
 	"github.com/snapcore/snapd/sysconfig"
+	"github.com/snapcore/snapd/testutil"
 )
 
 var (
-	CheckFDEFeatures = checkFDEFeatures
+	EncryptionAvailabilityCheck             = encryptionAvailabilityCheck
+	OrderedCurrentBootImages                = orderedCurrentBootImages
+	OrderedCurrentBootImagesHybrid          = orderedCurrentBootImagesHybrid
+	CheckFDEFeatures                        = checkFDEFeatures
+	PreinstallCheckSupportedWithEnvFallback = preinstallCheckSupportedWithEnvFallback
+
+	UbuntuISOBootMode = ubuntuISOBootMode
+	RunBootMode       = runBootMode
+	EphemeralBootMode = ephemeralBootMode
 )
+
+type BootMode = bootMode
+
+func MockPreinstallCheckTimeout(tm time.Duration) (restore func()) {
+	old := preinstallCheckTimeout
+	preinstallCheckTimeout = tm
+	return func() {
+		preinstallCheckTimeout = old
+	}
+}
 
 func MockTimeNow(f func() time.Time) (restore func()) {
 	old := timeNow
@@ -44,4 +66,34 @@ func MockSysconfigConfigureTargetSystem(f func(mod *asserts.Model, opts *sysconf
 	return func() {
 		sysconfigConfigureTargetSystem = old
 	}
+}
+
+func MockBootUseTokens(f func(model *asserts.Model) bool) (restore func()) {
+	old := bootUseTokens
+	bootUseTokens = f
+	return func() {
+		bootUseTokens = old
+	}
+}
+
+func MockSecbootFDEOpteeTAPresent(fn func() bool) (restore func()) {
+	restore = testutil.Backup(&secbootFDEOpteeTAPresent)
+	secbootFDEOpteeTAPresent = fn
+	return restore
+}
+
+func MockSecbootLoadCheckResult(f func(filename string) (*secboot.PreinstallCheckResult, error)) (restore func()) {
+	return testutil.Mock(&secbootLoadCheckResult, f)
+}
+
+func MockBootMaybeReadModeenv(f func() (*boot.Modeenv, error)) (restore func()) {
+	return testutil.Mock(&bootMaybeReadModeenv, f)
+}
+
+func MockBootReadModeenv(f func(rootdir string) (*boot.Modeenv, error)) (restore func()) {
+	return testutil.Mock(&bootReadModeenv, f)
+}
+
+func MockBootGetRunBootChain(f func(*boot.Modeenv) ([]bootloader.BootFile, error)) (restore func()) {
+	return testutil.Mock(&bootGetRunBootChain, f)
 }

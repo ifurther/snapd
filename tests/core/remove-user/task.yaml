@@ -1,5 +1,11 @@
 summary: Ensure remove-user functionality
 
+details: |
+    Check the command `snap remove-user` works properly. Verify that
+    it fails when run as non-root user without sudo and works when run
+    as non-root user with sudo. Also Verify the root user cannot be
+    removed.
+
 systems: [ubuntu-core-*]
 
 environment:
@@ -7,28 +13,20 @@ environment:
     USER_EMAIL: mvo@ubuntu.com
     USER_NAME: mvo
 
-prepare: |
-    # Note: make this test work with the user already created in the device
-    if [ "$(snap managed)" = "true" ]; then
-        # Leave a file indicating the device was initially managed
-        touch managed.device
+skip:
+    - reason: This device is initially managed
+      if: |
+        # Note: make this test work with the user already created in the device
+        [ "$(snap managed)" = "true" ]
 
-        exit 0
-    fi
+prepare: |
     snap create-user --sudoer "$USER_EMAIL"
 
 restore: |
-    if [ -e managed.device ]; then
-        exit 0
-    fi
     userdel --extrausers -r "$USER_NAME" || true
     rm -rf "/etc/sudoers.d/create-user-$USER_NAME"
 
 execute: |
-    if [ -e managed.device ]; then
-        exit 0
-    fi
-
     echo "precondition check: user in passwd"
     id "$USER_NAME"
     echo "precondition check: has sudoer file"
@@ -45,6 +43,7 @@ execute: |
 
     echo "snap remove-user needs root and snap login is not enough"
     if [ -n "$SPREAD_STORE_USER" ] && [ -n "$SPREAD_STORE_PASSWORD" ]; then
+        snap install expect --devmode
         echo "Checking successful login"
         expect -d -f "$TESTSLIB"/successful_login.exp
 
@@ -53,6 +52,8 @@ execute: |
             echo "remove-user command should have failed"
         fi
         [ "$obtained" = "$expected" ]
+
+        snap logout
     fi
 
     echo "snap remove-user succeeds when run as non-root user with sudo"

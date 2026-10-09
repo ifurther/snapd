@@ -24,6 +24,7 @@ import (
 
 	"github.com/snapcore/snapd/interfaces"
 	"github.com/snapcore/snapd/interfaces/udev"
+	"github.com/snapcore/snapd/systemd"
 )
 
 const u2fDevicesSummary = `allows access to u2f devices`
@@ -42,6 +43,16 @@ type u2fDevice struct {
 
 // https://github.com/Yubico/libu2f-host/blob/master/70-u2f.rules
 var u2fDevices = []u2fDevice{
+	{
+		Name:             "Authentrend ATKey",
+		VendorIDPattern:  "31bb",
+		ProductIDPattern: "0620|0621|0622|0625|0635|0711|0713",
+	},
+	{
+		Name:             "Tokey 3 FIDO",
+		VendorIDPattern:  "0d7a",
+		ProductIDPattern: "0200",
+	},
 	{
 		Name:             "Yubico YubiKey",
 		VendorIDPattern:  "1050",
@@ -95,7 +106,7 @@ var u2fDevices = []u2fDevice{
 	{
 		Name:             "Thetis Key",
 		VendorIDPattern:  "1ea8",
-		ProductIDPattern: "f025",
+		ProductIDPattern: "f025|f825|fc26|f829",
 	},
 	{
 		Name:             "Nitrokey FIDO U2F",
@@ -111,6 +122,11 @@ var u2fDevices = []u2fDevice{
 		Name:             "Nitrokey 3",
 		VendorIDPattern:  "20a0",
 		ProductIDPattern: "42b2",
+	},
+	{
+		Name:             "Nitrokey Passkey",
+		VendorIDPattern:  "20a0",
+		ProductIDPattern: "42f3",
 	},
 	{
 		Name:             "Google Titan U2F",
@@ -168,9 +184,9 @@ var u2fDevices = []u2fDevice{
 		ProductIDPattern: "0e90",
 	},
 	{
-		Name:             "Token2 FIDO2 key",
+		Name:             "Token2 FIDO2 Security Keys",
 		VendorIDPattern:  "349e",
-		ProductIDPattern: "0010|0011|0012|0020|0021|0022|0200|0201|0202",
+		ProductIDPattern: "0010|0011|0012|0013|0014|0015|0016|0020|0021|0022|0023|0024|0025|0026|0200|0201|0202|0203|0204|0205|0206",
 	},
 	{
 		Name:             "Swissbit iShield Key",
@@ -188,9 +204,34 @@ var u2fDevices = []u2fDevice{
 		ProductIDPattern: "8055",
 	},
 	{
-		Name:             "TrustKey TrustKey G310H",
+		Name:             "Kensington VeriMark DT Fingerprint Key",
+		VendorIDPattern:  "047d",
+		ProductIDPattern: "00f2",
+	},
+	{
+		Name:             "TrustKeys FIDO2 U2F",
 		VendorIDPattern:  "311f",
-		ProductIDPattern: "4a2a",
+		ProductIDPattern: "4a2a|a6e9",
+	},
+	{
+		Name:             "OneSpan DIGIPASS FX Series",
+		VendorIDPattern:  "1a44",
+		ProductIDPattern: "1501|1502|1503|1506|1507|1508|1509|150a|150b",
+	},
+	{
+		Name:             "Arculus AuthentiKey",
+		VendorIDPattern:  "3752",
+		ProductIDPattern: "0001",
+	},
+	{
+		Name:             "Cano Key",
+		VendorIDPattern:  "20a0",
+		ProductIDPattern: "42d4",
+	},
+	{
+		Name:             "Gemalto eToken Fusion",
+		VendorIDPattern:  "08e6",
+		ProductIDPattern: "34d2",
 	},
 }
 
@@ -198,7 +239,7 @@ const u2fDevicesConnectedPlugAppArmor = `
 # Description: Allow write access to u2f hidraw devices.
 
 # Use a glob rule and rely on device cgroup for mediation.
-/dev/hidraw* rw,
+/dev/hidraw* rwk,
 
 # char 234-254 are used for dynamic assignment, which u2f devices are
 /run/udev/data/c23[4-9]:* r,
@@ -217,19 +258,28 @@ type u2fDevicesInterface struct {
 }
 
 func (iface *u2fDevicesInterface) UDevConnectedPlug(spec *udev.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
-	for _, d := range u2fDevices {
-		spec.TagDevice(fmt.Sprintf("# %s\nSUBSYSTEM==\"hidraw\", KERNEL==\"hidraw*\", ATTRS{idVendor}==\"%s\", ATTRS{idProduct}==\"%s\"", d.Name, d.VendorIDPattern, d.ProductIDPattern))
+
+	if err := systemd.EnsureAtLeast(244); err != nil {
+		if !systemd.IsSystemdTooOld(err) {
+			return err
+		}
+		for _, d := range u2fDevices {
+			spec.TagDevice(fmt.Sprintf("# %s\nSUBSYSTEM==\"hidraw\", KERNEL==\"hidraw*\", ATTRS{idVendor}==\"%s\", ATTRS{idProduct}==\"%s\"", d.Name, d.VendorIDPattern, d.ProductIDPattern))
+		}
+	} else {
+		spec.TagDevice(fmt.Sprintf("SUBSYSTEM==\"hidraw\", KERNEL==\"hidraw*\", ENV{ID_SECURITY_TOKEN}==\"1\""))
 	}
 	return nil
 }
 
 func init() {
 	registerIface(&u2fDevicesInterface{commonInterface{
-		name:                  "u2f-devices",
-		summary:               u2fDevicesSummary,
-		implicitOnCore:        true,
-		implicitOnClassic:     true,
-		baseDeclarationSlots:  u2fDevicesBaseDeclarationSlots,
-		connectedPlugAppArmor: u2fDevicesConnectedPlugAppArmor,
+		name:                     "u2f-devices",
+		summary:                  u2fDevicesSummary,
+		implicitOnCore:           true,
+		implicitOnClassic:        true,
+		baseDeclarationSlots:     u2fDevicesBaseDeclarationSlots,
+		connectedPlugAppArmor:    u2fDevicesConnectedPlugAppArmor,
+		parallelInstancesSlotErr: errParallelInstancesSystemSlot,
 	}})
 }

@@ -20,6 +20,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/snapcore/snapd/cmd/snaplock"
@@ -79,7 +80,8 @@ func (upCtx *CommonProfileUpdateContext) Lock() (func(), error) {
 	// introduce a symlink that would cause us to mount something other
 	// than what we expected).
 	logger.Debugf("freezing processes of snap %q", instanceName)
-	if err := cgroup.FreezeSnapProcesses(instanceName); err != nil {
+	// TODO: Ideally we should use signal.NotifyContext
+	if err := cgroup.FreezeSnapProcesses(context.TODO(), instanceName); err != nil {
 		// If we cannot freeze the processes we should drop the lock.
 		lock.Close()
 		return nil, err
@@ -114,12 +116,4 @@ func (upCtx *CommonProfileUpdateContext) LoadCurrentProfile() (*osutil.MountProf
 		return nil, fmt.Errorf("cannot load current mount profile of snap %q: %s", upCtx.instanceName, err)
 	}
 	return profile, nil
-}
-
-// SaveCurrentProfile saves the current mount profile.
-func (upCtx *CommonProfileUpdateContext) SaveCurrentProfile(profile *osutil.MountProfile) error {
-	if err := profile.Save(upCtx.currentProfilePath); err != nil {
-		return fmt.Errorf("cannot save current mount profile of snap %q: %s", upCtx.instanceName, err)
-	}
-	return nil
 }

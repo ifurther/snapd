@@ -29,11 +29,14 @@ import (
 	"github.com/snapcore/snapd/osutil"
 )
 
-type groupFindGidOwningSuite struct{}
+type fshelpersSuite struct{}
 
-var _ = Suite(&groupFindGidOwningSuite{})
+var _ = Suite(&fshelpersSuite{})
 
-func (s *groupFindGidOwningSuite) TestSelfOwnedFile(c *C) {
+func (s *fshelpersSuite) TestSelfOwnedFile(c *C) {
+	if os.Geteuid() == 0 {
+		c.Skip("this test cannot run as root (files created by root are owned by root)")
+	}
 	name := filepath.Join(c.MkDir(), "testownedfile")
 	err := os.WriteFile(name, nil, 0644)
 	c.Assert(err, IsNil)
@@ -46,7 +49,7 @@ func (s *groupFindGidOwningSuite) TestSelfOwnedFile(c *C) {
 	c.Check(strconv.FormatUint(gid, 10), Equals, self.Gid)
 }
 
-func (s *groupFindGidOwningSuite) TestNoOwnedFile(c *C) {
+func (s *fshelpersSuite) TestNoOwnedFile(c *C) {
 	_, err := osutil.FindGidOwning("/tmp/filedoesnotexistbutwhy")
 	c.Assert(err, DeepEquals, os.ErrNotExist)
 }

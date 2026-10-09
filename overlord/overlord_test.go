@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2016-2022 Canonical Ltd
+ * Copyright (C) 2016-2026 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -28,6 +28,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -37,6 +38,7 @@ import (
 
 	"github.com/snapcore/snapd/boot"
 	"github.com/snapcore/snapd/dirs"
+	"github.com/snapcore/snapd/dirs/dirstest"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/overlord"
 	"github.com/snapcore/snapd/overlord/devicestate/devicestatetest"
@@ -47,6 +49,7 @@ import (
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/snapstate/snapstatetest"
 	"github.com/snapcore/snapd/overlord/state"
+	"github.com/snapcore/snapd/release"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/snapdenv"
 	"github.com/snapcore/snapd/snapdtool"
@@ -90,6 +93,7 @@ func (ovs *overlordSuite) SetUpTest(c *C) {
 	}
 
 	tmpdir := c.MkDir()
+	dirstest.MustMockCanonicalSnapMountDir(tmpdir)
 	dirs.SetRootDir(tmpdir)
 	ovs.AddCleanup(func() { dirs.SetRootDir("") })
 	ovs.AddCleanup(osutil.MockMountInfo(""))
@@ -122,8 +126,13 @@ func (ovs *overlordSuite) TestNew(c *C) {
 	c.Check(o.InterfaceManager(), NotNil)
 	c.Check(o.HookManager(), NotNil)
 	c.Check(o.DeviceManager(), NotNil)
+	c.Check(o.ClusterManager(), NotNil)
 	c.Check(o.CommandManager(), NotNil)
 	c.Check(o.SnapshotManager(), NotNil)
+	c.Check(o.FDEManager(), NotNil)
+	c.Check(o.ConfdbManager(), NotNil)
+	c.Check(o.DeviceMgmtManager(), NotNil)
+	c.Check(o.CertManager(), NotNil)
 	c.Check(configstateInitCalled, Equals, true)
 
 	o.InterfaceManager().DisableUDevMonitor()
@@ -146,10 +155,12 @@ func (ovs *overlordSuite) TestNew(c *C) {
 	// store is setup
 	sto := snapstate.Store(s, nil)
 	c.Check(sto, FitsTypeOf, &store.Store{})
-	c.Check(sto.(*store.Store).CacheDownloads(), Equals, 5)
+	c.Check(sto.(*store.Store).CachePolicy(), Equals, store.DefaultCachePolicyClassic)
 }
 
-func (ovs *overlordSuite) TestNewStore(c *C) {
+func (ovs *overlordSuite) TestNewStoreClassic(c *C) {
+	restore := release.MockOnClassic(true)
+	defer restore()
 	// this is a shallow test, the deep testing happens in the
 	// remodeling tests in managers_test.go
 	o, err := overlord.New(nil)
@@ -159,7 +170,27 @@ func (ovs *overlordSuite) TestNewStore(c *C) {
 
 	sto := o.NewStore(devBE)
 	c.Check(sto, FitsTypeOf, &store.Store{})
-	c.Check(sto.(*store.Store).CacheDownloads(), Equals, 5)
+	// we're using a classic system specific policy
+	pol := sto.(*store.Store).CachePolicy()
+	c.Check(pol, Equals, store.DefaultCachePolicyClassic)
+	c.Check(pol.MaxSizeBytes, Equals, uint64(0))
+}
+
+func (ovs *overlordSuite) TestNewStoreCore(c *C) {
+	restore := release.MockOnClassic(false)
+	defer restore()
+	o, err := overlord.New(nil)
+	c.Assert(err, IsNil)
+
+	devBE := o.DeviceManager().StoreContextBackend()
+
+	sto := o.NewStore(devBE)
+	c.Check(sto, FitsTypeOf, &store.Store{})
+	// we're using a core system specific policy
+	pol := sto.(*store.Store).CachePolicy()
+	c.Check(pol, Equals, store.DefaultCachePolicyCore)
+	// the size limit is set to 1GB
+	c.Check(pol.MaxSizeBytes, Equals, uint64(1*1024*1024*1024))
 }
 
 func (ovs *overlordSuite) TestNewWithGoodState(c *C) {
@@ -177,7 +208,7 @@ func (ovs *overlordSuite) TestNewWithGoodState(c *C) {
 		"last-task-id": 0,
 		"last-lane-id": 0,
 		"last-notice-id": 0
-	}`, patch.Level, patch.Sublevel, snapdtool.Version))
+	}`, patch.Level, patch.Sublevel, snapdtool.FullVersion()))
 	err := os.WriteFile(dirs.SnapStateFile, fakeState, 0600)
 	c.Assert(err, IsNil)
 
@@ -193,13 +224,25 @@ func (ovs *overlordSuite) TestNewWithGoodState(c *C) {
 	d, err := state.MarshalJSON()
 	c.Assert(err, IsNil)
 
-	var got, expected map[string]interface{}
+	var got, expected map[string]any
 	err = json.Unmarshal(d, &got)
 	c.Assert(err, IsNil)
 	err = json.Unmarshal(fakeState, &expected)
 	c.Assert(err, IsNil)
 
-	data, _ := got["data"].(map[string]interface{})
+	if runtime.Version() < "go1.24" {
+		// Go versions prior to 1.24 do not recognize "omitzero", and since a
+		// zero time.Time is not technically empty, it is not omitted by
+		// "omitempty". We expect a zero-valued "last-notice-timestamp", so it
+		// should be "0001-01-01T00:00:00Z" on go versions prior to 1.24.
+		lastTS, ok := got["last-notice-timestamp"]
+		c.Check(ok, Equals, true)
+		c.Check(lastTS, Equals, "0001-01-01T00:00:00Z")
+		// Delete the field so the DeepEquals check can succeed
+		delete(got, "last-notice-timestamp")
+	}
+
+	data, _ := got["data"].(map[string]any)
 	c.Assert(data, NotNil)
 
 	c.Check(got, DeepEquals, expected)
@@ -337,6 +380,34 @@ func (ovs *overlordSuite) TestTrivialRunAndStop(c *C) {
 
 	err = o.Stop()
 	c.Assert(err, IsNil)
+}
+
+func (ovs *overlordSuite) TestNewAndStop(c *C) {
+	o, err := overlord.New(nil)
+	c.Assert(err, IsNil)
+	errCh := make(chan error)
+	go func() {
+		errCh <- o.Stop()
+	}()
+	c.Assert(<-errCh, IsNil)
+}
+
+func (ovs *overlordSuite) TestRacingLoopAndStop(c *C) {
+	o, err := overlord.New(nil)
+	c.Assert(err, IsNil)
+
+	markSeeded(o)
+	// make sure we don't try to talk to the store
+	snapstate.CanAutoRefresh = nil
+
+	go func() {
+		o.Loop()
+	}()
+	errCh := make(chan error)
+	go func() {
+		errCh <- o.Stop()
+	}()
+	c.Assert(<-errCh, IsNil)
 }
 
 func (ovs *overlordSuite) TestUnknownTasks(c *C) {
@@ -1145,7 +1216,7 @@ func (ovs *overlordSuite) TestRequestRestartNoHandler(c *C) {
 	st.Lock()
 	defer st.Unlock()
 
-	restart.Request(st, restart.RestartDaemon, nil)
+	restart.Request(st, restart.RestartDaemon, nil, "")
 }
 
 type testRestartHandler struct {
@@ -1154,7 +1225,7 @@ type testRestartHandler struct {
 	rebootVerifiedErr error
 }
 
-func (rb *testRestartHandler) HandleRestart(t restart.RestartType, ri *boot.RebootInfo) {
+func (rb *testRestartHandler) HandleRestart(t restart.RestartType, ri *boot.RebootInfo, _ restart.RestartReason) {
 	rb.restartRequested = t
 }
 
@@ -1178,7 +1249,7 @@ func (ovs *overlordSuite) TestRequestRestartHandler(c *C) {
 	st.Lock()
 	defer st.Unlock()
 
-	restart.Request(st, restart.RestartDaemon, nil)
+	restart.Request(st, restart.RestartDaemon, nil, "")
 
 	c.Check(rb.restartRequested, Equals, restart.RestartDaemon)
 }
@@ -1383,4 +1454,39 @@ func (ovs *overlordSuite) TestLockWithTimeoutFailed(c *C) {
 	c.Check(notifyCalls, DeepEquals, []string{
 		"EXTEND_TIMEOUT_USEC=5000",
 	})
+}
+
+func (ovs *overlordSuite) TestAllStateManagersHaveEnsureLoggingTest(c *C) {
+	entries, err := os.ReadDir(".")
+	c.Assert(err, IsNil)
+
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasSuffix(entry.Name(), "state") {
+			continue
+		}
+		prefix := strings.TrimSuffix(entry.Name(), "state")
+		mgrPath := filepath.Join(entry.Name(), prefix+"mgr.go")
+		if !osutil.FileExists(mgrPath) {
+			continue
+		}
+
+		candidates := []string{
+			filepath.Join(entry.Name(), entry.Name()+"_test.go"),
+			filepath.Join(entry.Name(), prefix+"mgr_test.go"),
+		}
+
+		containsEnsureChecks := false
+		for _, testPath := range candidates {
+			if !osutil.FileExists(testPath) {
+				continue
+			}
+			content, err := os.ReadFile(testPath)
+			c.Assert(err, IsNil)
+			if strings.Contains(string(content), fmt.Sprintf(`swfeatstest.CheckEnsureLoopLogging("%s`, prefix+"mgr.go")) {
+				containsEnsureChecks = true
+				break
+			}
+		}
+		c.Assert(containsEnsureChecks, Equals, true, Commentf("None of %s calls swfeatstest.CheckEnsureLoopLogging on the file containing %s's Ensure() method", strings.Join(candidates, ", "), entry.Name()))
+	}
 }

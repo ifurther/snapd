@@ -1,19 +1,25 @@
 summary: Verify that we are able to request specific revisions of snaps from the store through prepare-image 
 
+details: |
+    The `snap prepare-image` command performs some of the steps necessary for
+    creating device images.
+
+    This test verifies that the prepare-image command prepares properly an
+    ubuntu-core 16 image when specific revisions of snaps are used. Check that
+    the expected revisions set in the seed.manifest are retrieve and the
+    generated manifest in the working directory contains correct content.
+
 # autopkgtest run only a subset of tests that deals with the integration
 # with the distro
 backends: [-autopkgtest]
 
 # disable the following distributions
 # ubuntu-14, lack of systemd-run
-# ubuntu-20.04-arm*, because we use pc kernel and gadget.
-# ubuntu-core-*-arm-*, because image generade is not amd64
-# ubuntu-18.04-32, lack of pc-kernel snap for pc-i386
+# ubuntu-*-arm*, because we use (developer1) amd64 model
 systems:
 - -ubuntu-14.04-*
-- -ubuntu-20.04-arm-*
+- -ubuntu-*-arm-*
 - -ubuntu-core-*-arm-*
-- -ubuntu-18.04-32
 
 environment:
     ROOT: /home/test/tmp/
@@ -22,31 +28,21 @@ environment:
     STORE_DIR: $(pwd)/fake-store-blobdir
     STORE_ADDR: localhost:11028
 
-prepare: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
+skip:
+    - reason: This test needs test keys to be trusted
+      if: |
+        [ "$TRUST_TEST_KEYS" = "false" ]
 
+prepare: |
     mkdir -p "$ROOT"
     chown test:test "$ROOT"
 
 restore: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
-    
     "$TESTSTOOLS"/store-state teardown-fake-store "$STORE_DIR"
     
     rm -rf "$ROOT"
 
 execute: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
-
     install_snap_to_fakestore() {
         local SNAP_NAME="$1"
         local SNAP_REVISION="$2"
@@ -84,10 +80,8 @@ execute: |
     # store script trying to fetch these after setting up the fake store.
     echo Installing required snaps we will need
     snap install core
-    snap install remarshal
-    snap install jq
 
-    echo Download snaps needed for the the model
+    echo Download snaps needed for the model
     snap download core
     snap download pc
     snap download pc-kernel
@@ -145,8 +139,11 @@ execute: |
     journalctl -u fakestore | grep 'requested snap "pc-kernel" revision 1'
     journalctl -u fakestore | grep 'requested snap "test-snapd-sh" revision 23'
 
+    echo Verifying fakestore endpoint access counts
+    fakestore debug-api stats | gojq -e '."request-stats"["/v2/snaps/refresh"] >= 1'
+
     # The generated seed.manifest will be in working directory.
-    echo Verifying the generated manifest has correct contents
+    echo Verifying the generated manifest has correct content
     MATCH "core\s1+$" < seed.manifest
     MATCH "pc\s1+$" < seed.manifest
     MATCH "pc-kernel\s1+$" < seed.manifest

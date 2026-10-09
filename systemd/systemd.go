@@ -34,11 +34,11 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"text/template"
 	"time"
 
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/gadget/quantity"
+	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/osutil/squashfs"
 	"github.com/snapcore/snapd/sandbox/selinux"
@@ -77,6 +77,13 @@ var (
 
 	// allow replacing the systemd implementation with a mock one
 	newSystemd = newSystemdReal
+
+	// maxUnitsPerShow is the maximum number of unit names passed to a single
+	// "systemctl show" invocation by showUnitProperties. Kept as a var so
+	// tests can reduce it to exercise the chunk-boundary logic without
+	// creating hundreds of fake units. 64 units x NAME_MAX (255) bytes ~ 16 KB,
+	// which should be below the ARG_MAX limit also on constrained systems.
+	maxUnitsPerShow = 64
 )
 
 // mu is a sync.Mutex that also supports to check if the lock is taken
@@ -118,14 +125,33 @@ func MockNewSystemd(f func(be Backend, rootDir string, mode InstanceMode, rep Re
 
 // systemctlCmd calls systemctl with the given args, returning its standard output (and wrapped error)
 var systemctlCmd = func(args ...string) ([]byte, error) {
-	bs, stderr, err := osutil.RunSplitOutput("systemctl", args...)
-	if err != nil {
-		exitCode, runErr := osutil.ExitCode(err)
-		return nil, &Error{cmd: args, exitCode: exitCode, runErr: runErr,
-			msg: osutil.CombineStdOutErr(bs, stderr)}
+	complete := systemctlAsyncCmd(args...)
+	return complete()
+}
+
+// systemctlAsyncCmd dispatches a systemctl command asynchronously. The
+// command is started before the function returns. The returned function
+// blocks until the command completes and returns its output and error.
+var systemctlAsyncCmd = func(args ...string) func() ([]byte, error) {
+	cmd := exec.Command("systemctl", args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		return func() ([]byte, error) {
+			return nil, &Error{cmd: args, runErr: err}
+		}
 	}
 
-	return bs, nil
+	return func() ([]byte, error) {
+		if err := cmd.Wait(); err != nil {
+			exitCode, runErr := osutil.ExitCode(err)
+			return nil, &Error{cmd: args, exitCode: exitCode, runErr: runErr,
+				msg: osutil.CombineStdOutErr(stdout.Bytes(), stderr.Bytes())}
+		}
+		return stdout.Bytes(), nil
+	}
 }
 
 func MockSystemdVersion(version int, injectedError error) (restore func()) {
@@ -144,15 +170,26 @@ func MockSystemdVersion(version int, injectedError error) (restore func()) {
 // The function can return the output and an error.
 func MockSystemctl(f func(args ...string) ([]byte, error)) func() {
 	var mutex sync.Mutex
-	oldSystemctlCmd := systemctlCmd
-	systemctlCmd = func(args ...string) ([]byte, error) {
-		// Thread-safe wrapper to call the locked systemctl
-		mutex.Lock()
-		defer mutex.Unlock()
-		return f(args...)
+	oldSystemctlAsyncCmd := systemctlAsyncCmd
+	// It's sufficient to mock the async helper as it's already used as a base
+	// for systemctlCmd() implementation.
+	systemctlAsyncCmd = func(args ...string) func() ([]byte, error) {
+		// The callback is called synchronously so that the command
+		// is logged before this function returns.
+		var out []byte
+		var err error
+		func() {
+			mutex.Lock()
+			defer mutex.Unlock()
+			out, err = f(args...)
+		}()
+		// The wait function returns the cached result immediately.
+		return func() ([]byte, error) {
+			return out, err
+		}
 	}
 	return func() {
-		systemctlCmd = oldSystemctlCmd
+		systemctlAsyncCmd = oldSystemctlAsyncCmd
 	}
 }
 
@@ -163,21 +200,29 @@ func MockSystemctl(f func(args ...string) ([]byte, error)) func() {
 // mocked invocation.
 func MockSystemctlWithDelay(f func(args ...string) ([]byte, time.Duration, error)) func() {
 	var mutex sync.Mutex
-	oldSystemctlCmd := systemctlCmd
-	systemctlCmd = func(args ...string) (bs []byte, err error) {
-		// Thread-safe wrapper to call the locked systemctl
+	oldSystemctlAsyncCmd := systemctlAsyncCmd
+	// It's sufficient to mock the async helper as it's already used as a base
+	// for systemctlCmd() implementation.
+	systemctlAsyncCmd = func(args ...string) func() ([]byte, error) {
+		// The callback is called synchronously so that the command
+		// is logged before this function returns.
+		var bs []byte
 		var delay time.Duration
+		var err error
 		func() {
 			mutex.Lock()
 			defer mutex.Unlock()
 			bs, delay, err = f(args...)
 		}()
-		// Emulate the delay outside the lock
-		time.Sleep(delay)
-		return bs, err
+		// The delay moves into the wait function to simulate the
+		// time spent blocking on the actual command execution.
+		return func() ([]byte, error) {
+			time.Sleep(delay)
+			return bs, err
+		}
 	}
 	return func() {
-		systemctlCmd = oldSystemctlCmd
+		systemctlAsyncCmd = oldSystemctlAsyncCmd
 	}
 }
 
@@ -227,6 +272,12 @@ func getVersion() (int, error) {
 		if i == 1 {
 			verstr = strings.TrimSpace(s)
 		}
+	}
+
+	// ignore the pre-release suffixes, since we otherwise we can't convert to an
+	// int and we only compare versions coarsely to check systemd is not too old
+	if i := strings.IndexRune(verstr, '~'); i != -1 {
+		verstr = verstr[:i]
 	}
 
 	ver, err := strconv.Atoi(verstr)
@@ -323,9 +374,14 @@ type MountUnitOptions struct {
 	Fstype      string
 	Options     []string
 	Origin      string
+	// RootDir is the root of the filesystem where the unit will be created
+	RootDir string
 	// PreventRestartIfModified is set if we do not want to restart the
 	// mount unit if modified
 	PreventRestartIfModified bool
+	// EnsureStartIfUnchanged is set if we want to make sure that the unit
+	// is started even if it was not modified.
+	EnsureStartIfUnchanged bool
 }
 
 // Backend identifies the implementation backend in use by a Systemd instance.
@@ -340,25 +396,28 @@ const (
 	EmulationModeBackend
 )
 
-type mountUpdateStatus int
+type MountUpdateStatus int
 
 const (
-	mountUnchanged mountUpdateStatus = iota
-	mountUpdated
-	mountCreated
+	MountUnchanged MountUpdateStatus = iota
+	MountUpdated
+	MountCreated
 )
 
-// EnsureMountUnitFlags contains flags that modify behavior of EnsureMountUnitFile
-// TODO should we call directly EnsureMountUnitFileWithOptions and
-// remove this type instead?
-type EnsureMountUnitFlags struct {
-	// PreventRestartIfModified is set if we do not want to restart the
-	// mount unit if even though it was modified
-	PreventRestartIfModified bool
-	// StartBeforeDriversLoad is set if the unit is needed before
-	// udevd starts to run rules
-	StartBeforeDriversLoad bool
-}
+// MountUnitFilter controls which mount units are returned by ListMountUnits.
+type MountUnitFilter int
+
+const (
+	// LoadedMountUnits returns units currently loaded in systemd's memory,
+	// as reported by "systemctl show *.mount". This is cheaper but may miss
+	// units that have been stopped and garbage-collected from systemd's memory.
+	LoadedMountUnits MountUnitFilter = iota
+	// InstalledMountUnits returns units that have a backing unit file
+	// installed on the filesystem, as reported by "systemctl list-unit-files".
+	// This includes units that are stopped and have been unloaded from systemd's
+	// memory, but excludes units that have no backing file.
+	InstalledMountUnits
+)
 
 // Systemd exposes a minimal interface to manage systemd via the systemctl command.
 type Systemd interface {
@@ -414,15 +473,17 @@ type Systemd interface {
 	// If namespaces is set to true, the log reader will include journal namespace
 	// logs, and is required to get logs for services which are in journal namespaces.
 	LogReader(services []string, n int, follow, namespaces bool) (io.ReadCloser, error)
-	// EnsureMountUnitFile adds/enables/starts a mount unit.
-	EnsureMountUnitFile(description, what, where, fstype string, flags EnsureMountUnitFlags) (string, error)
-	// EnsureMountUnitFileWithOptions adds/enables/starts a mount unit with options.
-	EnsureMountUnitFileWithOptions(unitOptions *MountUnitOptions) (string, error)
+	// ConfigureMountUnitOptions configures several options of the mount unit in-place.
+	ConfigureMountUnitOptions(o *MountUnitOptions, fstype string, startBeforeDrivers bool) error
+	// EnsureMountUnitFile adds/enables/starts a mount unit with options.
+	EnsureMountUnitFile(unitOptions *MountUnitOptions) (string, error)
 	// RemoveMountUnitFile unmounts/stops/disables/removes a mount unit.
 	RemoveMountUnitFile(baseDir string) error
-	// ListMountUnits gets the list of targets of the mount units created by
-	// the `origin` module for the given snap
-	ListMountUnits(snapName, origin string) ([]string, error)
+	// ListMountUnits gets the list of mount points of the mount units created
+	// by the `origin` module for the given snap. filter controls whether only
+	// units currently loaded in systemd's memory are returned (LoadedMountUnits)
+	// or units that have an installed backing file (InstalledMountUnits).
+	ListMountUnits(snapName, origin string, filter MountUnitFilter) ([]string, error)
 	// Mask the given service.
 	Mask(service string) error
 	// Unmask the given service.
@@ -440,6 +501,8 @@ type Systemd interface {
 	CurrentTasksCount(unit string) (uint64, error)
 	// Run a command
 	Run(command []string, opts *RunOptions) ([]byte, error)
+	// Set log level for the system
+	SetLogLevel(logLevel string) error
 }
 
 // KeyringMode describes how the kernel keyring is setup, see systemd.exec(5)
@@ -567,6 +630,22 @@ func (s *systemd) systemctl(args ...string) ([]byte, error) {
 		panic("unknown InstanceMode")
 	}
 	return systemctlCmd(args...)
+}
+
+// systemctlAsync dispatches a systemctl command asynchronously. The
+// command is dispatched before this method returns, and the returned
+// function blocks until the command completes.
+func (s *systemd) systemctlAsync(args ...string) func() ([]byte, error) {
+	switch s.mode {
+	case SystemMode:
+	case UserMode:
+		args = append([]string{"--user"}, args...)
+	case GlobalUserMode:
+		args = append([]string{"--user", "--global"}, args...)
+	default:
+		panic("unknown InstanceMode")
+	}
+	return systemctlAsyncCmd(args...)
 }
 
 func (s *systemd) Backend() Backend {
@@ -1044,18 +1123,17 @@ func (s *systemd) Stop(serviceNames []string) error {
 		panic("cannot call stop with GlobalUserMode")
 	}
 
-	// Start the real time progress tracking inside a go routine because the
-	// 'systemctl stop' request is blocking (which runs in the parent function).
-	// Note that although the status polling thread is separate, and could start
-	// before the 'systemctl stop' command, the poll ticker will not fire
-	// immediately, allowing the stop command to start first. The ordering is
-	// not assumed, but it helps make existing unit-test code work, because the
-	// systemctl mocking in some modules are implemented very simplistically, and
-	// assumes that the 'stop' argument comes before the 'show'.
-	errorRet := make(chan error)
-	quit := make(chan interface{})
+	// Dispatch the stop command asynchronously. Ensures we do not start
+	// pointlessly polling the status before starting the 'systemctl stop'
+	// command.
+	waitStop := s.systemctlAsync(append([]string{"stop"}, serviceNames...)...)
 
-	go func() {
+	// Start the real time progress tracking inside a goroutine. The
+	// polling goroutine reports progress while the stop command blocks.
+	errorRet := make(chan error)
+	quit := make(chan any)
+
+	go func(serviceNames []string) {
 		// The polling routine is the 'errorRet' channel sender, so we make
 		// sure we exit closing the channel explicitly, even though we always
 		// return the error result first. Closing the channel does not free the
@@ -1126,10 +1204,10 @@ func (s *systemd) Stop(serviceNames []string) error {
 				notifyShowFirst = false
 			}
 		}
-	}()
+	}(serviceNames)
 
-	// This command blocks until the 'systemctl stop' completes
-	_, errStop := s.systemctl(append([]string{"stop"}, serviceNames...)...)
+	// Blocks until the 'systemctl stop' completes
+	_, errStop := waitStop()
 
 	// Notify the progress loop to exit since systemctl completed the request
 	close(quit)
@@ -1366,16 +1444,20 @@ func MountUnitPath(baseDir string) string {
 	return filepath.Join(dirs.SnapServicesDir, escapedPath+".mount")
 }
 
-// MountUnitPathWithLifetime returns the path of a {,auto}mount unit
-// created in the systemd directory suitable for the given unit lifetime
-func MountUnitPathWithLifetime(lifetime UnitLifetime, mountPointDir string) string {
+// mountUnitPathWithLifetime returns the path of a {,auto}mount unit created in
+// the systemd directory suitable for the given unit lifetime. rootDir is the
+// directory for the root filesystem.
+func mountUnitPathWithLifetime(lifetime UnitLifetime, mountPointDir, rootDir string) string {
+	if rootDir == "" {
+		rootDir = dirs.GlobalRootDir
+	}
 	escapedPath := EscapeUnitNamePath(mountPointDir)
 	var servicesPath string
 	switch lifetime {
 	case Persistent:
-		servicesPath = dirs.SnapServicesDir
+		servicesPath = dirs.SnapServicesDirUnder(rootDir)
 	case Transient:
-		servicesPath = dirs.SnapRuntimeServicesDir
+		servicesPath = dirs.SnapRuntimeServicesDirUnder(rootDir)
 	default:
 		panic(fmt.Sprintf("unknown systemd unit lifetime %q", lifetime))
 	}
@@ -1386,7 +1468,7 @@ func MountUnitPathWithLifetime(lifetime UnitLifetime, mountPointDir string) stri
 func ExistingMountUnitPath(mountPointDir string) string {
 	lifetimes := []UnitLifetime{Persistent, Transient}
 	for _, lifetime := range lifetimes {
-		unit := MountUnitPathWithLifetime(lifetime, mountPointDir)
+		unit := mountUnitPathWithLifetime(lifetime, mountPointDir, "")
 		if osutil.FileExists(unit) {
 			return unit
 		}
@@ -1396,74 +1478,70 @@ func ExistingMountUnitPath(mountPointDir string) string {
 
 var squashfsFsType = squashfs.FsType
 
-// Note that WantedBy=multi-user.target and Before=local-fs.target are
-// only used to allow downgrading to an older version of snapd.
-//
-// We want (see isBeforeDrivers) some snaps and components to be mounted before
-// modules are loaded (that is before systemd-{udevd,modules-load}).
-const snapMountUnitTmpl = `[Unit]
-Description={{.Description}}
+const (
+	snappyOriginModule = "X-SnapdOrigin"
+)
+
+func assembleMountUnitContent(u *MountUnitOptions) string {
+	before := "Before=snapd.mounts.target"
+	if u.MountUnitType == BeforeDriversLoadMountUnit {
+		// We want some snaps and components to be mounted before
+		// modules are loaded (that is before systemd-{udevd,modules-load}).
+		before += "\nBefore=systemd-udevd.service systemd-modules-load.service\nBefore=usr-lib-modules.mount usr-lib-firmware.mount"
+	}
+	origin := ""
+	if u.Origin != "" {
+		origin = fmt.Sprintf("%s=%s\n", snappyOriginModule, u.Origin)
+	}
+	// Note that WantedBy=multi-user.target is only used to allow
+	// downgrading to an older version of snapd.
+	unitContent := fmt.Sprintf(`[Unit]
+Description=%[1]s
 After=snapd.mounts-pre.target
-Before=snapd.mounts.target{{if isBeforeDrivers .MountUnitType}}
-Before=systemd-udevd.service systemd-modules-load.service{{end}}
+%[2]s
 
 [Mount]
-What={{.What}}
-Where={{.Where}}
-Type={{.Fstype}}
-Options={{join .Options ","}}
+What=%[3]s
+Where=%[4]s
+Type=%[5]s
+Options=%[6]s
 LazyUnmount=yes
 
 [Install]
 WantedBy=snapd.mounts.target
 WantedBy=multi-user.target
-{{- with .Origin}}
-X-SnapdOrigin={{.}}
-{{- end}}
-`
-
-func isBeforeDriversLoadMountUnit(mType MountUnitType) bool {
-	return mType == BeforeDriversLoadMountUnit
+%[7]s`, u.Description, before, u.What, u.Where, u.Fstype, strings.Join(u.Options, ","), origin)
+	return unitContent
 }
 
-var templateFuncs = template.FuncMap{"join": strings.Join,
-	"isBeforeDrivers": isBeforeDriversLoadMountUnit}
-var parsedMountUnitTmpl = template.Must(template.New("unit").Funcs(templateFuncs).Parse(snapMountUnitTmpl))
-
-const (
-	snappyOriginModule = "X-SnapdOrigin"
-)
-
-func ensureMountUnitFile(u *MountUnitOptions) (mountUnitName string, modified mountUpdateStatus, err error) {
+// EnsureMountUnitFileContent creates a mount unit file.
+func EnsureMountUnitFileContent(u *MountUnitOptions) (mountUnitName string, modified MountUpdateStatus, err error) {
 	if u == nil {
-		return "", mountUnchanged, errors.New("ensureMountUnitFile() expects valid mount options")
+		return "", MountUnchanged, errors.New("ensureMountUnitFile() expects valid mount options")
 	}
 
-	mu := MountUnitPathWithLifetime(u.Lifetime, u.Where)
-	var unitContent bytes.Buffer
-	if err := parsedMountUnitTmpl.Execute(&unitContent, &u); err != nil {
-		return "", mountUnchanged, fmt.Errorf("cannot generate mount unit: %v", err)
-	}
+	mu := mountUnitPathWithLifetime(u.Lifetime, u.Where, u.RootDir)
 
 	if osutil.FileExists(mu) {
-		modified = mountUpdated
+		modified = MountUpdated
 	} else {
-		modified = mountCreated
+		modified = MountCreated
 	}
 
 	if err := os.MkdirAll(filepath.Dir(mu), 0755); err != nil {
-		return "", mountUnchanged, fmt.Errorf("cannot create directory %s: %v", filepath.Dir(mu), err)
+		return "", MountUnchanged, fmt.Errorf("cannot create directory %s: %v", filepath.Dir(mu), err)
 	}
 
+	unitContent := assembleMountUnitContent(u)
 	stateErr := osutil.EnsureFileState(mu, &osutil.MemoryFileState{
-		Content: unitContent.Bytes(),
+		Content: []byte(unitContent),
 		Mode:    0644,
 	})
 
 	if stateErr == osutil.ErrSameState {
-		modified = mountUnchanged
+		modified = MountUnchanged
 	} else if stateErr != nil {
-		return "", mountUnchanged, stateErr
+		return "", MountUnchanged, stateErr
 	}
 
 	return filepath.Base(mu), modified, nil
@@ -1481,10 +1559,10 @@ func fsMountOptions(fstype string) []string {
 	return options
 }
 
-// hostFsTypeAndMountOptions returns filesystem type and options to actually
+// HostFsTypeAndMountOptions returns filesystem type and options to actually
 // mount the given fstype at runtime, i.e. it determines if fuse should be used
 // for squashfs.
-func hostFsTypeAndMountOptions(fstype string) (hostFsType string, options []string) {
+func HostFsTypeAndMountOptions(fstype string) (hostFsType string, options []string) {
 	options = fsMountOptions(fstype)
 	hostFsType = fstype
 	if fstype == "squashfs" {
@@ -1495,53 +1573,70 @@ func hostFsTypeAndMountOptions(fstype string) (hostFsType string, options []stri
 	return hostFsType, options
 }
 
-func (s *systemd) EnsureMountUnitFile(description, what, where, fstype string, flags EnsureMountUnitFlags) (string, error) {
-	hostFsType, options := hostFsTypeAndMountOptions(fstype)
-	if osutil.IsDirectory(what) {
-		options = append(options, "bind")
+func (s *systemd) ConfigureMountUnitOptions(o *MountUnitOptions, fstype string, startBeforeDrivers bool) error {
+	if o.What == "" {
+		return errors.New(`internal error: cannot configure mount unit options: "What" cannot be unset`)
+	}
+	if o.Fstype != "" {
+		return errors.New(`internal error: cannot configure mount unit options: "Fstype" cannot be set`)
+	}
+	if len(o.Options) > 0 {
+		return errors.New(`internal error: cannot configure mount unit options: "Options" cannot be set`)
+	}
+
+	hostFsType, fsOpts := HostFsTypeAndMountOptions(fstype)
+	if osutil.IsDirectory(o.What) {
+		fsOpts = append(fsOpts, "bind")
 		hostFsType = "none"
 	}
-	mountOptions := &MountUnitOptions{
-		Lifetime:                 Persistent,
-		Description:              description,
-		What:                     what,
-		Where:                    where,
-		Fstype:                   hostFsType,
-		Options:                  options,
-		PreventRestartIfModified: flags.PreventRestartIfModified,
+
+	mountUnitType := RegularMountUnit
+	if startBeforeDrivers {
+		mountUnitType = BeforeDriversLoadMountUnit
 	}
-	if flags.StartBeforeDriversLoad {
-		mountOptions.MountUnitType = BeforeDriversLoadMountUnit
-	}
-	return s.EnsureMountUnitFileWithOptions(mountOptions)
+
+	o.Fstype = hostFsType
+	o.MountUnitType = mountUnitType
+	o.Options = fsOpts
+
+	return nil
 }
 
-func (s *systemd) EnsureMountUnitFileWithOptions(unitOptions *MountUnitOptions) (string, error) {
+func (s *systemd) EnsureMountUnitFile(unitOptions *MountUnitOptions) (string, error) {
 	daemonReloadLock.Lock()
 	defer daemonReloadLock.Unlock()
 
-	mountUnitName, modified, err := ensureMountUnitFile(unitOptions)
+	mountUnitName, modified, err := EnsureMountUnitFileContent(unitOptions)
 	if err != nil {
 		return "", err
 	}
-	if modified != mountUnchanged {
+	units := []string{mountUnitName}
+	if modified != MountUnchanged {
 		// we need to do a daemon-reload here to ensure that systemd really
 		// knows about this new mount unit file
 		if err := s.daemonReloadNoLock(); err != nil {
 			return "", err
 		}
 
-		units := []string{mountUnitName}
 		if err := s.EnableNoReload(units); err != nil {
 			return "", err
 		}
 
 		// If just modified, some times it is not convenient to restart
-		if modified != mountUpdated || !unitOptions.PreventRestartIfModified {
+		if modified != MountUpdated || !unitOptions.PreventRestartIfModified {
 			// Start/restart the created or modified unit now
 			if err := s.RestartNoWaitForStop(units); err != nil {
 				return "", err
 			}
+		}
+	} else if unitOptions.EnsureStartIfUnchanged {
+		// Make sure the unit is actually started. This is useful for
+		// removable units, in case the device was unplugged and then
+		// replugged and "snapctl mount" is called again. Note that we
+		// avoid calling restart as we do not want to stop the unit in
+		// case it was already active.
+		if err := s.StartNoBlock(units); err != nil {
+			return "", err
 		}
 	}
 
@@ -1549,6 +1644,23 @@ func (s *systemd) EnsureMountUnitFileWithOptions(unitOptions *MountUnitOptions) 
 }
 
 func (s *systemd) RemoveMountUnitFile(mountedDir string) error {
+	// unmount regardless of whether the unit file exists as
+	// the unit file may have been deleted while the mount is
+	// still active
+	isMounted, err := osutilIsMounted(mountedDir)
+	if err != nil {
+		return err
+	}
+	if isMounted {
+		// use umount -d (cleanup loopback devices) -l (lazy) to ensure
+		// that even busy mount points can be unmounted.
+		// note that the long option --lazy is not supported on trusty.
+		// the explicit -d is only needed on trusty.
+		if output, err := exec.Command("umount", "-d", "-l", mountedDir).CombinedOutput(); err != nil {
+			return osutil.OutputErr(output, err)
+		}
+	}
+
 	daemonReloadLock.Lock()
 	defer daemonReloadLock.Unlock()
 
@@ -1557,20 +1669,8 @@ func (s *systemd) RemoveMountUnitFile(mountedDir string) error {
 		return nil
 	}
 
-	// use umount -d (cleanup loopback devices) -l (lazy) to ensure that even busy mount points
-	// can be unmounted.
-	// note that the long option --lazy is not supported on trusty.
-	// the explicit -d is only needed on trusty.
-	isMounted, err := osutilIsMounted(mountedDir)
-	if err != nil {
-		return err
-	}
 	units := []string{filepath.Base(unit)}
 	if isMounted {
-		if output, err := exec.Command("umount", "-d", "-l", mountedDir).CombinedOutput(); err != nil {
-			return osutil.OutputErr(output, err)
-		}
-
 		if err := s.Stop(units); err != nil {
 			return err
 		}
@@ -1621,12 +1721,61 @@ func extractOriginModule(systemdUnitPath string) (string, error) {
 	return originModule, nil
 }
 
-func (s *systemd) ListMountUnits(snapName, origin string) ([]string, error) {
-	out, err := s.systemctl("show", "--property=Description,Where,FragmentPath", "*.mount")
+// listInstalledMountUnitNames returns the names of all mount unit files known to
+// systemd on disk by running "systemctl list-unit-files". This includes units
+// that are stopped and have been unloaded from memory.
+func (s *systemd) listInstalledMountUnitNames() ([]string, error) {
+	// TODO: Switch to using "--output=json" once the minimum required systemd
+	// version for "mount-control" interface is bumped up to 246.
+	listOut, err := s.systemctl("list-unit-files", "--no-legend", "*.mount")
 	if err != nil {
 		return nil, err
 	}
+	var names []string
+	for _, line := range bytes.Split(bytes.TrimRight(listOut, "\n"), []byte("\n")) {
+		// Each line is: "<unit-name>  <state>  [<preset>]"
+		// Skip blank lines: they should not appear but we must not panic on them.
+		fields := strings.Fields(string(line))
+		if len(fields) == 0 {
+			continue
+		}
+		names = append(names, fields[0])
+	}
+	return names, nil
+}
 
+// showUnitProperties runs "systemctl show <propertyOption>" for the given
+// unit names, chunking the calls to stay within ARG_MAX limits.
+// The returned byte slice is the concatenated output with "\n\n" record
+// separators preserved at chunk boundaries.
+func (s *systemd) showUnitProperties(propertyOption string, unitArgs []string) ([]byte, error) {
+	var out []byte
+	for len(unitArgs) > 0 {
+		chunk := unitArgs
+		if len(chunk) > maxUnitsPerShow {
+			chunk = chunk[:maxUnitsPerShow]
+		}
+		chunkOut, err := s.systemctl(append([]string{"show", propertyOption, "--"}, chunk...)...)
+		if err != nil {
+			return nil, err
+		}
+		// systemctl show ends each chunk with a single "\n". Insert an
+		// extra "\n" between chunks so that the boundary becomes "\n\n",
+		// which is the unit-record separator parseMountUnitsOutput expects.
+		if len(out) > 0 {
+			out = append(out, '\n')
+		}
+		out = append(out, chunkOut...)
+		unitArgs = unitArgs[len(chunk):]
+	}
+	return out, nil
+}
+
+// parseMountUnitsOutput parses the concatenated "systemctl show" output and
+// returns the mount points of units belonging to snapName and (optionally)
+// created by the given origin module. The output must include the
+// Description, Where, and FragmentPath properties.
+func parseMountUnitsOutput(out []byte, snapName, origin string) ([]string, error) {
 	var mountPoints []string
 	if bytes.TrimSpace(out) == nil {
 		return mountPoints, nil
@@ -1683,6 +1832,36 @@ func (s *systemd) ListMountUnits(snapName, origin string) ([]string, error) {
 		mountPoints = append(mountPoints, where)
 	}
 	return mountPoints, nil
+}
+
+func (s *systemd) ListMountUnits(snapName, origin string, filter MountUnitFilter) ([]string, error) {
+	var unitArgs []string
+	switch filter {
+	case InstalledMountUnits:
+		// listInstalledMountUnitNames enumerates all installed unit files known to
+		// systemd, including units that are stopped and have been unloaded from memory.
+		var err error
+		unitArgs, err = s.listInstalledMountUnitNames()
+		if err != nil {
+			return nil, err
+		}
+		if len(unitArgs) == 0 {
+			return nil, nil
+		}
+	case LoadedMountUnits:
+		// The *.mount glob is expanded by systemd against its in-memory units,
+		// so only loaded units are returned.
+		unitArgs = []string{"*.mount"}
+	default:
+		return nil, fmt.Errorf("internal error: unknown MountUnitFilter value %d", filter)
+	}
+
+	out, err := s.showUnitProperties("--property=Description,Where,FragmentPath", unitArgs)
+	if err != nil {
+		return nil, err
+	}
+
+	return parseMountUnitsOutput(out, snapName, origin)
 }
 
 func (s *systemd) ReloadOrRestart(serviceNames []string) error {
@@ -1744,4 +1923,21 @@ func (s *systemd) Run(command []string, opts *RunOptions) ([]byte, error) {
 		return nil, fmt.Errorf("cannot run %q: %v", command, osutil.OutputErrCombine(stdout, stderr, err))
 	}
 	return stdout, nil
+}
+
+func (s *systemd) SetLogLevel(logLevel string) error {
+	_, err := s.systemctl("log-level", logLevel)
+
+	// Older systemd versions used systemd-analyze instead, try that if error
+	if err != nil {
+		if stdout, stderr, err2 := osutil.RunSplitOutput(
+			"systemd-analyze", "set-log-level", logLevel); err2 == nil {
+			return nil
+		} else {
+			logger.Noticef("while running systemd-analyze: %v",
+				osutil.OutputErrCombine(stdout, stderr, err2))
+		}
+	}
+
+	return err
 }

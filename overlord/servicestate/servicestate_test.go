@@ -26,7 +26,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/user"
 	"path/filepath"
 	"strings"
 
@@ -35,12 +34,14 @@ import (
 	"github.com/snapcore/snapd/client"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/gadget/quantity"
+	"github.com/snapcore/snapd/osutil/user"
 	"github.com/snapcore/snapd/overlord/configstate/config"
 	"github.com/snapcore/snapd/overlord/servicestate"
 	"github.com/snapcore/snapd/overlord/servicestate/servicestatetest"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/snapstate/snapstatetest"
 	"github.com/snapcore/snapd/overlord/state"
+	"github.com/snapcore/snapd/overlord/swfeats/swfeatstest"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/snap/quota"
 	"github.com/snapcore/snapd/snap/snaptest"
@@ -152,7 +153,7 @@ NeedDaemonReload=no
 
 		// service only
 		app = &client.AppInfo{
-			Snap:   snp.InstanceName(),
+			Snap:   snp.InstanceName().String(),
 			Name:   "svc",
 			Daemon: "simple",
 		}
@@ -170,7 +171,7 @@ NeedDaemonReload=no
 
 		// service  + timer
 		app = &client.AppInfo{
-			Snap:   snp.InstanceName(),
+			Snap:   snp.InstanceName().String(),
 			Name:   "svc",
 			Daemon: "simple",
 		}
@@ -195,7 +196,7 @@ NeedDaemonReload=no
 
 		// service with socket
 		app = &client.AppInfo{
-			Snap:   snp.InstanceName(),
+			Snap:   snp.InstanceName().String(),
 			Name:   "svc",
 			Daemon: "simple",
 		}
@@ -224,7 +225,7 @@ NeedDaemonReload=no
 		// service with slot activation will always be enabled as we cannot
 		// disable/enable slot activation at the moment.
 		app = &client.AppInfo{
-			Snap:   snp.InstanceName(),
+			Snap:   snp.InstanceName().String(),
 			Name:   "svc",
 			Daemon: "simple",
 		}
@@ -239,7 +240,7 @@ NeedDaemonReload=no
 				Snap:      snp,
 				Name:      "dbus-slot",
 				Interface: "dbus",
-				Attrs: map[string]interface{}{
+				Attrs: map[string]any{
 					"bus":  "system",
 					"name": "org.example.Svc",
 				},
@@ -257,7 +258,7 @@ NeedDaemonReload=no
 		// When using a decorator without any uid provided, the global status is
 		// fetched, which is only enablement
 		app = &client.AppInfo{
-			Snap:   snp.InstanceName(),
+			Snap:   snp.InstanceName().String(),
 			Name:   "svc",
 			Daemon: "simple",
 		}
@@ -283,7 +284,7 @@ NeedDaemonReload=no
 				Snap:      snp,
 				Name:      "dbus-slot",
 				Interface: "dbus",
-				Attrs: map[string]interface{}{
+				Attrs: map[string]any{
 					"bus":  "session",
 					"name": "org.example.Svc",
 				},
@@ -365,7 +366,7 @@ NeedDaemonReload=no
 		disabled = !enabled
 
 		app = &client.AppInfo{
-			Snap:   snp.InstanceName(),
+			Snap:   snp.InstanceName().String(),
 			Name:   "svc",
 			Daemon: "simple",
 		}
@@ -391,7 +392,7 @@ NeedDaemonReload=no
 				Snap:      snp,
 				Name:      "dbus-slot",
 				Interface: "dbus",
-				Attrs: map[string]interface{}{
+				Attrs: map[string]any{
 					"bus":  "session",
 					"name": "org.example.Svc",
 				},
@@ -1039,4 +1040,8 @@ func (s *snapServiceOptionsSuite) TestLogReaderNamespaces(c *C) {
 	_, err := servicestate.LogReader(appInfos, 100, false)
 	c.Assert(err, IsNil)
 	c.Check(jctlCalls, Equals, 1)
+}
+
+func (s *snapServiceOptionsSuite) TestEnsureLoopLogging(c *C) {
+	swfeatstest.CheckEnsureLoopLogging("servicemgr.go", c, true)
 }

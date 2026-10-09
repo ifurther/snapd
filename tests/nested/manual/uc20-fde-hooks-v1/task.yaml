@@ -11,7 +11,6 @@ environment:
     NESTED_ENABLE_TPM: false
     NESTED_ENABLE_SECURE_BOOT: false
     NESTED_BUILD_SNAPD_FROM_CURRENT: true
-    NESTED_ENABLE_OVMF: true
 
 prepare: |
   echo "Build a kernel snap with the fde-setup hook"
@@ -30,7 +29,13 @@ prepare: |
 execute: |
   echo "Check that we have an encrypted system"
   remote.exec "find /dev/mapper" | MATCH ubuntu-data-[0-9a-f-]+
+
   remote.exec "test ! -e /var/lib/snapd/device/fde/recovery.key"
-  remote.exec "test -e /run/mnt/ubuntu-boot/device/fde/ubuntu-data.sealed-key"
-  remote.exec "test -e /run/mnt/ubuntu-seed/device/fde/ubuntu-data.recovery.sealed-key"
-  remote.exec "test -e /run/mnt/ubuntu-seed/device/fde/ubuntu-save.recovery.sealed-key"
+
+  # FIXME: use cryptsetup to check it is encrypted
+  VERSION="$(tests.nested show version)"
+  if [ "${VERSION}" -lt 26 ]; then
+    remote.exec "test -e /run/mnt/ubuntu-boot/device/fde/ubuntu-data.sealed-key"
+    remote.exec "test -e /run/mnt/ubuntu-seed/device/fde/ubuntu-data.recovery.sealed-key"
+    remote.exec "test -e /run/mnt/ubuntu-seed/device/fde/ubuntu-save.recovery.sealed-key"
+  fi

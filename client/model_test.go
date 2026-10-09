@@ -29,7 +29,6 @@ import (
 	"regexp"
 	"strings"
 
-	"golang.org/x/xerrors"
 	. "gopkg.in/check.v1"
 
 	"github.com/snapcore/snapd/asserts"
@@ -128,7 +127,7 @@ func (cs *clientSuite) TestClientRemodel(c *C) {
 
 	body, err := io.ReadAll(cs.req.Body)
 	c.Assert(err, IsNil)
-	jsonBody := make(map[string]interface{})
+	jsonBody := make(map[string]any)
 	err = json.Unmarshal(body, &jsonBody)
 	c.Assert(err, IsNil)
 	c.Check(jsonBody, HasLen, 1)
@@ -152,7 +151,7 @@ func (cs *clientSuite) TestClientRemodelOffline(c *C) {
 
 	body, err := io.ReadAll(cs.req.Body)
 	c.Assert(err, IsNil)
-	jsonBody := make(map[string]interface{})
+	jsonBody := make(map[string]any)
 	err = json.Unmarshal(body, &jsonBody)
 	c.Assert(err, IsNil)
 	c.Check(jsonBody, HasLen, 2)
@@ -201,7 +200,7 @@ func (cs *clientSuite) TestClientGetSerialHappy(c *C) {
 func (cs *clientSuite) TestClientCurrentModelAssertionErrIsWrapped(c *C) {
 	cs.err = errors.New("boom")
 	_, err := cs.cli.CurrentModelAssertion()
-	var e xerrors.Wrapper
+	var e interface{ Unwrap() error }
 	c.Assert(err, Implements, &e)
 }
 

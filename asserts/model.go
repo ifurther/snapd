@@ -69,8 +69,8 @@ type ModelSnap struct {
 }
 
 // SnapName implements naming.SnapRef.
-func (s *ModelSnap) SnapName() string {
-	return s.Name
+func (s *ModelSnap) SnapName() naming.SnapName {
+	return naming.SnapName(s.Name)
 }
 
 // ID implements naming.SnapRef.
@@ -113,10 +113,10 @@ var (
 	defaultModes       = []string{"run"}
 )
 
-func checkExtendedSnaps(extendedSnaps interface{}, base string, grade ModelGrade, modelIsClassic bool) (*modelSnaps, error) {
+func checkExtendedSnaps(extendedSnaps any, base string, grade ModelGrade, modelIsClassic bool) (*modelSnaps, error) {
 	const wrongHeaderType = `"snaps" header must be a list of maps`
 
-	entries, ok := extendedSnaps.([]interface{})
+	entries, ok := extendedSnaps.([]any)
 	if !ok {
 		return nil, fmt.Errorf(wrongHeaderType)
 	}
@@ -126,7 +126,7 @@ func checkExtendedSnaps(extendedSnaps interface{}, base string, grade ModelGrade
 	seenIDs := make(map[string]string, len(entries))
 
 	for _, entry := range entries {
-		snap, ok := entry.(map[string]interface{})
+		snap, ok := entry.(map[string]any)
 		if !ok {
 			return nil, fmt.Errorf(wrongHeaderType)
 		}
@@ -197,7 +197,7 @@ func isEssentialSnap(snapName, snapType, modelBase string) bool {
 	return false
 }
 
-func checkModesForSnap(snap map[string]interface{}, isEssential bool, what string) ([]string, error) {
+func checkModesForSnap(snap map[string]any, isEssential bool, what string) ([]string, error) {
 	modes, err := checkStringListInMap(snap, "modes", fmt.Sprintf("%q %s", "modes", what),
 		validSnapMode)
 	if err != nil {
@@ -217,7 +217,7 @@ func checkModesForSnap(snap map[string]interface{}, isEssential bool, what strin
 	return modes, nil
 }
 
-func checkModelSnap(snap map[string]interface{}, modelBase string, grade ModelGrade, modelIsClassic bool) (*ModelSnap, error) {
+func checkModelSnap(snap map[string]any, modelBase string, grade ModelGrade, modelIsClassic bool) (*ModelSnap, error) {
 	name, err := checkNotEmptyStringWhat(snap, "name", "of snap")
 	if err != nil {
 		return nil, err
@@ -338,13 +338,13 @@ snaps:
                                       # as the snap
       <component-name-2>: "required"|"optional" # presence, shortcut syntax
 **/
-func checkComponentsForMaps(m map[string]interface{}, validModes []string, what string) (map[string]ModelComponent, error) {
+func checkComponentsForMaps(m map[string]any, validModes []string, what string) (map[string]ModelComponent, error) {
 	const compsField = "components"
 	value, ok := m[compsField]
 	if !ok {
 		return nil, nil
 	}
-	comps, ok := value.(map[string]interface{})
+	comps, ok := value.(map[string]any)
 	if !ok {
 		return nil, fmt.Errorf("%q %s must be a map from strings to components",
 			compsField, what)
@@ -370,7 +370,7 @@ func checkComponentsForMaps(m map[string]interface{}, validModes []string, what 
 		}
 
 		// try map otherwise
-		compFields, ok := comp.(map[string]interface{})
+		compFields, ok := comp.(map[string]any)
 		if !ok {
 			return nil, fmt.Errorf("%s must be a map of strings to components or one of required|optional",
 				compWhat)
@@ -410,7 +410,7 @@ func checkComponentsForMaps(m map[string]interface{}, validModes []string, what 
 
 // unextended case support
 
-func checkSnapWithTrack(headers map[string]interface{}, which string) (*ModelSnap, error) {
+func checkSnapWithTrack(headers map[string]any, which string) (*ModelSnap, error) {
 	_, ok := headers[which]
 	if !ok {
 		return nil, nil
@@ -573,7 +573,7 @@ func (mvs *ModelValidationSet) AtSequence() *AtSequence {
 // Model holds a model assertion, which is a statement by a brand
 // about the properties of a device model.
 type Model struct {
-	assertionBase
+	AssertionBase
 	classic bool
 
 	baseSnap   *ModelSnap
@@ -626,6 +626,12 @@ func (mod *Model) Series() string {
 // Classic returns whether the model is a classic system.
 func (mod *Model) Classic() bool {
 	return mod.classic
+}
+
+// HybridClassic returns whether the model is a hybrid classic system, meaning
+// it is both classic and has an associated kernel snap.
+func (mod *Model) HybridClassic() bool {
+	return mod.classic && mod.kernelSnap != nil
 }
 
 // Distribution returns the linux distro specified in the model.
@@ -698,6 +704,18 @@ func (mod *Model) KernelTrack() string {
 // Base returns the base snap the model uses.
 func (mod *Model) Base() string {
 	return mod.HeaderString("base")
+}
+
+// BaseCoreVersion returns the version of the model's core boot base snap
+// (e.g. "core18" -> 18, "core" -> 16). An omitted base on a non-classic
+// model is treated as 16 (the core snap). It returns an error for a
+// non-core base.
+func (mod *Model) BaseCoreVersion() (int, error) {
+	base := mod.Base()
+	if !mod.Classic() && base == "" {
+		return 16, nil
+	}
+	return naming.CoreVersion(base)
 }
 
 // BaseSnap returns the details of the base snap the model uses.
@@ -775,19 +793,19 @@ func (mod *Model) Timestamp() time.Time {
 	return mod.timestamp
 }
 
-// Implement further consistency checks.
-func (mod *Model) checkConsistency(db RODatabase, acck *AccountKey) error {
+// CheckConsistency performs further checks using the assertion database.
+func (mod *Model) CheckConsistency(db RODatabase, acck *AccountKey) error {
 	// TODO: double check trust level of authority depending on class and possibly allowed-modes
 	return nil
 }
 
 // expected interface is implemented
-var _ consistencyChecker = (*Model)(nil)
+var _ ConsistencyChecker = (*Model)(nil)
 
 // limit model to only lowercase for now
 var validModel = regexp.MustCompile("^[a-zA-Z0-9](?:-?[a-zA-Z0-9])*$")
 
-func checkModel(headers map[string]interface{}) (string, error) {
+func checkModel(headers map[string]any) (string, error) {
 	s, err := checkStringMatches(headers, "model", validModel)
 	if err != nil {
 		return "", err
@@ -810,7 +828,7 @@ func checkAuthorityMatchesBrand(a Assertion) error {
 	return nil
 }
 
-func checkOptionalAuthority(headers map[string]interface{}, name string, brandID string, acceptsWildcard bool) ([]string, error) {
+func checkOptionalAuthority(headers map[string]any, name string, brandID string, acceptsWildcard bool) ([]string, error) {
 	ids := []string{brandID}
 	v, ok := headers[name]
 	if !ok {
@@ -821,7 +839,7 @@ func checkOptionalAuthority(headers map[string]interface{}, name string, brandID
 		if acceptsWildcard && x == "*" {
 			return nil, nil
 		}
-	case []interface{}:
+	case []any:
 		lst, err := checkStringListMatches(headers, name, validAccountID)
 		if err == nil {
 			if !strutil.ListContains(lst, brandID) {
@@ -838,22 +856,22 @@ func checkOptionalAuthority(headers map[string]interface{}, name string, brandID
 	}
 }
 
-func checkOptionalSerialAuthority(headers map[string]interface{}, brandID string) ([]string, error) {
+func checkOptionalSerialAuthority(headers map[string]any, brandID string) ([]string, error) {
 	const acceptsWildcard = false
 	return checkOptionalAuthority(headers, "serial-authority", brandID, acceptsWildcard)
 }
 
-func checkOptionalSystemUserAuthority(headers map[string]interface{}, brandID string) ([]string, error) {
+func checkOptionalSystemUserAuthority(headers map[string]any, brandID string) ([]string, error) {
 	const acceptsWildcard = true
 	return checkOptionalAuthority(headers, "system-user-authority", brandID, acceptsWildcard)
 }
 
-func checkOptionalPreseedAuthority(headers map[string]interface{}, brandID string) ([]string, error) {
+func checkOptionalPreseedAuthority(headers map[string]any, brandID string) ([]string, error) {
 	const acceptsWildcard = false
 	return checkOptionalAuthority(headers, "preseed-authority", brandID, acceptsWildcard)
 }
 
-func checkModelValidationSetAccountID(headers map[string]interface{}, what, brandID string) (string, error) {
+func checkModelValidationSetAccountID(headers map[string]any, what, brandID string) (string, error) {
 	accountID, err := checkOptionalStringWhat(headers, "account-id", what)
 	if err != nil {
 		return "", err
@@ -869,7 +887,7 @@ func checkModelValidationSetAccountID(headers map[string]interface{}, what, bran
 // checkOptionalModelValidationSetSequence reads the optional 'sequence' member, if
 // not set, returns 0 as this means unpinned. Unfortunately we are not able
 // to reuse `checkSequence` as it operates inside different parameters.
-func checkOptionalModelValidationSetSequence(headers map[string]interface{}, what string) (int, error) {
+func checkOptionalModelValidationSetSequence(headers map[string]any, what string) (int, error) {
 	// Default to 0 when the sequence header is not present
 	if _, ok := headers["sequence"]; !ok {
 		return 0, nil
@@ -887,7 +905,7 @@ func checkOptionalModelValidationSetSequence(headers map[string]interface{}, wha
 	return seq, nil
 }
 
-func checkModelValidationSetMode(headers map[string]interface{}, what string) (ModelValidationSetMode, error) {
+func checkModelValidationSetMode(headers map[string]any, what string) (ModelValidationSetMode, error) {
 	modeStr, err := checkNotEmptyStringWhat(headers, "mode", what)
 	if err != nil {
 		return "", err
@@ -899,7 +917,7 @@ func checkModelValidationSetMode(headers map[string]interface{}, what string) (M
 	return ModelValidationSetMode(modeStr), nil
 }
 
-func checkModelValidationSet(headers map[string]interface{}, brandID string) (*ModelValidationSet, error) {
+func checkModelValidationSet(headers map[string]any, brandID string) (*ModelValidationSet, error) {
 	name, err := checkStringMatchesWhat(headers, "name", "of validation-set", validValidationSetName)
 	if err != nil {
 		return nil, err
@@ -930,13 +948,13 @@ func checkModelValidationSet(headers map[string]interface{}, brandID string) (*M
 	}, nil
 }
 
-func checkOptionalModelValidationSets(headers map[string]interface{}, brandID string) ([]*ModelValidationSet, error) {
+func checkOptionalModelValidationSets(headers map[string]any, brandID string) ([]*ModelValidationSet, error) {
 	valSets, ok := headers["validation-sets"]
 	if !ok {
 		return nil, nil
 	}
 
-	entries, ok := valSets.([]interface{})
+	entries, ok := valSets.([]any)
 	if !ok {
 		return nil, fmt.Errorf(`"validation-sets" must be a list of validation sets`)
 	}
@@ -944,7 +962,7 @@ func checkOptionalModelValidationSets(headers map[string]interface{}, brandID st
 	vss := make([]*ModelValidationSet, len(entries))
 	seen := make(map[string]bool, len(entries))
 	for i, entry := range entries {
-		data, ok := entry.(map[string]interface{})
+		data, ok := entry.(map[string]any)
 		if !ok {
 			return nil, fmt.Errorf(`entry in "validation-sets" is not a valid validation-set`)
 		}
@@ -975,7 +993,7 @@ var (
 	validDistribution = regexp.MustCompile(`^[a-z0-9._-]*$`)
 )
 
-func assembleModel(assert assertionBase) (Assertion, error) {
+func assembleModel(assert AssertionBase) (Assertion, error) {
 	err := checkAuthorityMatchesBrand(&assert)
 	if err != nil {
 		return nil, err
@@ -1202,7 +1220,7 @@ func assembleModel(assert assertionBase) (Assertion, error) {
 
 	// ignore extra headers and non-empty body for future compatibility
 	return &Model{
-		assertionBase:              assert,
+		AssertionBase:              assert,
 		classic:                    classic,
 		baseSnap:                   modSnaps.base,
 		gadgetSnap:                 modSnaps.gadget,

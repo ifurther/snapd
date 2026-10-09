@@ -18,6 +18,8 @@
 #ifndef SNAP_CONFINE_PRIVS_H
 #define SNAP_CONFINE_PRIVS_H
 
+#include <sys/capability.h>
+
 /**
  * Permanently drop elevated permissions.
  *
@@ -34,5 +36,37 @@
  * nothing at all.
  **/
 void sc_privs_drop(void);
+
+/**
+ * Debug print of current capabilities with the provided message prefix.
+ */
+void sc_debug_capabilities(const char *msg_prefix);
+
+/**
+ * Compatibility wrapper around cap_set_ambient().
+ */
+int sc_cap_set_ambient(cap_value_t cap, cap_flag_value_t set);
+
+/**
+ * Compatibility wrapper around cap_reset_ambient().
+ */
+int sc_cap_reset_ambient(void);
+
+/**
+ * Release cap_t allocated through libcap.
+ *
+ * This function is designed to be used with SC_CLEANUP() macro.
+ **/
+void sc_cleanup_cap_t(cap_t *ptr);
+
+/**
+ * Assert that given caps are listed in the permitted set of the provided,
+ * current capability set.
+ *
+ * The function works like assert() and invokes die() when missing capabilities
+ * are found. Optional context message will be prepended to the error message
+ * displayed by die().
+ */
+void sc_cap_assert_permitted(cap_t current, const cap_value_t caps[], size_t caps_n, const char *die_context);
 
 #endif

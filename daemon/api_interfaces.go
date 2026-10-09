@@ -32,6 +32,8 @@ import (
 	"github.com/snapcore/snapd/overlord/ifacestate"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
+	"github.com/snapcore/snapd/overlord/swfeats"
+	"github.com/snapcore/snapd/snap/naming"
 )
 
 var (
@@ -39,9 +41,15 @@ var (
 		Path:        "/v2/interfaces",
 		GET:         interfacesConnectionsMultiplexer,
 		POST:        changeInterfaces,
+		Actions:     []string{"connect", "disconnect"},
 		ReadAccess:  openAccess{},
 		WriteAccess: authenticatedAccess{Polkit: polkitActionManageInterfaces},
 	}
+)
+
+var (
+	connectSnapChangeKind    = swfeats.RegisterChangeKind("connect-snap")
+	disconnectSnapChangeKind = swfeats.RegisterChangeKind("disconnect-snap")
 )
 
 // interfacesConnectionsMultiplexer multiplexes to either legacy (connection) or modern behavior (interfaces).
@@ -152,35 +160,36 @@ func changeInterfaces(c *Command, r *http.Request, user *auth.UserState) Respons
 	st.Lock()
 	defer st.Unlock()
 
-	checkInstalled := func(snapName string) error {
+	checkInstalled := func(instanceName naming.InstanceName) error {
 		// empty snap name is fine, ResolveConnect/ResolveDisconnect handles it.
-		if snapName == "" {
+		if instanceName == "" {
 			return nil
 		}
 		var snapst snapstate.SnapState
-		err := snapstate.Get(st, snapName, &snapst)
+		err := snapstate.Get(st, instanceName.String(), &snapst)
 		if (err == nil && !snapst.IsInstalled()) || errors.Is(err, state.ErrNoState) {
-			return fmt.Errorf("snap %q is not installed", snapName)
+			return fmt.Errorf("snap %q is not installed", instanceName)
 		}
 		if err == nil {
 			return nil
 		}
-		return fmt.Errorf("internal error: cannot get state of snap %q: %v", snapName, err)
+		return fmt.Errorf("internal error: cannot get state of snap %q: %v", instanceName, err)
 	}
 
 	for i := range a.Plugs {
-		a.Plugs[i].Snap = ifacestate.RemapSnapFromRequest(a.Plugs[i].Snap)
+		a.Plugs[i].Snap = naming.InstanceName(ifacestate.RemapSnapFromRequest(a.Plugs[i].Snap.String()))
 		if err := checkInstalled(a.Plugs[i].Snap); err != nil {
 			return errToResponse(err, nil, BadRequest, "%v")
 		}
 	}
 	for i := range a.Slots {
-		a.Slots[i].Snap = ifacestate.RemapSnapFromRequest(a.Slots[i].Snap)
+		a.Slots[i].Snap = naming.InstanceName(ifacestate.RemapSnapFromRequest(a.Slots[i].Snap.String()))
 		if err := checkInstalled(a.Slots[i].Snap); err != nil {
 			return errToResponse(err, nil, BadRequest, "%v")
 		}
 	}
 
+	var changeKind string
 	switch a.Action {
 	case "connect":
 		var connRef *interfaces.ConnRef
@@ -190,14 +199,15 @@ func changeInterfaces(c *Command, r *http.Request, user *auth.UserState) Respons
 			var ts *state.TaskSet
 			affected = snapNamesFromConns([]*interfaces.ConnRef{connRef})
 			summary = fmt.Sprintf("Connect %s:%s to %s:%s", connRef.PlugRef.Snap, connRef.PlugRef.Name, connRef.SlotRef.Snap, connRef.SlotRef.Name)
-			ts, err = ifacestate.Connect(st, connRef.PlugRef.Snap, connRef.PlugRef.Name, connRef.SlotRef.Snap, connRef.SlotRef.Name)
+			ts, err = ifacestate.Connect(st, connRef.PlugRef.Snap.String(), connRef.PlugRef.Name, connRef.SlotRef.Snap.String(), connRef.SlotRef.Name)
 			if _, ok := err.(*ifacestate.ErrAlreadyConnected); ok {
-				change := newChange(st, a.Action+"-snap", summary, nil, affected)
+				change := newChange(st, connectSnapChangeKind, summary, nil, affected)
 				change.SetStatus(state.DoneStatus)
 				return AsyncResponse(nil, change.ID())
 			}
 			tasksets = append(tasksets, ts)
 		}
+		changeKind = connectSnapChangeKind
 	case "disconnect":
 		var conns []*interfaces.ConnRef
 		summary = fmt.Sprintf("Disconnect %s:%s from %s:%s", a.Plugs[0].Snap, a.Plugs[0].Name, a.Slots[0].Snap, a.Slots[0].Name)
@@ -230,12 +240,13 @@ func changeInterfaces(c *Command, r *http.Request, user *auth.UserState) Respons
 			}
 			affected = snapNamesFromConns(conns)
 		}
+		changeKind = disconnectSnapChangeKind
 	}
 	if err != nil {
 		return errToResponse(err, nil, BadRequest, "%v")
 	}
 
-	change := newChange(st, a.Action+"-snap", summary, tasksets, affected)
+	change := newChange(st, changeKind, summary, tasksets, affected)
 	st.EnsureBefore(0)
 
 	return AsyncResponse(nil, change.ID())
@@ -244,8 +255,8 @@ func changeInterfaces(c *Command, r *http.Request, user *auth.UserState) Respons
 func snapNamesFromConns(conns []*interfaces.ConnRef) []string {
 	m := make(map[string]bool)
 	for _, conn := range conns {
-		m[conn.PlugRef.Snap] = true
-		m[conn.SlotRef.Snap] = true
+		m[conn.PlugRef.Snap.String()] = true
+		m[conn.SlotRef.Snap.String()] = true
 	}
 	l := make([]string, 0, len(m))
 	for name := range m {

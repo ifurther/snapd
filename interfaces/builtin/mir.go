@@ -114,7 +114,7 @@ func (iface *mirInterface) StaticInfo() interfaces.StaticInfo {
 
 func (iface *mirInterface) AppArmorConnectedPlug(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	old := "###SLOT_SECURITY_TAGS###"
-	new := spec.SnapAppSet().SlotLabelExpression(slot)
+	new := slot.LabelExpression()
 	snippet := strings.Replace(mirConnectedPlugAppArmor, old, new, -1)
 	spec.AddSnippet(snippet)
 	return nil
@@ -122,7 +122,7 @@ func (iface *mirInterface) AppArmorConnectedPlug(spec *apparmor.Specification, p
 
 func (iface *mirInterface) AppArmorConnectedSlot(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	old := "###PLUG_SECURITY_TAGS###"
-	new := spec.SnapAppSet().PlugLabelExpression(plug)
+	new := plug.LabelExpression()
 	snippet := strings.Replace(mirConnectedSlotAppArmor, old, new, -1)
 	spec.AddSnippet(snippet)
 	return nil
@@ -150,6 +150,12 @@ func (iface *mirInterface) UDevPermanentSlot(spec *udev.Specification, slot *sna
 
 func (iface *mirInterface) AutoConnect(*snap.PlugInfo, *snap.SlotInfo) bool {
 	return true
+}
+
+func (iface *mirInterface) ParallelInstancesSupportedForSlot(_ *snap.SlotInfo) error {
+	// mir server owns the well-known socket /run/mir_socket (or
+	// /run/user/*/mir_socket); only one snap instance can hold it at a time.
+	return errParallelInstancesUniqueResourceOwner
 }
 
 func init() {

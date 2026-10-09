@@ -29,7 +29,9 @@ import (
 	"github.com/snapcore/snapd/overlord/auth"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
+	"github.com/snapcore/snapd/overlord/swfeats"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 )
 
 var (
@@ -37,17 +39,24 @@ var (
 		Path:        "/v2/aliases",
 		GET:         getAliases,
 		POST:        changeAliases,
+		Actions:     []string{"alias", "unalias", "prefer"},
 		ReadAccess:  openAccess{},
 		WriteAccess: authenticatedAccess{},
 	}
 )
 
+var (
+	aliasChangeKind   = swfeats.RegisterChangeKind("alias")
+	unaliasChangeKind = swfeats.RegisterChangeKind("unalias")
+	preferChangeKind  = swfeats.RegisterChangeKind("prefer")
+)
+
 // aliasAction is an action performed on aliases
 type aliasAction struct {
-	Action string `json:"action"`
-	Snap   string `json:"snap"`
-	App    string `json:"app"`
-	Alias  string `json:"alias"`
+	Action string              `json:"action"`
+	Snap   naming.InstanceName `json:"snap"`
+	App    string              `json:"app"`
+	Alias  string              `json:"alias"`
 	// old now unsupported api
 	Aliases []string `json:"aliases"`
 }
@@ -75,12 +84,12 @@ func changeAliases(c *Command, r *http.Request, user *auth.UserState) Response {
 	case "alias":
 		taskset, err = snapstate.Alias(st, a.Snap, a.App, a.Alias)
 	case "unalias":
-		if a.Alias == a.Snap {
+		if a.Alias == a.Snap.String() {
 			// Do What I mean:
 			// check if a snap is referred/intended
 			// or just an alias
 			var snapst snapstate.SnapState
-			err := snapstate.Get(st, a.Snap, &snapst)
+			err := snapstate.Get(st, a.Snap.String(), &snapst)
 			if err != nil && !errors.Is(err, state.ErrNoState) {
 				return InternalError("%v", err)
 			}
@@ -101,21 +110,25 @@ func changeAliases(c *Command, r *http.Request, user *auth.UserState) Response {
 		return errToResponse(err, nil, BadRequest, "%v")
 	}
 
+	var changeKind string
 	var summary string
 	switch a.Action {
 	case "alias":
 		summary = fmt.Sprintf(i18n.G("Setup alias %q => %q for snap %q"), a.Alias, a.App, a.Snap)
+		changeKind = aliasChangeKind
 	case "unalias":
 		if a.Alias != "" {
 			summary = fmt.Sprintf(i18n.G("Remove manual alias %q for snap %q"), a.Alias, a.Snap)
 		} else {
 			summary = fmt.Sprintf(i18n.G("Disable all aliases for snap %q"), a.Snap)
 		}
+		changeKind = unaliasChangeKind
 	case "prefer":
 		summary = fmt.Sprintf(i18n.G("Prefer aliases of snap %q"), a.Snap)
+		changeKind = preferChangeKind
 	}
 
-	change := newChange(st, a.Action, summary, []*state.TaskSet{taskset}, []string{a.Snap})
+	change := newChange(st, changeKind, summary, []*state.TaskSet{taskset}, []string{a.Snap.String()})
 	st.EnsureBefore(0)
 
 	return AsyncResponse(nil, change.ID())

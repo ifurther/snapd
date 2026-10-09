@@ -20,9 +20,10 @@ package cgroup
 
 import (
 	"context"
+	"syscall"
 	"time"
 
-	"github.com/godbus/dbus"
+	"github.com/godbus/dbus/v5"
 
 	"github.com/snapcore/snapd/testutil"
 )
@@ -38,10 +39,16 @@ var (
 	ErrDBusNameHasNoOwner   = errDBusNameHasNoOwner
 	ErrDBusSpawnChildExited = errDBusSpawnChildExited
 
-	SecurityTagFromCgroupPath = securityTagFromCgroupPath
-
 	ApplyToSnap = applyToSnap
+
+	KillProcessesInCgroup = killProcessesInCgroup
+
+	CollectDevicesV1   = collectDevicesV1
+	FindSecurityTagsV1 = findSecurityTagsV1
 )
+
+// DeviceMapAccessor is exported for testing.
+type DeviceMapAccessor = deviceMapAccessor
 
 func MockFsTypeForPath(mock func(string) (int64, error)) (restore func()) {
 	old := fsTypeForPath
@@ -105,12 +112,6 @@ func MockCreateScopeJobTimeout(d time.Duration) (restore func()) {
 	}
 }
 
-func MockCgroupsFilePath(path string) (restore func()) {
-	r := testutil.Backup(&cgroupsFilePath)
-	cgroupsFilePath = path
-	return r
-}
-
 func MonitorDelete(folders []string, name string, channel chan string) error {
 	return currentWatcher.monitorDelete(folders, name, channel)
 }
@@ -135,3 +136,39 @@ func (iw *inotifyWatcher) MonitorDelete(folders []string, name string, channel c
 }
 
 var NewInotifyWatcher = newInotifyWatcher
+
+func MockFreezeSnapProcessesImplV1(fn func(ctx context.Context, snapName string) error) (restore func()) {
+	return testutil.Mock(&freezeSnapProcessesImplV1, fn)
+}
+
+func MockThawSnapProcessesImplV1(fn func(snapName string) error) (restore func()) {
+	return testutil.Mock(&thawSnapProcessesImplV1, fn)
+}
+
+func MockKillProcessesInCgroup(fn func(ctx context.Context, dir string, freeze func(ctx context.Context), thaw func()) error) (restore func()) {
+	return testutil.Mock(&killProcessesInCgroup, fn)
+}
+
+func MockSyscallKill(fn func(pid int, sig syscall.Signal) error) (restore func()) {
+	return testutil.Mock(&syscallKill, fn)
+}
+
+func MockOsReadFile(fn func(name string) ([]byte, error)) (restore func()) {
+	return testutil.Mock(&osReadFile, fn)
+}
+
+func MockMaxKillTimeout(t time.Duration) (restore func()) {
+	return testutil.Mock(&maxKillTimeout, t)
+}
+
+func MockKillThawCooldown(t time.Duration) (restore func()) {
+	return testutil.Mock(&killThawCooldown, t)
+}
+
+func MockLoadDeviceMap(fn func(string) (DeviceMapAccessor, error)) (restore func()) {
+	return testutil.Mock(&loadDeviceMapFunc, fn)
+}
+
+func MockFindDeviceMapsForSnap(fn func(string) ([]string, error)) (restore func()) {
+	return testutil.Mock(&findDeviceMapsForSnapFunc, fn)
+}

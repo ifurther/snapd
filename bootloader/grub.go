@@ -86,8 +86,11 @@ func (g *grub) dir() string {
 	return filepath.Join(g.rootdir, g.basedir)
 }
 
-func (g *grub) installManagedRecoveryBootConfig() error {
+func (g *grub) installManagedRecoveryBootConfig(opts *Options) error {
 	assetName := g.Name() + "-recovery.cfg"
+	if opts.HybridSystem {
+		assetName = g.Name() + "-recovery-hybrid.cfg"
+	}
 	systemFile := filepath.Join(g.rootdir, "/EFI/ubuntu/grub.cfg")
 	return genericSetBootConfigFromAsset(systemFile, assetName)
 }
@@ -101,7 +104,7 @@ func (g *grub) installManagedBootConfig() error {
 func (g *grub) InstallBootConfig(gadgetDir string, opts *Options) error {
 	if opts != nil && opts.Role == RoleRecovery {
 		// install managed config for the recovery partition
-		return g.installManagedRecoveryBootConfig()
+		return g.installManagedRecoveryBootConfig(opts)
 	}
 	if opts != nil && opts.Role == RoleRunMode {
 		// install managed boot config that can handle kernel.efi
@@ -211,6 +214,10 @@ func (g *grub) ExtractKernelAssets(s snap.PlaceInfo, snapf snap.Container) error
 
 func (g *grub) RemoveKernelAssets(s snap.PlaceInfo) error {
 	return removeKernelAssetsFromBootDir(g.dir(), s)
+}
+
+func (g *grub) RequiredByGadget(gadgetDir string) bool {
+	return checkForBlMarker(g, gadgetDir)
 }
 
 // ExtractedRunKernelImageBootloader helper methods
@@ -689,4 +696,64 @@ func (g *grub) BootChains(runBl Bootloader, kernelPath string) ([][]BootFile, er
 	}
 
 	return chains, nil
+}
+
+func (g *grub) RevocationTriggeringAssets() ([]string, error) {
+	if !g.recovery {
+		return nil, nil
+	}
+
+	assets, err := g.getGrubBootAssetsForArch()
+	if err != nil {
+		return nil, err
+	}
+
+	// We also add defaultShimBinary in case some new installation
+	// still use an old custom gadget that does not have the new
+	// boot chain yet.
+	return []string{assets.shimBinary.Id(), assets.defaultShimBinary.Id()}, nil
+}
+
+// ParametersForEfiLoadOption returns a serialized load option for the
+// shim binary. It should be called on a UefiBootloader.
+// updatedAssets is a list of assets that were installed/updated. This
+// only expects trusted assets.
+func (g *grub) ParametersForEfiLoadOption(updatedAssets []string) (description string, assetPath string, optionalData []byte, err error) {
+	if !g.recovery {
+		return "", "", nil, fmt.Errorf("internal error: run grub does not provide a boot entry")
+	}
+
+	knownAssets, err := g.getGrubBootAssetsForArch()
+	if err != nil {
+		return "", "", nil, err
+	}
+
+	foundFallbackShim := false
+	foundShim := false
+	// XXX: it would be nice to also check for fb.efi. However it
+	// is not part of a trusted boot chain, so we will not appear
+	// in updatedAssets
+
+	// Let's look for the shim binary
+	for _, updated := range updatedAssets {
+		if updated == knownAssets.shimBinary.Id() {
+			foundShim = true
+		}
+		if updated == knownAssets.defaultShimBinary.Id() {
+			foundFallbackShim = true
+		}
+	}
+
+	if foundShim {
+		assetPath = filepath.Join(g.rootdir, knownAssets.shimBinary.path)
+	} else if foundFallbackShim {
+		assetPath = filepath.Join(g.rootdir, knownAssets.defaultShimBinary.path)
+	} else {
+		return "", "", nil, ErrNoBootChainFound
+	}
+
+	description = "ubuntu"
+	optionalData = nil
+
+	return description, assetPath, optionalData, nil
 }

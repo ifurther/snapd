@@ -5,7 +5,7 @@
     "brand-id": "test-snapd",
     "model": "my-model",
     "architecture": "amd64",
-    "timestamp": "2024-04-09T00:00:00+00:00",
+    "timestamp": "2024-04-24T00:00:00+00:00",
     "grade": "dangerous",
     "base": "core24",
     "serial-authority": ["generic"],

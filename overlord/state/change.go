@@ -162,6 +162,7 @@ func (a byReadyTime) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a byReadyTime) Less(i, j int) bool { return a[i].readyTime.Before(a[j].readyTime) }
 
 func newChange(state *State, id, kind, summary string) *Change {
+	logger.Trace("new-change", "kind", kind, "id", id)
 	return &Change{
 		state:   state,
 		id:      id,
@@ -266,14 +267,14 @@ func (c *Change) Summary() string {
 
 // Set associates value with key for future consulting by managers.
 // The provided value must properly marshal and unmarshal with encoding/json.
-func (c *Change) Set(key string, value interface{}) {
+func (c *Change) Set(key string, value any) {
 	c.state.writing()
 	c.data.set(key, value)
 }
 
 // Get unmarshals the stored value associated with the provided key
 // into the value parameter.
-func (c *Change) Get(key string, value interface{}) error {
+func (c *Change) Get(key string, value any) error {
 	c.state.reading()
 	return c.data.get(key, value)
 }

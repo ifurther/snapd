@@ -19,6 +19,10 @@
 
 package builtin
 
+import (
+	"github.com/snapcore/snapd/interfaces"
+)
+
 /*
  * Microstack is a full OpenStack in a single snap package.
  * Virtual machines are spawned as QEMU processes with libvirt acting as a management
@@ -124,10 +128,11 @@ const microStackSupportConnectedPlugAppArmor = `
 
 @{PROC}/*/status r,
 
-@{PROC}/sys/fs/nr_open r,
-
 # Libvirt needs access to the PCI config space in order to be able to reset devices.
 /sys/devices/pci*/**/config rw,
+/sys/devices/pci*/**/driver_override rw,
+/sys/bus/pci/drivers/**/unbind rw,
+/sys/bus/pci/drivers_probe rw,
 
 # Spice
 owner /{dev,run}/shm/spice.* rw,
@@ -209,6 +214,20 @@ ptrace (read, trace) peer=libvirt-*,
 
 # Used by neutron-ovn-agent.
 unmount /run/netns/ovnmeta-*,
+
+# Required by libvirtd to detect and utilise AMD SEV capabilities for AMD CPU's
+/dev/sev rw,
+
+# Required by OVS to initialize DPDK
+# https://doc.dpdk.org/guides/linux_gsg/enable_func.html
+@{PROC}/@{pids}/pagemap r,
+capability ipc_lock,
+# Allow anonymous files backed by huge pages.
+# https://gitlab.com/apparmor/apparmor/-/issues/545
+# Note that this rule doesn't allow top level files and directories to be removed.
+# At the same time, subpaths are expected to be on squashfs unless modified
+# through layouts.
+owner / rw,
 `
 
 const microStackSupportConnectedPlugSecComp = `
@@ -221,6 +240,8 @@ const microStackSupportConnectedPlugSecComp = `
 mknod - |S_IFBLK -
 mknodat - - |S_IFBLK -
 `
+
+const microstackSupportServiceSnippet = interfaces.PlugServicesServiceSectionSnippet(`Delegate=true`)
 
 type microStackInterface struct {
 	commonInterface
@@ -254,6 +275,8 @@ func init() {
 		connectedPlugAppArmor:    microStackSupportConnectedPlugAppArmor,
 		connectedPlugSecComp:     microStackSupportConnectedPlugSecComp,
 		connectedPlugKModModules: microStackSupportConnectedPlugKmod,
-		serviceSnippets:          []string{`Delegate=true`},
+		serviceSnippets:          []interfaces.PlugServicesSnippet{microstackSupportServiceSnippet},
+		parallelInstancesPlugErr: errParallelInstancesSharedResources,
+		parallelInstancesSlotErr: errParallelInstancesSystemSlot,
 	}})
 }

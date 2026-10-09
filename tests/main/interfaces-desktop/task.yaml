@@ -7,8 +7,6 @@ details: |
     desktop interface.
 
 systems:
-    - -amazon-linux-2-*
-    - -centos-7-*
     - -ubuntu-14.04-*
     - -ubuntu-core-*
 

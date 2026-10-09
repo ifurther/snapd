@@ -19,6 +19,10 @@
 
 package builtin
 
+import (
+	"strings"
+)
+
 const cameraSummary = `allows access to all cameras`
 
 const cameraBaseDeclarationSlots = `
@@ -31,10 +35,10 @@ const cameraBaseDeclarationSlots = `
 
 const cameraConnectedPlugAppArmor = `
 # Until we have proper device assignment, allow access to all cameras
-/dev/video[0-9]* rw,
+###PROMPT### /dev/video[0-9]* rwk,
 
 # VideoCore cameras (shared device with VideoCore/EGL)
-/dev/vchiq rw,
+###PROMPT### /dev/vchiq rw,
 
 # Allow detection of cameras. Leaks plugged in USB device info
 /sys/bus/usb/devices/ r,
@@ -52,6 +56,18 @@ const cameraConnectedPlugAppArmor = `
 /sys/devices/platform/**/usb*/**/video4linux/** r,
 `
 
+// DetectCameraFromPath returns true if the given path corresponds to an
+// AppArmor rule with the prompt prefix from the camera interface.
+//
+// XXX: this is only necessary until metadata tags are fully supported by the
+// AppArmor parser and kernel. Then, this function should be removed.
+func DetectCameraFromPath(path string) bool {
+	if strings.HasPrefix(path, "/dev/video") || path == "/dev/vchiq" {
+		return true
+	}
+	return false
+}
+
 var cameraConnectedPlugUDev = []string{
 	`KERNEL=="video[0-9]*"`,
 	`KERNEL=="vchiq"`,
@@ -59,12 +75,13 @@ var cameraConnectedPlugUDev = []string{
 
 func init() {
 	registerIface(&commonInterface{
-		name:                  "camera",
-		summary:               cameraSummary,
-		implicitOnCore:        true,
-		implicitOnClassic:     true,
-		baseDeclarationSlots:  cameraBaseDeclarationSlots,
-		connectedPlugAppArmor: cameraConnectedPlugAppArmor,
-		connectedPlugUDev:     cameraConnectedPlugUDev,
+		name:                     "camera",
+		summary:                  cameraSummary,
+		implicitOnCore:           true,
+		implicitOnClassic:        true,
+		baseDeclarationSlots:     cameraBaseDeclarationSlots,
+		connectedPlugAppArmor:    cameraConnectedPlugAppArmor,
+		connectedPlugUDev:        cameraConnectedPlugUDev,
+		parallelInstancesSlotErr: errParallelInstancesSystemSlot,
 	})
 }

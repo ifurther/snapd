@@ -24,6 +24,7 @@ import (
 	"fmt"
 
 	"github.com/snapcore/snapd/bootloader"
+	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/snap"
 )
 
@@ -177,7 +178,7 @@ func applicable(s snap.PlaceInfo, t snap.Type, dev snap.Device) bool {
 
 	switch t {
 	case snap.TypeKernel:
-		if s.InstanceName() != dev.Kernel() {
+		if s.InstanceName().String() != dev.Kernel() {
 			// a remodel might leave behind installed a kernel that
 			// is not the device kernel anymore, ignore such a
 			// kernel by checking the name
@@ -188,7 +189,7 @@ func applicable(s snap.PlaceInfo, t snap.Type, dev snap.Device) bool {
 		if base == "" {
 			base = "core"
 		}
-		if s.InstanceName() != base {
+		if s.InstanceName().String() != base {
 			return false
 		}
 	case snap.TypeGadget:
@@ -196,7 +197,7 @@ func applicable(s snap.PlaceInfo, t snap.Type, dev snap.Device) bool {
 		// Second condition: a remodel might leave behind installed a
 		// gadget that is not the device gadget anymore, ignore such a
 		// gadget by checking the name
-		if !dev.HasModeenv() || s.InstanceName() != dev.Gadget() {
+		if !dev.HasModeenv() || s.InstanceName().String() != dev.Gadget() {
 			return false
 		}
 	default:
@@ -301,7 +302,7 @@ func InUse(typ snap.Type, dev snap.Device) (InUseFunc, error) {
 
 	return func(name string, rev snap.Revision) bool {
 		for _, cand := range cands {
-			if cand.SnapName() == name && cand.SnapRevision() == rev {
+			if cand.SnapName().String() == name && cand.SnapRevision() == rev {
 				return true
 			}
 		}
@@ -445,6 +446,31 @@ func SetRecoveryBootSystemAndMode(dev snap.Device, systemLabel, mode string) err
 	return bl.SetBootVars(m)
 }
 
+// ReconfigureRecoveryBootConfig rebuilds recovery boot configuration files for
+// bootloaders that support it. Returns true when the recovery bootloader
+// provides the capability and the reconfiguration was attempted.
+func ReconfigureRecoveryBootConfig(dev snap.Device) (updated bool, err error) {
+	if !dev.HasModeenv() || !dev.RunMode() {
+		return false, nil
+	}
+
+	opts := &bootloader.Options{
+		Role: bootloader.RoleRecovery,
+	}
+	bl, err := bootloader.Find(InitramfsUbuntuSeedDir, opts)
+	if err != nil {
+		return false, err
+	}
+	rcb, ok := bl.(bootloader.RecoveryBootConfigBootloader)
+	if !ok {
+		return false, nil
+	}
+	if err := rcb.Reconfigure(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // UpdateManagedBootConfigs updates managed boot config assets if
 // those are present for the ubuntu-boot bootloader. To do this it
 // needs information from the model, the gadget we are updating to,
@@ -506,6 +532,8 @@ func updateManagedBootConfigForBootloader(dev snap.Device, mode, gadgetSnapOrDir
 		return false, err
 	}
 
+	osutil.MaybeInjectFault("update-config-bootloader")
+
 	if cmdlineChange {
 		candidate := true
 		if err := updateCmdlineVars(tbl, gadgetSnapOrDir, cmdlineAppend, candidate, dev); err != nil {
@@ -559,22 +587,11 @@ func UpdateCommandLineForGadgetComponent(dev snap.Device, gadgetSnapOrDir, cmdli
 		return false, nil
 	}
 
+	osutil.MaybeInjectFault("update-command-line-gadget")
+
 	candidate := false
 	if err := updateCmdlineVars(tbl, gadgetSnapOrDir, cmdlineAppend, candidate, dev); err != nil {
 		return false, err
 	}
 	return cmdlineChange, nil
-}
-
-// MarkFactoryResetComplete runs a series of steps in a run system that complete a
-// factory reset process.
-func MarkFactoryResetComplete(encrypted bool) error {
-	if !encrypted {
-		// there is nothing to do on an unencrypted system
-		return nil
-	}
-	if err := postFactoryResetCleanup(); err != nil {
-		return fmt.Errorf("cannot perform post factory reset boot cleanup: %v", err)
-	}
-	return nil
 }

@@ -23,6 +23,7 @@ HOME_DIR/snap(/.*)?			gen_context(system_u:object_r:snappy_home_t,s0)
 /usr/bin/snap			--	gen_context(system_u:object_r:snappy_cli_exec_t,s0)
 /usr/bin/snapctl		--	gen_context(system_u:object_r:snappy_cli_exec_t,s0)
 
+# TODO add policy for snapd-apparmor?
 ifdef(`distro_redhat',`
 /usr/libexec/snapd/snapctl		--	gen_context(system_u:object_r:snappy_cli_exec_t,s0)
 /usr/libexec/snapd/snap-confine		--	gen_context(system_u:object_r:snappy_confine_exec_t,s0)
@@ -43,12 +44,18 @@ ifdef(`distro_debian',`
 /lib/systemd/system/snapd.* 	--	gen_context(system_u:object_r:snappy_unit_file_t,s0)
 ')
 
+/tmp/snap-private-tmp		-d	gen_context(system_u:object_r:snappy_tmp_t,s0)
+
 /var/run/snapd(/.*)?	        gen_context(system_u:object_r:snappy_var_run_t,s0)
 /var/run/snapd\.socket 		-s	gen_context(system_u:object_r:snappy_var_run_t,s0)
 /var/run/snapd-snap\.socket 	-s	gen_context(system_u:object_r:snappy_var_run_t,s0)
 /var/lib/snapd(/.*)?			gen_context(system_u:object_r:snappy_var_lib_t,s0)
 /var/cache/snapd(/.*)?			gen_context(system_u:object_r:snappy_var_cache_t,s0)
 /var/snap(/.*)?				gen_context(system_u:object_r:snappy_var_t,s0)
+# on openSUSE, snaps are mounted under /snap
+ifdef(`distro_opensuse',`
+/snap(/.*)?					gen_context(system_u:object_r:snappy_var_lib_t,s0)
+')
 
 /run/snapd(/.*)?	        gen_context(system_u:object_r:snappy_var_run_t,s0)
 /run/snapd\.socket 		-s	gen_context(system_u:object_r:snappy_var_run_t,s0)

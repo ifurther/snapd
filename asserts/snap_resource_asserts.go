@@ -33,12 +33,12 @@ import (
 // statement by the store acknowledging the receipt of data for a resource of a
 // snap and labeling it with a resource revision.
 type SnapResourceRevision struct {
-	assertionBase
+	AssertionBase
 	resourceSize     uint64
 	resourceRevision int
 	timestamp        time.Time
 
-	// TODO: integrity when the format is stabilized again
+	resourceIntegrityData []IntegrityData
 }
 
 // ResourceSHA3_384 returns the SHA3-384 digest of the snap resource.
@@ -82,8 +82,13 @@ func (resrev *SnapResourceRevision) Timestamp() time.Time {
 	return resrev.timestamp
 }
 
-// Implement further consistency checks.
-func (resrev *SnapResourceRevision) checkConsistency(db RODatabase, acck *AccountKey) error {
+// ResourceIntegrityData returns the integrity data associated with the snap resource revision assertion if any.
+func (resrev *SnapResourceRevision) ResourceIntegrityData() []IntegrityData {
+	return resrev.resourceIntegrityData
+}
+
+// CheckConsistency performs further checks using the assertion database.
+func (resrev *SnapResourceRevision) CheckConsistency(db RODatabase, acck *AccountKey) error {
 	otherProvenance := resrev.Provenance() != naming.DefaultProvenance
 	if !otherProvenance && !db.IsTrustedAccount(resrev.AuthorityID()) {
 		// delegating global-upload revisions is not allowed
@@ -129,7 +134,7 @@ func (resrev *SnapResourceRevision) checkConsistency(db RODatabase, acck *Accoun
 }
 
 // expected interface is implemented
-var _ consistencyChecker = (*SnapResourceRevision)(nil)
+var _ ConsistencyChecker = (*SnapResourceRevision)(nil)
 
 // Prerequisites returns references to this snap-resource-revision's prerequisite assertions.
 func (resrev *SnapResourceRevision) Prerequisites() []*Ref {
@@ -139,7 +144,7 @@ func (resrev *SnapResourceRevision) Prerequisites() []*Ref {
 	}
 }
 
-func checkResourceName(headers map[string]interface{}) error {
+func checkResourceName(headers map[string]any) error {
 	resName, err := checkNotEmptyString(headers, "resource-name")
 	if err != nil {
 		return err
@@ -151,7 +156,7 @@ func checkResourceName(headers map[string]interface{}) error {
 	return nil
 }
 
-func assembleSnapResourceRevision(assert assertionBase) (Assertion, error) {
+func assembleSnapResourceRevision(assert AssertionBase) (Assertion, error) {
 	if err := checkResourceName(assert.headers); err != nil {
 		return nil, err
 	}
@@ -186,13 +191,17 @@ func assembleSnapResourceRevision(assert assertionBase) (Assertion, error) {
 		return nil, err
 	}
 
-	// TODO: implement integrity stanza when format is stabilized again
+	resourceIntegrityData, err := checkSnapIntegrity(assert.headers)
+	if err != nil {
+		return nil, err
+	}
 
 	return &SnapResourceRevision{
-		assertionBase:    assert,
-		resourceSize:     resourceSize,
-		resourceRevision: resourceRevision,
-		timestamp:        timestamp,
+		AssertionBase:         assert,
+		resourceSize:          resourceSize,
+		resourceRevision:      resourceRevision,
+		timestamp:             timestamp,
+		resourceIntegrityData: resourceIntegrityData,
 	}, nil
 }
 
@@ -201,7 +210,7 @@ func assembleSnapResourceRevision(assert assertionBase) (Assertion, error) {
 // that the given snap resource revision can work with the given
 // snap revision.
 type SnapResourcePair struct {
-	assertionBase
+	AssertionBase
 	resourceRevision int
 	snapRevision     int
 	timestamp        time.Time
@@ -243,8 +252,8 @@ func (respair *SnapResourcePair) Timestamp() time.Time {
 	return respair.timestamp
 }
 
-// Implement further consistency checks.
-func (respair *SnapResourcePair) checkConsistency(db RODatabase, acck *AccountKey) error {
+// CheckConsistency performs further checks using the assertion database.
+func (respair *SnapResourcePair) CheckConsistency(db RODatabase, acck *AccountKey) error {
 	otherProvenance := respair.Provenance() != naming.DefaultProvenance
 	if !otherProvenance && !db.IsTrustedAccount(respair.AuthorityID()) {
 		// delegating global-upload revisions is not allowed
@@ -291,7 +300,7 @@ func (respair *SnapResourcePair) checkConsistency(db RODatabase, acck *AccountKe
 }
 
 // expected interface is implemented
-var _ consistencyChecker = (*SnapResourcePair)(nil)
+var _ ConsistencyChecker = (*SnapResourcePair)(nil)
 
 // Prerequisites returns references to this snap-resource-pair's prerequisite assertions.
 func (respair *SnapResourcePair) Prerequisites() []*Ref {
@@ -300,7 +309,7 @@ func (respair *SnapResourcePair) Prerequisites() []*Ref {
 	}
 }
 
-func assembleSnapResourcePair(assert assertionBase) (Assertion, error) {
+func assembleSnapResourcePair(assert AssertionBase) (Assertion, error) {
 	if err := checkResourceName(assert.headers); err != nil {
 		return nil, err
 	}
@@ -331,7 +340,7 @@ func assembleSnapResourcePair(assert assertionBase) (Assertion, error) {
 	}
 
 	return &SnapResourcePair{
-		assertionBase:    assert,
+		AssertionBase:    assert,
 		resourceRevision: resourceRevision,
 		snapRevision:     snapRevision,
 		timestamp:        timestamp,

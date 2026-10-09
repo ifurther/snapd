@@ -44,8 +44,12 @@ const rawusbConnectedPlugAppArmor = `
 # Allow detection of usb devices. Leaks plugged in USB device info
 /sys/bus/usb/devices/ r,
 /sys/devices/pci**/usb[0-9]** r,
-/sys/devices/platform/soc/*.usb/usb[0-9]** r,
+/sys/devices/platform/soc**/*.usb**/usb[0-9]** r,
+# SS USB controller as exposed by dwc3 driver
+/sys/devices/platform/soc**/*.ssusb**/usb[0-9]** r,
 /sys/devices/platform/scb/*.pcie/pci**/usb[0-9]** r,
+/sys/devices/platform/axi/*.pcie/*.usb/xhci-hcd.[0-9]*/usb[0-9]** r,
+/sys/devices/platform/axi/*.usb/usb[0-9]** r,
 
 /run/udev/data/c16[67]:[0-9] r, # ACM USB modems
 /run/udev/data/b180:*    r, # various USB block devices
@@ -69,13 +73,14 @@ var rawusbConnectedPlugUDev = []string{
 
 func init() {
 	registerIface(&commonInterface{
-		name:                  "raw-usb",
-		summary:               rawusbSummary,
-		implicitOnCore:        true,
-		implicitOnClassic:     true,
-		baseDeclarationSlots:  rawusbBaseDeclarationSlots,
-		connectedPlugAppArmor: rawusbConnectedPlugAppArmor,
-		connectedPlugSecComp:  rawusbConnectedPlugSecComp,
-		connectedPlugUDev:     rawusbConnectedPlugUDev,
+		name:                     "raw-usb",
+		summary:                  rawusbSummary,
+		implicitOnCore:           true,
+		implicitOnClassic:        true,
+		baseDeclarationSlots:     rawusbBaseDeclarationSlots,
+		connectedPlugAppArmor:    rawusbConnectedPlugAppArmor,
+		connectedPlugSecComp:     rawusbConnectedPlugSecComp,
+		connectedPlugUDev:        rawusbConnectedPlugUDev,
+		parallelInstancesSlotErr: errParallelInstancesSystemSlot,
 	})
 }

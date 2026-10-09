@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2014-2022 Canonical Ltd
+ * Copyright (C) 2014-2026 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -22,6 +22,7 @@ package snap
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -30,10 +31,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/snapcore/snapd/desktop/desktopentry"
 	"github.com/snapcore/snapd/dirs"
+	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/metautil"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/osutil/sys"
+	"github.com/snapcore/snapd/snap/integrity"
 	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/snapdtool"
 	"github.com/snapcore/snapd/strutil"
@@ -61,6 +65,17 @@ type ContainerPlaceInfo interface {
 
 	// MountDescription is the value for the mount unit Description field.
 	MountDescription() string
+
+	// DmVerityFile returns the name of the dm-verity hash file computed by the container's name
+	// and the digest.
+	// If the container doesn't contain integrity data or contains integrity data but not of type
+	// "dm-verity", this will return an error.
+	DmVerityFile() (string, error)
+
+	// DmVerityDigest returns the dm-verity digest of the integrity data associated with the container.
+	// If the container doesn't contain integrity data or contains integrity data but not of type
+	// "dm-verity", this will return an error.
+	DmVerityDigest() (string, error)
 }
 
 // PlaceInfo offers all the information about where a snap and its data are
@@ -68,10 +83,10 @@ type ContainerPlaceInfo interface {
 type PlaceInfo interface {
 	// InstanceName returns the name of the snap decorated with instance
 	// key, if any.
-	InstanceName() string
+	InstanceName() naming.InstanceName
 
 	// SnapName returns the name of the snap.
-	SnapName() string
+	SnapName() naming.SnapName
 
 	// SnapRevision returns the revision of the snap.
 	SnapRevision() Revision
@@ -111,18 +126,6 @@ type PlaceInfo interface {
 	// UserXdgRuntimeDir returns the per user XDG_RUNTIME_DIR directory
 	UserXdgRuntimeDir(userID sys.UserID) string
 
-	// DataHomeDirs returns a slice of globs that match all per user data directories
-	// of a snap.
-	DataHomeDirs(opts *dirs.SnapDirOptions) []string
-
-	// CommonDataHomeDirs returns a slice of globs that match all per user data
-	// directories common across revisions of the snap.
-	CommonDataHomeDirs(opts *dirs.SnapDirOptions) []string
-
-	// XdgRuntimeDirs returns a glob that matches all XDG_RUNTIME_DIR
-	// directories for all users of the snap.
-	XdgRuntimeDirs() string
-
 	// UserExposedHomeDir returns the snap's new home directory under ~/Snap.
 	UserExposedHomeDir(home string) string
 
@@ -132,16 +135,14 @@ type PlaceInfo interface {
 
 // MinimalPlaceInfo returns a PlaceInfo with just the location information for a
 // snap of the given instance name and revision.
-func MinimalPlaceInfo(instanceName string, revision Revision) PlaceInfo {
-	storeName, instanceKey := SplitInstanceName(instanceName)
-	return &Info{SideInfo: SideInfo{RealName: storeName, Revision: revision}, InstanceKey: instanceKey}
+func MinimalPlaceInfo(instanceName naming.InstanceName, revision Revision) PlaceInfo {
+	return &Info{SideInfo: SideInfo{RealName: instanceName.SnapName().String(), Revision: revision}, InstanceKey: instanceName.InstanceKey()}
 }
 
 // MinimalSnapContainerPlaceInfo returns a ContainerPlaceInfo with just the location
 // information for a snap of the given instance name and revision.
-func MinimalSnapContainerPlaceInfo(instanceName string, revision Revision) ContainerPlaceInfo {
-	storeName, instanceKey := SplitInstanceName(instanceName)
-	return &Info{SideInfo: SideInfo{RealName: storeName, Revision: revision}, InstanceKey: instanceKey}
+func MinimalSnapContainerPlaceInfo(instanceName naming.InstanceName, revision Revision) ContainerPlaceInfo {
+	return &Info{SideInfo: SideInfo{RealName: instanceName.SnapName().String(), Revision: revision}, InstanceKey: instanceName.InstanceKey()}
 }
 
 // ParsePlaceInfoFromSnapFileName returns a PlaceInfo with just the location
@@ -180,26 +181,26 @@ func BaseDir(name string) string {
 
 // MountDir returns the base directory where it gets mounted of the snap with
 // the given name and revision.
-func MountDir(name string, revision Revision) string {
-	return filepath.Join(BaseDir(name), revision.String())
+func MountDir(name naming.InstanceName, revision Revision) string {
+	return filepath.Join(BaseDir(name.String()), revision.String())
 }
 
 // ComponentMountDir returns the directory where a component gets mounted, which
 // will be of the form:
 // /snaps/<snap_instance>/components/mnt/<component_name>/<component_revision>
-func ComponentMountDir(componentName string, compRevision Revision, snapInstance string) string {
+func ComponentMountDir(componentName string, compRevision Revision, snapInstance naming.InstanceName) string {
 	return filepath.Join(ComponentsBaseDir(snapInstance), "mnt", componentName, compRevision.String())
 }
 
 // MountFile returns the path where the snap file that is mounted is installed,
 // using the default blob directory (dirs.SnapBlobDir).
-func MountFile(name string, revision Revision) string {
+func MountFile(name naming.InstanceName, revision Revision) string {
 	return MountFileInDir(dirs.SnapBlobDir, name, revision)
 }
 
 // MountFileInDir returns the path where the snap file that is mounted is
 // installed in a given directory.
-func MountFileInDir(dir, name string, revision Revision) string {
+func MountFileInDir(dir string, name naming.InstanceName, revision Revision) string {
 	return filepath.Join(dir, fmt.Sprintf("%s_%s.snap", name, revision))
 }
 
@@ -216,6 +217,11 @@ func SecurityTag(snapName string) string {
 // AppSecurityTag returns the application-specific security tag.
 func AppSecurityTag(snapName, appName string) string {
 	return fmt.Sprintf("%s.%s", SecurityTag(snapName), appName)
+}
+
+// ComponentSecurityTag returns a snap component's hook-specific security tag.
+func ComponentHookSecurityTag(snapInstance, componentName, hookName string) string {
+	return ScopedSecurityTag(fmt.Sprintf("%s+%s", snapInstance, componentName), "hook", hookName)
 }
 
 // HookSecurityTag returns the hook-specific security tag.
@@ -253,16 +259,20 @@ func CommonDataDir(name string) string {
 	return filepath.Join(dirs.SnapDataDir, name, "common")
 }
 
+// SequenceFile returns the path to the sequence file for the given snap name.
+func SequenceFile(name string) string {
+	return filepath.Join(dirs.SnapSeqDir, name+".json")
+}
+
 // HooksDir returns the directory containing the snap's hooks for given snap
-// name. The name can be either a snap name or snap instance name.
-func HooksDir(name string, revision Revision) string {
+// instance name.
+func HooksDir(name naming.InstanceName, revision Revision) string {
 	return filepath.Join(MountDir(name, revision), "meta", "hooks")
 }
 
 // ComponentHooksDir returns the directory containing the component's hooks for
-// the given component hook name. The provided snap name can be either a snap
-// name or snap instance name.
-func ComponentHooksDir(componentName string, compRevision Revision, snapInstance string) string {
+// the given component hook name.
+func ComponentHooksDir(componentName string, compRevision Revision, snapInstance naming.InstanceName) string {
 	return filepath.Join(ComponentMountDir(componentName, compRevision, snapInstance), "meta", "hooks")
 }
 
@@ -276,16 +286,6 @@ func snapDataDir(opts *dirs.SnapDirOptions) string {
 	}
 
 	return dirs.UserHomeSnapDir
-}
-
-// BaseDataHomeDirs returns the per user base data directories of the snap across multiple
-// home directories.
-func BaseDataHomeDirs(name string, opts *dirs.SnapDirOptions) []string {
-	var dataHomeGlob []string
-	for _, glob := range dirs.DataHomeGlobs(opts) {
-		dataHomeGlob = append(dataHomeGlob, filepath.Join(glob, name))
-	}
-	return dataHomeGlob
 }
 
 // UserDataDir returns the user-specific data directory for given snap name. The
@@ -373,6 +373,7 @@ type Info struct {
 	Epoch            Epoch
 	Base             string
 	Confinement      ConfinementType
+	Grade            GradeType
 	Apps             map[string]*AppInfo
 	LegacyAliases    map[string]*AppInfo // FIXME: eventually drop this
 	Hooks            map[string]*HookInfo
@@ -428,7 +429,18 @@ type Info struct {
 
 	// Categories this snap is in.
 	Categories []CategoryInfo
+
+	// IntegrityData available for this snap
+	IntegrityData *IntegrityDataInfo
+
+	// UbuntuCoreTracks comes from snap.yaml snapd-info.ubuntu-core-tracks; nil if omitted or empty.
+	UbuntuCoreTracks UbuntuCoreTracks
 }
+
+// UbuntuCoreTracks maps an Ubuntu Core boot base version, as a plain number
+// ("18", "20", ...), to one or more from-and-to track pairs
+// ("latest" -> "18") that describe allowed track redirections.
+type UbuntuCoreTracks map[string]map[string]string
 
 // StoreAccount holds information about a store account, for example of snap
 // publisher.
@@ -508,22 +520,22 @@ func (s *Info) Provenance() string {
 
 // InstanceName returns the blessed name of the snap decorated with instance
 // key, if any.
-func (s *Info) InstanceName() string {
-	return InstanceName(s.SnapName(), s.InstanceKey)
+func (s *Info) InstanceName() naming.InstanceName {
+	return InstanceName(s.SnapName().String(), s.InstanceKey)
 }
 
 // ContainerName returns the name of the container, which is the instance name
 // for snaps.
 func (s *Info) ContainerName() string {
-	return s.InstanceName()
+	return s.InstanceName().String()
 }
 
 // SnapName returns the global blessed name of the snap.
-func (s *Info) SnapName() string {
+func (s *Info) SnapName() naming.SnapName {
 	if s.RealName != "" {
-		return s.RealName
+		return naming.SnapName(s.RealName)
 	}
-	return s.SuggestedName
+	return naming.SnapName(s.SuggestedName)
 }
 
 // Filename returns the name of the snap with the revision number,
@@ -688,69 +700,43 @@ func (s *Info) HooksDir() string {
 
 // DataDir returns the data directory of the snap.
 func (s *Info) DataDir() string {
-	return DataDir(s.InstanceName(), s.Revision)
+	return DataDir(s.InstanceName().String(), s.Revision)
 }
 
 // UserDataDir returns the user-specific data directory of the snap.
 func (s *Info) UserDataDir(home string, opts *dirs.SnapDirOptions) string {
-	return UserDataDir(home, s.InstanceName(), s.Revision, opts)
+	return UserDataDir(home, s.InstanceName().String(), s.Revision, opts)
 }
 
 // UserCommonDataDir returns the user-specific data directory common across
 // revision of the snap.
 func (s *Info) UserCommonDataDir(home string, opts *dirs.SnapDirOptions) string {
-	return UserCommonDataDir(home, s.InstanceName(), opts)
+	return UserCommonDataDir(home, s.InstanceName().String(), opts)
 }
 
 // UserExposedHomeDir returns the new upper-case snap directory in the user home.
 func (s *Info) UserExposedHomeDir(home string) string {
-	return filepath.Join(home, dirs.ExposedSnapHomeDir, s.InstanceName())
+	return filepath.Join(home, dirs.ExposedSnapHomeDir, s.InstanceName().String())
 }
 
 // CommonDataDir returns the data directory common across revisions of the snap.
 func (s *Info) CommonDataDir() string {
-	return CommonDataDir(s.InstanceName())
+	return CommonDataDir(s.InstanceName().String())
 }
 
 // CommonDataSaveDir returns the save data directory common across revisions of the snap.
 func (s *Info) CommonDataSaveDir() string {
-	return CommonDataSaveDir(s.InstanceName())
-}
-
-// DataHomeDirs returns the per user data directories of the snap across multiple
-// home directories.
-func (s *Info) DataHomeDirs(opts *dirs.SnapDirOptions) []string {
-	var dataHomeGlob []string
-	for _, glob := range dirs.DataHomeGlobs(opts) {
-		dataHomeGlob = append(dataHomeGlob, filepath.Join(glob, s.InstanceName(), s.Revision.String()))
-	}
-	return dataHomeGlob
-}
-
-// CommonDataHomeDirs returns the per user data directories common across revisions
-// of the snap in all defined home directories.
-func (s *Info) CommonDataHomeDirs(opts *dirs.SnapDirOptions) []string {
-	var comDataHomeGlob []string
-	for _, glob := range dirs.DataHomeGlobs(opts) {
-		comDataHomeGlob = append(comDataHomeGlob, filepath.Join(glob, s.InstanceName(), "common"))
-	}
-	return comDataHomeGlob
+	return CommonDataSaveDir(s.InstanceName().String())
 }
 
 // UserXdgRuntimeDir returns the XDG_RUNTIME_DIR directory of the snap for a
 // particular user.
 func (s *Info) UserXdgRuntimeDir(euid sys.UserID) string {
-	return UserXdgRuntimeDir(euid, s.InstanceName())
-}
-
-// XdgRuntimeDirs returns the XDG_RUNTIME_DIR directories for all users of the
-// snap.
-func (s *Info) XdgRuntimeDirs() string {
-	return filepath.Join(dirs.XdgRuntimeDirGlob, fmt.Sprintf("snap.%s", s.InstanceName()))
+	return UserXdgRuntimeDir(euid, s.InstanceName().String())
 }
 
 func (s *Info) BinaryNameGlobs() []string {
-	return []string{s.InstanceName(), fmt.Sprintf("%s.*", s.InstanceName())}
+	return []string{s.InstanceName().String(), fmt.Sprintf("%s.*", s.InstanceName())}
 }
 
 // NeedsDevMode returns whether the snap needs devmode.
@@ -776,21 +762,46 @@ func (s *Info) Services() []*AppInfo {
 	return svcs
 }
 
-// ExpandSnapVariables resolves $SNAP, $SNAP_DATA and $SNAP_COMMON inside the
-// snap's mount namespace.
+// ExpandSnapVariables resolves $SNAP, $SNAP_DATA and $SNAP_COMMON in path for this snap.
 func (s *Info) ExpandSnapVariables(path string) string {
+	// NOTE: We use dirs.CoreSnapMountDir here as the path used will be
+	// always inside the mount namespace snap-confine creates and there
+	// we will always have a /snap directory available regardless if the
+	// system we're running on supports this or not.
+	return s.ExpandSnapVariablesSetSnapMountDir(path, dirs.CoreSnapMountDir, PerspectiveSelf)
+}
+
+type ExpandSnapPerspective int
+
+const (
+	// Expand variables from own perspective, assuming the parallel instance
+	// magic mapping of $SNAP_INSTANCE_NAME to $SNAP is in effect.
+	PerspectiveSelf ExpandSnapPerspective = iota
+	// Expand special variables from other snap's perspective, where $SNAP means
+	// the actual instance name
+	PerspectiveOther
+)
+
+// ExpandSnapVariablesSetSnapMountDir resolves $SNAP, $SNAP_DATA and
+// $SNAP_COMMON in path for this snap using snapMountDir as root directory.
+// Depending on the context, e.g. $SNAP used on the slot side of the connection,
+// while being expanded for use in the context of the plug, special variables
+// may mean instance-specific value.
+func (s *Info) ExpandSnapVariablesSetSnapMountDir(path, snapMountDir string, expandFor ExpandSnapPerspective) string {
+	name := s.SnapName().String()
+
+	if expandFor == PerspectiveOther {
+		name = s.InstanceName().String()
+	}
+
 	return os.Expand(path, func(v string) string {
 		switch v {
 		case "SNAP":
-			// NOTE: We use dirs.CoreSnapMountDir here as the path used will be
-			// always inside the mount namespace snap-confine creates and there
-			// we will always have a /snap directory available regardless if the
-			// system we're running on supports this or not.
-			return filepath.Join(dirs.CoreSnapMountDir, s.SnapName(), s.Revision.String())
+			return filepath.Join(snapMountDir, name, s.Revision.String())
 		case "SNAP_DATA":
-			return DataDir(s.SnapName(), s.Revision)
+			return DataDir(name, s.Revision)
 		case "SNAP_COMMON":
-			return CommonDataDir(s.SnapName())
+			return CommonDataDir(name)
 		}
 		return ""
 	})
@@ -846,22 +857,26 @@ func (s *Info) AppsForSlot(slot *SlotInfo) []*AppInfo {
 // HooksForPlug returns the list of hooks that are associated with the given
 // plug. If the plug is unscoped, then all hooks are returned.
 func (s *Info) HooksForPlug(plug *PlugInfo) []*HookInfo {
+	return hooksForPlug(plug, s.Hooks)
+}
+
+func hooksForPlug(plug *PlugInfo, hooks map[string]*HookInfo) []*HookInfo {
 	if plug.Unscoped {
-		hooks := make([]*HookInfo, 0, len(s.Hooks))
-		for _, hook := range s.Hooks {
-			hooks = append(hooks, hook)
+		plugHooks := make([]*HookInfo, 0, len(hooks))
+		for _, hook := range hooks {
+			plugHooks = append(plugHooks, hook)
 		}
-		return hooks
+		return plugHooks
 	}
 
-	var hooks []*HookInfo
-	for _, hook := range s.Hooks {
+	var plugHooks []*HookInfo
+	for _, hook := range hooks {
 		if _, ok := hook.Plugs[plug.Name]; ok {
-			hooks = append(hooks, hook)
+			plugHooks = append(plugHooks, hook)
 		}
 	}
 
-	return hooks
+	return plugHooks
 }
 
 // HooksForSlot returns the list of hooks that are associated with the given
@@ -921,11 +936,150 @@ func BadInterfacesSummary(snapInfo *Info) string {
 // and desktop filename.
 func (s *Info) DesktopPrefix() string {
 	if s.InstanceKey == "" {
-		return s.SnapName()
+		return s.SnapName().String()
 	}
 	// we cannot use the usual "_" separator because that is also used
 	// to separate "$snap_$desktopfile"
 	return fmt.Sprintf("%s+%s", s.SnapName(), s.InstanceKey)
+}
+
+// DesktopPlugFileIDs returns desktop-file-ids desktop plug attribute entries.
+// The desktop-file-ids attribute is optional so an empty list is returned if
+// the it is not found.
+//
+// Note: DesktopPlugFileIDs doesn't check if the desktop plug is connected because
+// the desktop-file-ids attribute is controlled by an allow-installation rule.
+func (s *Info) DesktopPlugFileIDs() ([]string, error) {
+	desktopPlugNames := make([]string, 0, len(s.Plugs))
+	for name, plug := range s.Plugs {
+		if plug.Interface == "desktop" {
+			desktopPlugNames = append(desktopPlugNames, name)
+		}
+	}
+	if len(desktopPlugNames) == 0 {
+		return nil, nil
+	}
+	sort.Strings(desktopPlugNames)
+
+	// TODO: The internal errors below should never happen due to validation
+	// in the desktop interface. It would be a good candidate for telemetry
+	// error reporting.
+
+	desktopFileIDs := make([]string, 0)
+	seenDesktopFileIDs := make(map[string]bool)
+	for _, plugName := range desktopPlugNames {
+		desktopPlug := s.Plugs[plugName]
+
+		attrVal, exists := desktopPlug.Lookup("desktop-file-ids")
+		if !exists {
+			// desktop-file-ids attribute is optional
+			continue
+		}
+
+		// desktop-file-ids must be a list of strings
+		attrList, ok := attrVal.([]any)
+		if !ok {
+			return nil, errors.New(`internal error: "desktop-file-ids" must be a list of strings`)
+		}
+
+		for _, val := range attrList {
+			desktopFileID, ok := val.(string)
+			if !ok {
+				return nil, errors.New(`internal error: "desktop-file-ids" must be a list of strings`)
+			}
+			if !strings.HasSuffix(desktopFileID, ".desktop") {
+				logger.Noticef("adding missing .desktop suffix to desktop file ID %s (snap %s)", desktopFileID, s.InstanceName())
+				desktopFileID = desktopFileID + ".desktop"
+			}
+			if seenDesktopFileIDs[desktopFileID] {
+				continue
+			}
+			seenDesktopFileIDs[desktopFileID] = true
+			desktopFileIDs = append(desktopFileIDs, desktopFileID)
+		}
+	}
+
+	if len(desktopFileIDs) == 0 {
+		return nil, nil
+	}
+	return desktopFileIDs, nil
+}
+
+func sanitizeDesktopFileName(base string) string {
+	var b strings.Builder
+	b.Grow(len(base))
+
+	for _, c := range base {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.' {
+			b.WriteRune(c)
+		} else {
+			b.WriteRune('_')
+		}
+	}
+
+	return b.String()
+}
+
+// MangleDesktopFileName returns the sanitized file name prefixed with Info.DesktopPrefix().
+// If the passed name (without the .desktop extension) is listed under the desktop-file-ids
+// desktop interface plug attribute then the desktop file name is returned as is without
+// mangling.
+//
+// File name sanitization is done by replacing any character not in [A-Za-z0-9-_.] by
+// an underscore '_'.
+//   - "test*.desktop" -> "PREFIX_test_.desktop
+//   - "test 123.desktop" -> "PREFIX_test_123.desktop
+//   - "test, *$$.desktop" -> "PREFIX_test_____.desktop"
+func (s *Info) MangleDesktopFileName(desktopFile string) (string, error) {
+	desktopFileIDs, err := s.DesktopPlugFileIDs()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Dir(desktopFile)
+	base := filepath.Base(desktopFile)
+	// Don't mangle desktop files if listed under desktop-file-ids attribute
+	// XXX: Do we want to fail if a desktop-file-ids entry doesn't
+	// have a corresponding file?
+	for _, desktopFileID := range desktopFileIDs {
+		if base == desktopFileID {
+			return filepath.Join(dir, base), nil
+		}
+	}
+
+	// Sanitization logic shouldn't worry about being backware compatible because the
+	// desktop files are always written when snapd starts in ensureDesktopFilesUpdated.
+	sanitizedBase := sanitizeDesktopFileName(base)
+
+	return filepath.Join(dir, fmt.Sprintf("%s_%s", s.DesktopPrefix(), sanitizedBase)), nil
+}
+
+type DesktopFilesFromInstalledSnapOptions struct {
+	// Mangles found desktop files using Info.MangleDesktopFileName()
+	MangleFileNames bool
+}
+
+// DesktopFilesFromInstalledSnap returns the desktop files found under <snap-mount>/meta/gui.
+func (s *Info) DesktopFilesFromInstalledSnap(opts DesktopFilesFromInstalledSnapOptions) ([]string, error) {
+	rootDir := filepath.Join(s.MountDir(), "meta", "gui")
+	if !osutil.IsDirectory(rootDir) {
+		return nil, nil
+	}
+	desktopFiles, err := filepath.Glob(filepath.Join(rootDir, "*.desktop"))
+	if err != nil {
+		return nil, fmt.Errorf("cannot get desktop files from %v: %s", rootDir, err)
+	}
+
+	if !opts.MangleFileNames {
+		return desktopFiles, nil
+	}
+
+	for i, df := range desktopFiles {
+		desktopFiles[i], err = s.MangleDesktopFileName(df)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return desktopFiles, nil
 }
 
 // DownloadInfo contains the information to download a snap.
@@ -977,7 +1131,7 @@ type PlugInfo struct {
 
 	Name      string
 	Interface string
-	Attrs     map[string]interface{}
+	Attrs     map[string]any
 	Label     string
 	Apps      map[string]*AppInfo
 
@@ -987,15 +1141,15 @@ type PlugInfo struct {
 	Unscoped bool
 }
 
-func lookupAttr(attrs map[string]interface{}, path string) (interface{}, bool) {
-	var v interface{}
+func lookupAttr(attrs map[string]any, path string) (any, bool) {
+	var v any
 	comps := strings.FieldsFunc(path, func(r rune) bool { return r == '.' })
 	if len(comps) == 0 {
 		return nil, false
 	}
 	v = attrs
 	for _, comp := range comps {
-		m, ok := v.(map[string]interface{})
+		m, ok := v.(map[string]any)
 		if !ok {
 			return nil, false
 		}
@@ -1008,7 +1162,7 @@ func lookupAttr(attrs map[string]interface{}, path string) (interface{}, bool) {
 	return v, true
 }
 
-func getAttribute(snapName string, ifaceName string, attrs map[string]interface{}, key string, val interface{}) error {
+func getAttribute(snapName string, ifaceName string, attrs map[string]any, key string, val any) error {
 	v, ok := lookupAttr(attrs, key)
 	if !ok {
 		return AttributeNotFoundError{fmt.Errorf("snap %q does not have attribute %q for interface %q", snapName, key, ifaceName)}
@@ -1017,11 +1171,11 @@ func getAttribute(snapName string, ifaceName string, attrs map[string]interface{
 	return metautil.SetValueFromAttribute(snapName, ifaceName, key, v, val)
 }
 
-func (plug *PlugInfo) Attr(key string, val interface{}) error {
-	return getAttribute(plug.Snap.InstanceName(), plug.Interface, plug.Attrs, key, val)
+func (plug *PlugInfo) Attr(key string, val any) error {
+	return getAttribute(plug.Snap.InstanceName().String(), plug.Interface, plug.Attrs, key, val)
 }
 
-func (plug *PlugInfo) Lookup(key string) (interface{}, bool) {
+func (plug *PlugInfo) Lookup(key string) (any, bool) {
 	return lookupAttr(plug.Attrs, key)
 }
 
@@ -1030,11 +1184,11 @@ func (plug *PlugInfo) String() string {
 	return fmt.Sprintf("%s:%s", plug.Snap.InstanceName(), plug.Name)
 }
 
-func (slot *SlotInfo) Attr(key string, val interface{}) error {
-	return getAttribute(slot.Snap.InstanceName(), slot.Interface, slot.Attrs, key, val)
+func (slot *SlotInfo) Attr(key string, val any) error {
+	return getAttribute(slot.Snap.InstanceName().String(), slot.Interface, slot.Attrs, key, val)
 }
 
-func (slot *SlotInfo) Lookup(key string) (interface{}, bool) {
+func (slot *SlotInfo) Lookup(key string) (any, bool) {
 	return lookupAttr(slot.Attrs, key)
 }
 
@@ -1049,7 +1203,7 @@ func gatherDefaultContentProvider(providerSnapsToContentTag map[string][]string,
 		if err := plug.Attr("default-provider", &dprovider); err == nil && dprovider != "" {
 			// usage can be "snap:slot" but slot
 			// is ignored/unused
-			name := strings.Split(dprovider, ":")[0]
+			name, _, _ := strings.Cut(dprovider, ":")
 			var contentTag string
 			plug.Attr("content", &contentTag)
 			if filterTags[contentTag] {
@@ -1085,7 +1239,7 @@ type SlotInfo struct {
 
 	Name      string
 	Interface string
-	Attrs     map[string]interface{}
+	Attrs     map[string]any
 	Label     string
 	Apps      map[string]*AppInfo
 
@@ -1145,6 +1299,18 @@ func (st StopModeType) Validate() error {
 	return fmt.Errorf(`"stop-mode" field contains invalid value %q`, st)
 }
 
+// Runnable represents a runnable element of a snap. This could either be an
+// app, a hook, or a component hook.
+type Runnable struct {
+	// CommandName is the name of the command that is run when this runnable
+	// runs.
+	CommandName string
+	// SecurityTag is the security tag associated with the runnable. Security
+	// tags are used by various security subsystems as "profile names" and
+	// sometimes also as a part of the file name.
+	SecurityTag string
+}
+
 // AppInfo provides information about an app.
 type AppInfo struct {
 	Snap *Info
@@ -1155,20 +1321,21 @@ type AppInfo struct {
 	CommandChain  []string
 	CommonID      string
 
-	Daemon          string
-	DaemonScope     DaemonScope
-	StopTimeout     timeout.Timeout
-	StartTimeout    timeout.Timeout
-	WatchdogTimeout timeout.Timeout
-	StopCommand     string
-	ReloadCommand   string
-	PostStopCommand string
-	RestartCond     RestartCondition
-	RestartDelay    timeout.Timeout
-	Completer       string
-	RefreshMode     string
-	StopMode        StopModeType
-	InstallMode     string
+	Daemon            string
+	DaemonScope       DaemonScope
+	StopTimeout       timeout.Timeout
+	StartTimeout      timeout.Timeout
+	WatchdogTimeout   timeout.Timeout
+	StopCommand       string
+	ReloadCommand     string
+	PostStopCommand   string
+	RestartCond       RestartCondition
+	RestartDelay      timeout.Timeout
+	SuccessExitStatus []string
+	Completer         string
+	RefreshMode       string
+	StopMode          StopModeType
+	InstallMode       string
 
 	// TODO: this should go away once we have more plumbing and can change
 	// things vs refactor
@@ -1190,6 +1357,14 @@ type AppInfo struct {
 	Timer *TimerInfo
 
 	Autostart string
+}
+
+// Runnable returns a Runnable for this app.
+func (app *AppInfo) Runnable() Runnable {
+	return Runnable{
+		CommandName: app.Name,
+		SecurityTag: app.SecurityTag(),
+	}
 }
 
 // ScreenshotInfo provides information about a screenshot.
@@ -1235,6 +1410,22 @@ type HookInfo struct {
 	Explicit bool
 }
 
+// Runnable returns a Runnable for this hook. If this hook points to a
+// component, then this runnable will represent a component hook.
+func (hook *HookInfo) Runnable() Runnable {
+	if hook.Component == nil {
+		return Runnable{
+			CommandName: fmt.Sprintf("hook.%s", hook.Name),
+			SecurityTag: hook.SecurityTag(),
+		}
+	}
+
+	return Runnable{
+		CommandName: fmt.Sprintf("%s+%s.hook.%s", hook.Snap.SnapName(), hook.Component.Name, hook.Name),
+		SecurityTag: hook.SecurityTag(),
+	}
+}
+
 // SystemUsernameInfo provides information about a system username (ie, a
 // UNIX user and group with the same name). The scope defines visibility of the
 // username wrt the snap and the system. Defined scopes:
@@ -1247,7 +1438,7 @@ type HookInfo struct {
 type SystemUsernameInfo struct {
 	Name  string
 	Scope string
-	Attrs map[string]interface{}
+	Attrs map[string]any
 }
 
 type CategoryInfo struct {
@@ -1266,7 +1457,7 @@ func (timer *TimerInfo) File() string {
 }
 
 func (app *AppInfo) String() string {
-	return JoinSnapApp(app.Snap.InstanceName(), app.Name)
+	return JoinSnapApp(app.Snap.InstanceName().String(), app.Name)
 }
 
 // SecurityTag returns application-specific security tag.
@@ -1274,35 +1465,81 @@ func (app *AppInfo) String() string {
 // Security tags are used by various security subsystems as "profile names" and
 // sometimes also as a part of the file name.
 func (app *AppInfo) SecurityTag() string {
-	return AppSecurityTag(app.Snap.InstanceName(), app.Name)
+	return AppSecurityTag(app.Snap.InstanceName().String(), app.Name)
 }
 
 // DesktopFile returns the path to the installed optional desktop file for the
 // application.
 func (app *AppInfo) DesktopFile() string {
+	desktopFileIDs, err := app.Snap.DesktopPlugFileIDs()
+	if err != nil || len(desktopFileIDs) == 0 {
+		return app.fallbackDesktopFile()
+	}
+
+	if app.CommonID != "" {
+		desktopID := app.CommonID + ".desktop"
+
+		if !strutil.ListContains(desktopFileIDs, desktopID) {
+			// In case the common ID is not one of the snap (and store-approved)
+			// desktop-file-ids, we should not use it as the app desktop file,
+			// but rather fallback to the default.
+			return app.fallbackDesktopFile()
+		}
+
+		desktopFileIDs = []string{desktopID}
+	}
+
+	// Loop through desktop-file-ids desktop interface plug attribute in order to
+	// have deterministic output
+	for _, desktopFileID := range desktopFileIDs {
+		desktopFile := filepath.Join(dirs.SnapDesktopFilesDir, desktopFileID)
+		if !osutil.FileExists(desktopFile) {
+			continue
+		}
+		// No need to also check instance name because we already filter by the
+		// snap's desktop file ids
+		de, err := desktopentry.Read(desktopFile)
+		if err != nil {
+			// Errors when reading indicates either an issue opening the desktop
+			// file or a malformed desktop file, both of which are internal
+			// errors caused somewhere else.
+			// Let's log for debugging and try the next desktop file id.
+			logger.Debugf("internal error: failed to read %q: %v", desktopFile, err)
+			continue
+		}
+		if de.SnapAppName == app.Name {
+			return desktopFile
+		}
+	}
+	return app.fallbackDesktopFile()
+}
+
+// fallbackDesktopFile returns the fallback desktop file using the simple
+// heuristic "$PREFIX_$APP.desktop".
+func (app *AppInfo) fallbackDesktopFile() string {
 	return filepath.Join(dirs.SnapDesktopFilesDir, fmt.Sprintf("%s_%s.desktop", app.Snap.DesktopPrefix(), app.Name))
 }
 
 // WrapperPath returns the path to wrapper invoking the app binary.
 func (app *AppInfo) WrapperPath() string {
-	return filepath.Join(dirs.SnapBinariesDir, JoinSnapApp(app.Snap.InstanceName(), app.Name))
+	return filepath.Join(dirs.SnapBinariesDir, JoinSnapApp(app.Snap.InstanceName().String(), app.Name))
 }
 
 // CompleterPath returns the path to the completer snippet for the app binary.
 func (app *AppInfo) CompleterPath() string {
-	return filepath.Join(dirs.CompletersDir, JoinSnapApp(app.Snap.InstanceName(), app.Name))
+	return filepath.Join(dirs.CompletersDir, JoinSnapApp(app.Snap.InstanceName().String(), app.Name))
 }
 
 // CompleterPath returns the legacy path to the completer snippet for the app binary.
 func (app *AppInfo) LegacyCompleterPath() string {
-	return filepath.Join(dirs.LegacyCompletersDir, JoinSnapApp(app.Snap.InstanceName(), app.Name))
+	return filepath.Join(dirs.LegacyCompletersDir, JoinSnapApp(app.Snap.InstanceName().String(), app.Name))
 }
 
 func (app *AppInfo) launcherCommand(command string) string {
 	if command != "" {
 		command = " " + command
 	}
-	if app.Name == app.Snap.SnapName() {
+	if app.Name == app.Snap.SnapName().String() {
 		return fmt.Sprintf("/usr/bin/snap run%s %s", command, app.Snap.InstanceName())
 	}
 	return fmt.Sprintf("/usr/bin/snap run%s %s.%s", command, app.Snap.InstanceName(), app.Name)
@@ -1377,11 +1614,11 @@ func (app *AppInfo) EnvChain() []osutil.ExpandableEnv {
 func (hook *HookInfo) SecurityTag() string {
 	if hook.Component != nil {
 		return HookSecurityTag(SnapComponentName(
-			hook.Snap.InstanceName(),
+			hook.Snap.InstanceName().String(),
 			hook.Component.Name,
 		), hook.Name)
 	}
-	return HookSecurityTag(hook.Snap.InstanceName(), hook.Name)
+	return HookSecurityTag(hook.Snap.InstanceName().String(), hook.Name)
 }
 
 // EnvChain returns the chain of environment overrides, possibly with
@@ -1414,7 +1651,7 @@ type BrokenSnapError interface {
 }
 
 type NotFoundError struct {
-	Snap     string
+	Snap     naming.InstanceName
 	Revision Revision
 	// Path encodes the path that triggered the not-found error. It may refer to
 	// a file inside the snap or to the snap file itself.
@@ -1439,7 +1676,7 @@ func (e NotFoundError) Broken() string {
 }
 
 type invalidMetaError struct {
-	Snap     string
+	Snap     naming.InstanceName
 	Revision Revision
 	Msg      string
 }
@@ -1469,13 +1706,13 @@ var SanitizePlugsSlots = sanitizePlugsSlotsUnimpl
 
 // ReadInfo reads the snap information for the installed snap with the given
 // name and given side-info.
-func ReadInfo(name string, si *SideInfo) (*Info, error) {
+func ReadInfo(name naming.InstanceName, si *SideInfo) (*Info, error) {
 	return ReadInfoFromMountPoint(name, MountDir(name, si.Revision), MountFile(name, si.Revision), si)
 }
 
 // ReadInfoFromMountPoint reads the snap information for a mounted
 // snap given the mound point, mount file, and side info.
-func ReadInfoFromMountPoint(name, mountPoint, mountFile string, si *SideInfo) (*Info, error) {
+func ReadInfoFromMountPoint(name naming.InstanceName, mountPoint, mountFile string, si *SideInfo) (*Info, error) {
 	snapYamlFn := filepath.Join(mountPoint, "meta", "snap.yaml")
 	meta, err := os.ReadFile(snapYamlFn)
 	if os.IsNotExist(err) {
@@ -1491,8 +1728,7 @@ func ReadInfoFromMountPoint(name, mountPoint, mountFile string, si *SideInfo) (*
 		return nil, &invalidMetaError{Snap: name, Revision: si.Revision, Msg: err.Error()}
 	}
 
-	_, instanceKey := SplitInstanceName(name)
-	info.InstanceKey = instanceKey
+	info.InstanceKey = name.InstanceKey()
 
 	hooksDir := filepath.Join(mountPoint, "meta", "hooks")
 	err = addImplicitHooks(info, hooksDir)
@@ -1525,11 +1761,11 @@ func ReadInfoFromMountPoint(name, mountPoint, mountFile string, si *SideInfo) (*
 
 // ReadCurrentInfo reads the snap information from the installed snap in
 // 'current' revision
-func ReadCurrentInfo(snapName string) (*Info, error) {
-	curFn := filepath.Join(dirs.SnapMountDir, snapName, "current")
+func ReadCurrentInfo(instanceName naming.InstanceName) (*Info, error) {
+	curFn := filepath.Join(dirs.SnapMountDir, instanceName.String(), "current")
 	realFn, err := os.Readlink(curFn)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %s", NotFoundError{Snap: snapName, Revision: R(0)}, err)
+		return nil, fmt.Errorf("%w: %s", NotFoundError{Snap: instanceName, Revision: R(0)}, err)
 	}
 	rev := filepath.Base(realFn)
 	revision, err := ParseRevision(rev)
@@ -1537,7 +1773,42 @@ func ReadCurrentInfo(snapName string) (*Info, error) {
 		return nil, fmt.Errorf("cannot read revision %s: %s", rev, err)
 	}
 
-	return ReadInfo(snapName, &SideInfo{Revision: revision})
+	return ReadInfo(instanceName, &SideInfo{Revision: revision})
+}
+
+// NewContainerFromDir creates a new Container from the given directory.
+// Generally, the implementation of this function is set by the snapdir package.
+var NewContainerFromDir func(snapName string) Container = func(snapName string) Container {
+	panic("internal error: snap.NewContainerFromDir function unset")
+}
+
+// ReadCurrentComponentInfo reads the ComponentInfo for the currently linked
+// revision of the given component associated with the given snap.
+func ReadCurrentComponentInfo(component string, info *Info) (*ComponentInfo, error) {
+	// TODO: creating this here is a bit of a hack, since we aren't actually
+	// able to set the revision of the component. we create it so that we can
+	// use ComponentLinkPath, which doesn't use the revision.
+	cpi := MinimalComponentContainerPlaceInfo(component, Revision{}, info.InstanceName())
+	link := ComponentLinkPath(cpi, info.Revision)
+
+	linkSource, err := os.Readlink(link)
+	if err != nil {
+		return nil, fmt.Errorf("cannot find current component %q for snap %q", component, info.InstanceName())
+	}
+
+	rev := filepath.Base(linkSource)
+
+	revision, err := ParseRevision(rev)
+	if err != nil {
+		return nil, fmt.Errorf("cannot parse current revision for component %q: %s", component, err)
+	}
+
+	container := NewContainerFromDir(link)
+
+	return ReadComponentInfoFromContainer(container, info, &ComponentSideInfo{
+		Revision:  revision,
+		Component: naming.NewComponentRef(info.SnapName(), component),
+	})
 }
 
 // ReadInfoFromSnapFile reads the snap information from the given Container and
@@ -1605,7 +1876,7 @@ func SplitSnapApp(snapApp string) (snap, app string) {
 func JoinSnapApp(snap, app string) string {
 	storeName, instanceKey := SplitInstanceName(snap)
 	if storeName == app {
-		return InstanceName(app, instanceKey)
+		return InstanceName(app, instanceKey).String()
 	}
 	return fmt.Sprintf("%s.%s", snap, app)
 }
@@ -1629,10 +1900,17 @@ func SplitInstanceName(instanceName string) (snapName, instanceKey string) {
 
 // SplitSnapComponentInstanceName extracts the snap component name from
 // a snap component instance name. Example:
-//   - SplitSnapComponentInstanceName("snap+component_1") -> "snap_1", "component"
-func SplitSnapComponentInstanceName(name string) (snapInstance, componentName string) {
-	snapInstance, componentName, _ = strings.Cut(name, "+")
-	return snapInstance, componentName
+//   - SplitSnapComponentInstanceName("snap_1+component_1") -> "snap_1", "component"
+func SplitSnapComponentInstanceName(name string) (snapInstance naming.InstanceName, componentName string) {
+	instanceString, componentName, _ := strings.Cut(name, "+")
+	return naming.InstanceName(instanceString), componentName
+}
+
+// SplitSnapInstanceAndComponents splits a name of the form
+// <snap_instance>+<comp1>...+<compN>.
+func SplitSnapInstanceAndComponents(name string) (string, []string) {
+	parts := strings.Split(name, "+")
+	return parts[0], parts[1:]
 }
 
 // SnapComponentName takes a snap instance name and a component name and returns
@@ -1643,21 +1921,11 @@ func SnapComponentName(snapInstance, componentName string) string {
 
 // InstanceName takes the snap name and the instance key and returns an instance
 // name of the snap.
-func InstanceName(snapName, instanceKey string) string {
+func InstanceName(snapName, instanceKey string) naming.InstanceName {
 	if instanceKey != "" {
-		return fmt.Sprintf("%s_%s", snapName, instanceKey)
+		return naming.InstanceName(fmt.Sprintf("%s_%s", snapName, instanceKey))
 	}
-	return snapName
-}
-
-// ByType supports sorting the given slice of snap info by types. The most
-// important types will come first.
-type ByType []*Info
-
-func (r ByType) Len() int      { return len(r) }
-func (r ByType) Swap(i, j int) { r[i], r[j] = r[j], r[i] }
-func (r ByType) Less(i, j int) bool {
-	return r[i].Type().SortsBefore(r[j].Type())
+	return naming.InstanceName(snapName)
 }
 
 // SortServices sorts the apps based on their Before and After specs, such that
@@ -1752,6 +2020,31 @@ func (a AppInfoBySnapApp) Less(i, j int) bool {
 	return iName < jName
 }
 
+// SnapdInfoFromSnapFile returns the snapd information carried by the given
+// snap. This is only applicable to snapd/core or UC20+ kernel snaps.
+func SnapdInfoFromSnapFile(snapf Container, snapType Type) (version string, flags map[string]string, err error) {
+	var infoFile string
+	missingOK := false
+	switch snapType {
+	case TypeOS, TypeSnapd:
+		infoFile = "/usr/lib/snapd/info"
+	case TypeKernel:
+		infoFile = "/snapd-info"
+		// some old kernel file will not contain this
+		missingOK = true
+	default:
+		return "", nil, fmt.Errorf("cannot extract snapd information, snaps of type %s do not carry snapd information", snapType)
+	}
+	b, err := snapf.ReadFile(infoFile)
+	if err != nil {
+		if missingOK && os.IsNotExist(err) {
+			return "", nil, nil
+		}
+		return "", nil, err
+	}
+	return snapdtool.ParseInfoFile(bytes.NewBuffer(b), fmt.Sprintf("from %s snap", snapType))
+}
+
 // SnapdAssertionMaxFormatsFromSnapFile returns the supported assertion max
 // formats for the snapd code carried by the given snap, plus its snapd
 // version. This is only applicable to snapd/core or UC20+ kernel snaps.
@@ -1763,34 +2056,18 @@ func SnapdAssertionMaxFormatsFromSnapFile(snapf Container) (maxFormats map[strin
 	if err != nil {
 		return nil, "", err
 	}
-	var infoFile string
-	missingOK := false
-	typ := info.Type()
-	switch typ {
-	case TypeOS, TypeSnapd:
-		infoFile = "/usr/lib/snapd/info"
-	case TypeKernel:
-		infoFile = "/snapd-info"
-		// some old kernel file will not contain this
-		missingOK = true
-	default:
-		return nil, "", fmt.Errorf("cannot extract assertion max formats information, snaps of type %s do not carry snapd", typ)
-	}
-	b, err := snapf.ReadFile(infoFile)
-	if err != nil {
-		if missingOK && os.IsNotExist(err) {
-			return nil, "", nil
-		}
-		return nil, "", err
-	}
-	ver, flags, err := snapdtool.ParseInfoFile(bytes.NewBuffer(b), fmt.Sprintf("from %s snap", typ))
+	ver, flags, err := SnapdInfoFromSnapFile(snapf, info.Type())
 	if err != nil {
 		return nil, "", err
+	}
+	if info.Type() == TypeKernel && flags == nil {
+		// some old kernels will not contain snapd-info
+		return nil, ver, nil
 	}
 	if fmts := flags["SNAPD_ASSERTS_FORMATS"]; fmts != "" {
 		err := json.Unmarshal([]byte(strings.Trim(fmts, "'")), &maxFormats)
 		if err != nil {
-			return nil, "", fmt.Errorf("cannot unmarshal SNAPD_ASSERTS_FORMATS from info file from %s snap", typ)
+			return nil, "", fmt.Errorf("cannot unmarshal SNAPD_ASSERTS_FORMATS from info file from %s snap", info.Type())
 		}
 		return maxFormats, ver, nil
 	}
@@ -1798,7 +2075,7 @@ func SnapdAssertionMaxFormatsFromSnapFile(snapf Container) (maxFormats map[strin
 	sysUser := 0
 	cmp, err := strutil.VersionCompare(ver, "2.46")
 	if err != nil {
-		return nil, "", fmt.Errorf("invalid snapd version in info file from %s snap: %v", typ, err)
+		return nil, "", fmt.Errorf("invalid snapd version in info file from %s snap: %v", info.Type(), err)
 	}
 	if cmp >= 0 {
 		sysUser = 1
@@ -1832,4 +2109,79 @@ var verToSnapDecl = []struct {
 	{"2.23", 2},
 	// ancient
 	{"2.17", 1},
+}
+
+// ConfdbPlugAttrs returns the account, confdb and view specified in a plug
+// if that plug is of type confdb. If it's not or the information cannot be
+// found, returns an error.
+func ConfdbPlugAttrs(plug *PlugInfo) (account, dbSchema, view string, err error) {
+	if plug.Interface != "confdb" {
+		return "", "", "", fmt.Errorf("must be confdb plug: %s", plug.Interface)
+	}
+
+	if err := plug.Attr("account", &account); err != nil {
+		return "", "", "", err
+	}
+
+	var confdbView string
+	if err := plug.Attr("view", &confdbView); err != nil {
+		return "", "", "", err
+	}
+
+	parts := strings.Split(confdbView, "/")
+	if len(parts) != 2 {
+		return "", "", "", fmt.Errorf("\"view\" must conform to <confdb-schema>/<view>: %s", confdbView)
+	}
+	dbSchema, view = parts[0], parts[1]
+
+	return account, dbSchema, view, nil
+}
+
+type RefreshFailureSeverity string
+
+const (
+	RefreshFailureSeverityNone        RefreshFailureSeverity = ""
+	RefreshFailureSeverityAfterReboot RefreshFailureSeverity = "after-reboot"
+)
+
+// RefreshFailures holds information about snap failed refreshes.
+type RefreshFailuresInfo struct {
+	// Revision is the target revision that caused the refresh failure.
+	Revision Revision `json:"revision"`
+	// FailureCount is the number of failed attempts to refresh to the given revision.
+	FailureCount int `json:"failure-count"`
+	// LastFailureTime is the time of the last failed refresh attempt for the revision.
+	LastFailureTime time.Time `json:"last-failure-time"`
+	// LastFailureSeverity identifies how severe the last failure was.
+	// This allows for more aggressive backoff delay for snaps that fail after a reboot.
+	LastFailureSeverity RefreshFailureSeverity `json:"last-failure-severity,omitempty"`
+}
+
+// IntegrityDataInfo contains all the integrity metadata associated with a snap.
+type IntegrityDataInfo struct {
+	integrity.IntegrityDataParams `json:"params"`
+
+	DownloadInfo `json:"download-info,omitempty"`
+}
+
+// DmVerityFile returns the name of the dm-verity hash file computed by the snap name and the digest.
+// If the snap doesn't contain integrity data or contains integrity data but not of type
+// "dm-verity", this will return an error.
+func (s *Info) DmVerityFile() (string, error) {
+	if s.IntegrityData == nil || s.IntegrityData.Type != "dm-verity" {
+		return "", fmt.Errorf("internal error: dm-verity data not found for file %q", s.MountFile())
+	}
+
+	return s.IntegrityData.IntegrityFile(s.MountFile())
+}
+
+// DmVerityDigest returns the dm-verity digest of the integrity data associated with the snap.
+// If the snap doesn't contain integrity data or contains integrity data but not of type
+// "dm-verity", this will return an error.
+func (s *Info) DmVerityDigest() (string, error) {
+	if s.IntegrityData == nil || s.IntegrityData.Type != "dm-verity" {
+		return "", fmt.Errorf("internal error: dm-verity data not found for file %q", s.MountFile())
+	}
+
+	return s.IntegrityData.Digest, nil
 }

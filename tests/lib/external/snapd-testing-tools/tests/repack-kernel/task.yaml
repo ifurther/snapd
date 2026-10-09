@@ -1,6 +1,11 @@
 summary: tests for the repack-kernel tool
 
-backends: [google]
+details: |
+    Check the repack-kernel tools properly handles extraction of the
+    kernel snap to a workspace directory, and then repacks it back
+    to a snap
+
+backends: [openstack*]
 
 # ubuntu-core-initramfs seems to be only available on ubuntu-20.04
 systems: [ubuntu-20.04-64]

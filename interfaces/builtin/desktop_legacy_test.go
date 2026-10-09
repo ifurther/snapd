@@ -74,7 +74,9 @@ func (s *DesktopLegacyInterfaceSuite) TestSanitizePlug(c *C) {
 
 func (s *DesktopLegacyInterfaceSuite) TestAppArmorSpec(c *C) {
 	// connected plug to core slot
-	spec := apparmor.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	appSet, err := interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec := apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.coreSlot), IsNil)
 	c.Assert(spec.SecurityTags(), DeepEquals, []string{"snap.consumer.app"})
 	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "# Description: Can access common desktop legacy methods")
@@ -85,15 +87,34 @@ func (s *DesktopLegacyInterfaceSuite) TestAppArmorSpec(c *C) {
 	// getDesktopFileRules() rules
 	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, `# This leaks the names of snaps with desktop files`)
 	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, `/var/lib/snapd/desktop/applications/ r,`)
-	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, `/var/lib/snapd/desktop/applications/@{SNAP_INSTANCE_DESKTOP}_*.desktop r,`)
-	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, `deny /var/lib/snapd/desktop/applications/@{SNAP_INSTANCE_DESKTOP}[^_.]*.desktop r,`)
-	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, `deny /var/lib/snapd/desktop/applications/[^c]* r,`)
-	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, `deny /var/lib/snapd/desktop/applications/consume[^r]* r,`)
 
 	// connected plug to core slot
-	spec = apparmor.NewSpecification(interfaces.NewSnapAppSet(s.coreSlot.Snap()))
+	appSet, err = interfaces.NewSnapAppSet(s.coreSlot.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec = apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedSlot(s.iface, s.plug, s.coreSlot), IsNil)
 	c.Assert(spec.SecurityTags(), HasLen, 0)
+}
+
+func (s *DesktopLegacyInterfaceSuite) TestChromiumStatusNotifierAppArmor(c *C) {
+	appSet, err := interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec := apparmor.NewSpecification(appSet)
+	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.coreSlot), IsNil)
+	snippet := spec.SnippetForTag("snap.consumer.app")
+
+	c.Check(snippet, testutil.Contains, `name=org.freedesktop.StatusNotifierItem-[0-9]*-[0-9]*,`)
+	c.Check(snippet, testutil.Contains, `path=/{StatusNotifierItem{,/[0-9]*},org/chromium/StatusNotifierItem/[0-9]*}
+    interface=org.freedesktop.StatusNotifierItem
+    member="New{Icon,IconThemePath,ToolTip}"`)
+	c.Check(snippet, testutil.Contains, `path=/{StatusNotifierItem{,/[0-9]*},org/chromium/StatusNotifierItem/[0-9]*}
+    interface=org.freedesktop.StatusNotifierItem
+    member={Activate,ContextMenu,Scroll,SecondaryActivate}`)
+	c.Check(snippet, testutil.Contains, `path=/{StatusNotifierItem{,/[0-9]*},org/chromium/StatusNotifierItem/[0-9]*}
+    interface=org.freedesktop.DBus.Properties
+    member=PropertiesChanged`)
+	c.Check(snippet, testutil.Contains, `path=/{StatusNotifierItem/menu,org/chromium/DbusMenu{,/[0-9]*},org/ayatana/NotificationItem/*/Menu}`)
+	c.Check(snippet, testutil.Contains, `path=/{StatusNotifierItem{,/[0-9]*},StatusNotifierItem/menu,org/chromium/StatusNotifierItem/[0-9]*,org/chromium/DbusMenu{,/[0-9]*},org/ayatana/NotificationItem/**}`)
 }
 
 func (s *DesktopLegacyInterfaceSuite) TestStaticInfo(c *C) {
@@ -107,3 +128,9 @@ func (s *DesktopLegacyInterfaceSuite) TestStaticInfo(c *C) {
 func (s *DesktopLegacyInterfaceSuite) TestInterfaces(c *C) {
 	c.Check(builtin.Interfaces(), testutil.DeepContains, s.iface)
 }
+
+// Test how desktop-legacy interface interacts desktop-file-ids attribute in desktop interface.
+var _ = Suite(&desktopFileRulesBaseSuite{
+	iface:    "desktop-legacy",
+	slotYaml: desktopLegacyCoreYaml,
+})

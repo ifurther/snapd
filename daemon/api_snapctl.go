@@ -22,6 +22,8 @@ package daemon
 import (
 	"net/http"
 
+	"strings"
+
 	"github.com/jessevdk/go-flags"
 
 	"github.com/snapcore/snapd/client"
@@ -52,7 +54,7 @@ func runSnapctl(c *Command, r *http.Request, user *auth.UserState) Response {
 		return BadRequest("snapctl cannot run without args")
 	}
 
-	ucred, err := ucrednetGet(r.RemoteAddr)
+	ucred, err := ucrednetGet(r.Context())
 	if err != nil {
 		return Forbidden("cannot get remote user: %s", err)
 	}
@@ -61,18 +63,25 @@ func runSnapctl(c *Command, r *http.Request, user *auth.UserState) Response {
 	// Actual context is validated later by get/set.
 	context, _ := c.d.overlord.HookManager().Context(snapctlPostData.ContextID)
 
-	// make the data read from stdin available for the hook
+	// Make the data read from stdin available for the hook via the
+	// context. If no context was found, calls to ensureContext() make sure
+	// we return with error before stdin is actually used.
 	// TODO: use a forwarded stdin here
-	if snapctlPostData.Stdin != nil {
+	if snapctlPostData.Stdin != nil && context != nil {
 		context.Lock()
 		context.Set("stdin", snapctlPostData.Stdin)
 		context.Unlock()
 	}
 
-	stdout, stderr, err := ctlcmdRun(context, snapctlPostData.Args, ucred.Uid)
+	var features []string
+	if header := r.Header.Get("X-Snapctl-Features"); header != "" {
+		features = strings.Split(header, ",")
+	}
+
+	stdout, stderr, changeID, err := ctlcmdRun(context, snapctlPostData.Args, ucred.Uid, features)
 	if err != nil {
 		if e, ok := err.(*ctlcmd.UnsuccessfulError); ok {
-			result := map[string]interface{}{
+			result := map[string]any{
 				"stdout":    string(stdout),
 				"stderr":    string(stderr),
 				"exit-code": e.ExitCode,
@@ -90,7 +99,7 @@ func runSnapctl(c *Command, r *http.Request, user *auth.UserState) Response {
 		if e, ok := err.(*flags.Error); ok && e.Type == flags.ErrHelp {
 			stdout = []byte(e.Error())
 		} else {
-			return BadRequest("error running snapctl: %s", err)
+			return BadRequest("snapctl: %s", err)
 		}
 	}
 
@@ -105,6 +114,11 @@ func runSnapctl(c *Command, r *http.Request, user *auth.UserState) Response {
 	result := map[string]string{
 		"stdout": string(stdout),
 		"stderr": string(stderr),
+	}
+
+	// If a change ID is returned, include it in the response.
+	if changeID != "" {
+		result["change-id"] = changeID
 	}
 
 	return SyncResponse(result)

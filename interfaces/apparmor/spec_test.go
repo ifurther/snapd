@@ -20,6 +20,7 @@
 package apparmor_test
 
 import (
+	"fmt"
 	"strings"
 
 	. "gopkg.in/check.v1"
@@ -62,37 +63,30 @@ var _ = Suite(&specSuite{
 			return nil
 		},
 	},
-	plugInfo: &snap.PlugInfo{
-		Snap:      &snap.Info{SuggestedName: "snap1"},
-		Name:      "name",
-		Interface: "test",
-		Apps: map[string]*snap.AppInfo{
-			"app1": {
-				Snap: &snap.Info{
-					SuggestedName: "snap1",
-				},
-				Name: "app1"}},
-	},
-	slotInfo: &snap.SlotInfo{
-		Snap:      &snap.Info{SuggestedName: "snap2"},
-		Name:      "name",
-		Interface: "test",
-		Apps: map[string]*snap.AppInfo{
-			"app2": {
-				Snap: &snap.Info{
-					SuggestedName: "snap2",
-				},
-				Name: "app2"}},
-	},
 })
 
 func (s *specSuite) SetUpTest(c *C) {
 	s.BaseTest.SetUpTest(c)
 	s.BaseTest.AddCleanup(snap.MockSanitizePlugsSlots(func(snapInfo *snap.Info) {}))
+	const plugYaml = `name: snap1
+version: 1
+apps:
+ app1:
+  plugs: [name]
+`
+	s.plug, s.plugInfo = ifacetest.MockConnectedPlug(c, plugYaml, nil, "name")
 
-	s.spec = apparmor.NewSpecification(interfaces.NewSnapAppSet(s.plugInfo.Snap))
-	s.plug = interfaces.NewConnectedPlug(s.plugInfo, nil, nil)
-	s.slot = interfaces.NewConnectedSlot(s.slotInfo, nil, nil)
+	s.spec = apparmor.NewSpecification(s.plug.AppSet())
+
+	const slotYaml = `name: snap2
+version: 1
+slots:
+ name:
+  interface: test
+apps:
+ app2:
+`
+	s.slot, s.slotInfo = ifacetest.MockConnectedSlot(c, slotYaml, nil, "name")
 }
 
 func (s *specSuite) TearDownTest(c *C) {
@@ -101,7 +95,10 @@ func (s *specSuite) TearDownTest(c *C) {
 
 // The spec.Specification can be used through the interfaces.Specification interface
 func (s *specSuite) TestSpecificationIface(c *C) {
-	spec := apparmor.NewSpecification(interfaces.NewSnapAppSet(s.plugInfo.Snap))
+	appSet, err := interfaces.NewSnapAppSet(s.plugInfo.Snap, nil)
+	c.Assert(err, IsNil)
+
+	spec := apparmor.NewSpecification(appSet)
 	var r interfaces.Specification = spec
 	c.Assert(r.AddConnectedPlug(s.iface, s.plug, s.slot), IsNil)
 	c.Assert(r.AddPermanentPlug(s.iface, s.plugInfo), IsNil)
@@ -109,13 +106,126 @@ func (s *specSuite) TestSpecificationIface(c *C) {
 		"snap.snap1.app1": {"connected-plug", "permanent-plug"},
 	})
 
-	spec = apparmor.NewSpecification(interfaces.NewSnapAppSet(s.slotInfo.Snap))
+	appSet, err = interfaces.NewSnapAppSet(s.slotInfo.Snap, nil)
+	c.Assert(err, IsNil)
+
+	spec = apparmor.NewSpecification(appSet)
 	r = spec
 	c.Assert(r.AddConnectedSlot(s.iface, s.plug, s.slot), IsNil)
 	c.Assert(r.AddPermanentSlot(s.iface, s.slotInfo), IsNil)
 	c.Assert(spec.Snippets(), DeepEquals, map[string][]string{
 		"snap.snap2.app2": {"connected-slot", "permanent-slot"},
 	})
+}
+
+// MetadataTagSnippet wraps a snippet in the given metadata tags.
+func (s *specSuite) TestMetadataTagSnippet(c *C) {
+	tagFoo := apparmor.RegisterMetadataTagWithInterface("foo", "an-interface")
+	tagBar := apparmor.RegisterMetadataTagWithInterface("bar", "another")
+	tagBaz := apparmor.RegisterMetadataTagWithInterface("baz", "yet-another")
+	tagQux := apparmor.RegisterMetadataTagWithInterface("qux", "an-interface")
+
+	restore := apparmor.MockMetadataTagsSupported(func() bool { return true })
+	defer restore()
+
+	snippetShort := "/foo r,"
+	snippetLong := `/path/to/dir/1 r,
+/path/to/dir/2 rw,
+/path/to/dir/3 rwkl,`
+
+	for _, testCase := range []struct {
+		snippet  string
+		tags     []apparmor.MetadataTag
+		expected string
+	}{
+		{
+			snippet:  snippetShort,
+			tags:     []apparmor.MetadataTag{},
+			expected: snippetShort,
+		},
+		{
+			snippet: snippetShort,
+			tags:    []apparmor.MetadataTag{tagBar},
+			expected: `
+tags=(bar) {
+/foo r,
+}
+`,
+		},
+		{
+			snippet: snippetShort,
+			tags:    []apparmor.MetadataTag{tagBar, tagBaz},
+			expected: `
+tags=(bar baz) {
+/foo r,
+}
+`,
+		},
+		{
+			snippet:  snippetLong,
+			tags:     []apparmor.MetadataTag{},
+			expected: snippetLong,
+		},
+		{
+			snippet: snippetLong,
+			tags:    []apparmor.MetadataTag{tagBar},
+			expected: `
+tags=(bar) {
+/path/to/dir/1 r,
+/path/to/dir/2 rw,
+/path/to/dir/3 rwkl,
+}
+`,
+		},
+		{
+			snippet: snippetLong,
+			tags:    []apparmor.MetadataTag{tagBar, tagBaz},
+			expected: `
+tags=(bar baz) {
+/path/to/dir/1 r,
+/path/to/dir/2 rw,
+/path/to/dir/3 rwkl,
+}
+`,
+		},
+	} {
+		result := apparmor.MetadataTagSnippet(testCase.snippet, testCase.tags)
+		c.Check(result, Equals, testCase.expected)
+	}
+
+	// Tags may be nested
+
+	inner := apparmor.MetadataTagSnippet("/ijk rwkl,", []apparmor.MetadataTag{tagFoo, tagBar})
+	snippet := fmt.Sprintf("/abc r,\n%s\n/xyz w,", inner)
+	result := apparmor.MetadataTagSnippet(snippet, []apparmor.MetadataTag{tagBaz, tagQux})
+	c.Check(result, Equals, `
+tags=(baz qux) {
+/abc r,
+
+tags=(foo bar) {
+/ijk rwkl,
+}
+
+/xyz w,
+}
+`)
+
+	// When metadata tags are not supported, snippets should be returned unchanged
+
+	restore = apparmor.MockMetadataTagsSupported(func() bool { return false })
+	defer restore()
+
+	for _, tags := range [][]apparmor.MetadataTag{
+		{},
+		{tagBar},
+		{tagBar, tagBaz},
+	} {
+		result := apparmor.MetadataTagSnippet(snippetShort, tags)
+		c.Check(result, Equals, snippetShort)
+
+		result = apparmor.MetadataTagSnippet(snippetLong, tags)
+		c.Check(result, Equals, snippetLong)
+	}
 }
 
 // AddSnippet adds a snippet for the given security tag.
@@ -286,7 +396,11 @@ func (s *specSuite) TestApparmorSnippetsFromLayout(c *C) {
 	restore := apparmor.SetSpecScope(s.spec, []string{"snap.vanguard.vanguard"})
 	defer restore()
 
-	s.spec.AddLayout(snapInfo)
+	appSet, err := interfaces.NewSnapAppSet(snapInfo, nil)
+	c.Assert(err, IsNil)
+
+	s.spec.AddLayout(appSet)
+
 	c.Assert(s.spec.Snippets(), DeepEquals, map[string][]string{
 		"snap.vanguard.vanguard": {
 			"# Layout path: /etc/foo.conf\n\"/etc/foo.conf\" mrwklix,",
@@ -553,14 +667,14 @@ func (s *specSuite) TestAddEnsureDirMounts(c *C) {
 	s.spec.AddEnsureDirMounts("personal-files", ensureDirSpecs)
 	c.Check("\n"+strings.Join(s.spec.UpdateNS(), "\n"), Equals, `
   # Allow the personal-files interface to create potentially missing directories
-  owner @{HOME}/ rw,
-  owner @{HOME}/.local/ rw,
-  owner @{HOME}/.local/share/ rw,
-  owner @{HOME}/dir1/ rw,
-  owner @{HOME}/dir1/dir2/ rw,
-  owner / rw,
-  owner /dir1/ rw,
-  owner /dir1/dir2/ rw,`)
+  owner "@{HOME}/" rw,
+  owner "@{HOME}/.local/" rw,
+  owner "@{HOME}/.local/share/" rw,
+  owner "@{HOME}/dir1/" rw,
+  owner "@{HOME}/dir1/dir2/" rw,
+  owner "/" rw,
+  owner "/dir1/" rw,
+  owner "/dir1/dir2/" rw,`)
 }
 
 func (s *specSuite) TestAddEnsureDirMountsReturnsOnDirsMatch(c *C) {
@@ -601,4 +715,141 @@ func (s *specSuite) TestSetSuppressPycacheDeny(c *C) {
 	c.Assert(s.spec.SuppressPycacheDeny(), Equals, false)
 	s.spec.SetSuppressPycacheDeny()
 	c.Assert(s.spec.SuppressPycacheDeny(), Equals, true)
+}
+
+var key1 = apparmor.RegisterSnippetKey("testkey1")
+var key2 = apparmor.RegisterSnippetKey("testkey2")
+
+func (s *specSuite) TestPrioritySnippets(c *C) {
+	restoreScope1 := apparmor.SetSpecScope(s.spec, []string{"snap.demo.scope1"})
+	defer restoreScope1()
+
+	// Test a scope with a normal snippet and prioritized ones
+	s.spec.AddSnippet("Test snippet 1")
+	s.spec.AddPrioritizedSnippet("Prioritized snippet 1", key1, 0)
+	s.spec.AddPrioritizedSnippet("Prioritized snippet 2", key1, 0)
+	s.spec.AddPrioritizedSnippet("Prioritized snippet 3", key2, 1)
+	s.spec.AddPrioritizedSnippet("Prioritized snippet 4", key2, 2)
+	s.spec.AddPrioritizedSnippet("Prioritized snippet 5", key2, 0)
+
+	// Test a scope with only prioritized snippets
+	restoreScope2 := apparmor.SetSpecScope(s.spec, []string{"snap.demo.scope2"})
+	defer restoreScope2()
+
+	s.spec.AddPrioritizedSnippet("Prioritized snippet 6", key1, 0)
+	s.spec.AddPrioritizedSnippet("Prioritized snippet 7", key1, 0)
+	s.spec.AddPrioritizedSnippet("Prioritized snippet 8", key2, 1)
+	s.spec.AddPrioritizedSnippet("Prioritized snippet 9", key2, 2)
+	s.spec.AddPrioritizedSnippet("Prioritized snippet 10", key2, 0)
+
+	snippets := s.spec.SnippetForTag("snap.demo.scope1")
+	c.Assert(snippets, testutil.Contains, "Test snippet 1")
+	c.Assert(snippets, testutil.Contains, "Prioritized snippet 1")
+	c.Assert(snippets, testutil.Contains, "Prioritized snippet 2")
+	c.Assert(snippets, Not(testutil.Contains), "Prioritized snippet 3")
+	c.Assert(snippets, testutil.Contains, "Prioritized snippet 4")
+	c.Assert(snippets, Not(testutil.Contains), "Prioritized snippet 5")
+
+	snippets = s.spec.SnippetForTag("snap.demo.scope2")
+	c.Assert(snippets, testutil.Contains, "Prioritized snippet 6")
+	c.Assert(snippets, testutil.Contains, "Prioritized snippet 7")
+	// Overridden by higher-priority snippet 9 with the same key (key2)
+	c.Assert(snippets, Not(testutil.Contains), "Prioritized snippet 8")
+	c.Assert(snippets, testutil.Contains, "Prioritized snippet 9")
+	// Overridden by higher-priority snippet 9 with the same key (key2)
+	c.Assert(snippets, Not(testutil.Contains), "Prioritized snippet 10")
+
+	tags := s.spec.SecurityTags()
+	c.Assert(tags, testutil.Contains, "snap.demo.scope1")
+	c.Assert(tags, testutil.Contains, "snap.demo.scope2")
+}
+
+func (s *specSuite) TestPrioritySnippetsNoRegisteredKey(c *C) {
+	var key1 apparmor.SnippetKey = apparmor.SnippetKey{}
+	c.Assert(func() { s.spec.AddPrioritizedSnippet("Prioritized snippet 1", key1, 0) }, PanicMatches, "priority key  is not registered")
+}
+
+func (s *specSuite) TestRegisterSameSnippetKeyTwice(c *C) {
+	c.Assert(func() { apparmor.RegisterSnippetKey("testkey1") }, PanicMatches, "priority key testkey1 is already registered")
+}
+
+func (s *specSuite) TestAddBasePrioritizedSnippet(c *C) {
+	restoreScope := apparmor.SetSpecScope(s.spec, []string{"snap.demo.app"})
+	defer restoreScope()
+
+	s.spec.AddBasePrioritizedSnippet("#foo#", key1)
+
+	// it's there, if no prioritized snippet is added
+	snippets := s.spec.SnippetForTag("snap.demo.app")
+	c.Assert(snippets, testutil.Contains, "#foo#")
+
+	// but a snippet of any priority is enough to override the base snippet
+	s.spec.AddPrioritizedSnippet("#bar#", key1, 0)
+	snippets = s.spec.SnippetForTag("snap.demo.app")
+
+	c.Assert(snippets, testutil.Contains, "#bar#")
+	c.Assert(snippets, Not(testutil.Contains), "#foo#")
+}
+
+func (s *specSuite) TestBasePrioritizedSnippetInvalid(c *C) {
+	key := apparmor.NewSnippetKey("unregistered-key")
+	c.Assert(func() { s.spec.AddBasePrioritizedSnippet("#foo#", key) }, PanicMatches, "snippet key \"unregistered-key\" is not registered")
+
+	s.spec.AddBasePrioritizedSnippet("#foo#", key1)
+	c.Assert(func() { s.spec.AddBasePrioritizedSnippet("#foo#", key1) }, PanicMatches, `already registered a snippet for key "testkey1" \(one base snippet per key expected\)`)
+}
+
+func (s *specSuite) TestMoreSnippets(c *C) {
+	keylist := apparmor.RegisteredSnippetKeys()
+	c.Assert(keylist, testutil.DeepUnsortedMatches, []string{"testkey1", "testkey2", "mount-info"})
+}
+
+func (s *specSuite) TestInterfaceForMetadataTag(c *C) {
+	_ = apparmor.RegisterMetadataTagWithInterface("testtag1", "an-interface")
+	_ = apparmor.RegisterMetadataTagWithInterface("testtag2", "another")
+	_ = apparmor.RegisterMetadataTagWithInterface("testtag3", "yet-another")
+
+	iface, ok := apparmor.InterfaceForMetadataTag("testtag1")
+	c.Check(ok, Equals, true)
+	c.Check(iface, Equals, "an-interface")
+
+	iface, ok = apparmor.InterfaceForMetadataTag("testtag2")
+	c.Check(ok, Equals, true)
+	c.Check(iface, Equals, "another")
+
+	iface, ok = apparmor.InterfaceForMetadataTag("testtag3")
+	c.Check(ok, Equals, true)
+	c.Check(iface, Equals, "yet-another")
+
+	iface, ok = apparmor.InterfaceForMetadataTag("testtag4")
+	c.Check(ok, Equals, false)
+	c.Check(iface, Equals, "")
+}
+
+func (s *specSuite) TestRegisterSameTagSameInterfaceTwice(c *C) {
+	tag1 := apparmor.RegisterMetadataTagWithInterface("will-be-associated", "with-me")
+	c.Check(tag1.String(), Equals, "will-be-associated")
+	tag2 := apparmor.RegisterMetadataTagWithInterface("will-be-associated", "with-me")
+	c.Check(tag2.String(), Equals, "will-be-associated")
+
+	iface, ok := apparmor.InterfaceForMetadataTag("will-be-associated")
+	c.Check(ok, Equals, true)
+	c.Check(iface, Equals, "with-me")
+}
+
+func (s *specSuite) TestRegisterSameTagDifferentInterface(c *C) {
+	tag1 := apparmor.RegisterMetadataTagWithInterface("something", "an-interface")
+	c.Check(tag1.String(), Equals, "something")
+
+	c.Check(func() { apparmor.RegisterMetadataTagWithInterface("something", "another") }, PanicMatches, `cannot register metadata tag "something" to two different interfaces: "an-interface" and "another"`)
+}
+
+func (s *specSuite) TestRegisterMetadataTagWithInterfaceEmpty(c *C) {
+	c.Check(func() { apparmor.RegisterMetadataTagWithInterface("to-nothing", "") }, PanicMatches, `cannot register metadata tag with missing interface: "to-nothing"`)
+}
+
+func (s *specSuite) TestRegisterMetadataTagInvalid(c *C) {
+	for _, badTag := range []string{"a,b", "a(b", "a)b", "a[b", "a]b", "a{b", "a}b", "a?b", "a*b", "a^b", `a"b`, `1ab`, `aBc`, `Ab`, `a/b`} {
+		c.Check(func() { apparmor.RegisterMetadataTagWithInterface(badTag, "something") }, PanicMatches, `cannot register invalid metadata tag: .*`)
+	}
 }

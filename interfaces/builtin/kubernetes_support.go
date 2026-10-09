@@ -119,8 +119,9 @@ profile systemd_run (attach_disconnected,mediate_deleted) {
   # This can be dropped once LP: #1890848 is fixed.
   ptrace (trace) peer=unconfined,
 
-  /{,usr/}bin/true ixr,
-  @{INSTALL_DIR}/{@{SNAP_NAME},@{SNAP_INSTANCE_NAME}}/@{SNAP_REVISION}/{,usr/}bin/true ixr,
+  # Support coreutils paths (LP: #2123870)
+  @{SNAP_COREUTIL_DIRS}true ixr,
+  @{INSTALL_DIR}/{@{SNAP_NAME},@{SNAP_INSTANCE_NAME}}/@{SNAP_REVISION}/@{SNAP_COREUTIL_DIRS}true ixr,
 ###KUBERNETES_SUPPORT_SYSTEMD_RUN###
 }
 `
@@ -251,6 +252,9 @@ mount
 umount
 umount2
 
+lsm_get_self_attr
+lsm_set_self_attr
+
 unshare
 setns - CLONE_NEWNET
 
@@ -293,7 +297,7 @@ type kubernetesSupportInterface struct {
 	commonInterface
 }
 
-func (iface *kubernetesSupportInterface) ServicePermanentPlug(plug *snap.PlugInfo) []string {
+func (iface *kubernetesSupportInterface) ServicePermanentPlug(plug *snap.PlugInfo) []interfaces.PlugServicesSnippet {
 	// only autobind-unix flavor does not get Delegate=true, all other flavors
 	// are usable to manage control groups of processes/containers, and thus
 	// need Delegate=true
@@ -302,7 +306,9 @@ func (iface *kubernetesSupportInterface) ServicePermanentPlug(plug *snap.PlugInf
 		return nil
 	}
 
-	return []string{"Delegate=true"}
+	return []interfaces.PlugServicesSnippet{
+		interfaces.PlugServicesServiceSectionSnippet("Delegate=true"),
+	}
 }
 
 func k8sFlavor(plug interfaces.Attrer) string {
@@ -388,11 +394,13 @@ func (iface *kubernetesSupportInterface) BeforePreparePlug(plug *snap.PlugInfo) 
 
 func init() {
 	registerIface(&kubernetesSupportInterface{commonInterface{
-		name:                 "kubernetes-support",
-		summary:              kubernetesSupportSummary,
-		implicitOnClassic:    true,
-		implicitOnCore:       true,
-		baseDeclarationPlugs: kubernetesSupportBaseDeclarationPlugs,
-		baseDeclarationSlots: kubernetesSupportBaseDeclarationSlots,
+		name:                     "kubernetes-support",
+		summary:                  kubernetesSupportSummary,
+		implicitOnClassic:        true,
+		implicitOnCore:           true,
+		baseDeclarationPlugs:     kubernetesSupportBaseDeclarationPlugs,
+		baseDeclarationSlots:     kubernetesSupportBaseDeclarationSlots,
+		parallelInstancesPlugErr: errParallelInstancesSharedResources,
+		parallelInstancesSlotErr: errParallelInstancesSystemSlot,
 	}})
 }

@@ -73,7 +73,7 @@ type AssertionType struct {
 	// forming types.
 	OptionalPrimaryKeyDefaults map[string]string
 
-	assembler func(assert assertionBase) (Assertion, error)
+	assembler func(assert AssertionBase) (Assertion, error)
 	flags     typeFlags
 }
 
@@ -124,6 +124,11 @@ func (at *AssertionType) AcceptablePrimaryKey(key []string) bool {
 	return true
 }
 
+// JSONBody returns true if the body for this assertion type must be JSON.
+func (at *AssertionType) JSONBody() bool {
+	return at.flags&jsonBody != 0
+}
+
 // Understood assertion types.
 var (
 	AccountType              = &AssertionType{"account", []string{"account-id"}, nil, assembleAccount, 0}
@@ -143,8 +148,10 @@ var (
 	PreseedType              = &AssertionType{"preseed", []string{"series", "brand-id", "model", "system-label"}, nil, assemblePreseed, 0}
 	SnapResourceRevisionType = &AssertionType{"snap-resource-revision", []string{"snap-id", "resource-name", "resource-sha3-384", "provenance"}, map[string]string{"provenance": naming.DefaultProvenance}, assembleSnapResourceRevision, 0}
 	SnapResourcePairType     = &AssertionType{"snap-resource-pair", []string{"snap-id", "resource-name", "resource-revision", "snap-revision", "provenance"}, map[string]string{"provenance": naming.DefaultProvenance}, assembleSnapResourcePair, 0}
-	AspectBundleType         = &AssertionType{"aspect-bundle", []string{"account-id", "name"}, nil, assembleAspectBundle, jsonBody}
-
+	ConfdbSchemaType         = &AssertionType{"confdb-schema", []string{"account-id", "name"}, nil, assembleConfdbSchema, jsonBody}
+	ClusterType              = &AssertionType{"cluster", []string{"cluster-id", "sequence"}, nil, assembleCluster, sequenceForming}
+	RequestMessageType       = &AssertionType{"request-message", []string{"account-id", "message-id"}, nil, assembleRequestMessage, 0}
+	HardwareIdentityType     = &AssertionType{"hardware-identity", []string{"issuer-id", "hardware-id-key-sha3-384"}, nil, assembleHardwareIdentity, 0}
 	// ...
 )
 
@@ -153,6 +160,8 @@ var (
 	DeviceSessionRequestType = &AssertionType{"device-session-request", []string{"brand-id", "model", "serial"}, nil, assembleDeviceSessionRequest, noAuthority}
 	SerialRequestType        = &AssertionType{"serial-request", nil, nil, assembleSerialRequest, noAuthority}
 	AccountKeyRequestType    = &AssertionType{"account-key-request", []string{"public-key-sha3-384"}, nil, assembleAccountKeyRequest, noAuthority}
+	ConfdbControlType        = &AssertionType{"confdb-control", []string{"brand-id", "model", "serial"}, nil, assembleConfdbControl, noAuthority}
+	ResponseMessageType      = &AssertionType{"response-message", []string{"account-id", "message-id", "device"}, nil, assembleResponseMessage, noAuthority}
 )
 
 var typeRegistry = map[string]*AssertionType{
@@ -173,11 +182,16 @@ var typeRegistry = map[string]*AssertionType{
 	PreseedType.Name:              PreseedType,
 	SnapResourceRevisionType.Name: SnapResourceRevisionType,
 	SnapResourcePairType.Name:     SnapResourcePairType,
-	AspectBundleType.Name:         AspectBundleType,
+	ConfdbSchemaType.Name:         ConfdbSchemaType,
+	ClusterType.Name:              ClusterType,
+	RequestMessageType.Name:       RequestMessageType,
+	HardwareIdentityType.Name:     HardwareIdentityType,
 	// no authority
 	DeviceSessionRequestType.Name: DeviceSessionRequestType,
 	SerialRequestType.Name:        SerialRequestType,
 	AccountKeyRequestType.Name:    AccountKeyRequestType,
+	ConfdbControlType.Name:        ConfdbControlType,
+	ResponseMessageType.Name:      ResponseMessageType,
 }
 
 // Type returns the AssertionType with name or nil
@@ -207,7 +221,9 @@ func init() {
 	// 3: support for on-store/on-brand/on-model device scope constraints
 	// 4: support for plug-names/slot-names constraints
 	// 5: alt attr matcher usage (was unused before, has new behavior now)
-	maxSupportedFormat[SnapDeclarationType.Name] = 5
+	// 6: support for $PLUG_PUBLISHER_ID/$SLOT_PUBLISHER_ID in attr constraints
+	// 7: support for on-classic distro/variant constraints
+	maxSupportedFormat[SnapDeclarationType.Name] = 7
 
 	// 1: support to limit to device serials
 	// 2: support for user-presence constraint
@@ -246,7 +262,7 @@ func MockOptionalPrimaryKey(assertType *AssertionType, key, defaultValue string)
 	}
 }
 
-var formatAnalyzer = map[*AssertionType]func(headers map[string]interface{}, body []byte) (formatnum int, err error){
+var formatAnalyzer = map[*AssertionType]func(headers map[string]any, body []byte) (formatnum int, err error){
 	AccountKeyType:      accountKeyFormatAnalyze,
 	SnapDeclarationType: snapDeclarationFormatAnalyze,
 	SystemUserType:      systemUserFormatAnalyze,
@@ -271,7 +287,7 @@ func MaxSupportedFormats(min int) (maxFormats map[string]int) {
 }
 
 // SuggestFormat returns a minimum format that supports the features that would be used by an assertion with the given components.
-func SuggestFormat(assertType *AssertionType, headers map[string]interface{}, body []byte) (formatnum int, err error) {
+func SuggestFormat(assertType *AssertionType, headers map[string]any, body []byte) (formatnum int, err error) {
 	analyzer := formatAnalyzer[assertType]
 	if analyzer == nil {
 		// no analyzer, format 0 is all there is
@@ -528,10 +544,10 @@ type Assertion interface {
 	AuthorityID() string
 
 	// Header retrieves the header with name
-	Header(name string) interface{}
+	Header(name string) any
 
 	// Headers returns the complete headers
-	Headers() map[string]interface{}
+	Headers() map[string]any
 
 	// HeaderString retrieves the string value of header with name or ""
 	HeaderString(name string) string
@@ -566,15 +582,15 @@ type SequenceMember interface {
 // customSigner represents an assertion with special arrangements for its signing key (e.g. self-signed), rather than the usual case where an assertion is signed by its authority.
 type customSigner interface {
 	// signKey returns the public key material for the key that signed this assertion.  See also SignKeyID.
-	signKey() PublicKey
+	signKey(db RODatabase) (PublicKey, error)
 }
 
 // MediaType is the media type for encoded assertions on the wire.
 const MediaType = "application/x.ubuntu.assertion"
 
-// assertionBase is the concrete base to hold representation data for actual assertions.
-type assertionBase struct {
-	headers map[string]interface{}
+// AssertionBase holds the common representation shared by assertion types.
+type AssertionBase struct {
+	headers map[string]any
 	body    []byte
 	// parsed format iteration
 	format int
@@ -587,40 +603,40 @@ type assertionBase struct {
 }
 
 // HeaderString retrieves the string value of header with name or ""
-func (ab *assertionBase) HeaderString(name string) string {
+func (ab *AssertionBase) HeaderString(name string) string {
 	s, _ := ab.headers[name].(string)
 	return s
 }
 
 // Type returns the assertion type.
-func (ab *assertionBase) Type() *AssertionType {
+func (ab *AssertionBase) Type() *AssertionType {
 	return Type(ab.HeaderString("type"))
 }
 
 // Format returns the assertion format iteration.
-func (ab *assertionBase) Format() int {
+func (ab *AssertionBase) Format() int {
 	return ab.format
 }
 
 // SupportedFormat returns whether the assertion uses a supported
 // format iteration. If false the assertion might have been only
 // partially parsed.
-func (ab *assertionBase) SupportedFormat() bool {
+func (ab *AssertionBase) SupportedFormat() bool {
 	return ab.format <= maxSupportedFormat[ab.HeaderString("type")]
 }
 
 // Revision returns the assertion revision.
-func (ab *assertionBase) Revision() int {
+func (ab *AssertionBase) Revision() int {
 	return ab.revision
 }
 
 // AuthorityID returns the authority-id a.k.a the authority responsible for the assertion.
-func (ab *assertionBase) AuthorityID() string {
+func (ab *AssertionBase) AuthorityID() string {
 	return ab.HeaderString("authority-id")
 }
 
 // Header returns the value of an header by name.
-func (ab *assertionBase) Header(name string) interface{} {
+func (ab *AssertionBase) Header(name string) any {
 	v := ab.headers[name]
 	if v == nil {
 		return nil
@@ -629,32 +645,32 @@ func (ab *assertionBase) Header(name string) interface{} {
 }
 
 // Headers returns the complete headers.
-func (ab *assertionBase) Headers() map[string]interface{} {
+func (ab *AssertionBase) Headers() map[string]any {
 	return copyHeaders(ab.headers)
 }
 
 // Body returns the body of the assertion.
-func (ab *assertionBase) Body() []byte {
+func (ab *AssertionBase) Body() []byte {
 	return ab.body
 }
 
 // Signature returns the signed content and its unprocessed signature.
-func (ab *assertionBase) Signature() (content, signature []byte) {
+func (ab *AssertionBase) Signature() (content, signature []byte) {
 	return ab.content, ab.signature
 }
 
 // SignKeyID returns the key id for the key that signed this assertion.
-func (ab *assertionBase) SignKeyID() string {
+func (ab *AssertionBase) SignKeyID() string {
 	return ab.HeaderString("sign-key-sha3-384")
 }
 
 // Prerequisites returns references to the prerequisite assertions for the validity of this one.
-func (ab *assertionBase) Prerequisites() []*Ref {
+func (ab *AssertionBase) Prerequisites() []*Ref {
 	return nil
 }
 
 // Ref returns a reference representing this assertion.
-func (ab *assertionBase) Ref() *Ref {
+func (ab *AssertionBase) Ref() *Ref {
 	assertType := ab.Type()
 	primKey := make([]string, len(assertType.PrimaryKey))
 	for i, name := range assertType.PrimaryKey {
@@ -667,12 +683,12 @@ func (ab *assertionBase) Ref() *Ref {
 }
 
 // At returns an AtRevision referencing this assertion at its revision.
-func (ab *assertionBase) At() *AtRevision {
+func (ab *AssertionBase) At() *AtRevision {
 	return &AtRevision{Ref: *ab.Ref(), Revision: ab.Revision()}
 }
 
 // expected interface is implemented
-var _ Assertion = (*assertionBase)(nil)
+var _ Assertion = (*AssertionBase)(nil)
 
 // Decode parses a serialized assertion.
 //
@@ -955,7 +971,7 @@ func (d *Decoder) Decode() (Assertion, error) {
 	return assemble(headers, finalBody, finalContent, finalSig)
 }
 
-func checkIteration(headers map[string]interface{}, name string) (int, error) {
+func checkIteration(headers map[string]any, name string) (int, error) {
 	iternum, err := checkIntWithDefault(headers, name, 0)
 	if err != nil {
 		return -1, err
@@ -966,16 +982,16 @@ func checkIteration(headers map[string]interface{}, name string) (int, error) {
 	return iternum, nil
 }
 
-func checkFormat(headers map[string]interface{}) (int, error) {
+func checkFormat(headers map[string]any) (int, error) {
 	return checkIteration(headers, "format")
 }
 
-func checkRevision(headers map[string]interface{}) (int, error) {
+func checkRevision(headers map[string]any) (int, error) {
 	return checkIteration(headers, "revision")
 }
 
 // Assemble assembles an assertion from its components.
-func Assemble(headers map[string]interface{}, body, content, signature []byte) (Assertion, error) {
+func Assemble(headers map[string]any, body, content, signature []byte) (Assertion, error) {
 	err := checkHeaders(headers)
 	if err != nil {
 		return nil, err
@@ -983,14 +999,14 @@ func Assemble(headers map[string]interface{}, body, content, signature []byte) (
 	return assemble(headers, body, content, signature)
 }
 
-func checkAuthority(_ *AssertionType, headers map[string]interface{}) error {
+func checkAuthority(_ *AssertionType, headers map[string]any) error {
 	if _, err := checkNotEmptyString(headers, "authority-id"); err != nil {
 		return err
 	}
 	return nil
 }
 
-func checkNoAuthority(assertType *AssertionType, headers map[string]interface{}) error {
+func checkNoAuthority(assertType *AssertionType, headers map[string]any) error {
 	if _, ok := headers["authority-id"]; ok {
 		return fmt.Errorf("%q assertion cannot have authority-id set", assertType.Name)
 	}
@@ -1008,7 +1024,7 @@ func checkJSON(assertType *AssertionType, body []byte) (err error) {
 		return fmt.Errorf(`body must contain JSON`)
 	}
 
-	var val interface{}
+	var val any
 	if err := json.Unmarshal(body, &val); err != nil {
 		return fmt.Errorf("invalid JSON in body: %v", err)
 	}
@@ -1019,6 +1035,8 @@ func checkJSON(assertType *AssertionType, body []byte) (err error) {
 	}
 
 	if !reflect.DeepEqual(body, formatted) {
+		// TODO: replace this with a manual comparison so we can give more context
+		// in the error message
 		return fmt.Errorf(`JSON in body must be indented with 2 spaces and sort object entries by key`)
 	}
 
@@ -1026,7 +1044,7 @@ func checkJSON(assertType *AssertionType, body []byte) (err error) {
 }
 
 // assemble is the internal variant of Assemble, assumes headers are already checked for supported types
-func assemble(headers map[string]interface{}, body, content, signature []byte) (Assertion, error) {
+func assemble(headers map[string]any, body, content, signature []byte) (Assertion, error) {
 	length, err := checkIntWithDefault(headers, "body-length", 0)
 	if err != nil {
 		return nil, fmt.Errorf("assertion: %v", err)
@@ -1039,8 +1057,10 @@ func assemble(headers map[string]interface{}, body, content, signature []byte) (
 		return nil, fmt.Errorf("assertion body is not utf8")
 	}
 
-	if _, err := checkDigest(headers, "sign-key-sha3-384", crypto.SHA3_384); err != nil {
-		return nil, fmt.Errorf("assertion: %v", err)
+	if !isBuiltinSignature(signature) {
+		if _, err := checkDigest(headers, "sign-key-sha3-384", crypto.SHA3_384); err != nil {
+			return nil, fmt.Errorf("assertion: %v", err)
+		}
 	}
 
 	typ, err := checkNotEmptyString(headers, "type")
@@ -1093,7 +1113,7 @@ func assemble(headers map[string]interface{}, body, content, signature []byte) (
 		return nil, fmt.Errorf("empty assertion signature")
 	}
 
-	assert, err := assertType.assembler(assertionBase{
+	assert, err := assertType.assembler(AssertionBase{
 		headers:   headers,
 		body:      body,
 		format:    formatnum,
@@ -1107,11 +1127,11 @@ func assemble(headers map[string]interface{}, body, content, signature []byte) (
 	return assert, nil
 }
 
-func writeHeader(buf *bytes.Buffer, headers map[string]interface{}, name string) {
+func writeHeader(buf *bytes.Buffer, headers map[string]any, name string) {
 	appendEntry(buf, fmt.Sprintf("%s:", name), headers[name], 0)
 }
 
-func assembleAndSign(assertType *AssertionType, headers map[string]interface{}, body []byte, privKey PrivateKey) (Assertion, error) {
+func assembleAndSign(assertType *AssertionType, headers map[string]any, body []byte, privKey PrivateKey) (Assertion, error) {
 	err := checkAssertType(assertType)
 	if err != nil {
 		return nil, err
@@ -1254,14 +1274,14 @@ func assembleAndSign(assertType *AssertionType, headers map[string]interface{}, 
 	}
 	content := buf.Bytes()
 
-	signature, err := signContent(content, privKey)
+	signature, err := signAndEncode(content, privKey)
 	if err != nil {
 		return nil, fmt.Errorf("cannot sign assertion: %v", err)
 	}
 	// be 'cat' friendly, add a ignored newline to the signature which is the last part of the encoded assertion
 	signature = append(signature, '\n')
 
-	assert, err := assertType.assembler(assertionBase{
+	assert, err := assertType.assembler(AssertionBase{
 		headers:   finalHeaders,
 		body:      finalBody,
 		format:    formatnum,
@@ -1276,7 +1296,7 @@ func assembleAndSign(assertType *AssertionType, headers map[string]interface{}, 
 }
 
 // SignWithoutAuthority assembles an assertion without a set authority with the provided information and signs it with the given private key.
-func SignWithoutAuthority(assertType *AssertionType, headers map[string]interface{}, body []byte, privKey PrivateKey) (Assertion, error) {
+func SignWithoutAuthority(assertType *AssertionType, headers map[string]any, body []byte, privKey PrivateKey) (Assertion, error) {
 	if assertType.flags&noAuthority == 0 {
 		return nil, fmt.Errorf("cannot sign assertions needing a definite authority with SignWithoutAuthority")
 	}

@@ -20,6 +20,7 @@ package devicestate
 
 import (
 	"bytes"
+	"context"
 	"crypto/rsa"
 	"encoding/json"
 	"errors"
@@ -41,6 +42,7 @@ import (
 	"github.com/snapcore/snapd/overlord/auth"
 	"github.com/snapcore/snapd/overlord/configstate/config"
 	"github.com/snapcore/snapd/overlord/configstate/proxyconf"
+	"github.com/snapcore/snapd/overlord/hookstate"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/snapdenv"
@@ -182,7 +184,7 @@ type registrationContext interface {
 	Model() *asserts.Model
 
 	GadgetForSerialRequestConfig() string
-	SerialRequestExtraHeaders() map[string]interface{}
+	SerialRequestExtraHeaders() map[string]any
 	SerialRequestAncillaryAssertions() []asserts.Assertion
 
 	FinishRegistration(serial *asserts.Serial) error
@@ -214,7 +216,7 @@ func (rc *initialRegistrationContext) GadgetForSerialRequestConfig() string {
 	return rc.model.Gadget()
 }
 
-func (rc *initialRegistrationContext) SerialRequestExtraHeaders() map[string]interface{} {
+func (rc *initialRegistrationContext) SerialRequestExtraHeaders() map[string]any {
 	return nil
 }
 
@@ -270,7 +272,7 @@ type requestIDResp struct {
 	RequestID string `json:"request-id"`
 }
 
-func retryErr(t *state.Task, nTentatives int, reason string, a ...interface{}) error {
+func retryErr(t *state.Task, nTentatives int, reason string, a ...any) error {
 	t.State().Lock()
 	defer t.State().Unlock()
 	if nTentatives >= maxTentatives {
@@ -307,7 +309,7 @@ func retryBadStatus(t *state.Task, nTentatives int, reason string, resp *http.Re
 	return fmt.Errorf("%s: unexpected status %d", reason, resp.StatusCode)
 }
 
-func prepareSerialRequest(t *state.Task, regCtx registrationContext, privKey asserts.PrivateKey, device *auth.DeviceState, client *http.Client, cfg *serialRequestConfig) (string, error) {
+func (m *DeviceManager) prepareSerialRequest(t *state.Task, regCtx registrationContext, privKey asserts.PrivateKey, device *auth.DeviceState, client *http.Client, cfg *serialRequestConfig) (string, error) {
 	// limit tentatives starting from scratch before going to
 	// slower full retries
 	var nTentatives int
@@ -388,13 +390,22 @@ func prepareSerialRequest(t *state.Task, regCtx registrationContext, privKey ass
 		return "", retryErr(t, nTentatives, "cannot read response with request-id for making a request for a serial: %v", err)
 	}
 
+	cfgBody, err := m.maybeRunPrepareSerialRequestHook(st, requestID.RequestID, regCtx.GadgetForSerialRequestConfig())
+	if err != nil {
+		return "", fmt.Errorf("failed to run prepare serial request hook: %v", err)
+	}
+
+	if cfgBody != nil {
+		cfg.body = cfgBody
+	}
+
 	encodedPubKey, err := asserts.EncodePublicKey(privKey.PublicKey())
 	if err != nil {
 		return "", fmt.Errorf("internal error: cannot encode device public key: %v", err)
 
 	}
 
-	headers := map[string]interface{}{
+	headers := map[string]any{
 		"brand-id":   device.Brand,
 		"model":      device.Model,
 		"request-id": requestID.RequestID,
@@ -498,7 +509,7 @@ var httputilNewHTTPClient = httputil.NewHTTPClient
 
 var errStoreOffline = errors.New("snap store is marked offline")
 
-func getSerial(t *state.Task, regCtx registrationContext, privKey asserts.PrivateKey, device *auth.DeviceState, tm timings.Measurer) (serial *asserts.Serial, ancillaryBatch *asserts.Batch, err error) {
+func (m *DeviceManager) getSerial(t *state.Task, regCtx registrationContext, privKey asserts.PrivateKey, device *auth.DeviceState, tm timings.Measurer) (serial *asserts.Serial, ancillaryBatch *asserts.Batch, err error) {
 	var serialSup serialSetup
 	err = t.Get("serial-setup", &serialSup)
 	if err != nil && !errors.Is(err, state.ErrNoState) {
@@ -549,7 +560,7 @@ func getSerial(t *state.Task, regCtx registrationContext, privKey asserts.Privat
 		var serialRequest string
 		var err error
 		timings.Run(tm, "prepare-serial-request", "prepare device serial request", func(timings.Measurer) {
-			serialRequest, err = prepareSerialRequest(t, regCtx, privKey, device, client, cfg)
+			serialRequest, err = m.prepareSerialRequest(t, regCtx, privKey, device, client, cfg)
 		})
 		if err != nil { // errors & retries
 			return nil, nil, err
@@ -813,7 +824,7 @@ func (m *DeviceManager) doRequestSerial(t *state.Task, _ *tomb.Tomb) error {
 	var serial *asserts.Serial
 	var ancillaryBatch *asserts.Batch
 	timings.Run(perfTimings, "get-serial", "get device serial", func(tm timings.Measurer) {
-		serial, ancillaryBatch, err = getSerial(t, regCtx, privKey, device, tm)
+		serial, ancillaryBatch, err = m.getSerial(t, regCtx, privKey, device, tm)
 	})
 	if err == errPoll {
 		t.Logf("Will poll for device serial assertion in 60 seconds")
@@ -932,4 +943,83 @@ func fetchKeys(st *state.State, keyID string) (errAcctKey error, err error) {
 		}
 	}
 	return nil, nil
+}
+
+// maybeRunPrepareSerialRequestHook checks if the gadget has a prepare-serial-request
+// hook and runs it with the provided request ID.
+// It returns the modified registration body if the hook updated it, or nil if no hook
+// exists or the body was not changed.
+func (m *DeviceManager) maybeRunPrepareSerialRequestHook(st *state.State, requestID, gadgetName string) ([]byte, error) {
+	st.Lock()
+	defer st.Unlock()
+
+	// no gadget present
+	if gadgetName == "" {
+		return nil, nil
+	}
+
+	gadgetInfo, err := snapstate.CurrentInfo(st, gadgetName)
+	if err != nil {
+		return nil, err
+	}
+
+	if gadgetInfo.Hooks["prepare-serial-request"] == nil {
+		return nil, nil
+	}
+
+	hooksup := &hookstate.HookSetup{
+		Snap: gadgetName,
+		Hook: "prepare-serial-request",
+	}
+
+	// Add request id to config for hook to use
+	tr := config.NewTransaction(st)
+	err = tr.Set(gadgetName, "registration.request-id", requestID)
+	if err != nil {
+		return nil, fmt.Errorf("cannot set request id: %v", err)
+	}
+	tr.Commit()
+
+	// Run the hook (this will unlock/relock the state)
+	err = m.runPrepareSerialRequestHook(st, hooksup)
+	if err != nil {
+		return nil, err
+	}
+
+	// read updated registration body without decoding
+	var encodedBody json.RawMessage
+	tr = config.NewTransaction(st)
+	err = tr.Get(gadgetName, "registration.body", &encodedBody)
+	if err != nil {
+		return nil, fmt.Errorf("cannot get updated registration body: %v", err)
+	}
+
+	var body map[string]any
+	err = json.Unmarshal([]byte(encodedBody), &body)
+	if err != nil {
+		return nil, fmt.Errorf("cannot unmarshal registration body as JSON (hook did not overwrite or wrote incorrectly?): %v", err)
+	}
+
+	// check for the minimal mandatory fields. We're not rejecting unknown fields
+	// for forwards compatibility
+	mandatory := []string{"hardware-id-key-sha3-384", "request-id-signature"}
+	for _, field := range mandatory {
+		if _, ok := body[field]; !ok {
+			return nil, fmt.Errorf("'prepare-serial-request' hook did not set mandatory field %q in registration body", field)
+		}
+	}
+
+	return []byte(encodedBody), nil
+}
+
+func (m *DeviceManager) runPrepareSerialRequestHook(st *state.State, hooksup *hookstate.HookSetup) error {
+	st.Unlock()
+	defer st.Lock()
+
+	_, err := m.hookMgr.EphemeralRunHook(context.Background(), hooksup, nil)
+	if err != nil {
+		return fmt.Errorf("cannot run prepare serial request hook: %v", err)
+	}
+
+	return nil
 }

@@ -1,5 +1,14 @@
 summary: verify the output of 'snap services' command
 
+details: |
+    The "snap services" command shows all the services provided by all the
+    snaps, their state at present, their automatic startup as well as auxiliary
+    properties such as being bus-activated or belonging to the user session
+    instead of the system.
+
+    The test installs a number of snaps and observers the output of the
+    aforementioned command.
+
 systems:
   # TODO: dbus issue
   - -ubuntu-core-22-*
@@ -8,13 +17,18 @@ prepare: |
     snap set system experimental.user-daemons=true
 
 restore: |
+    snap remove --purge test-snapd-service || true
+    snap remove --purge socket-activation || true
+    snap remove --purge test-snapd-timer-service || true
+    snap remove --purge test-snapd-dbus-service || true
+    snap remove --purge test-snapd-user-service || true
     snap unset system experimental.user-daemons
 
 execute: |
     # precondition check of systemctl behavior for non-existing services;
     # it is expected that the returned UnitFileState is empty.
     systemctl show --property=Id foo.service | MATCH "foo.service"
-    systemctl show --property=ActiveState foo.service | MATCH "inactive"
+    systemctl show --property=ActiveState foo.service | MATCH '^ActiveState=inactive$'
     UNIT_FILE_STATE=$(systemctl show --property=UnitFileState foo.service)
     if [[ "$UNIT_FILE_STATE" != "UnitFileState=" ]]; then
         echo "unexpected value of UnitFileState for non-existing service: $UNIT_FILE_STATE"

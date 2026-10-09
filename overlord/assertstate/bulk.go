@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2020 Canonical Ltd
+ * Copyright (C) 2020-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -28,6 +28,8 @@ import (
 
 	"github.com/snapcore/snapd/asserts"
 	"github.com/snapcore/snapd/asserts/snapasserts"
+	"github.com/snapcore/snapd/confdb"
+	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/release"
@@ -139,6 +141,47 @@ func bulkRefreshSnapDeclarations(s *state.State, snapStates map[string]*snapstat
 	}
 
 	return nil
+}
+
+func bulkRefreshConfdbSchemas(s *state.State, schemaIDs []confdb.SchemaID, userID int, deviceCtx snapstate.DeviceContext, opts *RefreshAssertionsOptions) error {
+	db := cachedDB(s)
+
+	// all assertion refs will be in the same group
+	pool := asserts.NewPool(db, maxGroups)
+	for i, id := range schemaIDs {
+		account, name := id.Account, id.Name
+		ref := &asserts.Ref{
+			Type:       asserts.ConfdbSchemaType,
+			PrimaryKey: []string{account, name},
+		}
+
+		grp := fmt.Sprintf("%s-%d", storeGroup, i)
+		if err := pool.AddToUpdate(ref, grp); err != nil {
+			return fmt.Errorf("cannot prepare confdb assertion %s/%s for refresh: %v", account, name, err)
+		}
+	}
+
+	err := resolvePool(s, pool, nil, userID, deviceCtx, opts)
+	if err == nil {
+		return nil
+	}
+
+	if rerr, ok := err.(*resolvePoolError); ok {
+		for grp, e := range rerr.errors {
+			if errors.Is(e, &asserts.NotFoundError{}) {
+				// ignore failures to refresh confdb-schemas that cannot be found as they
+				// may be unpublished (only locally acknowledged)
+				logger.Noticef("ignoring not found error when refreshing confdb-schema: %v", e)
+				delete(rerr.errors, grp)
+			}
+		}
+
+		if len(rerr.errors) == 0 {
+			return nil
+		}
+	}
+
+	return err
 }
 
 func bulkRefreshValidationSetAsserts(s *state.State, vsets map[string]*ValidationSetTracking, beforeCommitChecker func(*asserts.Database, asserts.Backstore) error, userID int, deviceCtx snapstate.DeviceContext, opts *RefreshAssertionsOptions) error {

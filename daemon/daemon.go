@@ -25,6 +25,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"mime"
 	"net"
 	"net/http"
 	"os"
@@ -36,7 +38,9 @@ import (
 	"github.com/gorilla/mux"
 	"gopkg.in/tomb.v2"
 
+	"github.com/snapcore/snapd/asserts"
 	"github.com/snapcore/snapd/boot"
+	"github.com/snapcore/snapd/client"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/netutil"
@@ -44,14 +48,18 @@ import (
 	"github.com/snapcore/snapd/overlord"
 	"github.com/snapcore/snapd/overlord/auth"
 	"github.com/snapcore/snapd/overlord/restart"
+	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/standby"
 	"github.com/snapcore/snapd/overlord/state"
+	"github.com/snapcore/snapd/seclog"
 	"github.com/snapcore/snapd/snapdenv"
 	"github.com/snapcore/snapd/store"
 	"github.com/snapcore/snapd/systemd"
+	"github.com/snapcore/snapd/wrappers"
 )
 
 var ErrRestartSocket = fmt.Errorf("daemon stop requested to wait for socket activation")
+var ErrNoFailureRecoveryNeeded = fmt.Errorf("no failure recovery needed")
 
 var systemdSdNotify = systemd.SdNotify
 
@@ -80,6 +88,8 @@ type Daemon struct {
 	requestedRestart restart.RestartType
 	// reboot info needed to handle reboots
 	rebootInfo *boot.RebootInfo
+	// reason for a restart request, empty otherwise
+	restartReason restart.RestartReason
 	// set to remember that we need to exit the daemon in a way that
 	// prevents systemd from restarting it
 	restartSocket bool
@@ -103,6 +113,9 @@ type Command struct {
 	PUT  ResponseFunc
 	POST ResponseFunc
 
+	// List of possible values an action field can have
+	Actions []string
+
 	// Access control.
 	ReadAccess  accessChecker
 	WriteAccess accessChecker
@@ -112,10 +125,9 @@ type Command struct {
 
 func (c *Command) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	st := c.d.state
-	st.Lock()
+	// userFromRequest locks the state internally when checking authentication.
 	// TODO Look at the error and fail if there's an attempt to authenticate with invalid data.
 	user, _ := userFromRequest(st, r)
-	st.Unlock()
 
 	// check if we are in degradedMode
 	if c.d.degradedErr != nil && r.Method != "GET" {
@@ -123,8 +135,8 @@ func (c *Command) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ucred, err := ucrednetGet(r.RemoteAddr)
-	if err != nil && err != errNoID {
+	ucred, err := ucrednetGet(r.Context())
+	if err != nil && err != errNoPeerCredentials {
 		logger.Noticef("unexpected error when attempting to get UID: %s", err)
 		InternalError(err.Error()).ServeHTTP(w, r)
 		return
@@ -153,25 +165,43 @@ func (c *Command) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if rspe := access.CheckAccess(c.d, r, ucred, user); rspe != nil {
+	// One read, so later stages look the action up from context instead of
+	// touching the body again.
+	action, err := extractRequestAction(r)
+	if isBodyUnusable(err) {
+		BadRequest(err.Error()).ServeHTTP(w, r)
+		return
+	}
+	r = r.WithContext(withActionResult(r.Context(), action, err))
+	if errors.Is(err, errUnexpectedDataAfterBody) {
+		BadRequest(err.Error()).ServeHTTP(w, r)
+		return
+	}
+
+	authzRec := newAuthzRecorder(
+		seclogSnapdUserFromAuth(user),
+		ucred.seclogPeer(),
+		seclog.Endpoint{Method: r.Method, Path: r.URL.Path, Action: action},
+	)
+	rspe := access.CheckAccess(c.d, r, ucred, user, authzRec)
+	authzRec.log()
+	if rspe != nil {
 		rspe.ServeHTTP(w, r)
 		return
 	}
+
+	traceSnapdAPI(c, r)
 
 	rsp := rspf(c, r, user)
 
 	if srsp, ok := rsp.(StructuredResponse); ok {
 		rjson := srsp.JSON()
 
-		st.Lock()
-		_, rst := restart.Pending(st)
-		st.Unlock()
+		rst := c.d.overlord.RestartManager().Pending()
 		rjson.addMaintenanceFromRestartType(rst)
 
 		if rjson.Type != ResponseTypeError {
-			st.Lock()
 			count, stamp := st.WarningsSummary()
-			st.Unlock()
 			rjson.addWarningCount(count, stamp)
 		}
 
@@ -180,6 +210,160 @@ func (c *Command) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rsp.ServeHTTP(w, r)
+}
+
+const maxBodySize = 4 * 1024 * 1024
+
+var (
+	errBodyTooLarge            = errors.New("body size limit exceeded")
+	errBodyUnreadable          = errors.New("cannot read request body")
+	errEmptyBody               = errors.New("empty request body")
+	errUnexpectedDataAfterBody = errors.New("unexpected data after request body")
+	errActionResultNotCached   = errors.New("internal error: request action not cached")
+)
+
+// isBodyUnusable reports a body later stages cannot be served from (oversize
+// or a broken stream). A decode failure is not unusable.
+func isBodyUnusable(err error) bool {
+	return errors.Is(err, errBodyTooLarge) || errors.Is(err, errBodyUnreadable)
+}
+
+// actionInRequest is the JSON shape used to pick the top-level "action" out of a body.
+type actionInRequest struct {
+	Action string `json:"action"`
+}
+
+type actionContextKey struct{}
+
+// actionResult is the cached outcome of extractRequestAction: the action, if
+// any, and the parse error, if any. A decode error does not clear the action.
+type actionResult struct {
+	action   string
+	parseErr error
+}
+
+func withActionResult(ctx context.Context, action string, err error) context.Context {
+	return context.WithValue(ctx, actionContextKey{}, actionResult{action: action, parseErr: err})
+}
+
+// actionResultFromContext returns the action cached by withActionResult.
+// A miss is errActionResultNotCached: ServeHTTP always caches first, so a miss
+// means the caller skipped that step rather than that the request had no action.
+func actionResultFromContext(ctx context.Context) (string, error) {
+	cached, ok := ctx.Value(actionContextKey{}).(actionResult)
+	if !ok {
+		return "", errActionResultNotCached
+	}
+	return cached.action, cached.parseErr
+}
+
+// requestBodyPolicy reports whether the body is buffered in memory (and
+// rejected if larger than maxBodySize) and whether it is decoded for "action".
+// Selection is loose so tracing can still see an action; callers apply
+// stricter rules themselves.
+func requestBodyPolicy(r *http.Request) (bufferBody, decodeAction bool) {
+	// TODO: buffer PUT once size limits for snap conf and confdb are established
+	if r.Method != "POST" {
+		return false, false
+	}
+
+	ct := r.Header.Get("Content-Type")
+	if ct == "" {
+		// The snap client often omits Content-Type on JSON. snap ack is
+		// the exception: it streams assertions to POST /v2/assertions
+		// with no Content-Type at all.
+		if strings.TrimSuffix(r.URL.Path, "/") == "/v2/assertions" {
+			return false, false
+		}
+		return true, true
+	}
+
+	mediaType, _, _ := mime.ParseMediaType(ct)
+	if mediaType == "" {
+		// Unrecognised type is not a stream exemption.
+		return true, false
+	}
+
+	// snap try shares POST /v2/snaps and multipart/form-data with sideload;
+	// telling them apart means buffering the form, so both are left unread.
+	if strings.HasPrefix(mediaType, "multipart/") ||
+		mediaType == client.SnapshotExportMediaType ||
+		mediaType == asserts.MediaType {
+		return false, false
+	}
+
+	return true, mediaType == "application/json"
+}
+
+// extractRequestAction buffers the request body once, rejecting it if oversize
+// and extracting the action. Bodies that requestBodyPolicy leaves unread
+// (recognised streams, PUT, non-POST) are not touched.
+func extractRequestAction(r *http.Request) (string, error) {
+	bufferBody, decodeAction := requestBodyPolicy(r)
+	if !bufferBody {
+		if decodeAction {
+			return "", errors.New("internal error: cannot decode action without buffering the body")
+		}
+		return "", nil
+	}
+
+	if r.ContentLength > maxBodySize {
+		return "", errBodyTooLarge
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodySize+1))
+	if err != nil {
+		// Partial bytes are not the whole body, and the rest was never limited.
+		return "", fmt.Errorf("%w: %v", errBodyUnreadable, err)
+	}
+	if len(body) > maxBodySize {
+		return "", errBodyTooLarge
+	}
+
+	// net/http closes the body it captured when the request was read, not
+	// whatever r.Body holds later, so this does not leak the original.
+	r.Body = io.NopCloser(bytes.NewReader(body))
+
+	if !decodeAction {
+		return "", nil
+	}
+	return decodeActionFromBody(body)
+}
+
+// decodeActionFromBody returns the top-level "action", empty when the body has
+// no such field. Trailing data after the JSON value is an error and does not
+// discard a decoded action.
+func decodeActionFromBody(body []byte) (string, error) {
+	if len(body) == 0 {
+		return "", errEmptyBody
+	}
+
+	var req actionInRequest
+	dec := json.NewDecoder(bytes.NewReader(body))
+	if err := dec.Decode(&req); err != nil {
+		return "", err
+	}
+	// Decode again rather than Decoder.More(), which misses trailing } and ].
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return req.Action, errUnexpectedDataAfterBody
+	}
+	return req.Action, nil
+}
+
+func traceSnapdAPI(c *Command, r *http.Request) {
+	if !osutil.GetenvBool("SNAPD_TRACE") {
+		return
+	}
+	action, err := actionResultFromContext(r.Context())
+	if err != nil && !errors.Is(err, errEmptyBody) {
+		logger.Trace("endpoint-error", "body-read", err)
+	}
+	if action != "" {
+		logger.Trace("endpoint", "method", r.Method, "path", c.Path, "action", action)
+		return
+	}
+	logger.Trace("endpoint", "method", r.Method, "path", c.Path)
 }
 
 type wrappedWriter struct {
@@ -214,7 +398,8 @@ func logit(handler http.Handler) http.Handler {
 		t := time.Since(t0)
 		url := r.URL.String()
 		if !strings.Contains(url, "/changes/") {
-			logger.Debugf("%s %s %s %s %d", r.RemoteAddr, r.Method, r.URL, t, ww.s)
+			ucred, _ := ucrednetGet(r.Context())
+			logger.Debugf("%s %s %s %s %d", ucred.String(), r.Method, r.URL, t, ww.s)
 		}
 	})
 }
@@ -317,8 +502,9 @@ func (d *Daemon) initStandbyHandling() {
 	d.standbyOpinions.Start()
 }
 
-// Start the Daemon
-func (d *Daemon) Start() error {
+// Start the Daemon. Takes a context which will be used as the base request
+// context in the embedded http.Server.
+func (d *Daemon) Start(ctx context.Context) (err error) {
 	if d.expectedRebootDidNotHappen {
 		// we need to schedule and wait for a system restart
 		d.tomb.Kill(nil)
@@ -342,13 +528,18 @@ func (d *Daemon) Start() error {
 	}
 	// now perform expensive overlord/manages initialization
 	if err := d.overlord.StartUp(); err != nil {
+		if errors.Is(err, snapstate.ErrUnexpectedRuntimeRestart) {
+			logger.Noticef("detected failure recovery context, but no recovery needed")
+			return ErrNoFailureRecoveryNeeded
+		}
 		return err
 	}
 
 	d.connTracker = &connTracker{conns: make(map[net.Conn]struct{})}
 	d.serve = &http.Server{
-		Handler:   logit(d.router),
-		ConnState: d.connTracker.trackConn,
+		Handler:     logit(d.router),
+		ConnState:   d.connTracker.trackConn,
+		ConnContext: ucrednetConnContext,
 	}
 
 	// enable standby handling
@@ -365,9 +556,13 @@ func (d *Daemon) Start() error {
 	d.overlord.Loop()
 
 	d.tomb.Go(func() error {
+		// Serve might return either net.ErrClosed (net.Listener is
+		// closed) or http.ErrServerClosed (Shutdown() called) - see
+		// Daemon.Stop() as this is racy.
 		if d.snapListener != nil {
 			d.tomb.Go(func() error {
-				if err := d.serve.Serve(d.snapListener); err != http.ErrServerClosed && d.tomb.Err() == tomb.ErrStillAlive {
+				if err := d.serve.Serve(d.snapListener); !errors.Is(err, http.ErrServerClosed) &&
+					!errors.Is(err, net.ErrClosed) && d.tomb.Err() == tomb.ErrStillAlive {
 					return err
 				}
 
@@ -375,7 +570,8 @@ func (d *Daemon) Start() error {
 			})
 		}
 
-		if err := d.serve.Serve(d.snapdListener); err != http.ErrServerClosed && d.tomb.Err() == tomb.ErrStillAlive {
+		if err := d.serve.Serve(d.snapdListener); !errors.Is(err, http.ErrServerClosed) &&
+			!errors.Is(err, net.ErrClosed) && d.tomb.Err() == tomb.ErrStillAlive {
 			return err
 		}
 
@@ -388,7 +584,7 @@ func (d *Daemon) Start() error {
 }
 
 // HandleRestart implements overlord.RestartBehavior.
-func (d *Daemon) HandleRestart(t restart.RestartType, rebootInfo *boot.RebootInfo) {
+func (d *Daemon) HandleRestart(t restart.RestartType, rebootInfo *boot.RebootInfo, reason restart.RestartReason) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -398,6 +594,7 @@ func (d *Daemon) HandleRestart(t restart.RestartType, rebootInfo *boot.RebootInf
 		}
 	}
 	d.rebootInfo = rebootInfo
+	d.restartReason = reason
 
 	// die when asked to restart (systemd should get us back up!) etc
 	switch t {
@@ -422,6 +619,8 @@ func (d *Daemon) HandleRestart(t restart.RestartType, rebootInfo *boot.RebootInf
 		d.requestedRestart = t
 		d.restartSocket = true
 	case restart.StopDaemon:
+		// Preseed runs on the build host, not the device in the field, so no
+		// security event is emitted.
 		logger.Noticef("stopping snapd as requested")
 	default:
 		logger.Noticef("internal error: restart handler called with unknown restart type: %v", t)
@@ -484,43 +683,48 @@ func (d *Daemon) Stop(sigCh chan<- os.Signal) error {
 	// needsFullShutdown is whether the entire system will
 	// shutdown or not as a consequence of this request
 	needsFullShutdown := false
-	switch d.requestedRestart {
+	restartType := d.requestedRestart
+	switch restartType {
 	case restart.RestartSystem, restart.RestartSystemNow, restart.RestartSystemHaltNow, restart.RestartSystemPoweroffNow:
 		needsFullShutdown = true
 	}
 	immediateShutdown := false
-	switch d.requestedRestart {
+	switch restartType {
 	case restart.RestartSystemNow, restart.RestartSystemHaltNow, restart.RestartSystemPoweroffNow:
 		immediateShutdown = true
 	}
 	restartSocket := d.restartSocket
 	rebootInfo := d.rebootInfo
+	restartReason := d.restartReason
 	d.mu.Unlock()
 
 	// before not accepting any new client connections we need to write the
 	// maintenance.json file for potential clients to see after the daemon stops
 	// responding so they can read it correctly and handle the maintenance
-	if err := d.updateMaintenanceFile(d.requestedRestart); err != nil {
+	if err := d.updateMaintenanceFile(restartType); err != nil {
 		logger.Noticef("error writing maintenance file: %v", err)
 	}
+
+	// Close now the sockets. This must happen before the call to wrappers.RestartSnapd to
+	// ensure we do not have two snapd instances running at the same and trying to use the same
+	// sockets simultaneously.
+	// TODO maybe we should not close them, at least if the connections come from systemd, so
+	// it can pass the fds to the new process without ever having rejected incoming
+	// connections.
+
+	// Daemon.Stop may be called before the operation that requested the restart
+	// (which would have triggered this invocation of Daemon.Stop) released the
+	// state lock. Acquiring the lock here synchronizes with that operation,
+	// ensuring it has exited its critical section before the managers are shutdown.
+	d.state.Lock()
+	d.state.Unlock()
 
 	// take a timestamp before shutting down the snap listener, and
 	// use the time we may spend on waiting for hooks against the shutdown
 	// delay.
 	ts := time.Now()
+	d.overlord.ShutDown()
 	if d.snapListener != nil {
-		// stop running hooks first
-		// and do it more gracefully if we are restarting
-		hookMgr := d.overlord.HookManager()
-		d.state.Lock()
-		ok, _ := restart.Pending(d.state)
-		d.state.Unlock()
-		if ok {
-			logger.Noticef("gracefully waiting for running hooks")
-			hookMgr.GracefullyWaitRunningHooks()
-			logger.Noticef("done waiting for running hooks")
-		}
-		hookMgr.StopHooks()
 		d.snapListener.Close()
 	}
 	timeSpent := time.Since(ts)
@@ -558,7 +762,7 @@ func (d *Daemon) Stop(sigCh chan<- os.Signal) error {
 		// If this is the case we do a "normal" snapd restart
 		// to process the new changes.
 		if !d.standbyOpinions.CanStandby() {
-			d.restartSocket = false
+			restartSocket = false
 		}
 	}
 	d.overlord.Stop()
@@ -569,7 +773,11 @@ func (d *Daemon) Stop(sigCh chan<- os.Signal) error {
 			// the process is shutting down anyway, so we may just
 			// as well close the active connections right now
 			d.serve.Close()
-		} else {
+		} else if !errors.Is(err, net.ErrClosed) {
+			// serve.Shutdown could have returned net.ErrClosed as
+			// we are closing the listeners before the server -
+			// ignore that error.
+
 			// do not stop the shutdown even if the tomb errors
 			// because we already scheduled a slow shutdown and
 			// exiting here will just restart snapd (via systemd)
@@ -577,16 +785,43 @@ func (d *Daemon) Stop(sigCh chan<- os.Signal) error {
 			if needsFullShutdown {
 				logger.Noticef("WARNING: cannot stop daemon: %v", err)
 			} else {
+				// Wait failed: this is an aborted shutdown, not a
+				// completed controlled restart or standby, so do
+				// not emit sys_restart_snapd or sys_standby_snapd.
 				return err
 			}
 		}
 	}
 
 	if needsFullShutdown {
-		return d.doReboot(sigCh, d.requestedRestart, rebootInfo, immediateShutdown, rebootWaitTimeout)
+		return d.doReboot(sigCh, restartType, rebootInfo, immediateShutdown, rebootWaitTimeout)
 	}
 
-	if d.restartSocket {
+	if restartType == restart.RestartDaemon {
+		seclog.LogSystemRestartSnapd(d.Version, restartReason)
+		if restartReason == "" {
+			logger.Noticef("restarting daemon")
+		} else {
+			logger.Noticef("restarting daemon (%s)", restartReason)
+		}
+		// This has effect only if snapd was not started by snapd.service, which is the
+		// case on seeding boot in UC (see run-snapd-from-snap script in core* bases).
+		// Otherwise we are simply restarted by systemd after exiting. For the former case,
+		// there will be two running instances of snapd for a brief amount of time, so we
+		// must ensure that any global resource is freed before this call.
+		if err := wrappers.RestartSnapd(); err != nil {
+			logger.Noticef("while restarting snapd: %v", err)
+		}
+		return nil
+	}
+
+	if restartSocket {
+		seclog.LogSystemStandbySnapd(d.Version, restartReason)
+		if restartReason == "" {
+			logger.Noticef("entering standby")
+		} else {
+			logger.Noticef("entering standby (%s)", restartReason)
+		}
 		return ErrRestartSocket
 	}
 

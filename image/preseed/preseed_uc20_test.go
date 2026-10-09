@@ -39,6 +39,8 @@ import (
 	"github.com/snapcore/snapd/seed"
 	"github.com/snapcore/snapd/seed/seedtest"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
+	"github.com/snapcore/snapd/snap/snaptest"
 	"github.com/snapcore/snapd/store"
 	"github.com/snapcore/snapd/store/tooling"
 	"github.com/snapcore/snapd/testutil"
@@ -90,13 +92,13 @@ var sysFsOverlaysGood = []string{"class/backlight", "class/bluetooth", "class/gp
 
 var sysFsOverlaysBad = []string{"class/backlight-xxx", "class/spi", "devices/pci"}
 
-func (s *preseedSuite) testRunPreseedUC20Happy(c *C, customAppArmorFeaturesDir, sysfsOverlay string) {
+func (s *preseedSuite) testRunPreseedUC20Happy(c *C, customAppArmorFeaturesDir, sysfsOverlay string, handleWritablePaths bool) {
 
 	testKey, _ := assertstest.GenerateKey(752)
 
 	ts := &toolingStore{&seedtest.SeedSnaps{}}
 	ts.SeedSnaps.SetupAssertSigning("canonical")
-	ts.Brands.Register("my-brand", testKey, map[string]interface{}{
+	ts.Brands.Register("my-brand", testKey, map[string]any{
 		"verification": "verified",
 	})
 
@@ -111,19 +113,19 @@ func (s *preseedSuite) testRunPreseedUC20Happy(c *C, customAppArmorFeaturesDir, 
 	restoreTrusted := preseed.MockTrusted(ts.StoreSigning.Trusted)
 	defer restoreTrusted()
 
-	model := ts.Brands.Model("my-brand", "my-model-uc20", map[string]interface{}{
+	model := ts.Brands.Model("my-brand", "my-model-uc20", map[string]any{
 		"display-name": "My Model",
 		"architecture": "amd64",
 		"base":         "core20",
 		"grade":        "dangerous",
 		"timestamp":    "2019-11-01T08:00:00+00:00",
-		"snaps": []interface{}{
-			map[string]interface{}{
+		"snaps": []any{
+			map[string]any{
 				"name": "pc-kernel",
 				"id":   "pckernelidididididididididididid",
 				"type": "kernel",
 			},
-			map[string]interface{}{
+			map[string]any{
 				"name": "pc",
 				"id":   "pcididididididididididididididid",
 				"type": "gadget",
@@ -143,11 +145,39 @@ func (s *preseedSuite) testRunPreseedUC20Happy(c *C, customAppArmorFeaturesDir, 
 					Revision: snap.R("1")}},
 			},
 			SnapsForMode: map[string][]*seed.Snap{
-				"run": {{
-					Path: "/some/path/foo.snap",
-					SideInfo: &snap.SideInfo{
-						RealName: "foo"},
-				}}},
+				"run": {
+					{
+						Path: "/some/path/bar.snap",
+						SideInfo: &snap.SideInfo{
+							RealName: "bar",
+							SnapID:   snaptest.AssertedSnapID("bar"),
+							Revision: snap.R(1),
+						},
+						Components: []seed.Component{
+							{
+								Path: "/some/path/bar+comp2.snap",
+								CompSideInfo: snap.ComponentSideInfo{
+									Component: naming.NewComponentRef("bar", "comp2"),
+									Revision:  snap.R(2),
+								},
+							},
+						},
+					},
+					{
+						Path: "/some/path/foo.snap",
+						SideInfo: &snap.SideInfo{
+							RealName: "foo",
+						},
+						Components: []seed.Component{
+							{
+								Path: "/some/path/foo+comp1.snap",
+								CompSideInfo: snap.ComponentSideInfo{
+									Component: naming.NewComponentRef("foo", "comp1"),
+								},
+							},
+						},
+					},
+				}},
 			loadAssertions: func(db asserts.RODatabase, commitTo func(*asserts.Batch) error) error {
 				batch := asserts.NewBatch(nil)
 				c.Assert(batch.Add(ts.StoreSigning.StoreAccountKey("")), IsNil)
@@ -168,7 +198,13 @@ func (s *preseedSuite) testRunPreseedUC20Happy(c *C, customAppArmorFeaturesDir, 
 	dirs.SetRootDir(tmpDir)
 	defer mockChrootDirs(c, tmpDir, true)()
 
-	mockChootCmd := testutil.MockCommand(c, "chroot", "")
+	writableTmpDir := filepath.Join(tmpDir, "writable-tmp")
+
+	mockChootCmd := testutil.MockCommand(c, "chroot", fmt.Sprintf(`#!/bin/sh
+	set -eux
+	[ -L %[1]s/system-data/snap/snapd/current ]
+	[ "$(readlink %[1]s/system-data/snap/snapd/current)" = preseeding ]
+`, writableTmpDir))
 	defer mockChootCmd.Restore()
 
 	mockMountCmd := testutil.MockCommand(c, "mount", "")
@@ -183,7 +219,6 @@ func (s *preseedSuite) testRunPreseedUC20Happy(c *C, customAppArmorFeaturesDir, 
 	})
 	defer restoreMakePreseedTmpDir()
 
-	writableTmpDir := filepath.Join(tmpDir, "writable-tmp")
 	restoreMakeWritableTempDir := preseed.MockMakeWritableTempDir(func() (string, error) {
 		return writableTmpDir, nil
 	})
@@ -204,8 +239,21 @@ func (s *preseedSuite) testRunPreseedUC20Happy(c *C, customAppArmorFeaturesDir, 
 	c.Assert(os.MkdirAll(filepath.Join(preseedTmpDir, "usr/lib/snapd"), 0755), IsNil)
 	c.Assert(os.WriteFile(filepath.Join(preseedTmpDir, "usr/lib/snapd/preseed.json"), []byte(exportFileContents), 0644), IsNil)
 
-	mockWritablePaths := testutil.MockCommand(c, filepath.Join(preseedTmpDir, "/usr/lib/core/handle-writable-paths"), "")
-	defer mockWritablePaths.Restore()
+	mockWritablePaths := testutil.MockCommand(c, "handle-writable-paths-outer", "")
+
+	var mockWritablePathsInner *testutil.MockCmd
+	if handleWritablePaths {
+		// preseedTmpDir gets removed before we can check logs, we forward calls
+		mockWritablePathsInner = testutil.MockCommand(c, filepath.Join(preseedTmpDir, "/usr/lib/core/handle-writable-paths"), "exec handle-writable-paths-outer \"$0\" \"$@\"")
+		defer mockWritablePathsInner.Restore()
+	} else {
+		coreWritableConf := filepath.Join(preseedTmpDir, "/usr/lib/tmpfiles.d/core-writable.conf")
+		c.Assert(os.MkdirAll(filepath.Dir(coreWritableConf), 0755), IsNil)
+		c.Assert(os.WriteFile(coreWritableConf, nil, 0644), IsNil)
+	}
+
+	mockTmpFiles := testutil.MockCommand(c, "systemd-tmpfiles", "")
+	defer mockTmpFiles.Restore()
 
 	restore := osutil.MockMountInfo(fmt.Sprintf(`130 30 42:1 / %s/somepath rw,relatime shared:54 - ext4 /some/path rw
 `, preseedTmpDir))
@@ -230,6 +278,16 @@ func (s *preseedSuite) testRunPreseedUC20Happy(c *C, customAppArmorFeaturesDir, 
 
 	c.Assert(preseed.Core20(opts), IsNil)
 
+	if handleWritablePaths {
+		c.Check(mockTmpFiles.Calls(), HasLen, 0)
+		fmt.Printf("START\n")
+		c.Assert(mockWritablePaths.Calls(), HasLen, 1)
+		c.Check(mockWritablePaths.Calls()[0], DeepEquals, []string{"handle-writable-paths-outer", fmt.Sprintf("%s/usr/lib/core/handle-writable-paths", preseedTmpDir), preseedTmpDir})
+	} else {
+		c.Assert(mockTmpFiles.Calls(), HasLen, 1)
+		c.Check(mockTmpFiles.Calls()[0], DeepEquals, []string{"systemd-tmpfiles", fmt.Sprintf("--root=%s", preseedTmpDir), "--create", "core-writable.conf"})
+	}
+
 	c.Check(mockChootCmd.Calls()[0], DeepEquals, []string{"chroot", preseedTmpDir, "/usr/lib/snapd/snapd"})
 
 	expectedMountCalls := [][]string{
@@ -251,15 +309,21 @@ func (s *preseedSuite) testRunPreseedUC20Happy(c *C, customAppArmorFeaturesDir, 
 		{"mount", "--bind", filepath.Join(writableTmpDir, "system-data/etc/systemd"), filepath.Join(preseedTmpDir, "etc/systemd")},
 		{"mount", "--bind", filepath.Join(writableTmpDir, "system-data/etc/dbus-1"), filepath.Join(preseedTmpDir, "etc/dbus-1")},
 		{"mount", "--bind", filepath.Join(writableTmpDir, "system-data/etc/udev/rules.d"), filepath.Join(preseedTmpDir, "etc/udev/rules.d")},
+		{"mount", "--bind", filepath.Join(writableTmpDir, "system-data/etc/modules-load.d"), filepath.Join(preseedTmpDir, "etc/modules-load.d")},
+		{"mount", "--bind", filepath.Join(writableTmpDir, "system-data/etc/modprobe.d"), filepath.Join(preseedTmpDir, "etc/modprobe.d")},
 		{"mount", "--bind", filepath.Join(writableTmpDir, "system-data/var/lib/extrausers"), filepath.Join(preseedTmpDir, "var/lib/extrausers")},
 		{"mount", "--bind", filepath.Join(targetSnapdRoot, "/usr/lib/snapd"), filepath.Join(preseedTmpDir, "usr/lib/snapd")},
+		{"mount", "--bind", targetSnapdRoot, filepath.Join(preseedTmpDir, "snap/snapd/preseeding")},
 		{"mount", "--bind", filepath.Join(tmpDir, "system-seed"), filepath.Join(preseedTmpDir, "var/lib/snapd/seed")},
 	}
 
 	expectedUmountCalls := [][]string{
 		{"umount", filepath.Join(preseedTmpDir, "var/lib/snapd/seed")},
+		{"umount", filepath.Join(preseedTmpDir, "snap/snapd/preseeding")},
 		{"umount", filepath.Join(preseedTmpDir, "usr/lib/snapd")},
 		{"umount", filepath.Join(preseedTmpDir, "var/lib/extrausers")},
+		{"umount", filepath.Join(preseedTmpDir, "etc/modprobe.d")},
+		{"umount", filepath.Join(preseedTmpDir, "etc/modules-load.d")},
 		{"umount", filepath.Join(preseedTmpDir, "etc/udev/rules.d")},
 		{"umount", filepath.Join(preseedTmpDir, "etc/dbus-1")},
 		{"umount", filepath.Join(preseedTmpDir, "etc/systemd")},
@@ -288,7 +352,7 @@ func (s *preseedSuite) testRunPreseedUC20Happy(c *C, customAppArmorFeaturesDir, 
 			expectedMountCalls = append(expectedMountCalls[:sysFsMountFirstIndex+i+1], expectedMountCalls[sysFsMountFirstIndex+i:]...)
 			expectedMountCalls[sysFsMountFirstIndex+i] = []string{"mount", "--bind", filepath.Join(sysfsOverlay, "sys", dir), filepath.Join(preseedTmpDir, "sys", dir)}
 			// order of umounts is reversed, prepend
-			const sysFsUmountFirstIndex = 11
+			const sysFsUmountFirstIndex = 14
 			expectedUmountCalls = append(expectedUmountCalls[:sysFsUmountFirstIndex+1], expectedUmountCalls[sysFsUmountFirstIndex:]...)
 			expectedUmountCalls[sysFsUmountFirstIndex] = []string{"umount", filepath.Join(preseedTmpDir, "sys", dir)}
 		}
@@ -350,7 +414,20 @@ func (s *preseedSuite) testRunPreseedUC20Happy(c *C, customAppArmorFeaturesDir, 
 				SnapID:   "snapdidididididididididididididd",
 				Revision: 1,
 			}, {
-				Name: "foo",
+				Name:     "bar",
+				SnapID:   snaptest.AssertedSnapID("bar"),
+				Revision: 1,
+				Components: []asserts.PreseedComponent{{
+					Name:     "comp2",
+					Revision: 2,
+				}},
+			}, {
+				Name:     "foo",
+				Revision: -1,
+				Components: []asserts.PreseedComponent{{
+					Name:     "comp1",
+					Revision: -1,
+				}},
 			}})
 		default:
 			c.Fatalf("unexpected assertion: %s", as.Type().Name)
@@ -365,11 +442,18 @@ func (s *preseedSuite) testRunPreseedUC20Happy(c *C, customAppArmorFeaturesDir, 
 }
 
 func (s *preseedSuite) TestRunPreseedUC20Happy(c *C) {
-	s.testRunPreseedUC20Happy(c, "", "")
+	const handleWritablePaths = false
+	s.testRunPreseedUC20Happy(c, "", "", handleWritablePaths)
+}
+
+func (s *preseedSuite) TestRunPreseedUC20HappyWritablePaths(c *C) {
+	const handleWritablePaths = true
+	s.testRunPreseedUC20Happy(c, "", "", handleWritablePaths)
 }
 
 func (s *preseedSuite) TestRunPreseedUC20HappyCustomApparmorFeaturesDir(c *C) {
-	s.testRunPreseedUC20Happy(c, "/custom-aa-features", "")
+	const handleWritablePaths = false
+	s.testRunPreseedUC20Happy(c, "/custom-aa-features", "", handleWritablePaths)
 }
 
 func (s *preseedSuite) TestRunPreseedUC20HappySysfsOverlay(c *C) {
@@ -410,7 +494,8 @@ func (s *preseedSuite) TestRunPreseedUC20HappySysfsOverlay(c *C) {
 		c.Assert(err, IsNil)
 	}
 
-	s.testRunPreseedUC20Happy(c, "", tmpdir)
+	const handleWritablePaths = false
+	s.testRunPreseedUC20Happy(c, "", tmpdir, handleWritablePaths)
 }
 
 func (s *preseedSuite) TestRunPreseedUC20ExecFormatError(c *C) {

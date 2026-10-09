@@ -1,8 +1,27 @@
 summary: Sandboxing of the snaps works
 
+details: |
+    Snapd pioneered an universal confinement/sandbox for all installed
+    applications. This test captures two oldest features of the confinement
+    system: that on apparmor-capable systems the $HOME directory is protected
+    for both root and non-root users, and that the seccomp (system call filter)
+    works for both the main architecture, and for the 32-bit sub-architecture if
+    the CPU supports one.
+
+skip:
+    - reason: No sandboxing in the system
+      if: |
+        [ "$(snap debug confinement)" != "strict" ] && not os.query is-ubuntu
+
+prepare: |
+    if tests.session has-session-systemd-and-dbus; then
+        tests.session -u test prepare
+        tests.cleanup defer tests.session -u test restore
+    fi
+
 restore: |
     rm -f /home/test/foo
-    # requied! in autopkgtest no suite restore is run at all
+    # required! in autopkgtest no suite restore is run at all
     snap remove --purge test-snapd-sandbox
     snap remove --purge test-snapd-hello-multi-arch
 
@@ -12,8 +31,6 @@ execute: |
             echo "all ubuntu systems must have strict confinement"
             exit 1
         fi
-        echo "SKIP: no sandboxing"
-        exit 0
     fi
 
     "$TESTSTOOLS"/snaps-state install-local test-snapd-sandbox
@@ -38,20 +55,28 @@ execute: |
     done
 
     echo "Ensure the apparmor sandbox for snaps works for users"
-    not su -l -c 'test-snapd-sandbox -c "touch /home/test/foo"' test 2>stderr.log
+    if tests.session has-session-systemd-and-dbus; then
+        not tests.session -u test exec test-snapd-sandbox -c "touch /home/test/foo" test 2>stderr.log
+    else
+        not su -l -c 'test-snapd-sandbox -c "touch /home/test/foo"' test 2>stderr.log
+    fi
     MATCH <stderr.log '.* Permission denied'
 
-    echo "But with the right plug the user can put files into home"
-    su -l -c  'test-snapd-sandbox.with-home-plug -c "echo good >/home/test/foo"' test
-    test -e /home/test/foo
-    echo "and also read them back"
-    su -l -c  'test-snapd-sandbox.with-home-plug -c "cat /home/test/foo"' test | MATCH good
-
+    echo "But with the right plug the user can put files into home and read them back"
+    if tests.session has-session-systemd-and-dbus; then
+        tests.session -u test exec test-snapd-sandbox.with-home-plug -c "echo good >/home/test/foo"
+        test -e /home/test/foo
+        tests.session -u test exec test-snapd-sandbox.with-home-plug -c "cat /home/test/foo" | MATCH good
+    else
+        su -l -c  'test-snapd-sandbox.with-home-plug -c "echo good >/home/test/foo"' test
+        test -e /home/test/foo
+        su -l -c  'test-snapd-sandbox.with-home-plug -c "cat /home/test/foo"' test | MATCH good
+    fi
 
     ############## SECCOMP
     echo "Ensure seccomp sandbox works"
     cat >sec.py <<'EOF'
-    #!/usr/bin/python3
+    #!/usr/bin/env python3
     from ctypes import c_long, CDLL, get_errno
     from ctypes.util import find_library
     import errno, sys
@@ -77,6 +102,6 @@ execute: |
     if os.query is-pc-amd64; then
         echo "Ensure secondary arch works for amd64 with i386 binaries"
         snap install --edge test-snapd-hello-multi-arch
-        # this will fail if the seccomp seconardy arch handling is broken
+        # this will fail if the seccomp secondary arch handling is broken
         test-snapd-hello-multi-arch.hello-i386 | MATCH Hello
     fi

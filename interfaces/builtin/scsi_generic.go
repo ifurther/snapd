@@ -28,8 +28,9 @@ const scsiGenericBaseDeclarationSlots = `
         - core
     deny-auto-connection: true
 `
+
 const scsiGenericBaseDeclarationPlugs = `
-  block-devices:
+  scsi-generic:
     allow-installation: false
     deny-auto-connection: true
 `
@@ -47,12 +48,14 @@ var scsiGenericConnectedPlugUDev = []string{
 
 func init() {
 	registerIface(&commonInterface{
-		name:                  "scsi-generic",
-		summary:               scsiGenericSummary,
-		implicitOnCore:        true,
-		implicitOnClassic:     true,
-		baseDeclarationSlots:  scsiGenericBaseDeclarationSlots,
-		connectedPlugAppArmor: scsiGenericConnectedPlugAppArmor,
-		connectedPlugUDev:     scsiGenericConnectedPlugUDev,
+		name:                     "scsi-generic",
+		summary:                  scsiGenericSummary,
+		implicitOnCore:           true,
+		implicitOnClassic:        true,
+		baseDeclarationSlots:     scsiGenericBaseDeclarationSlots,
+		baseDeclarationPlugs:     scsiGenericBaseDeclarationPlugs,
+		connectedPlugAppArmor:    scsiGenericConnectedPlugAppArmor,
+		connectedPlugUDev:        scsiGenericConnectedPlugUDev,
+		parallelInstancesSlotErr: errParallelInstancesSystemSlot,
 	})
 }

@@ -21,10 +21,14 @@ package interfaces
 
 import (
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 )
 
-// SecurityTagGlob returns a pattern that matches all security tags belonging to
+// SecurityTagGlobs returns patterns that match all security tags belonging to
 // the same snap as the given app.
-func SecurityTagGlob(snapName string) string {
-	return snap.AppSecurityTag(snapName, "*")
+func SecurityTagGlobs(instanceName naming.InstanceName) []string {
+	return []string{
+		snap.AppSecurityTag(instanceName.String(), "*"),
+		snap.ComponentHookSecurityTag(instanceName.String(), "*", "*"),
+	}
 }

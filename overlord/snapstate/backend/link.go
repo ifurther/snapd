@@ -20,24 +20,28 @@
 package backend
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/snapcore/snapd/boot"
 	"github.com/snapcore/snapd/cmd/snaplock/runinhibit"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/progress"
+	"github.com/snapcore/snapd/sandbox/cgroup"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/timings"
 	"github.com/snapcore/snapd/wrappers"
 )
 
 var wrappersAddSnapdSnapServices = wrappers.AddSnapdSnapServices
+var wrappersStartServices = wrappers.StartServices
+var wrappersStopServices = wrappers.StopServices
+var cgroupKillSnapProcesses = cgroup.KillSnapProcesses
 
 // LinkContext carries additional information about the current or the previous
 // state of the snap
@@ -46,16 +50,15 @@ type LinkContext struct {
 	// installed
 	FirstInstall bool
 
-	// IsUndo is set when we are installing the previous snap while
-	// performing a revert of the latest one that was installed
-	IsUndo bool
-
 	// ServiceOptions is used to configure services.
 	ServiceOptions *wrappers.SnapServiceOptions
 
 	// RunInhibitHint is used only in Unlink snap, and can be used to
 	// establish run inhibition lock for refresh operations.
 	RunInhibitHint runinhibit.Hint
+
+	// StateUnlocker is passed to inhibition lock operations.
+	StateUnlocker runinhibit.Unlocker
 
 	// RequireMountedSnapdSnap indicates that the apps and services
 	// generated when linking need to use tooling from the snapd snap mount.
@@ -64,6 +67,32 @@ type LinkContext struct {
 	// SkipBinaries indicates that we should skip removing snap binaries,
 	// icons and desktop files in UnlinkSnap
 	SkipBinaries bool
+
+	// HasOtherInstances indicates that other instances of the snap are
+	// already installed in the system.
+	HasOtherInstances bool
+}
+
+func createSharedSnapDirForParallelInstance(s snap.PlaceInfo) error {
+	_, key := snap.SplitInstanceName(s.InstanceName().String())
+
+	if key != "" {
+		err := os.MkdirAll(snap.BaseDir(s.SnapName().String()), 0755)
+		if err != nil && !os.IsExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+func removeSharedSnapDirForParallelInstance(s snap.PlaceInfo) {
+	_, instanceKey := snap.SplitInstanceName(s.InstanceName().String())
+
+	if instanceKey != "" {
+		// failure to remove is ok, there may be revisions of the
+		// instance-less snap installed in the system
+		os.Remove(snap.BaseDir(s.SnapName().String()))
+	}
 }
 
 func updateCurrentSymlinks(info *snap.Info) (revert func(), e error) {
@@ -125,21 +154,38 @@ func updateCurrentSymlinks(info *snap.Info) (revert func(), e error) {
 	return revertFunc, nil
 }
 
+// MaybeSetNextBoot configures the system for a reboot if necesssary because
+// of a snap refresh. isUndo must be set when we are installing the previous
+// snap while performing a revert of the latest one that was installed
+func (b Backend) MaybeSetNextBoot(info *snap.Info, dev snap.Device, isUndo bool) (boot.RebootInfo, error) {
+	if b.preseed {
+		return boot.RebootInfo{}, nil
+	}
+
+	bootCtx := boot.NextBootContext{BootWithoutTry: isUndo}
+	return boot.Participant(info, info.Type(), dev).SetNextBoot(bootCtx)
+}
+
 // LinkSnap makes the snap available by generating wrappers and setting the current symlinks.
-func (b Backend) LinkSnap(info *snap.Info, dev snap.Device, linkCtx LinkContext, tm timings.Measurer) (rebootRequired boot.RebootInfo, e error) {
+func (b Backend) LinkSnap(info *snap.Info, dev snap.Device, linkCtx LinkContext, tm timings.Measurer) (e error) {
+	// explicitly prevent passing nil state unlocker to avoid internal errors of
+	// forgeting to pass the unlocker leading to deadlocks.
+	if linkCtx.StateUnlocker == nil {
+		return errors.New("internal error: LinkContext.StateUnlocker cannot be nil")
+	}
+
 	if info.Revision.Unset() {
-		return boot.RebootInfo{}, fmt.Errorf("cannot link snap %q with unset revision", info.InstanceName())
+		return fmt.Errorf("cannot link snap %q with unset revision", info.InstanceName())
 	}
 
 	osutil.MaybeInjectFault("link-snap")
 
 	var err error
-	var restart wrappers.SnapdRestart
 	timings.Run(tm, "generate-wrappers", fmt.Sprintf("generate wrappers for snap %s", info.InstanceName()), func(timings.Measurer) {
-		restart, err = b.generateWrappers(info, linkCtx)
+		err = b.generateWrappers(info, linkCtx)
 	})
 	if err != nil {
-		return boot.RebootInfo{}, err
+		return err
 	}
 	defer func() {
 		if e == nil {
@@ -150,50 +196,37 @@ func (b Backend) LinkSnap(info *snap.Info, dev snap.Device, linkCtx LinkContext,
 		})
 	}()
 
-	var rebootInfo boot.RebootInfo
-	if !b.preseed {
-		bootCtx := boot.NextBootContext{BootWithoutTry: linkCtx.IsUndo}
-		rebootInfo, err = boot.Participant(
-			info, info.Type(), dev).SetNextBoot(bootCtx)
-		if err != nil {
-			return boot.RebootInfo{}, err
+	// only after link snap it will be possible to execute snap
+	// applications, so ensure that the shared snap directory exists for
+	// parallel installed snaps
+	if err := createSharedSnapDirForParallelInstance(info); err != nil {
+		return err
+	}
+	cleanupSharedParallelInstanceDir := func() {
+		if !linkCtx.HasOtherInstances {
+			removeSharedSnapDirForParallelInstance(info)
 		}
 	}
 
-	revertSymlinks, err := updateCurrentSymlinks(info)
+	_, err = updateCurrentSymlinks(info)
 	if err != nil {
-		return boot.RebootInfo{}, err
+		cleanupSharedParallelInstanceDir()
+		return err
 	}
 	// if anything below here could return error, you need to
 	// somehow clean up whatever updateCurrentSymlinks did
 
-	if restart != nil {
-		if err := restart.Restart(); err != nil {
-			logger.Noticef("WARNING: cannot restart services: %v", err)
-			revertSymlinks()
-
-			return boot.RebootInfo{}, err
-		}
-
-	}
-
 	// Stop inhibiting application startup by removing the inhibitor file.
-	if err := runinhibit.Unlock(info.InstanceName()); err != nil {
-		return boot.RebootInfo{}, err
+	if err := runinhibit.Unlock(info.InstanceName(), linkCtx.StateUnlocker); err != nil {
+		return err
 	}
 
-	return rebootInfo, nil
-}
-
-func componentLinkPath(cpi snap.ContainerPlaceInfo, snapRev snap.Revision) string {
-	instanceName, compName, _ := strings.Cut(cpi.ContainerName(), "+")
-	compBase := snap.ComponentsBaseDir(instanceName)
-	return filepath.Join(compBase, snapRev.String(), compName)
+	return nil
 }
 
 func (b Backend) LinkComponent(cpi snap.ContainerPlaceInfo, snapRev snap.Revision) error {
 	mountDir := cpi.MountDir()
-	linkPath := componentLinkPath(cpi, snapRev)
+	linkPath := snap.ComponentLinkPath(cpi, snapRev)
 
 	// Create components directory
 	compsDir := filepath.Dir(linkPath)
@@ -211,16 +244,30 @@ func (b Backend) LinkComponent(cpi snap.ContainerPlaceInfo, snapRev snap.Revisio
 	return osutil.AtomicSymlink(linkTarget, linkPath)
 }
 
-func (b Backend) StartServices(apps []*snap.AppInfo, disabledSvcs []string, meter progress.Meter, tm timings.Measurer) error {
-	flags := &wrappers.StartServicesFlags{Enable: true}
-	return wrappers.StartServices(apps, disabledSvcs, flags, meter, tm)
+func (b Backend) StartServices(apps []*snap.AppInfo, disabledSvcs *wrappers.DisabledServices, meter progress.Meter, tm timings.Measurer) error {
+	// Services need to be sorted according to their Before
+	// and After requirements
+	startupOrdered, err := snap.SortServices(apps)
+	if err != nil {
+		return err
+	}
+	opts := &wrappers.StartServicesOptions{Enable: true}
+	return wrappersStartServices(startupOrdered, disabledSvcs, opts, meter, tm)
 }
 
-func (b Backend) StopServices(apps []*snap.AppInfo, reason snap.ServiceStopReason, meter progress.Meter, tm timings.Measurer) error {
-	return wrappers.StopServices(apps, nil, reason, meter, tm)
+func (b Backend) StopServices(apps []*snap.AppInfo, removedSvcs map[string]*snap.AppInfo, disabledSvcs *wrappers.DisabledServices, reason snap.ServiceStopReason, undoer Undoer, meter progress.Meter, tm timings.Measurer) error {
+	// Register the undo before stopping so that services are
+	// started again even when StopServices fails partway through
+	// (some services stopped, then an error on a later one).
+	undoer.AddUndo(func() error {
+		// StartServices filters out disabled services, so only
+		// previously enabled services will be started again.
+		return b.StartServices(apps, disabledSvcs, meter, tm)
+	})
+	return wrappersStopServices(apps, removedSvcs, nil, reason, meter, tm)
 }
 
-func (b Backend) generateWrappers(s *snap.Info, linkCtx LinkContext) (wrappers.SnapdRestart, error) {
+func (b Backend) generateWrappers(s *snap.Info, linkCtx LinkContext) error {
 	var err error
 	var cleanupFuncs []func(*snap.Info) error
 	defer func() {
@@ -238,7 +285,7 @@ func (b Backend) generateWrappers(s *snap.Info, linkCtx LinkContext) (wrappers.S
 
 	// add the CLI apps from the snap.yaml
 	if err = wrappers.EnsureSnapBinaries(s); err != nil {
-		return nil, err
+		return err
 	}
 	cleanupFuncs = append(cleanupFuncs, wrappers.RemoveSnapBinaries)
 
@@ -250,7 +297,7 @@ func (b Backend) generateWrappers(s *snap.Info, linkCtx LinkContext) (wrappers.S
 	if err = wrappers.EnsureSnapServices(map[*snap.Info]*wrappers.SnapServiceOptions{
 		s: linkCtx.ServiceOptions,
 	}, ensureOpts, nil, progress.Null); err != nil {
-		return nil, err
+		return err
 	}
 	cleanupFuncs = append(cleanupFuncs, func(s *snap.Info) error {
 		return wrappers.RemoveSnapServices(s, progress.Null)
@@ -258,23 +305,23 @@ func (b Backend) generateWrappers(s *snap.Info, linkCtx LinkContext) (wrappers.S
 
 	// add D-Bus service activation files
 	if err = wrappers.AddSnapDBusActivationFiles(s); err != nil {
-		return nil, err
+		return err
 	}
 	cleanupFuncs = append(cleanupFuncs, wrappers.RemoveSnapDBusActivationFiles)
 
 	// add the desktop files
 	if err = wrappers.EnsureSnapDesktopFiles([]*snap.Info{s}); err != nil {
-		return nil, err
+		return err
 	}
 	cleanupFuncs = append(cleanupFuncs, wrappers.RemoveSnapDesktopFiles)
 
 	// add the desktop icons
 	if err = wrappers.EnsureSnapIcons(s); err != nil {
-		return nil, err
+		return err
 	}
 	cleanupFuncs = append(cleanupFuncs, wrappers.RemoveSnapIcons)
 
-	return nil, nil
+	return nil
 }
 
 func removeGeneratedWrappers(s *snap.Info, linkCtx LinkContext, meter progress.Meter) error {
@@ -318,7 +365,7 @@ type GenerateSnapdWrappersOptions struct {
 	Preseeding bool
 }
 
-func GenerateSnapdWrappers(s *snap.Info, opts *GenerateSnapdWrappersOptions) (wrappers.SnapdRestart, error) {
+func GenerateSnapdWrappers(s *snap.Info, opts *GenerateSnapdWrappersOptions) error {
 	wrappersOpts := &wrappers.AddSnapdSnapServicesOptions{}
 	if opts != nil {
 		wrappersOpts.Preseeding = opts.Preseeding
@@ -343,9 +390,14 @@ func removeGeneratedSnapdWrappers(s *snap.Info, firstInstall bool, meter progres
 func (b Backend) UnlinkSnap(info *snap.Info, linkCtx LinkContext, meter progress.Meter) error {
 	var err0 error
 	if hint := linkCtx.RunInhibitHint; hint != runinhibit.HintNotInhibited {
+		// explicitly prevent passing nil state unlocker to avoid internal errors of
+		// forgeting to pass the unlocker leading to deadlocks.
+		if linkCtx.StateUnlocker == nil {
+			return errors.New("internal error: LinkContext.StateUnlocker cannot be nil if LinkContext.RunInhibitHint is set")
+		}
 		// inhibit startup of new programs
 		inhibitInfo := runinhibit.InhibitInfo{Previous: info.SnapRevision()}
-		err0 = runinhibit.LockWithHint(info.InstanceName(), hint, inhibitInfo)
+		err0 = runinhibit.LockWithHint(info.InstanceName(), hint, inhibitInfo, linkCtx.StateUnlocker)
 	}
 
 	// remove generated services, binaries etc
@@ -354,11 +406,15 @@ func (b Backend) UnlinkSnap(info *snap.Info, linkCtx LinkContext, meter progress
 	// and finally remove current symlinks
 	err2 := removeCurrentSymlinks(info)
 
+	// XXX intentional lack of symmetry with LinkSnap wrt. parallel installs
+	// handling, the directory cleanup is left to be executed during the
+	// last phase of snap removal
+
 	// FIXME: aggregate errors instead
 	return firstErr(err0, err1, err2)
 }
 
-func (b Backend) QueryDisabledServices(info *snap.Info, pb progress.Meter) ([]string, error) {
+func (b Backend) QueryDisabledServices(info *snap.Info, pb progress.Meter) (*wrappers.DisabledServices, error) {
 	return wrappers.QueryDisabledServices(info, pb)
 }
 
@@ -395,7 +451,7 @@ func removeCurrentSymlinks(info snap.PlaceInfo) error {
 }
 
 func (b Backend) UnlinkComponent(cpi snap.ContainerPlaceInfo, snapRev snap.Revision) error {
-	linkPath := componentLinkPath(cpi, snapRev)
+	linkPath := snap.ComponentLinkPath(cpi, snapRev)
 
 	err := os.Remove(linkPath)
 	if err != nil {
@@ -406,5 +462,25 @@ func (b Backend) UnlinkComponent(cpi snap.ContainerPlaceInfo, snapRev snap.Revis
 		}
 	}
 
+	// Try also to remove the <snap_rev>/ subdirectory, as this might be
+	// the only installed component. But simply ignore if not empty.
+	os.Remove(filepath.Dir(linkPath))
+
 	return nil
+}
+
+func (b Backend) KillSnapApps(snapName string, reason snap.AppKillReason, tm timings.Measurer) error {
+	if reason != snap.KillReasonOther {
+		logger.Debugf("KillSnapApps called for %q, reason: %v", snapName, reason)
+	} else {
+		logger.Debugf("KillSnapApps called for %q", snapName)
+	}
+
+	var err error
+	timings.Run(tm, "kill-snap-apps", fmt.Sprintf("kill running apps for snap %s", snapName), func(timings.Measurer) {
+		// TODO: Ideally the context should come from the caller
+		err = cgroupKillSnapProcesses(context.TODO(), snapName)
+	})
+
+	return err
 }

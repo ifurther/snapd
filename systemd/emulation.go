@@ -124,25 +124,19 @@ func (s *emulation) LogReader(services []string, n int, follow, namespaces bool)
 	return nil, fmt.Errorf("LogReader")
 }
 
-func (s *emulation) EnsureMountUnitFile(description, what, where, fstype string, flags EnsureMountUnitFlags) (string, error) {
+func (s *emulation) ConfigureMountUnitOptions(o *MountUnitOptions, fstype string, startBeforeDrivers bool) error {
+	o.Fstype = fstype
 	// We don't build the options in exactly the same way as in the systemd
 	// type because these options will be written in a unit that is used in
 	// a host different to where this is running (the one used while
 	// creating the preseeding tarball). Here we assume that the final
 	// target is not a container.
-	mountUnitOptions := append(fsMountOptions(fstype), squashfs.StandardOptions()...)
-	return s.EnsureMountUnitFileWithOptions(&MountUnitOptions{
-		Lifetime:                 Persistent,
-		Description:              description,
-		What:                     what,
-		Where:                    where,
-		Fstype:                   fstype,
-		Options:                  mountUnitOptions,
-		PreventRestartIfModified: flags.PreventRestartIfModified,
-	})
+	o.Options = append(fsMountOptions(fstype), squashfs.StandardOptions()...)
+
+	return nil
 }
 
-func (s *emulation) EnsureMountUnitFileWithOptions(unitOptions *MountUnitOptions) (string, error) {
+func (s *emulation) EnsureMountUnitFile(unitOptions *MountUnitOptions) (string, error) {
 	if osutil.IsDirectory(unitOptions.What) {
 		return "", fmt.Errorf("bind-mounted directory is not supported in emulation mode")
 	}
@@ -150,12 +144,12 @@ func (s *emulation) EnsureMountUnitFileWithOptions(unitOptions *MountUnitOptions
 	// Pass directly options, note that passed options need to be correct
 	// for the final target that will use the preseeding tarball. See also
 	// comment in EnsureMountUnitFile.
-	mountUnitName, modified, err := ensureMountUnitFile(unitOptions)
+	mountUnitName, modified, err := EnsureMountUnitFileContent(unitOptions)
 	if err != nil {
 		return "", err
 	}
 
-	if modified == mountUnchanged {
+	if modified == MountUnchanged {
 		return mountUnitName, nil
 	}
 
@@ -164,13 +158,18 @@ func (s *emulation) EnsureMountUnitFileWithOptions(unitOptions *MountUnitOptions
 		return "", err
 	}
 
+	mounted, err := osutil.IsMounted(unitOptions.Where)
+	if err != nil {
+		return "", fmt.Errorf("cannot check mountpoint in preseed mode: %w", err)
+	}
+
 	// Here we need options that work for the system where we create the
 	// tarball, so things are similar to what is done for
 	// systemd.EnsureMountUnitFile. For instance, when preseeding in a lxd
 	// container, the snap will be mounted with fuse, but mount unit will
 	// use squashfs.
-	hostFsType, actualOptions := hostFsTypeAndMountOptions(unitOptions.Fstype)
-	if modified == mountUpdated {
+	hostFsType, actualOptions := HostFsTypeAndMountOptions(unitOptions.Fstype)
+	if modified == MountUpdated && mounted {
 		actualOptions = append(actualOptions, "remount")
 	}
 	cmd := exec.Command("mount", "-t", hostFsType, unitOptions.What, unitOptions.Where, "-o", strings.Join(actualOptions, ","))
@@ -186,11 +185,9 @@ func (s *emulation) EnsureMountUnitFileWithOptions(unitOptions *MountUnitOptions
 }
 
 func (s *emulation) RemoveMountUnitFile(mountedDir string) error {
-	unit := MountUnitPath(dirs.StripRootDir(mountedDir))
-	if !osutil.FileExists(unit) {
-		return nil
-	}
-
+	// unmount regardless of whether the unit file exists as
+	// the unit file may have been deleted while the mount is
+	// still active
 	isMounted, err := osutilIsMounted(mountedDir)
 	if err != nil {
 		return err
@@ -200,6 +197,11 @@ func (s *emulation) RemoveMountUnitFile(mountedDir string) error {
 		if output, err := exec.Command("umount", "-d", "-l", mountedDir).CombinedOutput(); err != nil {
 			return osutil.OutputErr(output, err)
 		}
+	}
+
+	unit := MountUnitPath(dirs.StripRootDir(mountedDir))
+	if !osutil.FileExists(unit) {
+		return nil
 	}
 
 	if err := s.DisableNoReload([]string{filepath.Base(unit)}); err != nil {
@@ -213,7 +215,7 @@ func (s *emulation) RemoveMountUnitFile(mountedDir string) error {
 	return nil
 }
 
-func (s *emulation) ListMountUnits(snapName, origin string) ([]string, error) {
+func (s *emulation) ListMountUnits(snapName, origin string, filter MountUnitFilter) ([]string, error) {
 	return nil, &notImplementedError{"ListMountUnits"}
 }
 
@@ -237,4 +239,8 @@ func (s *emulation) Umount(whatOrWhere string) error {
 
 func (s *emulation) Run(command []string, opts *RunOptions) ([]byte, error) {
 	return nil, &notImplementedError{"Run"}
+}
+
+func (s *emulation) SetLogLevel(logLevel string) error {
+	return &notImplementedError{"SetLogLevel"}
 }

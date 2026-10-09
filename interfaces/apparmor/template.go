@@ -58,7 +58,7 @@ package apparmor
 // 'base: other').
 //
 // The preamble and default accesses common to all bases go in templateCommon.
-// These rules include the aformentioned host file rules as well as non-file
+// These rules include the aforementioned host file rules as well as non-file
 // rules (eg signal, dbus, unix, etc).
 var templateCommon = `
 # vim:syntax=apparmor
@@ -79,12 +79,19 @@ var templateCommon = `
 # SNAP_NAME so the security policy will allow writing to both locations (since
 # they are equivalent).
 
+# The template is applied to all the snaps regardless of their base snaps. Some base
+# snaps, notably core26, chose to ship uutils-coreutils as their native installation
+# location used by cargo.
+# The usr/bin/gnu rule deliberately doesn't have a trailing slash
+# This is to support paths like /usr/bin/ls -> /usr/bin/gnuls
+@{SNAP_COREUTIL_DIRS}="/{bin/,usr/bin/,usr/bin/gnu,usr/lib/cargo/bin/coreutils/}"
 ###VAR###
 
 ###PROFILEATTACH### ###FLAGS### {
   #include <abstractions/base>
   #include <abstractions/consoles>
   #include <abstractions/openssl>
+  ###KERNEL_MODULES_AND_FIRMWARE###
 
   # While in later versions of the base abstraction, include this explicitly
   # for series 16 and cross-distro
@@ -109,17 +116,6 @@ var templateCommon = `
   # directory of the mount (LP: #1848919)
   owner @{HOME}/.Private/ r,
   owner @{HOMEDIRS}/.ecryptfs/*/.Private/ r,
-
-  # for python apps/services
-  #include <abstractions/python>
-  /etc/python3.[0-9]*/**                                r,
-
-  ###PYCACHEDENY###
-
-  # for perl apps/services
-  #include <abstractions/perl>
-  # Missing from perl abstraction
-  /usr/lib/@{multiarch}/perl{,5,-base}/auto/**.so* mr,
 
   # Note: the following dangerous accesses should not be allowed in most
   # policy, but we cannot explicitly deny since other trusted interfaces might
@@ -157,28 +153,14 @@ var templateCommon = `
   /run/systemd/users/[0-9]* r,
   /etc/default/nss r,
 
-  # libnss-systemd (subset from nameservice abstraction)
-  #
-  #   https://systemd.io/USER_GROUP_API/
-  #   https://systemd.io/USER_RECORD/
-  #   https://www.freedesktop.org/software/systemd/man/nss-systemd.html
-  #
-  # Allow User/Group lookups via common VarLink socket APIs. Applications need
-  # to either consult all of them or the io.systemd.Multiplexer frontend.
-  /run/systemd/userdb/ r,
-  /run/systemd/userdb/io.systemd.Multiplexer rw,
-  /run/systemd/userdb/io.systemd.DynamicUser rw,        # systemd-exec users
-  /run/systemd/userdb/io.systemd.Home rw,               # systemd-home dirs
-  /run/systemd/userdb/io.systemd.NameServiceSwitch rw,  # UNIX/glibc NSS
-  /run/systemd/userdb/io.systemd.Machine rw,            # systemd-machined
-
   /etc/libnl-3/{classid,pktloc} r,      # apps that use libnl
 
   # For snappy reexec on 4.8+ kernels
   /usr/lib/snapd/snap-exec m,
+  # Support for merged snapctl and snap-exec binaries
+  /usr/lib/snapd/snapctl m,
 
   # For gdb support
-  /usr/lib/snapd/snap-gdb-shim ixr,
   /usr/lib/snapd/snap-gdbserver-shim ixr,
 
   # For in-snap tab completion
@@ -196,6 +178,9 @@ var templateCommon = `
   /etc/os-release rk,
   /usr/lib/os-release k,
 
+  # Debian version of the host OS which might be required in AppArmor-secured Debian
+  /etc/debian_version r,
+
   # systemd native journal API (see sd_journal_print(4)). This should be in
   # AppArmor's base abstraction, but until it is, include here. We include
   # the base journal path as well as the journal namespace pattern path. Each
@@ -203,6 +188,7 @@ var templateCommon = `
   /run/systemd/journal{,.snap-*}/socket w,
   /run/systemd/journal{,.snap-*}/stdout rw, # 'r' shouldn't be needed, but journald
                                             # doesn't leak anything so allow
+  /run/systemd/journal{,.snap-*}/dev-log w,
 
   # snapctl and its requirements
   /usr/bin/snapctl ixr,
@@ -214,6 +200,9 @@ var templateCommon = `
   # broken but eventually we may conditionally deny this since it is an
   # information leak.
   #deny /{,var/}run/utmp r,
+
+  # Allow reading the maximum number of open file descriptors.
+  @{PROC}/sys/fs/nr_open r,
 
   # java
   @{PROC}/@{pid}/ r,
@@ -261,9 +250,12 @@ var templateCommon = `
   owner @{PROC}/@{pid}/cgroup rk,
   @{PROC}/@{pid}/cpuset r,
   @{PROC}/@{pid}/io r,
+  owner @{PROC}/@{pid}/fdinfo/* r,
   owner @{PROC}/@{pid}/limits r,
   owner @{PROC}/@{pid}/loginuid r,
+  owner @{PROC}/@{pid}/sessionid r,
   @{PROC}/@{pid}/smaps r,
+  @{PROC}/@{pid}/smaps_rollup r,
   @{PROC}/@{pid}/stat r,
   @{PROC}/@{pid}/statm r,
   @{PROC}/@{pid}/status r,
@@ -294,6 +286,8 @@ var templateCommon = `
   # unprivilged, dedicated user).
   /run/uuidd/request rw,
   /sys/devices/virtual/tty/{console,tty*}/active r,
+
+  # cgroup v1
   /sys/fs/cgroup/memory/{,user.slice/}memory.limit_in_bytes r,
   /sys/fs/cgroup/memory/{,**/}snap.@{SNAP_INSTANCE_NAME}{,.*}/memory.limit_in_bytes r,
   /sys/fs/cgroup/memory/{,**/}snap.@{SNAP_INSTANCE_NAME}{,.*}/memory.stat r,
@@ -301,6 +295,13 @@ var templateCommon = `
   /sys/fs/cgroup/cpu,cpuacct/{,**/}snap.@{SNAP_INSTANCE_NAME}{,.*}/cpu.cfs_{period,quota}_us r,
   /sys/fs/cgroup/cpu,cpuacct/{,user.slice/}cpu.shares r,
   /sys/fs/cgroup/cpu,cpuacct/{,**/}snap.@{SNAP_INSTANCE_NAME}{,.*}/cpu.shares r,
+  # cgroup v2
+  /sys/fs/cgroup/{system,user}.slice/{,**/}snap.@{SNAP_INSTANCE_NAME}{,.*}/memory.max r,
+  /sys/fs/cgroup/{system,user}.slice/{,**/}snap.@{SNAP_INSTANCE_NAME}{,.*}/memory.high r,
+  /sys/fs/cgroup/{system,user}.slice/{,**/}snap.@{SNAP_INSTANCE_NAME}{,.*}/memory.stat r,
+  /sys/fs/cgroup/{system,user}.slice/{,**/}snap.@{SNAP_INSTANCE_NAME}{,.*}/cpu.max r,
+  /sys/fs/cgroup/{system,user}.slice/{,**/}snap.@{SNAP_INSTANCE_NAME}{,.*}/cpu.weight r,
+
   /sys/kernel/mm/transparent_hugepage/hpage_pmd_size r,
   /sys/module/apparmor/parameters/enabled r,
   /{,usr/}lib/ r,
@@ -373,7 +374,7 @@ var templateCommon = `
   /var/snap/{@{SNAP_NAME},@{SNAP_INSTANCE_NAME}}/@{SNAP_REVISION}/** wl,
   /var/snap/{@{SNAP_NAME},@{SNAP_INSTANCE_NAME}}/common/** wl,
 
-  # The ubuntu-core-launcher creates an app-specific private restricted /tmp
+  # The snap-confine program creates an app-specific private restricted /tmp
   # and will fail to launch the app if something goes wrong. As such, we can
   # simply allow full access to /tmp.
   /tmp/   r,
@@ -479,13 +480,47 @@ var templateCommon = `
   /run/lock/ r,
   /run/lock/snap.@{SNAP_INSTANCE_NAME}/ rw,
   /run/lock/snap.@{SNAP_INSTANCE_NAME}/** mrwklix,
+
+  # Allow listing and reading systemd-provided credentials.
+  /run/credentials/ r,
+  /run/credentials/snap.@{SNAP_INSTANCE_NAME}.*.service/ r,
+  /run/credentials/snap.@{SNAP_INSTANCE_NAME}.*.service/** r,
+
+  # Work around for https://gitlab.com/apparmor/apparmor/-/issues/571
+  # which prevents access to mmap MAP_HUGETLB.
+  allow file / rwm,
+
+  # Allow snaps to inherit sockets from other snaps. This prevents snaps
+  # invoked by classic snaps with output redirected to a socket pair from losing
+  # their stdio files.
+  unix (send, receive) addr=none peer=(addr=none, label="snap.*"),
   
   ###DEVMODE_SNAP_CONFINE###
 `
 
 var templateFooter = `
+###BASE_RUNTIME_EXTRA###
 ###SNIPPETS###
 }
+`
+
+// defaultPerlTemplateRules contains perl runtime-specific rules
+// common to core* and non-core bases.
+// Perl has been removed from core24 onwards.
+var defaultPerlTemplateRules = `
+  # for perl apps/services
+  #include <abstractions/perl>
+  # Missing from perl abstraction
+  /usr/lib/@{multiarch}/perl{,5,-base}/auto/**.so* mr,
+`
+
+// defaultPythonTemplateRules contains python runtime-specific rules
+// common to core* and non-core bases.
+// Python has been removed from core26 onwards.
+var defaultPythonTemplateRules = `
+  # for python apps/services
+  #include <abstractions/python>
+  /etc/python3.[0-9]*/** r,
 `
 
 // defaultCoreRuntimeTemplateRules contains core* runtime-specific rules. In general,
@@ -499,21 +534,6 @@ var defaultCoreRuntimeTemplateRules = `
   /usr/share/terminfo/** k,
   /usr/share/zoneinfo/** k,
 
-  # for python apps/services
-  /usr/bin/python{,2,2.[0-9]*,3,3.[0-9]*} ixr,
-  # additional accesses needed for newer pythons in later bases
-  /usr/lib{,32,64}/python3.[0-9]*/**.{pyc,so}           mr,
-  /usr/lib{,32,64}/python3.[0-9]*/**.{egg,py,pth}       r,
-  /usr/lib{,32,64}/python3.[0-9]*/{site,dist}-packages/ r,
-  /usr/lib{,32,64}/python3.[0-9]*/lib-dynload/*.so      mr,
-  /usr/include/python3.[0-9]*/pyconfig.h               r,
-
-  # for perl apps/services
-  /usr/bin/perl{,5*} ixr,
-  # AppArmor <2.12 doesn't have rules for perl-base, so add them here
-  /usr/lib/@{multiarch}/perl{,5,-base}/**            r,
-  /usr/lib/@{multiarch}/perl{,5,-base}/[0-9]*/**.so* mr,
-
   # for bash 'binaries' (do *not* use abstractions/bash)
   # user-specific bash files
   /{,usr/}bin/bash ixr,
@@ -521,124 +541,130 @@ var defaultCoreRuntimeTemplateRules = `
   /usr/share/terminfo/** r,
 
   # Common utilities for shell scripts
-  /{,usr/}bin/arch ixr,
+  # Support coreutils paths (LP: #2123870)
+  @{SNAP_COREUTIL_DIRS}arch ixr,
   /{,usr/}bin/{,g,m}awk ixr,
-  /{,usr/}bin/base32 ixr,
-  /{,usr/}bin/base64 ixr,
-  /{,usr/}bin/basename ixr,
+  @{SNAP_COREUTIL_DIRS}base32 ixr,
+  @{SNAP_COREUTIL_DIRS}base64 ixr,
+  @{SNAP_COREUTIL_DIRS}basename ixr,
   /{,usr/}bin/bunzip2 ixr,
   /{,usr/}bin/busctl ixr,
   /{,usr/}bin/bzcat ixr,
   /{,usr/}bin/bzdiff ixr,
   /{,usr/}bin/bzgrep ixr,
   /{,usr/}bin/bzip2 ixr,
-  /{,usr/}bin/cat ixr,
-  /{,usr/}bin/chgrp ixr,
-  /{,usr/}bin/chmod ixr,
-  /{,usr/}bin/chown ixr,
+  @{SNAP_COREUTIL_DIRS}cat ixr,
+  @{SNAP_COREUTIL_DIRS}chgrp ixr,
+  @{SNAP_COREUTIL_DIRS}chmod ixr,
+  @{SNAP_COREUTIL_DIRS}chown ixr,
   /{,usr/}bin/clear ixr,
   /{,usr/}bin/cmp ixr,
-  /{,usr/}bin/cp ixr,
+  @{SNAP_COREUTIL_DIRS}cp ixr,
   /{,usr/}bin/cpio ixr,
-  /{,usr/}bin/cut ixr,
-  /{,usr/}bin/date ixr,
+  @{SNAP_COREUTIL_DIRS}cut ixr,
+  @{SNAP_COREUTIL_DIRS}date ixr,
   /{,usr/}bin/dbus-daemon ixr,
   /{,usr/}bin/dbus-run-session ixr,
   /{,usr/}bin/dbus-send ixr,
-  /{,usr/}bin/dd ixr,
+  @{SNAP_COREUTIL_DIRS}dd ixr,
   /{,usr/}bin/diff{,3} ixr,
-  /{,usr/}bin/dir ixr,
-  /{,usr/}bin/dirname ixr,
-  /{,usr/}bin/du ixr,
-  /{,usr/}bin/echo ixr,
+  @{SNAP_COREUTIL_DIRS}dir ixr,
+  @{SNAP_COREUTIL_DIRS}dirname ixr,
+  @{SNAP_COREUTIL_DIRS}du ixr,
+  @{SNAP_COREUTIL_DIRS}echo ixr,
   /{,usr/}bin/{,e,f,r}grep ixr,
-  /{,usr/}bin/env ixr,
-  /{,usr/}bin/expr ixr,
-  /{,usr/}bin/false ixr,
+  @{SNAP_COREUTIL_DIRS}env ixr,
+  @{SNAP_COREUTIL_DIRS}expr ixr,
+  @{SNAP_COREUTIL_DIRS}false ixr,
   /{,usr/}bin/find ixr,
   /{,usr/}bin/flock ixr,
-  /{,usr/}bin/fmt ixr,
-  /{,usr/}bin/fold ixr,
+  @{SNAP_COREUTIL_DIRS}fmt ixr,
+  @{SNAP_COREUTIL_DIRS}fold ixr,
+  /{,usr/}bin/free ixr,
   /{,usr/}bin/getconf ixr,
   /{,usr/}bin/getent ixr,
   /{,usr/}bin/getopt ixr,
-  /{,usr/}bin/groups ixr,
+  @{SNAP_COREUTIL_DIRS}groups ixr,
   /{,usr/}bin/gzip ixr,
-  /{,usr/}bin/head ixr,
+  @{SNAP_COREUTIL_DIRS}head ixr,
   /{,usr/}bin/hostname ixr,
-  /{,usr/}bin/id ixr,
+  @{SNAP_COREUTIL_DIRS}id ixr,
   /{,usr/}bin/igawk ixr,
   /{,usr/}bin/infocmp ixr,
+  @{SNAP_COREUTIL_DIRS}install ixr,
   /{,usr/}bin/kill ixr,
   /{,usr/}bin/ldd ixr,
   /{usr/,}lib{,32,64}/ld{,32,64}-*.so ix,
   /{usr/,}lib/@{multiarch}/ld{,32,64}-*.so* ix,
   /{,usr/}bin/less{,file,pipe} ixr,
-  /{,usr/}bin/ln ixr,
   /{,usr/}bin/line ixr,
-  /{,usr/}bin/link ixr,
+  @{SNAP_COREUTIL_DIRS}link ixr,
+  @{SNAP_COREUTIL_DIRS}ln ixr,
   /{,usr/}bin/locale ixr,
   /{,usr/}bin/logger ixr,
-  /{,usr/}bin/ls ixr,
-  /{,usr/}bin/md5sum ixr,
-  /{,usr/}bin/mkdir ixr,
-  /{,usr/}bin/mkfifo ixr,
-  /{,usr/}bin/mknod ixr,
-  /{,usr/}bin/mktemp ixr,
+  @{SNAP_COREUTIL_DIRS}ls ixr,
+  @{SNAP_COREUTIL_DIRS}md5sum ixr,
+  @{SNAP_COREUTIL_DIRS}mkdir ixr,
+  @{SNAP_COREUTIL_DIRS}mkfifo ixr,
+  @{SNAP_COREUTIL_DIRS}mknod ixr,
+  @{SNAP_COREUTIL_DIRS}mktemp ixr,
   /{,usr/}bin/more ixr,
-  /{,usr/}bin/mv ixr,
-  /{,usr/}bin/nice ixr,
-  /{,usr/}bin/nohup ixr,
-  /{,usr/}bin/numfmt ixr,
-  /{,usr/}bin/od ixr,
+  @{SNAP_COREUTIL_DIRS}mv ixr,
+  @{SNAP_COREUTIL_DIRS}nice ixr,
+  @{SNAP_COREUTIL_DIRS}nohup ixr,
+  @{SNAP_COREUTIL_DIRS}numfmt ixr,
+  @{SNAP_COREUTIL_DIRS}od ixr,
   /{,usr/}bin/openssl ixr, # may cause harmless capability block_suspend denial
-  /{,usr/}bin/paste ixr,
+  @{SNAP_COREUTIL_DIRS}paste ixr,
   /{,usr/}bin/pgrep ixr,
-  /{,usr/}bin/printenv ixr,
-  /{,usr/}bin/printf ixr,
+  @{SNAP_COREUTIL_DIRS}printenv ixr,
+  @{SNAP_COREUTIL_DIRS}printf ixr,
   /{,usr/}bin/ps ixr,
-  /{,usr/}bin/pwd ixr,
-  /{,usr/}bin/readlink ixr,
-  /{,usr/}bin/realpath ixr,
+  @{SNAP_COREUTIL_DIRS}pwd ixr,
+  @{SNAP_COREUTIL_DIRS}readlink ixr,
+  @{SNAP_COREUTIL_DIRS}realpath ixr,
   /{,usr/}bin/rev ixr,
-  /{,usr/}bin/rm ixr,
-  /{,usr/}bin/rmdir ixr,
+  @{SNAP_COREUTIL_DIRS}rm ixr,
+  @{SNAP_COREUTIL_DIRS}rmdir ixr,
   /{,usr/}bin/run-parts ixr,
   /{,usr/}bin/sed ixr,
-  /{,usr/}bin/seq ixr,
-  /{,usr/}bin/sha{1,224,256,384,512}sum ixr,
-  /{,usr/}bin/shuf ixr,
-  /{,usr/}bin/sleep ixr,
-  /{,usr/}bin/sort ixr,
-  /{,usr/}bin/stat ixr,
-  /{,usr/}bin/stdbuf ixr,
-  /{,usr/}bin/stty ixr,
-  /{,usr/}bin/sync ixr,
+  @{SNAP_COREUTIL_DIRS}seq ixr,
+  /{,usr/}bin/setpriv ixr,
+  @{SNAP_COREUTIL_DIRS}sha{1,224,256,384,512}sum ixr,
+  @{SNAP_COREUTIL_DIRS}shuf ixr,
+  @{SNAP_COREUTIL_DIRS}sleep ixr,
+  @{SNAP_COREUTIL_DIRS}sort ixr,
+  @{SNAP_COREUTIL_DIRS}stat ixr,
+  @{SNAP_COREUTIL_DIRS}stdbuf ixr,
+  @{SNAP_COREUTIL_DIRS}stty ixr,
+  @{SNAP_COREUTIL_DIRS}sync ixr,
   /{,usr/}bin/systemd-cat ixr,
-  /{,usr/}bin/tac ixr,
-  /{,usr/}bin/tail ixr,
+  /{,usr/}bin/systemd-creds ixr,
+  @{SNAP_COREUTIL_DIRS}tac ixr,
+  @{SNAP_COREUTIL_DIRS}tail ixr,
   /{,usr/}bin/tar ixr,
-  /{,usr/}bin/tee ixr,
-  /{,usr/}bin/test ixr,
+  @{SNAP_COREUTIL_DIRS}tee ixr,
+  @{SNAP_COREUTIL_DIRS}test ixr,
   /{,usr/}bin/tempfile ixr,
   /{,usr/}bin/tset ixr,
-  /{,usr/}bin/touch ixr,
+  @{SNAP_COREUTIL_DIRS}touch ixr,
   /{,usr/}bin/tput ixr,
-  /{,usr/}bin/tr ixr,
-  /{,usr/}bin/true ixr,
-  /{,usr/}bin/tty ixr,
-  /{,usr/}bin/uname ixr,
-  /{,usr/}bin/uniq ixr,
-  /{,usr/}bin/unlink ixr,
+  @{SNAP_COREUTIL_DIRS}tr ixr,
+  @{SNAP_COREUTIL_DIRS}true ixr,
+  @{SNAP_COREUTIL_DIRS}tty ixr,
+  @{SNAP_COREUTIL_DIRS}uname ixr,
+  @{SNAP_COREUTIL_DIRS}uniq ixr,
+  @{SNAP_COREUTIL_DIRS}unlink ixr,
   /{,usr/}bin/unxz ixr,
   /{,usr/}bin/unzip ixr,
   /{,usr/}bin/uptime ixr,
-  /{,usr/}bin/vdir ixr,
-  /{,usr/}bin/wc ixr,
+  @{SNAP_COREUTIL_DIRS}vdir ixr,
+  /{,usr/}bin/vim.tiny ixr,
+  @{SNAP_COREUTIL_DIRS}wc ixr,
   /{,usr/}bin/which{,.debianutils} ixr,
   /{,usr/}bin/xargs ixr,
   /{,usr/}bin/xz ixr,
-  /{,usr/}bin/yes ixr,
+  @{SNAP_COREUTIL_DIRS}yes ixr,
   /{,usr/}bin/zcat ixr,
   /{,usr/}bin/z{,e,f}grep ixr,
   /{,usr/}bin/zip ixr,
@@ -653,7 +679,36 @@ var defaultCoreRuntimeTemplateRules = `
   /{,usr/}sbin/ldconfig{,.real} ixr,
 
   # Allow all snaps to chroot
+  # chroot can be on either coreutil paths or sbin depending on the Ubuntu release
+  @{SNAP_COREUTIL_DIRS}chroot ixr,
   /{,usr/}sbin/chroot ixr,
+
+  # Allow pidof (and killall5, as pidof can be a symlink to killall5 in some distros)
+  /{,usr/}bin/pidof ixr,
+  /{,usr/}sbin/killall5 ixr,
+`
+
+// defaultCoreRuntimePerlTemplateRules contains perl runtime-specific rules
+// for core* bases. Perl has been removed from core24 onwards.
+var defaultCoreRuntimePerlTemplateRules = `
+  # for perl apps/services
+  /usr/bin/perl{,5*} ixr,
+  # AppArmor <2.12 doesn't have rules for perl-base, so add them here
+  /usr/lib/@{multiarch}/perl{,5,-base}/**            r,
+  /usr/lib/@{multiarch}/perl{,5,-base}/[0-9]*/**.so* mr,
+`
+
+// defaultCoreRuntimePythonTemplateRules contains python runtime-specific rules
+// for core* bases. Python has been removed from core26 onwards.
+var defaultCoreRuntimePythonTemplateRules = `
+  # for python apps/services
+  /usr/bin/python{,2,2.[0-9]*,3,3.[0-9]*} ixr,
+  # additional accesses needed for newer pythons in later bases
+  /usr/lib{,32,64}/python3.[0-9]*/**.{pyc,so}           mr,
+  /usr/lib{,32,64}/python3.[0-9]*/**.{egg,py,pth}       r,
+  /usr/lib{,32,64}/python3.[0-9]*/{site,dist}-packages/ r,
+  /usr/lib{,32,64}/python3.[0-9]*/lib-dynload/*.so      mr,
+  /usr/include/python3.[0-9]*/pyconfig.h               r,
 `
 
 // defaultCoreRuntimeTemplate contains the default apparmor template for core* bases. It
@@ -681,6 +736,7 @@ var defaultOtherBaseTemplateRules = `
   # - /lib/modules
   #
   # Everything but /lib/firmware and /lib/modules
+  # TODO: use GenerateAAREExclusionPatterns for this
   /{,usr/}lib/ r,
   /{,usr/}lib/[^fm]** mrklix,
   /{,usr/}lib/{f[^i],m[^o]}** mrklix,
@@ -709,6 +765,7 @@ var defaultOtherBaseTemplateRules = `
   #
   # Everything but /usr/lib and /usr/src, which are handled elsewhere.
   /usr/ r,
+  # TODO: use GenerateAAREExclusionPatterns for this
   /usr/[^ls]** mrklix,
   /usr/{l[^i],s[^r]}** mrklix,
   /usr/{li[^b],sr[^c]}** mrklix,
@@ -884,6 +941,11 @@ var classicJailmodeSnippet = `
 
   # For snappy reexec on 4.8+ kernels
   @{INSTALL_DIR}/core/*/usr/lib/snapd/snap-exec m,
+  # Same as above but accounting for the case when the
+  # snapd snap is installed and executes the snap application.
+  @{INSTALL_DIR}/snapd/*/usr/lib/snapd/snap-exec rm,
+  # Support for merged snapctl and snap-exec binaries
+  @{INSTALL_DIR}/snapd/*/usr/lib/snapd/snapctl rm,
 `
 
 var ptraceTraceDenySnippet = `
@@ -942,7 +1004,7 @@ var updateNSTemplate = `
 
 ###INCLUDE_SYSTEM_TUNABLES_HOME_D_WITH_VENDORED_APPARMOR###
 
-profile snap-update-ns.###SNAP_INSTANCE_NAME### (attach_disconnected) {
+profile snap-update-ns.###SNAP_INSTANCE_NAME### flags=(attach_disconnected) {
   # The next four rules mirror those above. We want to be able to read
   # and map snap-update-ns into memory but it may come from a variety of places.
   /usr/lib{,exec,64}/snapd/snap-update-ns mr,
@@ -988,6 +1050,13 @@ profile snap-update-ns.###SNAP_INSTANCE_NAME### (attach_disconnected) {
   # Allow reading own cgroups
   owner @{PROC}/@{pid}/cgroup r,
 
+  # Allow reading own mountinfo (Go runtime 1.25+)
+  owner @{PROC}/@{pid}/mountinfo r,
+
+  # Allow reading the auxv, apparently Go does this on s390x
+  # https://bugs.launchpad.net/snapd/+bug/2141461
+  owner @{PROC}/@{pid}/auxv r,
+
   # Allow reading somaxconn, required in newer distro releases
   @{PROC}/sys/net/core/somaxconn r,
   # but silence noisy denial of inet/inet6
@@ -1000,6 +1069,12 @@ profile snap-update-ns.###SNAP_INSTANCE_NAME### (attach_disconnected) {
   # Allow creating/grabbing global and per-snap lock files.
   /run/snapd/lock/###SNAP_INSTANCE_NAME###.lock rwk,
   /run/snapd/lock/.lock rwk,
+
+  # While the base abstraction has rules for encryptfs encrypted home and
+  # private directories, it is missing rules for directory read on the toplevel
+  # directory of the mount (LP: #1848919)
+  owner @{HOME}/.Private/ r,
+  owner @{HOMEDIRS}/.ecryptfs/*/.Private/ r,
 
   # Allow reading stored mount namespaces,
   /run/snapd/ns/ r,
@@ -1015,6 +1090,10 @@ profile snap-update-ns.###SNAP_INSTANCE_NAME### (attach_disconnected) {
   # Those files are written by snap-update-ns and represent the actual
   # mount profile at a given moment.
   /run/snapd/ns/snap.###SNAP_INSTANCE_NAME###.fstab{,.*} rw,
+
+  # Allow writing to a log file for both per-snap and per-snap-and-user log files.
+  /run/snapd/ns/snap.###SNAP_INSTANCE_NAME###.log w,
+  /run/snapd/ns/snap.###SNAP_INSTANCE_NAME###.user.*.log w,
 
   # NOTE: at this stage the /snap directory is stable as we have called
   # pivot_root already.
@@ -1059,6 +1138,8 @@ profile snap-update-ns.###SNAP_INSTANCE_NAME### (attach_disconnected) {
   /tmp/ r,
   /usr/ r,
   /var/ r,
+  /var/lib/ r,
+  /var/lib/snapd/ r,
   /var/snap/ r,
 
   # Allow reading timezone data.
@@ -1094,3 +1175,18 @@ profile snap-update-ns.###SNAP_INSTANCE_NAME### (attach_disconnected) {
 ###SNIPPETS###
 }
 `
+
+var MountInfoKey = RegisterSnippetKey("mount-info")
+
+// basePrioritizedSnippets holds snippets that are added to the base template
+// if no more specific snippet is added by an interface.
+var basePrioritizedSnippets = map[SnippetKey]string{
+	// Go (1.25+) reads /proc/self/mountinfo to implement container-aware
+	// GOMAXPROCS (see also: https://github.com/golang/go/issues/77911) which we
+	// can't blanket allow so deny to silence log. Specific interfaces can override
+	// using AddPrioritizedSnippet with any priority.
+	MountInfoKey: `
+deny @{PROC}/self/mountinfo r,
+deny @{PROC}/@{pid}/mountinfo r,
+`,
+}

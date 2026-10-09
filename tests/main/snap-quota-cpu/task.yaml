@@ -8,8 +8,6 @@ details: |
 # and this is tested in the snap-quota spread test.
 systems:
   - -ubuntu-14.04-*
-  - -centos-7-*
-  - -amazon-linux-2-*
   - -ubuntu-16.04-*
   - -ubuntu-core-16-*
 
@@ -20,6 +18,9 @@ prepare: |
 restore: |
   echo "Stopping the service"
   snap stop test-snapd-stressd.stress-sc
+  snap remove-quota group-one || true
+  # despite removing groups, in 18.04 and 20.04, the slices stay behind
+  find /sys/fs/cgroup/ -type d -name 'snap.*.slice' -prune -ls -exec rmdir \{\} \;
 
 execute: |
   echo "Starting service and verifying cpu usage"
@@ -37,7 +38,7 @@ execute: |
       # We use 'top' here to get the current CPU usage as top sorts by CPU usage, 
       # so we assume that 'stress' is going to lie in the top as the odds of another
       # process being in the top is close to 0.
-      usage=$(top -w256 -b -n 2 -d 0.2 | head | grep "$service_name" | awk '{print $9*100}')
+      usage=$(top -w256 -b -n 2 -d 0.2 | head | grep "$service_name" | awk '{print $9*100}' | xargs printf "%.0f\n")
       if [ "$usage" -gt "$expected_usage" ]; then
         return 0
       fi
@@ -57,7 +58,7 @@ execute: |
 
   echo "The systemd slice should be active now"
   sliceName="snap.$(systemd-escape --path group-one).slice"
-  systemctl show --property=ActiveState "$sliceName" | MATCH "ActiveState=active"
+  systemctl show --property=ActiveState "$sliceName" | MATCH '^ActiveState=active$'
 
   echo "The service should also still be active"
   snap services test-snapd-stressd.stress-sc | MATCH "test-snapd-stressd.stress-sc\s+disabled\s+active"
@@ -103,7 +104,7 @@ execute: |
       # We use 'top' here to get the current CPU usage as top sorts by CPU usage, 
       # so we assume that 'stress' is going to lie in the top as the odds of another
       # process being in the top is close to 0.
-      usage=$(top -w256 -b -n 2 -d 0.2 | head | grep "$service_name" | awk '{print $9*100}')
+      usage=$(top -w256 -b -n 2 -d 0.2 | head | grep "$service_name" | awk '{print $9*100}' | xargs printf "%.0f\n")
       if [ "$usage" -lt "$expected_usage" ]; then
         return 0
       fi
@@ -122,6 +123,9 @@ execute: |
   echo "Update the quota to a lower percentage while running"
   snap set-quota group-one --cpu=1x20%
 
+  echo "Restart the snap to ensure the new limits are in effect"
+  snap restart test-snapd-stressd
+
   echo "Verifying quota cpu usage, expecting around 20% usage"
   # allow for up to 10% difference, this is necessary due to how we measure
   ensure_cpu_usage_lower_than "stress" 30
@@ -135,7 +139,7 @@ execute: |
   systemctl show --property=ControlGroup snap.test-snapd-stressd.stress-sc.service | NOMATCH "/$sliceName/snap.test-snapd-stressd.stress-sc.service"
 
   echo "And the slice is not active anymore"
-  systemctl show --property=ActiveState "$sliceName" | MATCH "ActiveState=inactive"
+  systemctl show --property=ActiveState "$sliceName" | MATCH '^ActiveState=inactive$'
 
   echo "Verifying cpu usage, expecting at least above 60% again"
   ensure_cpu_usage_higher_than "stress" 60

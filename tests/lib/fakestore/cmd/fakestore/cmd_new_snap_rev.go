@@ -29,7 +29,7 @@ import (
 
 type cmdNewSnapRevision struct {
 	Positional struct {
-		Snap string `description:"Snap file"`
+		Snap string `description:"Path to a snap file"`
 	} `positional-args:"yes"`
 
 	TopDir          string `long:"dir" description:"Directory to be used by the store to keep and serve snaps, <dir>/asserts is used for assertions"`
@@ -37,7 +37,7 @@ type cmdNewSnapRevision struct {
 }
 
 func (x *cmdNewSnapRevision) Execute(args []string) error {
-	headers := map[string]interface{}{}
+	headers := map[string]any{}
 	if x.SnapRevJsonPath != "" {
 		content, err := os.ReadFile(x.SnapRevJsonPath)
 		if err != nil {

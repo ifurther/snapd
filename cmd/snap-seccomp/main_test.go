@@ -285,6 +285,10 @@ faccessat
 restart_syscall
 # libc6 2.31/gcc-9.3
 mprotect
+# libc6 2.42
+getrandom
+clock_gettime
+clock_gettime64
 `
 	bpfPath := filepath.Join(c.MkDir(), "bpf")
 	err := main.Compile([]byte(common+seccompAllowlist), bpfPath)
@@ -504,6 +508,10 @@ func (s *snapSeccompSuite) TestCompile(c *C) {
 		{"ioctl\n~ioctl - TIOCSTI\n~ioctl - TIOCLINUX\nioctl - !TIOCSTI", "ioctl;native;-,TIOCSTI", DenyExplicit},
 		{"ioctl\n~ioctl - TIOCSTI\n~ioctl - TIOCLINUX\nioctl - !TIOCSTI", "ioctl;native;-,TIOCLINUX", DenyExplicit},
 		{"ioctl\n~ioctl - TIOCSTI\n~ioctl - TIOCLINUX\nioctl - !TIOCSTI", "ioctl;native;-,TIOCGWINSZ", Allow},
+
+		// see CVE-2019-7303
+		{"ioctl\n~ioctl - 4294967295|TIOCSTI", "ioctl;native;-,TIOCSTI", DenyExplicit},
+		{"ioctl\n~ioctl - 4294967295|TIOCLINUX", "ioctl;native;-,TIOCLINUX", DenyExplicit},
 
 		// test_bad_seccomp_filter_args_clone
 		{"setns - CLONE_NEWNET", "setns;native;-,99", Deny},
@@ -843,6 +851,21 @@ func (s *snapSeccompSuite) TestRestrictionsWorkingArgsTermios(c *C) {
 	}
 }
 
+func (s *snapSeccompSuite) TestRestrictionsWorkingPipe2(c *C) {
+	for _, t := range []struct {
+		seccompAllowlist string
+		bpfInput         string
+		expected         int
+	}{
+		// good input
+		{"pipe2 - |O_NOTIFICATION_PIPE", "pipe2;native;-,O_NOTIFICATION_PIPE", Allow},
+		// bad input
+		{"pipe2 - |O_NOTIFICATION_PIPE", "quotactl;native;-,99", Deny},
+	} {
+		s.runBpf(c, t.seccompAllowlist, t.bpfInput, t.expected)
+	}
+}
+
 func (s *snapSeccompSuite) TestRestrictionsWorkingArgsUidGid(c *C) {
 	// while 'root' user usually has uid 0, 'daemon' user uid may vary
 	// across distributions, best lookup the uid directly
@@ -918,4 +941,28 @@ func (s *snapSeccompSuite) TestExportBpfErrors(c *C) {
 	// invalid filter
 	_, err = main.ExportBPF(fout, &seccomp.ScmpFilter{})
 	c.Check(err, ErrorMatches, "cannot export bpf filter: filter is invalid or uninitialized")
+}
+
+func (s *snapSeccompSuite) TestDump(c *C) {
+	dir := c.MkDir()
+	bpfPath := filepath.Join(dir, "bpf")
+	prof := `
+execve
+uname
+~ioctl
+`
+	err := main.Compile([]byte(prof), bpfPath)
+	c.Assert(err, IsNil)
+	err = main.Dump(filepath.Join(dir, "foo"), filepath.Join(dir, "foo-dump"))
+	c.Assert(err, ErrorMatches, "open .*/foo: no such file or directory")
+
+	err = main.Dump(filepath.Join(dir, "bpf"), filepath.Join(dir, "bpf"))
+	c.Assert(err, IsNil)
+	fi, err := os.Stat(filepath.Join(dir, "bpf.allow"))
+	c.Assert(err, IsNil)
+	c.Check(fi.Size() > 10, Equals, true)
+
+	fi, err = os.Stat(filepath.Join(dir, "bpf.deny"))
+	c.Assert(err, IsNil)
+	c.Check(fi.Size() > 10, Equals, true)
 }

@@ -26,8 +26,6 @@ import (
 	"hash/crc32"
 	"os"
 
-	"golang.org/x/xerrors"
-
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/strutil"
@@ -171,8 +169,8 @@ type Env struct {
 // cToGoString convert string in passed byte array into string type
 // if string in byte array is not terminated, empty string is returned
 func cToGoString(c []byte) string {
-	if end := bytes.IndexByte(c, 0); end >= 0 {
-		return string(c[:end])
+	if before, _, ok := bytes.Cut(c, []byte{0}); ok {
+		return string(before)
 	}
 	// no trailing \0 - return ""
 	return ""
@@ -234,45 +232,13 @@ func (l *Env) Load() error {
 	return nil
 }
 
-type compatErrNotExist struct {
-	err error
-}
-
-func (e compatErrNotExist) Error() string {
-	return e.err.Error()
-}
-
-func (e compatErrNotExist) Unwrap() error {
-	// for go 1.9 (and 1.10) xerrors compatibility, we check if os.PathError
-	// implements Unwrap(), and if not return os.ErrNotExist directly
-	if _, ok := e.err.(interface {
-		Unwrap() error
-	}); !ok {
-		return os.ErrNotExist
-	}
-	return e.err
-}
-
 // LoadEnv loads the lk bootloader environment from the specified file. The
 // bootloader environment in the referenced file must be of the same version
 // that the Env object was created with using NewEnv.
-// The returned error may wrap os.ErrNotExist, so instead of using
-// os.IsNotExist, callers should use xerrors.Is(err,os.ErrNotExist) instead.
 func (l *Env) LoadEnv(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
-		// TODO: when we drop support for Go 1.9, this code can go away, in Go
-		//       1.9 *os.PathError does not implement Unwrap(), and so callers
-		//       that try to call xerrors.Is(err,os.ErrNotExist) will fail, so
-		//       instead we do our own wrapping first such that when Unwrap() is
-		//       called by xerrors.Is() it will see os.ErrNotExist directly when
-		//       compiled with a version of Go that does not implement Unwrap()
-		//       on os.PathError
-		if os.IsNotExist(err) {
-			err = compatErrNotExist{err: err}
-		}
-		fmtStr := "cannot open LK env file: %w"
-		return xerrors.Errorf(fmtStr, err)
+		return fmt.Errorf("cannot open LK env file: %w", err)
 	}
 
 	if err := binary.Read(f, binary.LittleEndian, l.variant); err != nil {
@@ -592,6 +558,32 @@ func (matr bootimgMatrixGeneric) setBootPart(bootpart, bootPartValue string) err
 // currently installed kernel snap revision, so that a new try kernel snap does
 // not overwrite the existing installed kernel snap.
 func (matr bootimgMatrixGeneric) findFreeBootPartition(reserved []string, newValue string) (string, error) {
+	// first check whether newValue is already assigned to a boot image
+	// partition, and if so return that partition. This needs to be a separate
+	// pass over the whole matrix, before any free partition is considered:
+	// otherwise a free partition appearing earlier in the matrix would be
+	// returned and the caller would go on to assign newValue to it too, leaving
+	// the very same value occupying two boot image partitions.
+	// It also needs to be handled before checking the reserved values since we
+	// may sometimes need to find a "free" boot partition for the specific
+	// kernel revision that is already installed, thus it will show up in the
+	// reserved list, but it will also be newValue.
+	// This case happens in practice during seeding of kernels on uc16/uc18,
+	// where we already extracted the kernel at image build time and we will
+	// go to extract the kernel again during seeding, as well as on any
+	// re-extraction of the currently installed kernel at run time.
+	for x := range matr {
+		bootPartLabel := cToGoString(matr[x][MATRIX_ROW_PARTITION][:])
+		// skip boot image partition labels that are unset, see the comment in
+		// the loop below
+		if bootPartLabel == "" {
+			continue
+		}
+		if cToGoString(matr[x][MATRIX_ROW_VALUE][:]) == newValue {
+			return bootPartLabel, nil
+		}
+	}
+
 	for x := range matr {
 		bootPartLabel := cToGoString(matr[x][MATRIX_ROW_PARTITION][:])
 		// skip boot image partition labels that are unset, for example this may
@@ -604,18 +596,6 @@ func (matr bootimgMatrixGeneric) findFreeBootPartition(reserved []string, newVal
 		}
 
 		val := cToGoString(matr[x][MATRIX_ROW_VALUE][:])
-
-		// if the value is exactly the same, as requested return it, this needs
-		// to be handled before checking the reserved values since we may
-		// sometimes need to find a "free" boot partition for the specific
-		// kernel revision that is already installed, thus it will show up in
-		// the reserved list, but it will also be newValue
-		// this case happens in practice during seeding of kernels on uc16/uc18,
-		// where we already extracted the kernel at image build time and we will
-		// go to extract the kernel again during seeding
-		if val == newValue {
-			return bootPartLabel, nil
-		}
 
 		// if this value was reserved, skip it
 		if strutil.ListContains(reserved, val) {

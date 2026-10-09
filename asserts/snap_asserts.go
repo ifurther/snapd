@@ -20,10 +20,11 @@
 package asserts
 
 import (
-	"bytes"
 	"crypto"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	// expected for digests
@@ -39,7 +40,7 @@ import (
 // snap binding its identifying snap-id to a name, asserting its
 // publisher and its other properties.
 type SnapDeclaration struct {
-	assertionBase
+	AssertionBase
 	refreshControl      []string
 	plugRules           map[string]*PlugRule
 	slotRules           map[string]*SlotRule
@@ -60,8 +61,8 @@ func (snapdcl *SnapDeclaration) SnapID() string {
 }
 
 // SnapName returns the declared snap name.
-func (snapdcl *SnapDeclaration) SnapName() string {
-	return snapdcl.HeaderString("snap-name")
+func (snapdcl *SnapDeclaration) SnapName() naming.SnapName {
+	return naming.SnapName(snapdcl.HeaderString("snap-name"))
 }
 
 // PublisherID returns the identifier of the publisher of the declared snap.
@@ -115,8 +116,8 @@ func (snapdcl *SnapDeclaration) RevisionAuthority(provenance string) []*Revision
 	return res
 }
 
-// Implement further consistency checks.
-func (snapdcl *SnapDeclaration) checkConsistency(db RODatabase, acck *AccountKey) error {
+// CheckConsistency performs further checks using the assertion database.
+func (snapdcl *SnapDeclaration) CheckConsistency(db RODatabase, acck *AccountKey) error {
 	if !db.IsTrustedAccount(snapdcl.AuthorityID()) {
 		return fmt.Errorf("snap-declaration assertion for %q (id %q) is not signed by a directly trusted authority: %s", snapdcl.SnapName(), snapdcl.SnapID(), snapdcl.AuthorityID())
 	}
@@ -134,7 +135,7 @@ func (snapdcl *SnapDeclaration) checkConsistency(db RODatabase, acck *AccountKey
 }
 
 // expected interface is implemented
-var _ consistencyChecker = (*SnapDeclaration)(nil)
+var _ ConsistencyChecker = (*SnapDeclaration)(nil)
 
 // Prerequisites returns references to this snap-declaration's prerequisite assertions.
 func (snapdcl *SnapDeclaration) Prerequisites() []*Ref {
@@ -143,7 +144,7 @@ func (snapdcl *SnapDeclaration) Prerequisites() []*Ref {
 	}
 }
 
-func compilePlugRules(plugs map[string]interface{}, compiled func(iface string, plugRule *PlugRule)) error {
+func compilePlugRules(plugs map[string]any, compiled func(iface string, plugRule *PlugRule)) error {
 	for iface, rule := range plugs {
 		plugRule, err := compilePlugRule(iface, rule)
 		if err != nil {
@@ -154,7 +155,7 @@ func compilePlugRules(plugs map[string]interface{}, compiled func(iface string, 
 	return nil
 }
 
-func compileSlotRules(slots map[string]interface{}, compiled func(iface string, slotRule *SlotRule)) error {
+func compileSlotRules(slots map[string]any, compiled func(iface string, slotRule *SlotRule)) error {
 	for iface, rule := range slots {
 		slotRule, err := compileSlotRule(iface, rule)
 		if err != nil {
@@ -165,7 +166,7 @@ func compileSlotRules(slots map[string]interface{}, compiled func(iface string, 
 	return nil
 }
 
-func snapDeclarationFormatAnalyze(headers map[string]interface{}, body []byte) (formatnum int, err error) {
+func snapDeclarationFormatAnalyze(headers map[string]any, body []byte) (formatnum int, err error) {
 	_, plugsOk := headers["plugs"]
 	_, slotsOk := headers["slots"]
 	if !(plugsOk || slotsOk) {
@@ -196,6 +197,12 @@ func snapDeclarationFormatAnalyze(headers map[string]interface{}, body []byte) (
 		if rule.feature(altAttrMatcherFeature) {
 			setFormatNum(5)
 		}
+		if rule.feature(publisherIDConstraintsFeature) {
+			setFormatNum(6)
+		}
+		if rule.feature(onClassicVariantConstraintsFeature) {
+			setFormatNum(7)
+		}
 	})
 	if err != nil {
 		return 0, err
@@ -218,6 +225,12 @@ func snapDeclarationFormatAnalyze(headers map[string]interface{}, body []byte) (
 		if rule.feature(altAttrMatcherFeature) {
 			setFormatNum(5)
 		}
+		if rule.feature(publisherIDConstraintsFeature) {
+			setFormatNum(6)
+		}
+		if rule.feature(onClassicVariantConstraintsFeature) {
+			setFormatNum(7)
+		}
 	})
 	if err != nil {
 		return 0, err
@@ -226,12 +239,12 @@ func snapDeclarationFormatAnalyze(headers map[string]interface{}, body []byte) (
 	return formatnum, nil
 }
 
-func checkAliases(headers map[string]interface{}) (map[string]string, error) {
+func checkAliases(headers map[string]any) (map[string]string, error) {
 	value, ok := headers["aliases"]
 	if !ok {
 		return nil, nil
 	}
-	aliasList, ok := value.([]interface{})
+	aliasList, ok := value.([]any)
 	if !ok {
 		return nil, fmt.Errorf(`"aliases" header must be a list of alias maps`)
 	}
@@ -241,7 +254,7 @@ func checkAliases(headers map[string]interface{}) (map[string]string, error) {
 
 	aliasMap := make(map[string]string, len(aliasList))
 	for i, item := range aliasList {
-		aliasItem, ok := item.(map[string]interface{})
+		aliasItem, ok := item.(map[string]any)
 		if !ok {
 			return nil, fmt.Errorf(`"aliases" header must be a list of alias maps`)
 		}
@@ -268,7 +281,7 @@ func checkAliases(headers map[string]interface{}) (map[string]string, error) {
 	return aliasMap, nil
 }
 
-func assembleSnapDeclaration(assert assertionBase) (Assertion, error) {
+func assembleSnapDeclaration(assert AssertionBase) (Assertion, error) {
 	_, err := checkExistsString(assert.headers, "snap-name")
 	if err != nil {
 		return nil, err
@@ -336,7 +349,7 @@ func assembleSnapDeclaration(assert assertionBase) (Assertion, error) {
 
 	ra, ok := assert.headers["revision-authority"]
 	if ok {
-		ramaps, ok := ra.([]interface{})
+		ramaps, ok := ra.([]any)
 		if !ok {
 			return nil, fmt.Errorf("revision-authority stanza must be a list of maps")
 		}
@@ -346,7 +359,7 @@ func assembleSnapDeclaration(assert assertionBase) (Assertion, error) {
 		}
 		ras = make([]*RevisionAuthority, 0, len(ramaps))
 		for _, ramap := range ramaps {
-			m, ok := ramap.(map[string]interface{})
+			m, ok := ramap.(map[string]any)
 			if !ok {
 				return nil, fmt.Errorf("revision-authority stanza must be a list of maps")
 			}
@@ -396,7 +409,7 @@ func assembleSnapDeclaration(assert assertionBase) (Assertion, error) {
 	}
 
 	return &SnapDeclaration{
-		assertionBase:       assert,
+		AssertionBase:       assert,
 		refreshControl:      refControl,
 		plugRules:           plugRules,
 		slotRules:           slotRules,
@@ -458,11 +471,54 @@ func (ra *RevisionAuthority) CheckResourceRevision(resrev *SnapResourceRevision,
 	return ra.checkProvenanceAndRevision(resrev, "resource", resrev.ResourceRevision(), model, store)
 }
 
-// SnapIntegrity holds information about integrity data included in a revision
-// for a given snap.
-type SnapIntegrity struct {
-	SHA3_384 string
-	Size     uint64
+var validSnapIntegrityTypes = []string{"dm-verity"}
+
+var validVersionsForIntegrityType = map[string][]int{
+	// version 1 corresponds to dm-verity format 1
+	"dm-verity": {1},
+}
+
+var validHashAlgorithmsForIntegrityType = map[string][]string{
+	// kernel supported algorithms:
+	// https://gitlab.com/cryptsetup/cryptsetup/-/blob/main/lib/crypto_backend/crypto_kernel.c?ref_type=heads#L35
+	// Go crypto's supported algorithms:
+	// https://cs.opensource.google/go/go/+/refs/tags/go1.23.4:src/crypto/crypto.go;l=68
+	"dm-verity": {
+		"sha256",
+	},
+}
+
+func contains[V int | string](l []V, i V) bool {
+	for _, v := range l {
+		if v == i {
+			return true
+		}
+	}
+
+	return false
+}
+
+func toHash(s string) crypto.Hash {
+	switch s {
+	case "sha256":
+		return crypto.SHA256
+	default:
+		return 0
+	}
+}
+
+// IntegrityData holds information about integrity data of a specific type included in a snap or resource's revision.
+//
+// A single snap or resource revision can have multiple variants of integrity data which are represented as an array in the
+// snap or resource revision assertion.
+type IntegrityData struct {
+	Type          string
+	Version       uint
+	HashAlg       string
+	DataBlockSize uint
+	HashBlockSize uint
+	Digest        string
+	Salt          string
 }
 
 // SnapFileSHA3_384 computes the SHA3-384 digest of the given snap file.
@@ -483,7 +539,7 @@ func SnapFileSHA3_384(snapPath string) (digest string, size uint64, err error) {
 // SnapBuild holds a snap-build assertion, asserting the properties of a snap
 // at the time it was built by the developer.
 type SnapBuild struct {
-	assertionBase
+	AssertionBase
 	size      uint64
 	timestamp time.Time
 }
@@ -513,7 +569,7 @@ func (snapbld *SnapBuild) Timestamp() time.Time {
 	return snapbld.timestamp
 }
 
-func assembleSnapBuild(assert assertionBase) (Assertion, error) {
+func assembleSnapBuild(assert AssertionBase) (Assertion, error) {
 	_, err := checkDigest(assert.headers, "snap-sha3-384", crypto.SHA3_384)
 	if err != nil {
 		return nil, err
@@ -540,7 +596,7 @@ func assembleSnapBuild(assert assertionBase) (Assertion, error) {
 	}
 	// ignore extra headers and non-empty body for future compatibility
 	return &SnapBuild{
-		assertionBase: assert,
+		AssertionBase: assert,
 		size:          size,
 		timestamp:     timestamp,
 	}, nil
@@ -550,12 +606,12 @@ func assembleSnapBuild(assert assertionBase) (Assertion, error) {
 // store acknowledging the receipt of a build of a snap and labeling it with a
 // snap revision.
 type SnapRevision struct {
-	assertionBase
+	AssertionBase
 	snapSize     uint64
 	snapRevision int
 	timestamp    time.Time
 
-	snapIntegrity *SnapIntegrity
+	snapIntegrityData []IntegrityData
 }
 
 // SnapSHA3_384 returns the SHA3-384 digest of the snap.
@@ -595,13 +651,13 @@ func (snaprev *SnapRevision) Timestamp() time.Time {
 	return snaprev.timestamp
 }
 
-// SnapIntegrity returns the snap integrity data associated with the snap revision if any.
-func (snaprev *SnapRevision) SnapIntegrity() *SnapIntegrity {
-	return snaprev.snapIntegrity
+// SnapIntegrityData returns the integrity data associated with the snap revision if any.
+func (snaprev *SnapRevision) SnapIntegrityData() []IntegrityData {
+	return snaprev.snapIntegrityData
 }
 
-// Implement further consistency checks.
-func (snaprev *SnapRevision) checkConsistency(db RODatabase, acck *AccountKey) error {
+// CheckConsistency performs further checks using the assertion database.
+func (snaprev *SnapRevision) CheckConsistency(db RODatabase, acck *AccountKey) error {
 	otherProvenance := snaprev.Provenance() != naming.DefaultProvenance
 	if !otherProvenance && !db.IsTrustedAccount(snaprev.AuthorityID()) {
 		// delegating global-upload revisions is not allowed
@@ -648,7 +704,7 @@ func (snaprev *SnapRevision) checkConsistency(db RODatabase, acck *AccountKey) e
 }
 
 // expected interface is implemented
-var _ consistencyChecker = (*SnapRevision)(nil)
+var _ ConsistencyChecker = (*SnapRevision)(nil)
 
 // Prerequisites returns references to this snap-revision's prerequisite assertions.
 func (snaprev *SnapRevision) Prerequisites() []*Ref {
@@ -659,7 +715,7 @@ func (snaprev *SnapRevision) Prerequisites() []*Ref {
 	}
 }
 
-func checkSnapRevisionWhat(headers map[string]interface{}, name, what string) (snapRevision int, err error) {
+func checkSnapRevisionWhat(headers map[string]any, name, what string) (snapRevision int, err error) {
 	snapRevision, err = checkIntWhat(headers, name, what)
 	if err != nil {
 		return 0, err
@@ -670,7 +726,104 @@ func checkSnapRevisionWhat(headers map[string]interface{}, name, what string) (s
 	return snapRevision, nil
 }
 
-func assembleSnapRevision(assert assertionBase) (Assertion, error) {
+func checkOptionalSnapRevisionWhat(headers map[string]any, name, what string) (snapRevision int, err error) {
+	if _, ok := headers[name]; !ok {
+		return 0, nil
+	}
+	return checkSnapRevisionWhat(headers, name, what)
+}
+
+func checkSnapIntegrity(headers map[string]any) ([]IntegrityData, error) {
+	value, ok := headers["integrity"]
+	if !ok {
+		// integrity stanzas are optional
+		return nil, nil
+	}
+
+	integrityList, ok := value.([]any)
+	if !ok {
+		return nil, fmt.Errorf(`"integrity" header must contain a list of integrity data`)
+	}
+	if len(integrityList) == 0 {
+		return nil, nil
+	}
+
+	var snapIntegrityDataList []IntegrityData
+
+	for i, il := range integrityList {
+		id, ok := il.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf(`"integrity" header must contain a list of integrity data`)
+		}
+
+		what := fmt.Sprintf("of integrity data [%d]", i)
+		typ, err := checkExistsStringWhat(id, "type", what)
+		if err != nil {
+			return nil, err
+		}
+
+		if !contains(validSnapIntegrityTypes, typ) {
+			return nil, fmt.Errorf("\"type\" of integrity data [%d] must be one of (%s)", i, strings.Join(validSnapIntegrityTypes, "|"))
+		}
+
+		what = fmt.Sprintf("of integrity data [%d] of type %q", i, typ)
+		version, err := checkUintWhat(id, "version", 64, what)
+		if err != nil {
+			return nil, err
+		}
+
+		if !contains(validVersionsForIntegrityType[typ], int(version)) {
+			return nil, fmt.Errorf(`version of integrity data [%d] of type %q must be one of %v`, i, typ, validVersionsForIntegrityType[typ])
+		}
+
+		alg, err := checkExistsStringWhat(id, "hash-algorithm", what)
+		if err != nil {
+			return nil, err
+		}
+
+		if !contains(validHashAlgorithmsForIntegrityType[typ], alg) {
+			return nil, fmt.Errorf(`hash algorithm of integrity data [%d] of type %q must be one of %v`, i, typ, validHashAlgorithmsForIntegrityType[typ])
+		}
+
+		what = fmt.Sprintf("of integrity data [%d] of type %q (%s)", i, typ, alg)
+		dataBlockSize, err := checkUintWhat(id, "data-block-size", 64, what)
+		if err != nil {
+			return nil, err
+		}
+
+		hashBlockSize, err := checkUintWhat(id, "hash-block-size", 64, what)
+		if err != nil {
+			return nil, err
+		}
+
+		h := toHash(alg)
+		encDigest, err := checkDigestDecWhat(id, "digest", h, hex.DecodeString, what)
+		if err != nil {
+			return nil, err
+		}
+
+		encSalt, err := checkDigestDecWhat(id, "salt", h, hex.DecodeString, what)
+		if err != nil {
+			return nil, err
+		}
+
+		snapIntegrityData := IntegrityData{
+			Type:          typ,
+			Version:       uint(version),
+			HashAlg:       alg,
+			DataBlockSize: uint(dataBlockSize),
+			HashBlockSize: uint(hashBlockSize),
+			Digest:        encDigest,
+			Salt:          encSalt,
+		}
+
+		snapIntegrityDataList = append(snapIntegrityDataList, snapIntegrityData)
+	}
+
+	return snapIntegrityDataList, nil
+}
+
+func assembleSnapRevision(assert AssertionBase) (Assertion, error) {
 	_, err := checkDigest(assert.headers, "snap-sha3-384", crypto.SHA3_384)
 	if err != nil {
 		return nil, err
@@ -706,37 +859,17 @@ func assembleSnapRevision(assert assertionBase) (Assertion, error) {
 		return nil, err
 	}
 
-	integrityMap, err := checkMap(assert.headers, "integrity")
+	snapIntegrityData, err := checkSnapIntegrity(assert.headers)
 	if err != nil {
 		return nil, err
 	}
 
-	var snapIntegrity *SnapIntegrity
-
-	if integrityMap != nil {
-		// TODO: this will change again to support format agility
-		_, err := checkDigestWhat(integrityMap, "sha3-384", crypto.SHA3_384, "of integrity header")
-		if err != nil {
-			return nil, err
-		}
-
-		size, err := checkUintWhat(integrityMap, "size", 64, "of integrity header")
-		if err != nil {
-			return nil, err
-		}
-
-		snapIntegrity = &SnapIntegrity{
-			SHA3_384: integrityMap["sha3-384"].(string),
-			Size:     size,
-		}
-	}
-
 	return &SnapRevision{
-		assertionBase: assert,
-		snapSize:      snapSize,
-		snapRevision:  snapRevision,
-		timestamp:     timestamp,
-		snapIntegrity: snapIntegrity,
+		AssertionBase:     assert,
+		snapSize:          snapSize,
+		snapRevision:      snapRevision,
+		timestamp:         timestamp,
+		snapIntegrityData: snapIntegrityData,
 	}, nil
 }
 
@@ -745,7 +878,7 @@ func assembleSnapRevision(assert assertionBase) (Assertion, error) {
 // the series, meaning updating to that revision of approved-snap-id
 // has been approved by the owner of the gating snap with snap-id.
 type Validation struct {
-	assertionBase
+	AssertionBase
 	revoked              bool
 	timestamp            time.Time
 	approvedSnapRevision int
@@ -781,8 +914,8 @@ func (validation *Validation) Timestamp() time.Time {
 	return validation.timestamp
 }
 
-// Implement further consistency checks.
-func (validation *Validation) checkConsistency(db RODatabase, acck *AccountKey) error {
+// CheckConsistency performs further checks using the assertion database.
+func (validation *Validation) CheckConsistency(db RODatabase, acck *AccountKey) error {
 	_, err := db.Find(SnapDeclarationType, map[string]string{
 		"series":  validation.Series(),
 		"snap-id": validation.ApprovedSnapID(),
@@ -813,7 +946,7 @@ func (validation *Validation) checkConsistency(db RODatabase, acck *AccountKey) 
 }
 
 // expected interface is implemented
-var _ consistencyChecker = (*Validation)(nil)
+var _ ConsistencyChecker = (*Validation)(nil)
 
 // Prerequisites returns references to this validation's prerequisite assertions.
 func (validation *Validation) Prerequisites() []*Ref {
@@ -823,7 +956,7 @@ func (validation *Validation) Prerequisites() []*Ref {
 	}
 }
 
-func assembleValidation(assert assertionBase) (Assertion, error) {
+func assembleValidation(assert AssertionBase) (Assertion, error) {
 	approvedSnapRevision, err := checkSnapRevisionWhat(assert.headers, "approved-snap-revision", "header")
 	if err != nil {
 		return nil, err
@@ -840,149 +973,11 @@ func assembleValidation(assert assertionBase) (Assertion, error) {
 	}
 
 	return &Validation{
-		assertionBase:        assert,
+		AssertionBase:        assert,
 		revoked:              revoked,
 		timestamp:            timestamp,
 		approvedSnapRevision: approvedSnapRevision,
 	}, nil
-}
-
-// BaseDeclaration holds a base-declaration assertion, declaring the
-// policies (to start with interface ones) applying to all snaps of
-// a series.
-type BaseDeclaration struct {
-	assertionBase
-	plugRules map[string]*PlugRule
-	slotRules map[string]*SlotRule
-	timestamp time.Time
-}
-
-// Series returns the series whose snaps are governed by the declaration.
-func (basedcl *BaseDeclaration) Series() string {
-	return basedcl.HeaderString("series")
-}
-
-// Timestamp returns the time when the base-declaration was issued.
-func (basedcl *BaseDeclaration) Timestamp() time.Time {
-	return basedcl.timestamp
-}
-
-// PlugRule returns the plug-side rule about the given interface if one was included in the plugs stanza of the declaration, otherwise it returns nil.
-func (basedcl *BaseDeclaration) PlugRule(interfaceName string) *PlugRule {
-	return basedcl.plugRules[interfaceName]
-}
-
-// SlotRule returns the slot-side rule about the given interface if one was included in the slots stanza of the declaration, otherwise it returns nil.
-func (basedcl *BaseDeclaration) SlotRule(interfaceName string) *SlotRule {
-	return basedcl.slotRules[interfaceName]
-}
-
-// Implement further consistency checks.
-func (basedcl *BaseDeclaration) checkConsistency(db RODatabase, acck *AccountKey) error {
-	// XXX: not signed or stored yet in a db, but being ready for that
-	if !db.IsTrustedAccount(basedcl.AuthorityID()) {
-		return fmt.Errorf("base-declaration assertion for series %s is not signed by a directly trusted authority: %s", basedcl.Series(), basedcl.AuthorityID())
-	}
-	return nil
-}
-
-// expected interface is implemented
-var _ consistencyChecker = (*BaseDeclaration)(nil)
-
-func assembleBaseDeclaration(assert assertionBase) (Assertion, error) {
-	var plugRules map[string]*PlugRule
-	plugs, err := checkMap(assert.headers, "plugs")
-	if err != nil {
-		return nil, err
-	}
-	if plugs != nil {
-		plugRules = make(map[string]*PlugRule, len(plugs))
-		err := compilePlugRules(plugs, func(iface string, rule *PlugRule) {
-			plugRules[iface] = rule
-		})
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	var slotRules map[string]*SlotRule
-	slots, err := checkMap(assert.headers, "slots")
-	if err != nil {
-		return nil, err
-	}
-	if slots != nil {
-		slotRules = make(map[string]*SlotRule, len(slots))
-		err := compileSlotRules(slots, func(iface string, rule *SlotRule) {
-			slotRules[iface] = rule
-		})
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	timestamp, err := checkRFC3339Date(assert.headers, "timestamp")
-	if err != nil {
-		return nil, err
-	}
-
-	return &BaseDeclaration{
-		assertionBase: assert,
-		plugRules:     plugRules,
-		slotRules:     slotRules,
-		timestamp:     timestamp,
-	}, nil
-}
-
-var builtinBaseDeclaration *BaseDeclaration
-
-// BuiltinBaseDeclaration exposes the initialized builtin base-declaration assertion. This is used by overlord/assertstate, other code should use assertstate.BaseDeclaration.
-func BuiltinBaseDeclaration() *BaseDeclaration {
-	return builtinBaseDeclaration
-}
-
-var (
-	builtinBaseDeclarationCheckOrder      = []string{"type", "authority-id", "series"}
-	builtinBaseDeclarationExpectedHeaders = map[string]interface{}{
-		"type":         "base-declaration",
-		"authority-id": "canonical",
-		"series":       release.Series,
-	}
-)
-
-// InitBuiltinBaseDeclaration initializes the builtin base-declaration based on headers (or resets it if headers is nil).
-func InitBuiltinBaseDeclaration(headers []byte) error {
-	if headers == nil {
-		builtinBaseDeclaration = nil
-		return nil
-	}
-	trimmed := bytes.TrimSpace(headers)
-	h, err := parseHeaders(trimmed)
-	if err != nil {
-		return err
-	}
-	for _, name := range builtinBaseDeclarationCheckOrder {
-		expected := builtinBaseDeclarationExpectedHeaders[name]
-		if h[name] != expected {
-			return fmt.Errorf("the builtin base-declaration %q header is not set to expected value %q", name, expected)
-		}
-	}
-	revision, err := checkRevision(h)
-	if err != nil {
-		return fmt.Errorf("cannot assemble the builtin-base declaration: %v", err)
-	}
-	h["timestamp"] = time.Now().UTC().Format(time.RFC3339)
-	a, err := assembleBaseDeclaration(assertionBase{
-		headers:   h,
-		body:      nil,
-		revision:  revision,
-		content:   trimmed,
-		signature: []byte("$builtin"),
-	})
-	if err != nil {
-		return fmt.Errorf("cannot assemble the builtin base-declaration: %v", err)
-	}
-	builtinBaseDeclaration = a.(*BaseDeclaration)
-	return nil
 }
 
 type dateRange struct {
@@ -999,7 +994,7 @@ type dateRange struct {
 // snap-developer for the current publisher (the snap-declaration publisher-id)
 // is relevant to a device.
 type SnapDeveloper struct {
-	assertionBase
+	AssertionBase
 	developerRanges map[string][]*dateRange
 }
 
@@ -1013,7 +1008,8 @@ func (snapdev *SnapDeveloper) PublisherID() string {
 	return snapdev.HeaderString("publisher-id")
 }
 
-func (snapdev *SnapDeveloper) checkConsistency(db RODatabase, acck *AccountKey) error {
+// CheckConsistency performs further checks using the assertion database.
+func (snapdev *SnapDeveloper) CheckConsistency(db RODatabase, acck *AccountKey) error {
 	// Check authority is the publisher or trusted.
 	authorityID := snapdev.AuthorityID()
 	publisherID := snapdev.PublisherID()
@@ -1063,7 +1059,7 @@ func (snapdev *SnapDeveloper) checkConsistency(db RODatabase, acck *AccountKey) 
 }
 
 // expected interface is implemented
-var _ consistencyChecker = (*SnapDeveloper)(nil)
+var _ ConsistencyChecker = (*SnapDeveloper)(nil)
 
 // Prerequisites returns references to this snap-developer's prerequisite assertions.
 func (snapdev *SnapDeveloper) Prerequisites() []*Ref {
@@ -1086,24 +1082,24 @@ func (snapdev *SnapDeveloper) Prerequisites() []*Ref {
 	return refs
 }
 
-func assembleSnapDeveloper(assert assertionBase) (Assertion, error) {
+func assembleSnapDeveloper(assert AssertionBase) (Assertion, error) {
 	developerRanges, err := checkDevelopers(assert.headers)
 	if err != nil {
 		return nil, err
 	}
 
 	return &SnapDeveloper{
-		assertionBase:   assert,
+		AssertionBase:   assert,
 		developerRanges: developerRanges,
 	}, nil
 }
 
-func checkDevelopers(headers map[string]interface{}) (map[string][]*dateRange, error) {
+func checkDevelopers(headers map[string]any) (map[string][]*dateRange, error) {
 	value, ok := headers["developers"]
 	if !ok {
 		return nil, nil
 	}
-	developers, ok := value.([]interface{})
+	developers, ok := value.([]any)
 	if !ok {
 		return nil, fmt.Errorf(`"developers" must be a list of developer maps`)
 	}
@@ -1118,7 +1114,7 @@ func checkDevelopers(headers map[string]interface{}) (map[string][]*dateRange, e
 
 	developerRanges := make(map[string][]*dateRange)
 	for i, item := range developers {
-		developer, ok := item.(map[string]interface{})
+		developer, ok := item.(map[string]any)
 		if !ok {
 			return nil, fmt.Errorf(`"developers" must be a list of developer maps`)
 		}

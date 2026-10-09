@@ -26,6 +26,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/snapcore/snapd/snap/integrity"
 )
 
 // Container is the interface to interact with the low-level snap files.
@@ -76,6 +78,9 @@ type InstallOptions struct {
 	// an installation on ubuntu-data that does not depend or reference
 	// ubuntu-seed at all.
 	MustNotCrossDevices bool
+	// IntegrityDataParams contains optional integrity data that also need to be
+	// linked/copied over to the install location if set.
+	IntegrityDataParams *integrity.IntegrityDataParams
 }
 
 var (
@@ -221,7 +226,7 @@ func evalAndValidateSymlink(c Container, path string) (symlinkInfo, error) {
 }
 
 // ValidateComponentContainer does a minimal quick check on a snap component container.
-func ValidateComponentContainer(c Container, contName string, logf func(format string, v ...interface{})) error {
+func ValidateComponentContainer(c Container, contName string, logf func(format string, v ...any)) error {
 	needsrx := map[string]bool{
 		".":    true,
 		"meta": true,
@@ -235,7 +240,7 @@ func ValidateComponentContainer(c Container, contName string, logf func(format s
 }
 
 // ValidateSnapContainer does a minimal quick check on a snap container.
-func ValidateSnapContainer(c Container, s *Info, logf func(format string, v ...interface{})) error {
+func ValidateSnapContainer(c Container, s *Info, logf func(format string, v ...any)) error {
 	needsrx := map[string]bool{
 		".":    true,
 		"meta": true,
@@ -300,7 +305,7 @@ func ValidateSnapContainer(c Container, s *Info, logf func(format string, v ...i
 		}
 	}
 
-	return validateContainer(c, needsrx, needsx, needsr, needsf, noskipd, "snap", s.InstanceName(), logf)
+	return validateContainer(c, needsrx, needsx, needsr, needsf, noskipd, "snap", s.InstanceName().String(), logf)
 }
 
 // validateContainer validates data from a container. Arguments are the
@@ -313,12 +318,12 @@ func ValidateSnapContainer(c Container, s *Info, logf func(format string, v ...i
 // - noskipd tracks directories we want to descend into despite not being in needs*
 // The function also takes the type and name for the container (for logging
 // purposes) and a log function.
-func validateContainer(c Container, needsrx, needsx, needsr, needsf, noskipd map[string]bool, contType, name string, logf func(format string, v ...interface{})) error {
+func validateContainer(c Container, needsrx, needsx, needsr, needsf, noskipd map[string]bool, contType, name string, logf func(format string, v ...any)) error {
 	seen := make(map[string]bool, len(needsx)+len(needsrx)+len(needsr))
 
 	// bad modes are logged instead of being returned because the end user
 	// can do nothing with the info (and the developer can read the logs)
-	hasBadModes := false
+	var firstBadModeErr error
 	err := c.Walk(".", func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -342,7 +347,9 @@ func validateContainer(c Container, needsrx, needsx, needsr, needsf, noskipd map
 			symlinkInfo, err := evalAndValidateSymlink(c, path)
 			if err != nil {
 				logf("%s", err)
-				hasBadModes = true
+				if firstBadModeErr == nil {
+					firstBadModeErr = err
+				}
 			} else {
 				// use target mode for checks below
 				mode = symlinkInfo.targetMode
@@ -351,33 +358,48 @@ func validateContainer(c Container, needsrx, needsx, needsr, needsf, noskipd map
 
 		if mode.IsDir() {
 			if mode.Perm()&0555 != 0555 {
-				logf("in %s %q: %q should be world-readable and executable, and isn't: %s", contType, name, path, mode)
-				hasBadModes = true
+				err := fmt.Errorf("%q should be world-readable and executable, and isn't: %s", path, mode)
+				logf("in %s %q: %v", contType, name, err)
+				if firstBadModeErr == nil {
+					firstBadModeErr = err
+				}
 			}
 		} else {
 			if needsrx[path] {
 				if mode.Perm()&0555 != 0555 {
-					logf("in snap %q: %q should be world-readable and executable, and isn't: %s", name, path, mode)
-					hasBadModes = true
+					err := fmt.Errorf("%q should be world-readable and executable, and isn't: %s", path, mode)
+					logf("in snap %q: %v", name, err)
+					if firstBadModeErr == nil {
+						firstBadModeErr = err
+					}
 				}
 			}
 			// XXX: do we need to match other directories?
 			if needsf[path] || strings.HasPrefix(path, "meta/") {
 				if mode&(os.ModeNamedPipe|os.ModeSocket|os.ModeDevice) != 0 {
-					logf("in %s %q: %q should be a regular file (or a symlink) and isn't", contType, name, path)
-					hasBadModes = true
+					err := fmt.Errorf("%q should be a regular file (or a symlink) and isn't", path)
+					logf("in %s %q: %v", contType, name, err)
+					if firstBadModeErr == nil {
+						firstBadModeErr = err
+					}
 				}
 			}
 			if needsx[path] || strings.HasPrefix(path, "meta/hooks/") {
 				if mode.Perm()&0111 == 0 {
-					logf("in %s %q: %q should be executable, and isn't: %s", contType, name, path, mode)
-					hasBadModes = true
+					err := fmt.Errorf("%q should be executable, and isn't: %s", path, mode)
+					logf("in %s %q: %v", contType, name, err)
+					if firstBadModeErr == nil {
+						firstBadModeErr = err
+					}
 				}
 			} else {
 				// in needsr, or under meta but not a hook
 				if mode.Perm()&0444 != 0444 {
-					logf("in %s %q: %q should be world-readable, and isn't: %s", contType, name, path, mode)
-					hasBadModes = true
+					err := fmt.Errorf("%q should be world-readable, and isn't: %s", path, mode)
+					logf("in %s %q: %v", contType, name, err)
+					if firstBadModeErr == nil {
+						firstBadModeErr = err
+					}
 				}
 			}
 		}
@@ -387,18 +409,25 @@ func validateContainer(c Container, needsrx, needsx, needsr, needsf, noskipd map
 		return err
 	}
 	if len(seen) != len(needsx)+len(needsrx)+len(needsr) {
+		var firstPath string
 		for _, needs := range []map[string]bool{needsx, needsrx, needsr} {
 			for path := range needs {
 				if !seen[path] {
 					logf("in %s %q: path %q does not exist", contType, name, path)
+					if firstPath == "" {
+						firstPath = path
+					}
 				}
 			}
 		}
-		return ErrMissingPaths
+		// TODO: aggregate path errors not just the first one
+		return fmt.Errorf("%w: path %q does not exist", ErrMissingPaths, firstPath)
 	}
 
-	if hasBadModes {
-		return ErrBadModes
+	if firstBadModeErr != nil {
+		// TODO:GOVERSION: fmt.Errorf("%w: %w", ErrBadModes, firstBadModeErr) when using go 1.20+
+		// TODO: aggregate bad mode errors not just the first one
+		return fmt.Errorf("%w: %v", ErrBadModes, firstBadModeErr)
 	}
 	return nil
 }
@@ -423,8 +452,8 @@ func normPath(path string) string {
 		// not something inside the snap
 		return ""
 	}
-	if idx := strings.IndexByte(path, ' '); idx > -1 {
-		return path[:idx]
+	if before, _, ok := strings.Cut(path, " "); ok {
+		return before
 	}
 
 	return path

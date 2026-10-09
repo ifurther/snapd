@@ -40,6 +40,7 @@ import (
 	"github.com/snapcore/snapd/release"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/store"
+	"github.com/snapcore/snapd/store/storetest"
 	"github.com/snapcore/snapd/testutil"
 )
 
@@ -78,25 +79,31 @@ func (s *prereqSuite) SetUpTest(c *C) {
 	s.AddCleanup(restoreInstallSize)
 
 	restore := snapstate.MockEnforcedValidationSets(func(st *state.State, extraVss ...*asserts.ValidationSet) (*snapasserts.ValidationSets, error) {
-		return nil, nil
+		return snapasserts.NewValidationSets(), nil
 	})
 	s.AddCleanup(restore)
 
 	s.AddCleanup(osutil.MockMountInfo(``))
 
 	s.AddCleanup(snapstate.MockEnsuredMountsUpdated(s.snapmgr, true))
+
+	s.AddCleanup(snapstate.MockProcessDelayedSecurityBackendEffects(func(st *state.State, lanes []int, joinLane int) (ts *state.TaskSet) {
+		// only one snap is updated
+		c.Check(lanes, HasLen, 1)
+		return state.NewTaskSet(st.NewTask("process-delayed-security-backend-effects", "Process delayed backend effects"))
+	}))
+
 }
 
 func (s *prereqSuite) TestDoPrereqNothingToDo(c *C) {
 	s.state.Lock()
 
-	si1 := &snap.SideInfo{
-		RealName: "core",
-		Revision: snap.R(1),
-	}
-	snapstate.Set(s.state, "core", &snapstate.SnapState{
-		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{si1}),
-		Current:  si1.Revision,
+	// install snapd so that prerequisites handler won't try to install it
+	snapstate.Set(s.state, "snapd", &snapstate.SnapState{
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "snapd", Revision: snap.R(1)},
+		}),
+		Current: snap.R(1),
 	})
 
 	t := s.state.NewTask("prerequisites", "test")
@@ -105,6 +112,182 @@ func (s *prereqSuite) TestDoPrereqNothingToDo(c *C) {
 			RealName: "foo",
 			Revision: snap.R(33),
 		},
+		Base: "none",
+	})
+	s.state.NewChange("sample", "...").AddTask(t)
+	s.state.Unlock()
+
+	s.se.Ensure()
+	s.se.Wait()
+
+	s.state.Lock()
+	defer s.state.Unlock()
+	c.Assert(s.fakeBackend.ops, HasLen, 0)
+	c.Check(t.Status(), Equals, state.DoneStatus)
+}
+
+func (s *prereqSuite) TestPrereqTaskRetriesIfBaseIsBeingRemoved(c *C) {
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	rmChg := s.state.NewChange("remove-snap", "remove some-base")
+	blocker := s.state.NewTask("blocker", "keep removal in progress")
+	blocker.SetStatus(state.HoldStatus)
+	autoDisconnect := s.state.NewTask("auto-disconnect", "remove some-base connections")
+	autoDisconnect.Set("full-remove", true)
+	autoDisconnect.Set("snap-setup", &snapstate.SnapSetup{
+		SideInfo: &snap.SideInfo{RealName: "some-base", Revision: snap.R(1)},
+	})
+	autoDisconnect.WaitFor(blocker)
+	rmChg.AddTask(blocker)
+	rmChg.AddTask(autoDisconnect)
+
+	prereq := s.state.NewTask("prerequisites", "foo")
+	prereq.Set("snap-setup", &snapstate.SnapSetup{
+		SideInfo: &snap.SideInfo{RealName: "foo", Revision: snap.R(1)},
+		Base:     "some-base",
+		Type:     snap.TypeApp,
+	})
+	installChg := s.state.NewChange("install-snap", "install foo")
+	installChg.AddTask(prereq)
+
+	s.state.Unlock()
+	s.se.Ensure()
+	s.se.Wait()
+	s.state.Lock()
+
+	c.Check(prereq.Status(), Equals, state.DoingStatus)
+	c.Check(prereq.AtTime().IsZero(), Equals, false)
+
+	// mock the base removal finishing. The prereq task should unblock
+	rmChg.SetStatus(state.DoneStatus)
+	prereq.At(time.Now())
+
+	s.state.Unlock()
+	s.se.Ensure()
+	s.se.Wait()
+	s.state.Lock()
+
+	c.Check(prereq.Status(), Equals, state.DoneStatus)
+}
+
+func (s *prereqSuite) TestPrereqTaskRetriesIfKernelBaseIsBeingRemoved(c *C) {
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	rmChg := s.state.NewChange("remove-snap", "remove some-base")
+	blocker := s.state.NewTask("blocker", "keep removal in progress")
+	blocker.SetStatus(state.HoldStatus)
+	autoDisconnect := s.state.NewTask("auto-disconnect", "remove some-base connections")
+	autoDisconnect.Set("full-remove", true)
+	autoDisconnect.Set("snap-setup", &snapstate.SnapSetup{
+		SideInfo: &snap.SideInfo{RealName: "some-base", Revision: snap.R(1)},
+	})
+	autoDisconnect.WaitFor(blocker)
+	rmChg.AddTask(blocker)
+	rmChg.AddTask(autoDisconnect)
+
+	prereq := s.state.NewTask("prerequisites", "kernel")
+	prereq.Set("snap-setup", &snapstate.SnapSetup{
+		SideInfo: &snap.SideInfo{RealName: "kernel", Revision: snap.R(1)},
+		Base:     "some-base",
+		Type:     snap.TypeKernel,
+	})
+	chg := s.state.NewChange("install-snap", "install kernel")
+	chg.AddTask(prereq)
+
+	s.state.Unlock()
+	s.se.Ensure()
+	s.se.Wait()
+	s.state.Lock()
+
+	c.Check(prereq.Status(), Equals, state.DoingStatus)
+	c.Check(prereq.AtTime().IsZero(), Equals, false)
+}
+
+func (s *prereqSuite) TestPrereqTaskSkipsRetryIfKernelHasEmptyBase(c *C) {
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	rmChg := s.state.NewChange("remove-snap", "remove core")
+	autoDisconnect := s.state.NewTask("auto-disconnect", "remove core connections")
+	autoDisconnect.Set("full-remove", true)
+	autoDisconnect.Set("snap-setup", &snapstate.SnapSetup{
+		SideInfo: &snap.SideInfo{RealName: "core", Revision: snap.R(1)},
+	})
+	rmChg.AddTask(autoDisconnect)
+
+	prereq := s.state.NewTask("prerequisites", "kernel")
+	prereq.Set("snap-setup", &snapstate.SnapSetup{
+		SideInfo: &snap.SideInfo{RealName: "kernel", Revision: snap.R(1)},
+		Type:     snap.TypeKernel,
+		// no base set means there is no base, not "core" as default
+	})
+	chg := s.state.NewChange("install-snap", "install kernel")
+	chg.AddTask(prereq)
+
+	s.state.Unlock()
+	s.se.Ensure()
+	s.se.Wait()
+	s.state.Lock()
+
+	// so we don't retry
+	c.Check(prereq.Status(), Equals, state.DoneStatus)
+}
+
+func (s *prereqSuite) TestPrereqTaskFailsIfBaseRemovalIsInSameChange(c *C) {
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	blocker := s.state.NewTask("blocker", "keep removal in progress")
+	blocker.SetStatus(state.HoldStatus)
+	autoDisconnect := s.state.NewTask("auto-disconnect", "remove some-base connections")
+	autoDisconnect.Set("full-remove", true)
+	autoDisconnect.Set("snap-setup", &snapstate.SnapSetup{
+		SideInfo: &snap.SideInfo{RealName: "some-base", Revision: snap.R(1)},
+	})
+	autoDisconnect.WaitFor(blocker)
+
+	prereq := s.state.NewTask("prerequisites", "foo")
+	prereq.Set("snap-setup", &snapstate.SnapSetup{
+		SideInfo: &snap.SideInfo{RealName: "foo", Revision: snap.R(1)},
+		Base:     "some-base",
+		Type:     snap.TypeApp,
+	})
+
+	chg := s.state.NewChange("install-snap", "install foo and remove some-base")
+	chg.AddTask(blocker)
+	chg.AddTask(autoDisconnect)
+	chg.AddTask(prereq)
+
+	s.state.Unlock()
+	s.se.Ensure()
+	s.se.Wait()
+	s.state.Lock()
+
+	c.Check(chg.Err(), ErrorMatches, "(?s).*internal error: prerequisites task 3 cannot wait on auto-disconnect in same change.*")
+}
+
+func (s *prereqSuite) TestDoPrereqNothingToDoOnCore(c *C) {
+	restore := release.MockOnClassic(false)
+	defer restore()
+
+	s.state.Lock()
+
+	snapstate.Set(s.state, "core", &snapstate.SnapState{
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "core", Revision: snap.R(1)},
+		}),
+		Current: snap.R(1),
+	})
+
+	t := s.state.NewTask("prerequisites", "test")
+	t.Set("snap-setup", &snapstate.SnapSetup{
+		SideInfo: &snap.SideInfo{
+			RealName: "foo",
+			Revision: snap.R(33),
+		},
+		Base: "core",
 	})
 	s.state.NewChange("sample", "...").AddTask(t)
 	s.state.Unlock()
@@ -129,6 +312,8 @@ func (s *prereqSuite) TestDoPrereqWithBaseNone(c *C) {
 		},
 		Base:               "none",
 		PrereqContentAttrs: map[string][]string{"prereq1": {"some-content"}},
+		// set devmode to prove that prerequisites don't inherit these flags
+		Flags: snapstate.Flags{DevMode: true},
 	})
 	chg := s.state.NewChange("sample", "...")
 	chg.AddTask(t)
@@ -144,18 +329,21 @@ func (s *prereqSuite) TestDoPrereqWithBaseNone(c *C) {
 	// check that the do-prereq task added all needed prereqs
 	expectedLinkedSnaps := []string{"prereq1", "snapd"}
 	linkedSnaps := make([]string, 0, len(expectedLinkedSnaps))
-	lane := 0
+	var prereqLanes []int
 	for _, t := range chg.Tasks() {
 		if t.Kind() == "link-snap" {
 			snapsup, err := snapstate.TaskSnapSetup(t)
 			c.Assert(err, IsNil)
-			linkedSnaps = append(linkedSnaps, snapsup.InstanceName())
+			// prerequisites are installed with sanitized flags
+			c.Check(snapsup.DevMode, Equals, false)
+			linkedSnaps = append(linkedSnaps, snapsup.InstanceName().String())
 		} else if t.Kind() == "prerequisites" {
-			c.Assert(t.Lanes(), DeepEquals, []int{lane})
-			lane++
+			c.Assert(t.Lanes(), HasLen, 1)
+			prereqLanes = append(prereqLanes, t.Lanes()[0])
 		}
 	}
-	c.Assert(lane, Equals, 3)
+	// original prereq, early/sync prereqs for prereq1, early/sync prereqs for snapd.
+	c.Assert(prereqLanes, DeepEquals, []int{0, 1, 1, 2, 2})
 	c.Check(linkedSnaps, DeepEquals, expectedLinkedSnaps)
 }
 
@@ -198,7 +386,7 @@ func (s *prereqSuite) TestDoPrereqManyTransactional(c *C) {
 		if t.Kind() == "link-snap" {
 			snapsup, err := snapstate.TaskSnapSetup(t)
 			c.Assert(err, IsNil)
-			linkedSnaps = append(linkedSnaps, snapsup.InstanceName())
+			linkedSnaps = append(linkedSnaps, snapsup.InstanceName().String())
 		}
 	}
 	c.Check(linkedSnaps, testutil.DeepUnsortedMatches, expectedLinkedSnaps)
@@ -301,20 +489,93 @@ func (s *prereqSuite) TestDoPrereqTalksToStoreAndQueues(c *C) {
 			},
 			revno: snap.R(11),
 		},
+		{
+			op: "storesvc-snap-action",
+		},
+		{
+			op: "storesvc-snap-action:action",
+			action: store.SnapAction{
+				Action:       "install",
+				InstanceName: "snapd",
+				Channel:      "stable",
+			},
+			revno: snap.R(11),
+		},
 	})
 	c.Check(t.Status(), Equals, state.DoneStatus)
 
 	// check that the do-prereq task added all needed prereqs
-	expectedLinkedSnaps := []string{"prereq1", "prereq2", "some-base"}
+	expectedLinkedSnaps := []string{"prereq1", "prereq2", "some-base", "snapd"}
 	linkedSnaps := make([]string, 0, len(expectedLinkedSnaps))
 	for _, t := range chg.Tasks() {
 		if t.Kind() == "link-snap" {
 			snapsup, err := snapstate.TaskSnapSetup(t)
 			c.Assert(err, IsNil)
-			linkedSnaps = append(linkedSnaps, snapsup.InstanceName())
+			linkedSnaps = append(linkedSnaps, snapsup.InstanceName().String())
 		}
 	}
 	c.Check(linkedSnaps, testutil.DeepUnsortedMatches, expectedLinkedSnaps)
+}
+
+func (s *prereqSuite) TestDoPrereqSkipsSameChangeInFlightPrereq(c *C) {
+	s.runner.AddHandler("link-snap", func(task *state.Task, _ *tomb.Tomb) error {
+		st := task.State()
+		st.Lock()
+		defer st.Unlock()
+
+		snapsup, _ := snapstate.TaskSnapSetup(task)
+		var snapst snapstate.SnapState
+		snapstate.Get(st, snapsup.InstanceName().String(), &snapst)
+		snapst.Current = snapsup.Revision()
+		snapst.Sequence.Revisions = append(snapst.Sequence.Revisions, sequence.NewRevisionSideState(snapsup.SideInfo, nil))
+		snapstate.Set(st, snapsup.InstanceName().String(), &snapst)
+
+		return nil
+	}, nil)
+
+	s.state.Lock()
+	link := s.state.NewTask("link-snap", "Pretend prereq gets installed")
+	link.Set("snap-setup", &snapstate.SnapSetup{
+		SideInfo: &snap.SideInfo{
+			RealName: "some-prereq",
+			Revision: snap.R(11),
+		},
+	})
+
+	// install snapd so that prerequisites handler won't try to install it
+	snapstate.Set(s.state, "snapd", &snapstate.SnapState{
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "snapd", Revision: snap.R(1)},
+		}),
+		Current: snap.R(1),
+	})
+
+	// pretend foo gets installed and needs some-prereq, which is in progress
+	prereq := s.state.NewTask("prerequisites", "foo")
+	prereq.Set("snap-setup", &snapstate.SnapSetup{
+		SideInfo: &snap.SideInfo{
+			RealName: "foo",
+		},
+		Base:               "none",
+		PrereqContentAttrs: map[string][]string{"some-prereq": nil},
+	})
+	link.WaitFor(prereq)
+
+	chg := s.state.NewChange("sample", "...")
+	chg.AddTask(prereq)
+	chg.AddTask(link)
+	s.state.Unlock()
+
+	s.se.Ensure()
+	s.se.Wait()
+
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	c.Check(prereq.Status(), Equals, state.DoneStatus)
+	c.Check(prereq.AtTime().IsZero(), Equals, true)
+	c.Check(link.Status(), Equals, state.DoStatus)
+	c.Check(chg.Status(), Equals, state.DoStatus)
 }
 
 func (s *prereqSuite) TestDoPrereqRetryWhenBaseInFlight(c *C) {
@@ -341,10 +602,10 @@ func (s *prereqSuite) TestDoPrereqRetryWhenBaseInFlight(c *C) {
 
 			snapsup, _ := snapstate.TaskSnapSetup(task)
 			var snapst snapstate.SnapState
-			snapstate.Get(st, snapsup.InstanceName(), &snapst)
+			snapstate.Get(st, snapsup.InstanceName().String(), &snapst)
 			snapst.Current = snapsup.Revision()
 			snapst.Sequence.Revisions = append(snapst.Sequence.Revisions, sequence.NewRevisionSideState(snapsup.SideInfo, nil))
-			snapstate.Set(st, snapsup.InstanceName(), &snapst)
+			snapstate.Set(st, snapsup.InstanceName().String(), &snapst)
 
 			// check that prerequisites task is not done yet, it must wait for core.
 			// This check guarantees that prerequisites task found link-snap snap
@@ -362,6 +623,14 @@ func (s *prereqSuite) TestDoPrereqRetryWhenBaseInFlight(c *C) {
 		},
 	})
 
+	// install snapd so that prerequisites handler won't try to install it
+	snapstate.Set(s.state, "snapd", &snapstate.SnapState{
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "snapd", Revision: snap.R(1)},
+		}),
+		Current: snap.R(1),
+	})
+
 	// pretend foo gets installed and needs core (which is in progress)
 	prereqTask = s.state.NewTask("prerequisites", "foo")
 	prereqTask.Set("snap-setup", &snapstate.SnapSetup{
@@ -369,6 +638,9 @@ func (s *prereqSuite) TestDoPrereqRetryWhenBaseInFlight(c *C) {
 			RealName: "foo",
 		},
 	})
+	// mark this as the prerequisites synchronization task so same-change
+	// required prerequisites are retried
+	prereqTask.Set("prerequisites-sync", true)
 
 	chg := s.state.NewChange("sample", "...")
 	chg.AddTask(prereqTask)
@@ -402,6 +674,436 @@ func (s *prereqSuite) TestDoPrereqRetryWhenBaseInFlight(c *C) {
 	c.Check(chg.Status(), Equals, state.DoneStatus)
 }
 
+func (s *prereqSuite) TestDoPrereqRetryWhenPrereqInstallInAnotherChange(c *C) {
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	// keep the other change's link-snap pending
+	blocker := s.state.NewTask("blocker", "block prereq1 link task")
+	link := s.state.NewTask("link-snap", "pretend prereq1 gets installed")
+	link.Set("snap-setup", &snapstate.SnapSetup{
+		SideInfo: &snap.SideInfo{
+			RealName: "prereq1",
+			Revision: snap.R(11),
+		},
+	})
+	link.WaitFor(blocker)
+
+	// install snapd so that prerequisites handler won't try to install it
+	snapstate.Set(s.state, "snapd", &snapstate.SnapState{
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "snapd", Revision: snap.R(1)},
+		}),
+		Current: snap.R(1),
+	})
+
+	prereq := s.state.NewTask("prerequisites", "foo")
+	prereq.Set("snap-setup", &snapstate.SnapSetup{
+		SideInfo: &snap.SideInfo{
+			RealName: "foo",
+		},
+		Base:               "none",
+		PrereqContentAttrs: map[string][]string{"prereq1": nil},
+	})
+
+	linkChg := s.state.NewChange("install", "install prereq1")
+	linkChg.AddTask(blocker)
+	linkChg.AddTask(link)
+
+	prereqChg := s.state.NewChange("install", "install foo")
+	prereqChg.AddTask(prereq)
+
+	s.state.Unlock()
+	defer s.state.Lock()
+
+	s.se.Ensure()
+	s.se.Wait()
+
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	// doing + scheduled at-time means the handler returned state.Retry
+	c.Check(prereq.Status(), Equals, state.DoingStatus)
+	c.Check(prereq.AtTime().IsZero(), Equals, false)
+}
+
+func (s *prereqSuite) TestDoPrereqSyncFailsForMissingBase(c *C) {
+	s.state.Lock()
+	defer s.state.Unlock()
+	snapstate.Set(s.state, "snapd", &snapstate.SnapState{
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "snapd", Revision: snap.R(1)},
+		}),
+		Current: snap.R(1),
+	})
+
+	setup := s.state.NewTask("download-snap", "foo setup")
+	setup.Set("snap-setup", &snapstate.SnapSetup{
+		SideInfo: &snap.SideInfo{
+			RealName: "foo",
+		},
+		Base: "core18",
+	})
+	setup.SetStatus(state.DoneStatus)
+
+	prereq := s.state.NewTask("prerequisites", "foo prerequisites synchronization")
+	prereq.Set("snap-setup-task", setup.ID())
+	prereq.Set("prerequisites-sync", true)
+
+	chg := s.state.NewChange("sample", "...")
+	chg.AddTask(setup)
+	chg.AddTask(prereq)
+
+	s.state.Unlock()
+	s.se.Ensure()
+	s.se.Wait()
+	s.se.Ensure()
+	s.se.Wait()
+	s.state.Lock()
+
+	c.Check(chg.Status(), Equals, state.ErrorStatus)
+	c.Check(chg.Err(), ErrorMatches, `(?s).*cannot install snap base "core18": prerequisite "core18" is not available during prerequisites synchronization.*`)
+	c.Check(s.fakeBackend.ops.Count("storesvc-snap-action:action"), Equals, 0)
+}
+
+func (s *prereqSuite) TestDoPrereqSyncDoesNotFailForMissingContentProviderUpdate(c *C) {
+	snapstate.AutoAliases = func(*state.State, *snap.Info) (map[string]string, error) {
+		return nil, nil
+	}
+	s.AddCleanup(func() { snapstate.AutoAliases = nil })
+
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	mockInstalledSnap(c, s.state, `name: some-snap`, false)
+	snapstate.Set(s.state, "snapd", &snapstate.SnapState{
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "snapd", Revision: snap.R(1)},
+		}),
+		Current: snap.R(1),
+	})
+
+	setup := s.state.NewTask("download-snap", "foo setup")
+	setup.Set("snap-setup", &snapstate.SnapSetup{
+		SideInfo: &snap.SideInfo{
+			RealName: "foo",
+		},
+		Base:               "none",
+		PrereqContentAttrs: map[string][]string{"some-snap": {"this-does-not-match"}},
+	})
+	setup.SetStatus(state.DoneStatus)
+
+	prereq := s.state.NewTask("prerequisites", "foo prerequisites synchronization")
+	prereq.Set("snap-setup-task", setup.ID())
+	prereq.Set("prerequisites-sync", true)
+
+	chg := s.state.NewChange("sample", "...")
+	chg.AddTask(setup)
+	chg.AddTask(prereq)
+
+	s.state.Unlock()
+	s.se.Ensure()
+	s.se.Wait()
+	s.se.Ensure()
+	s.se.Wait()
+	s.state.Lock()
+
+	c.Check(chg.Status(), Equals, state.DoneStatus)
+	c.Check(chg.Err(), IsNil)
+	c.Check(s.fakeBackend.ops.Count("storesvc-snap-action:action"), Equals, 0)
+}
+
+func (s *prereqSuite) TestDoPrereqSyncDoesNotFailForMissingContentProviderInstall(c *C) {
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	snapstate.Set(s.state, "snapd", &snapstate.SnapState{
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "snapd", Revision: snap.R(1)},
+		}),
+		Current: snap.R(1),
+	})
+
+	setup := s.state.NewTask("download-snap", "foo setup")
+	setup.Set("snap-setup", &snapstate.SnapSetup{
+		SideInfo: &snap.SideInfo{
+			RealName: "foo",
+		},
+		Base:               "none",
+		PrereqContentAttrs: map[string][]string{"some-snap": {"some-content"}},
+	})
+	setup.SetStatus(state.DoneStatus)
+
+	prereq := s.state.NewTask("prerequisites", "foo prerequisites synchronization")
+	prereq.Set("snap-setup-task", setup.ID())
+	prereq.Set("prerequisites-sync", true)
+
+	chg := s.state.NewChange("sample", "...")
+	chg.AddTask(setup)
+	chg.AddTask(prereq)
+
+	s.state.Unlock()
+	s.se.Ensure()
+	s.se.Wait()
+	s.se.Ensure()
+	s.se.Wait()
+	s.state.Lock()
+
+	c.Check(chg.Status(), Equals, state.DoneStatus)
+	c.Check(chg.Err(), IsNil)
+	c.Check(s.fakeBackend.ops.Count("storesvc-snap-action:action"), Equals, 0)
+}
+
+func (s *prereqSuite) TestDoPrereqRetryWhenDifferentLaneWaitsOnBaseInFlight(c *C) {
+	restore := snapstate.MockPrerequisitesRetryTimeout(1 * time.Millisecond)
+	defer restore()
+
+	var prereqTask *state.Task
+
+	calls := 0
+	s.runner.AddHandler("link-snap",
+		func(task *state.Task, _ *tomb.Tomb) error {
+			st := task.State()
+			st.Lock()
+			defer st.Unlock()
+
+			calls += 1
+			if calls == 1 {
+				// retry again later, this forces taskrunner
+				// to pick prequisites task.
+				return &state.Retry{After: 1 * time.Millisecond}
+			}
+
+			// setup everything as if the snap is installed
+			snapsup, _ := snapstate.TaskSnapSetup(task)
+			var snapst snapstate.SnapState
+			snapstate.Get(st, snapsup.InstanceName().String(), &snapst)
+			snapst.Current = snapsup.Revision()
+			snapst.Sequence.Revisions = append(snapst.Sequence.Revisions, sequence.NewRevisionSideState(snapsup.SideInfo, nil))
+			snapstate.Set(st, snapsup.InstanceName().String(), &snapst)
+
+			// prerequisites must still retry when only another lane for the same
+			// snap is already waiting on the base link-snap.
+			c.Check(prereqTask.Status(), Equals, state.DoingStatus)
+
+			return nil
+		}, nil)
+	s.runner.AddHandler("test-task", func(task *state.Task, _ *tomb.Tomb) error {
+		return nil
+	}, nil)
+
+	s.state.Lock()
+	tBase := s.state.NewTask("link-snap", "Pretend core18 gets installed")
+	tBase.Set("snap-setup", &snapstate.SnapSetup{
+		SideInfo: &snap.SideInfo{
+			RealName: "core18",
+			Revision: snap.R(11),
+		},
+		Type: snap.TypeBase,
+	})
+
+	// install snapd so that prerequisites handler won't try to install it
+	snapstate.Set(s.state, "snapd", &snapstate.SnapState{
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "snapd", Revision: snap.R(1)},
+		}),
+		Current: snap.R(1),
+	})
+
+	prereqTask = s.state.NewTask("prerequisites", "foo")
+	prereqTask.Set("snap-setup", &snapstate.SnapSetup{
+		SideInfo: &snap.SideInfo{
+			RealName: "foo",
+		},
+		Base: "core18",
+	})
+	// mark this as the prerequisites synchronization task so same-change
+	// required prerequisites are retried
+	prereqTask.Set("prerequisites-sync", true)
+	prereqTask.JoinLane(s.state.NewLane())
+
+	// this task belongs to the same snap and waits on the base link-snap, but
+	// it is in a different lane from prerequisites, so we do not expect to
+	// consider it evidence that the snap and base tasks are already properly
+	// ordered.
+	differentLaneTask := s.state.NewTask("test-task", "foo later task")
+	differentLaneTask.Set("snap-setup", &snapstate.SnapSetup{
+		SideInfo: &snap.SideInfo{
+			RealName: "foo",
+		},
+	})
+	differentLaneTask.JoinLane(s.state.NewLane())
+	differentLaneTask.WaitFor(tBase)
+
+	chg := s.state.NewChange("sample", "...")
+	chg.AddTask(prereqTask)
+	chg.AddTask(tBase)
+	chg.AddTask(differentLaneTask)
+
+	for i := 0; i < 500; i++ {
+		time.Sleep(1 * time.Millisecond)
+		s.state.Unlock()
+		s.se.Ensure()
+		s.se.Wait()
+		s.state.Lock()
+		if prereqTask.Status() == state.DoneStatus {
+			break
+		}
+	}
+
+	c.Check(calls, Equals, 2)
+	c.Check(tBase.Status(), Equals, state.DoneStatus)
+	c.Check(prereqTask.Status(), Equals, state.DoneStatus)
+	s.state.Unlock()
+}
+
+func (s *prereqSuite) TestDoPrereqFailWhenCircularDependencyDetected(c *C) {
+	s.runner.AddHandler("link-snap",
+		func(task *state.Task, _ *tomb.Tomb) error {
+			st := task.State()
+			st.Lock()
+			defer st.Unlock()
+
+			// setup everything as if the snap is installed
+
+			snapsup, _ := snapstate.TaskSnapSetup(task)
+			var snapst snapstate.SnapState
+			snapstate.Get(st, snapsup.InstanceName().String(), &snapst)
+			snapst.Current = snapsup.Revision()
+			snapst.Sequence.Revisions = append(snapst.Sequence.Revisions, sequence.NewRevisionSideState(snapsup.SideInfo, nil))
+			snapstate.Set(st, snapsup.InstanceName().String(), &snapst)
+
+			return nil
+		}, nil)
+
+	s.state.Lock()
+
+	// these tasks will help us create the circular dependency
+	blocker := s.state.NewTask("blocker", "...")
+	waiter := s.state.NewTask("waiter", "...")
+	waiter.WaitFor(blocker)
+
+	link := s.state.NewTask("link-snap", "Pretend core gets installed")
+	link.Set("snap-setup", &snapstate.SnapSetup{
+		SideInfo: &snap.SideInfo{
+			RealName: "core",
+			Revision: snap.R(11),
+		},
+	})
+	link.WaitFor(waiter)
+
+	// install snapd so that prerequisites handler won't try to install it
+	snapstate.Set(s.state, "snapd", &snapstate.SnapState{
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "snapd", Revision: snap.R(1)},
+		}),
+		Current: snap.R(1),
+	})
+
+	// pretend foo gets installed and needs core (which is in progress)
+	prereqs := s.state.NewTask("prerequisites", "foo")
+	prereqs.Set("snap-setup", &snapstate.SnapSetup{
+		SideInfo: &snap.SideInfo{
+			RealName: "foo",
+		},
+	})
+	// mark this as the prerequisites synchronization task so circular waits are
+	// still detected
+	prereqs.Set("prerequisites-sync", true)
+
+	// prereqs waits on link, out of band.
+	// link waits on waiter, which waits on blocker.
+	// blocker waits on prereqs.
+	//
+	// thus, link waits on prereqs and prereqs waits on link.
+	blocker.WaitFor(prereqs)
+
+	chg := s.state.NewChange("sample", "...")
+	chg.AddTask(prereqs)
+	chg.AddTask(link)
+
+	s.state.Unlock()
+	s.se.Ensure()
+	s.se.Wait()
+	s.state.Lock()
+
+	// we should pick up on this circular dependency and fail if we detect it
+	c.Check(chg.Err(), ErrorMatches, fmt.Sprintf(
+		"(?s).*prerequisites task cannot wait on task %[1]q because task %[1]q is waiting on the prerequisites task.*",
+		link.ID(),
+	))
+}
+
+func (s *prereqSuite) TestDoPrereqNoRetryWhenBaseInFlightDuringRemodel(c *C) {
+	restore := snapstate.MockPrerequisitesRetryTimeout(1 * time.Millisecond)
+	defer restore()
+
+	s.runner.AddHandler("link-snap", func(task *state.Task, _ *tomb.Tomb) error {
+		st := task.State()
+		st.Lock()
+		defer st.Unlock()
+
+		snapsup, err := snapstate.TaskSnapSetup(task)
+		c.Assert(err, IsNil)
+		fmt.Println(snapsup.InstanceName())
+
+		return nil
+	}, nil)
+
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	restore = snapstatetest.MockDeviceContext(&snapstatetest.TrivialDeviceContext{
+		Remodeling: true,
+	})
+	defer restore()
+
+	// make it look like core is already installed
+	snapstate.Set(s.state, "core", &snapstate.SnapState{
+		Active: true,
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "core", Revision: snap.R(1)},
+		}),
+		Current:  snap.R(1),
+		SnapType: "os",
+	})
+
+	// pretend foo gets installed and needs core (which we will make it look
+	// like the install is in progress)
+	prereqTask := s.state.NewTask("prerequisites", "foo")
+	prereqTask.Set("snap-setup", &snapstate.SnapSetup{
+		SideInfo: &snap.SideInfo{
+			RealName: "foo",
+		},
+	})
+
+	tCore := s.state.NewTask("link-snap", "Pretend core gets installed")
+	tCore.Set("snap-setup", &snapstate.SnapSetup{
+		SideInfo: &snap.SideInfo{
+			RealName: "core",
+			Revision: snap.R(11),
+		},
+	})
+
+	// this makes sure that the prereq task runs first, but the link-snap task
+	// for core will be found by the prereq task handler
+	tCore.WaitFor(prereqTask)
+
+	chg := s.state.NewChange("sample", "...")
+	chg.AddTask(prereqTask)
+	chg.AddTask(tCore)
+
+	s.state.Unlock()
+	s.se.Ensure()
+	s.se.Wait()
+	s.state.Lock()
+
+	// prereq task is done, but the core task isn't done. this means that we
+	// didn't wait for the core task to finish, since we are remodeling
+	c.Check(prereqTask.Status(), Equals, state.DoneStatus)
+	c.Check(tCore.Status(), Equals, state.DoStatus)
+}
+
 func (s *prereqSuite) TestDoPrereqChannelEnvvars(c *C) {
 	os.Setenv("SNAPD_BASES_CHANNEL", "edge")
 	defer os.Unsetenv("SNAPD_BASES_CHANNEL")
@@ -409,10 +1111,11 @@ func (s *prereqSuite) TestDoPrereqChannelEnvvars(c *C) {
 	defer os.Unsetenv("SNAPD_PREREQS_CHANNEL")
 	s.state.Lock()
 
-	snapstate.Set(s.state, "core", &snapstate.SnapState{
+	// install snapd so that prerequisites handler won't try to install it
+	snapstate.Set(s.state, "snapd", &snapstate.SnapState{
 		Active: true,
 		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
-			{RealName: "core", Revision: snap.R(1)},
+			{RealName: "snapd", Revision: snap.R(1)},
 		}),
 		Current:  snap.R(1),
 		SnapType: "os",
@@ -531,7 +1234,10 @@ func (s *prereqSuite) TestDoPrereqNothingToDoForSnapdSnap(c *C) {
 	s.state.Unlock()
 }
 
-func (s *prereqSuite) TestDoPrereqCore16wCoreNothingToDo(c *C) {
+func (s *prereqSuite) TestDoPrereqCore16WithCoreNothingToDoOnCore(c *C) {
+	restore := release.MockOnClassic(false)
+	defer restore()
+
 	s.state.Lock()
 
 	si1 := &snap.SideInfo{
@@ -563,12 +1269,8 @@ func (s *prereqSuite) TestDoPrereqCore16wCoreNothingToDo(c *C) {
 	c.Check(t.Status(), Equals, state.DoneStatus)
 }
 
-func (s *prereqSuite) testDoPrereqNoCorePullsInSnaps(c *C, base string) {
-	restore := release.MockOnClassic(true)
-	defer restore()
-
+func (s *prereqSuite) testDoPrereqBasePullsInSnapd(c *C, base string) {
 	s.state.Lock()
-
 	t := s.state.NewTask("prerequisites", "test")
 	t.Set("snap-setup", &snapstate.SnapSetup{
 		SideInfo: &snap.SideInfo{
@@ -616,16 +1318,32 @@ func (s *prereqSuite) testDoPrereqNoCorePullsInSnaps(c *C, base string) {
 	c.Check(t.Status(), Equals, state.DoneStatus)
 }
 
-func (s *prereqSuite) TestDoPrereqCore16noCore(c *C) {
-	s.testDoPrereqNoCorePullsInSnaps(c, "core16")
+func (s *prereqSuite) TestDoPrereqCorePullsInSnapd(c *C) {
+	s.testDoPrereqBasePullsInSnapd(c, "core")
 }
 
-func (s *prereqSuite) TestDoPrereqCore18NoCorePullsInSnapd(c *C) {
-	s.testDoPrereqNoCorePullsInSnaps(c, "core18")
+func (s *prereqSuite) TestDoPrereqCore16PullsInSnapd(c *C) {
+	s.testDoPrereqBasePullsInSnapd(c, "core16")
 }
 
-func (s *prereqSuite) TestDoPrereqOtherBaseNoCorePullsInSnapd(c *C) {
-	s.testDoPrereqNoCorePullsInSnaps(c, "some-base")
+func (s *prereqSuite) TestDoPrereqCore18PullsInSnapd(c *C) {
+	s.testDoPrereqBasePullsInSnapd(c, "core18")
+}
+
+func (s *prereqSuite) TestDoPrereqCore20PullsInSnapd(c *C) {
+	s.testDoPrereqBasePullsInSnapd(c, "core20")
+}
+
+func (s *prereqSuite) TestDoPrereqCore22PullsInSnapd(c *C) {
+	s.testDoPrereqBasePullsInSnapd(c, "core22")
+}
+
+func (s *prereqSuite) TestDoPrereqCore24PullsInSnapd(c *C) {
+	s.testDoPrereqBasePullsInSnapd(c, "core24")
+}
+
+func (s *prereqSuite) TestDoPrereqOtherBasePullsInSnapd(c *C) {
+	s.testDoPrereqBasePullsInSnapd(c, "other-base")
 }
 
 func (s *prereqSuite) TestDoPrereqBaseIsNotBase(c *C) {
@@ -781,6 +1499,64 @@ func (s *prereqSuite) TestPreReqContentAttrsNotSatisfied(c *C) {
 	c.Check(chg.Tasks()[0].Kind(), Equals, "prerequisites")
 	c.Check(chg.Tasks()[0].Status(), Equals, state.DoneStatus)
 	c.Check(chg.Tasks()[0].Log(), HasLen, 0)
+
+	// TODO: this check is here to verify that we're disabling rerefreshes when
+	// updating prereqs. should be removed when we change that behavior.
+	for _, t := range chg.Tasks() {
+		c.Assert(t.Kind(), Not(Equals), "check-rerefresh")
+	}
+}
+
+func (s *prereqSuite) TestPreReqContentAttrsRefreshKeepsTrackedChannel(c *C) {
+	snapstate.AutoAliases = func(*state.State, *snap.Info) (map[string]string, error) {
+		return nil, nil
+	}
+	s.AddCleanup(func() { snapstate.AutoAliases = nil })
+
+	st := s.state
+	st.Lock()
+
+	mockInstalledSnap(c, st, `name: some-snap`, false)
+
+	var snapst snapstate.SnapState
+	c.Assert(snapstate.Get(st, "some-snap", &snapst), IsNil)
+	snapst.TrackingChannel = "latest/edge"
+	snapstate.Set(st, "some-snap", &snapst)
+
+	snapstate.Set(st, "snapd", &snapstate.SnapState{
+		Active: true,
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "snapd", Revision: snap.R(1)},
+		}),
+		Current:  snap.R(1),
+		SnapType: "snapd",
+	})
+
+	t := st.NewTask("prerequisites", "test")
+	t.Set("snap-setup", &snapstate.SnapSetup{
+		SideInfo: &snap.SideInfo{
+			RealName: "foo",
+			Revision: snap.R(33),
+		},
+		Base:               "none",
+		PrereqContentAttrs: map[string][]string{"some-snap": {"this-does-not-match"}},
+	})
+	chg := st.NewChange("sample", "...")
+	chg.AddTask(t)
+	st.Unlock()
+
+	s.se.Ensure()
+	s.se.Wait()
+
+	st.Lock()
+	defer st.Unlock()
+
+	c.Assert(chg.Err(), IsNil)
+	c.Assert(s.fakeBackend.ops.Count("storesvc-snap-action:action"), Equals, 1)
+	op := s.fakeBackend.ops.MustFindOp(c, "storesvc-snap-action:action")
+	c.Check(op.action.InstanceName, Equals, "some-snap")
+	c.Check(op.action.Action, Equals, "refresh")
+	c.Check(op.action.Channel, Equals, "latest/edge")
 }
 
 func (s *prereqSuite) TestPreReqContentAttrsNotSatisfiedSeeding(c *C) {
@@ -833,20 +1609,16 @@ func (s *prereqSuite) TestDoPrereqSkipDuringRemodel(c *C) {
 	s.state.Lock()
 
 	restore := snapstatetest.MockDeviceContext(&snapstatetest.TrivialDeviceContext{
-		Remodeling: true,
+		DeviceModel: MakeModel20("gadget", nil),
+		Remodeling:  true,
 	})
 	defer restore()
 
-	// install snapd so that prerequisites handler won't try to install it
-	snapstate.Set(s.state, "snapd", &snapstate.SnapState{
-		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
-			{
-				RealName: "snapd",
-				Revision: snap.R(1),
-			},
-		}),
-		Current: snap.R(1),
-	})
+	// replace the store here so we can force an error if we actually call
+	// InstallWithDeviceContext. if we do not do this, and we fail to properly
+	// handle the remodel case, InstallWithDeviceContext will return a
+	// ChangeConflictError, which is then ignored, making this test invalid
+	snapstate.ReplaceStore(s.state, storetest.Store{})
 
 	prereqTask := s.state.NewTask("prerequisites", "test")
 	prereqTask.Set("snap-setup", &snapstate.SnapSetup{

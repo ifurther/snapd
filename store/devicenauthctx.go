@@ -38,11 +38,19 @@ type DeviceAndAuthContext interface {
 	StoreID(fallback string) (string, error)
 
 	DeviceSessionRequestParams(nonce string) (*DeviceSessionRequestParams, error)
-	ProxyStoreParams(defaultURL *url.URL) (proxyStoreID string, proxySroreURL *url.URL, err error)
+	// ProxyStoreParams returns the parameters of a proxy store. If one is set
+	// up in the system, the returned URL points to the proxy store and its ID
+	// is non-empty. Otherwise returns the fallback defaultURL.
+	ProxyStoreParams(defaultURL *url.URL) (proxyStoreID string, proxyStoreURL *url.URL, err error)
 
+	// CloudInfo returns details about the cloud the current system is running
+	// in. Returns nil if no evidence of cloud was found at runtime.
 	CloudInfo() (*auth.CloudInfo, error)
 
 	StoreOffline() (bool, error)
+
+	// WithSnapStoreDelta returns whether snap store delta format experimental flag is set or not.
+	WithSnapStoreDelta() bool
 }
 
 // DeviceSessionRequestParams gathers the assertions and information to be sent to request a device session.

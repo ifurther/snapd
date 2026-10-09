@@ -1,3 +1,23 @@
+// -*- Mode: Go; indent-tabs-mode: t -*-
+//go:build linux
+
+/*
+ * Copyright (C) 2020-2024 Canonical Ltd
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 3 as
+ * published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ */
+
 package snapdtool_test
 
 import (
@@ -102,7 +122,7 @@ func benchmarkCSRE(b *testing.B, data string) {
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		snapdtool.SystemSnapSupportsReExec(tempdir)
+		snapdtool.CandidateVersionNewer(tempdir)
 	}
 }
 
@@ -112,6 +132,6 @@ func BenchmarkCSRE_fakeHuge(b *testing.B) { benchmarkCSRE(b, dataHuge) }
 
 func BenchmarkCSRE_real(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		snapdtool.SystemSnapSupportsReExec("/snap/core/current")
+		snapdtool.CandidateVersionNewer("/snap/core/current")
 	}
 }

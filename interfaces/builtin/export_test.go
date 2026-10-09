@@ -25,8 +25,10 @@ import (
 	. "gopkg.in/check.v1"
 
 	"github.com/snapcore/snapd/interfaces"
+	"github.com/snapcore/snapd/sandbox/apparmor"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/snap/snaptest"
+	"github.com/snapcore/snapd/testutil"
 )
 
 var (
@@ -34,13 +36,32 @@ var (
 	ResolveSpecialVariable      = resolveSpecialVariable
 	ImplicitSystemPermanentSlot = implicitSystemPermanentSlot
 	ImplicitSystemConnectedSlot = implicitSystemConnectedSlot
-	AareExclusivePatterns       = aareExclusivePatterns
-	GetDesktopFileRules         = getDesktopFileRules
 	StringListAttribute         = stringListAttribute
-	IsPathMountedWritable       = isPathMountedWritable
+
+	ErrParallelInstancesSystemPlug      = errParallelInstancesSystemPlug
+	ErrParallelInstancesSystemSlot      = errParallelInstancesSystemSlot
+	ErrParallelInstancesGadgetSlot      = errParallelInstancesGadgetSlot
+	ErrParallelInstancesSharedResources = errParallelInstancesSharedResources
 )
 
-func MprisGetName(iface interfaces.Interface, attribs map[string]interface{}) (string, error) {
+type GbmDriverLibsInterface gbmDriverLibsInterface
+
+func SymlinksUserIfaceFromGbmIface(iface interfaces.Interface) interfaces.SymlinksUser {
+	gbmIface := iface.(*gbmDriverLibsInterface)
+	return interfaces.SymlinksUser(gbmIface)
+}
+
+func SymlinksUserIfaceFromEglIface(iface interfaces.Interface) interfaces.SymlinksUser {
+	eglIface := iface.(*eglDriverLibsInterface)
+	return interfaces.SymlinksUser(eglIface)
+}
+
+func SymlinksUserIfaceFromVulkanIface(iface interfaces.Interface) interfaces.SymlinksUser {
+	vulkanIface := iface.(*vulkanDriverLibsInterface)
+	return interfaces.SymlinksUser(vulkanIface)
+}
+
+func MprisGetName(iface interfaces.Interface, attribs map[string]any) (string, error) {
 	return iface.(*mprisInterface).getName(attribs)
 }
 
@@ -82,28 +103,26 @@ func MockSlot(c *C, yaml string, si *snap.SideInfo, slotName string) *snap.SlotI
 
 func MockConnectedPlug(c *C, yaml string, si *snap.SideInfo, plugName string) (*interfaces.ConnectedPlug, *snap.PlugInfo) {
 	info := snaptest.MockInfo(c, yaml, si)
+
+	set, err := interfaces.NewSnapAppSet(info, nil)
+	c.Assert(err, IsNil)
+
 	if plugInfo, ok := info.Plugs[plugName]; ok {
-		return interfaces.NewConnectedPlug(plugInfo, nil, nil), plugInfo
+		return interfaces.NewConnectedPlug(plugInfo, set, nil, nil), plugInfo
 	}
 	panic(fmt.Sprintf("cannot find plug %q in snap %q", plugName, info.InstanceName()))
 }
 
 func MockConnectedSlot(c *C, yaml string, si *snap.SideInfo, slotName string) (*interfaces.ConnectedSlot, *snap.SlotInfo) {
 	info := snaptest.MockInfo(c, yaml, si)
+
+	set, err := interfaces.NewSnapAppSet(info, nil)
+	c.Assert(err, IsNil)
+
 	if slotInfo, ok := info.Slots[slotName]; ok {
-		return interfaces.NewConnectedSlot(slotInfo, nil, nil), slotInfo
+		return interfaces.NewConnectedSlot(slotInfo, set, nil, nil), slotInfo
 	}
 	panic(fmt.Sprintf("cannot find slot %q in snap %q", slotName, info.InstanceName()))
-}
-
-func MockOsGetenv(mock func(string) string) (restore func()) {
-	old := osGetenv
-	restore = func() {
-		osGetenv = old
-	}
-	osGetenv = mock
-
-	return restore
 }
 
 func MockProcCpuinfo(filename string) (restore func()) {
@@ -124,4 +143,24 @@ func MockDirsToEnsure(fn func(paths []string) ([]*interfaces.EnsureDirSpec, erro
 	dirsToEnsure = fn
 
 	return restore
+}
+
+func MockApparmorGenerateAAREExclusionPatterns(fn func(excludePatterns []string, opts *apparmor.AAREExclusionPatternsOptions) (string, error)) (restore func()) {
+	return testutil.Mock(&apparmorGenerateAAREExclusionPatterns, fn)
+}
+
+func MockDesktopFilesFromInstalledSnap(fn func(s *snap.Info) ([]string, error)) (restore func()) {
+	return testutil.Mock(&desktopFilesFromInstalledSnap, fn)
+}
+
+func MockGpioCheckConfigfsSupport(fn func() error) (restore func()) {
+	return testutil.Mock(&gpioCheckConfigfsSupport, fn)
+}
+
+func AllowedKernelMountOptions() []string {
+	return allowedKernelMountOptions
+}
+
+func MockSystemdNotifySocket(f func() (string, error)) (restore func()) {
+	return testutil.Mock(&systemdNotifySocket, f)
 }

@@ -20,13 +20,16 @@
 package builtin
 
 import (
+	"path/filepath"
 	"strings"
 
+	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/interfaces"
 	"github.com/snapcore/snapd/interfaces/apparmor"
 	"github.com/snapcore/snapd/interfaces/dbus"
 	"github.com/snapcore/snapd/interfaces/seccomp"
 	"github.com/snapcore/snapd/osutil"
+	"github.com/snapcore/snapd/release"
 	"github.com/snapcore/snapd/snap"
 )
 
@@ -100,7 +103,7 @@ dbus (send)
     bus=system
     path=/org/freedesktop/login1{,/**}
     interface=org.freedesktop.login1.Manager
-    member={CanPowerOff,CanSuspend,CanHibernate,CanHybridSleep,PowerOff,Suspend,Hibernate,HybridSleep,Inhibit}
+    member={CanPowerOff,CanSuspend,CanHibernate,CanSuspendThenHibernate,CanHybridSleep,PowerOff,Suspend,Hibernate,SuspendThenHybernate,HybridSleep,ListInhibitors,Inhibit}
     peer=(label=unconfined),
 `
 
@@ -224,7 +227,7 @@ func (iface *upowerObserveInterface) Name() string {
 func (iface *upowerObserveInterface) StaticInfo() interfaces.StaticInfo {
 	return interfaces.StaticInfo{
 		Summary:              upowerObserveSummary,
-		ImplicitOnCore:       osutil.IsExecutable("/usr/libexec/upowerd"),
+		ImplicitOnCore:       !release.OnClassic && osutil.IsExecutable(filepath.Join(dirs.GlobalRootDir, "/usr/libexec/upowerd")),
 		ImplicitOnClassic:    true,
 		BaseDeclarationSlots: upowerObserveBaseDeclarationSlots,
 	}
@@ -232,7 +235,7 @@ func (iface *upowerObserveInterface) StaticInfo() interfaces.StaticInfo {
 
 func (iface *upowerObserveInterface) AppArmorConnectedPlug(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	old := "###SLOT_SECURITY_TAGS###"
-	new := spec.SnapAppSet().SlotLabelExpression(slot)
+	new := slot.LabelExpression()
 	if implicitSystemConnectedSlot(slot) {
 		// Let confined apps access unconfined upower on classic
 		new = "unconfined"
@@ -265,7 +268,7 @@ func (iface *upowerObserveInterface) DBusPermanentSlot(spec *dbus.Specification,
 
 func (iface *upowerObserveInterface) AppArmorConnectedSlot(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	old := "###PLUG_SECURITY_TAGS###"
-	new := spec.SnapAppSet().PlugLabelExpression(plug)
+	new := plug.LabelExpression()
 	snippet := strings.Replace(upowerObserveConnectedSlotAppArmor, old, new, -1)
 	spec.AddSnippet(snippet)
 	return nil
@@ -274,6 +277,12 @@ func (iface *upowerObserveInterface) AppArmorConnectedSlot(spec *apparmor.Specif
 func (iface *upowerObserveInterface) AutoConnect(*snap.PlugInfo, *snap.SlotInfo) bool {
 	// allow what declarations allowed
 	return true
+}
+
+func (iface *upowerObserveInterface) ParallelInstancesSupportedForSlot(_ *snap.SlotInfo) error {
+	// UPower owns the well-known bus name org.freedesktop.UPower on the
+	// system bus; only one snap instance can hold it at a time.
+	return errParallelInstancesUniqueResourceOwner
 }
 
 func init() {

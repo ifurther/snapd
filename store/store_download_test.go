@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,18 +31,22 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/sha3"
+	"golang.org/x/sys/unix"
 	. "gopkg.in/check.v1"
 	"gopkg.in/retry.v1"
 
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/httputil"
+	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/overlord/auth"
 	"github.com/snapcore/snapd/progress"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/squashfs"
 	"github.com/snapcore/snapd/store"
 	"github.com/snapcore/snapd/testutil"
 )
@@ -54,6 +59,8 @@ type storeDownloadSuite struct {
 	localUser *auth.UserState
 
 	mockXDelta *testutil.MockCmd
+
+	logbuf *bytes.Buffer
 }
 
 var _ = Suite(&storeDownloadSuite{})
@@ -80,6 +87,18 @@ func (s *storeDownloadSuite) SetUpTest(c *C) {
 			Factor:  1,
 		},
 	)))
+
+	buf, restore := logger.MockLogger()
+	s.AddCleanup(restore)
+	s.logbuf = buf
+}
+
+func (s *storeDownloadSuite) TearDownTest(c *C) {
+	if s.logbuf.Len() != 0 {
+		c.Logf("logs:\n%s", s.logbuf.String())
+	}
+
+	s.BaseTest.TearDownTest(c)
 }
 
 func (s *storeDownloadSuite) TestDownloadOK(c *C) {
@@ -105,7 +124,7 @@ func (s *storeDownloadSuite) TestDownloadOK(c *C) {
 	c.Assert(path, testutil.FileEquals, expectedContent)
 }
 
-func (s *storeDownloadSuite) TestDownloadRangeRequest(c *C) {
+func (s *storeDownloadSuite) TestDownloadRangeRequestNon0Partial(c *C) {
 	partialContentStr := "partial content "
 	missingContentStr := "was downloaded"
 	expectedContentStr := partialContentStr + missingContentStr
@@ -126,6 +145,34 @@ func (s *storeDownloadSuite) TestDownloadRangeRequest(c *C) {
 
 	targetFn := filepath.Join(c.MkDir(), "foo_1.0_all.snap")
 	err := os.WriteFile(targetFn+".partial", []byte(partialContentStr), 0644)
+	c.Assert(err, IsNil)
+
+	err = s.store.Download(s.ctx, "foo", targetFn, &snap.DownloadInfo, nil, nil, nil)
+	c.Assert(err, IsNil)
+
+	c.Assert(targetFn, testutil.FileEquals, expectedContentStr)
+}
+
+func (s *storeDownloadSuite) TestDownloadRangeRequest0Partial(c *C) {
+	expectedContentStr := "partial content was downloaded"
+
+	restore := store.MockDownload(func(ctx context.Context, name, sha3, url string, user *auth.UserState, s *store.Store, w io.ReadWriteSeeker, resume int64, pbar progress.Meter, dlOpts *store.DownloadOptions) error {
+		c.Check(resume, Equals, int64(0)) // full download
+		c.Check(url, Equals, "URL")
+		w.Write([]byte(expectedContentStr))
+		return nil
+	})
+	defer restore()
+
+	snap := &snap.Info{}
+	snap.RealName = "foo"
+	snap.DownloadURL = "URL"
+	snap.Sha3_384 = "abcdabcd"
+	snap.Size = int64(len(expectedContentStr))
+
+	targetFn := filepath.Join(c.MkDir(), "foo_1.0_all.snap")
+	// 0-sized partial download
+	err := os.WriteFile(targetFn+".partial", nil, 0644)
 	c.Assert(err, IsNil)
 
 	err = s.store.Download(s.ctx, "foo", targetFn, &snap.DownloadInfo, nil, nil, nil)
@@ -520,11 +567,11 @@ func (s *storeDownloadSuite) TestDownloadSyncFails(c *C) {
 }
 
 var downloadDeltaTests = []struct {
-	info        snap.DownloadInfo
-	withUser    bool
-	format      string
-	expectedURL string
-	expectError bool
+	info             snap.DownloadInfo
+	withUser         bool
+	supportedFormats []string
+	expectedURL      string
+	expectError      bool
 }{{
 	// No user delta download.
 	info: snap.DownloadInfo{
@@ -533,9 +580,9 @@ var downloadDeltaTests = []struct {
 			{DownloadURL: "delta-url", Format: "xdelta3", FromRevision: 24, ToRevision: 26},
 		},
 	},
-	format:      "xdelta3",
-	expectedURL: "delta-url",
-	expectError: false,
+	supportedFormats: []string{"xdelta3"},
+	expectedURL:      "delta-url",
+	expectError:      false,
 }, {
 	// With user detla download.
 	info: snap.DownloadInfo{
@@ -544,23 +591,21 @@ var downloadDeltaTests = []struct {
 			{DownloadURL: "delta-url", Format: "xdelta3", FromRevision: 24, ToRevision: 26},
 		},
 	},
-	withUser:    true,
-	format:      "xdelta3",
-	expectedURL: "delta-url",
-	expectError: false,
+	withUser:         true,
+	supportedFormats: []string{"xdelta3"},
+	expectedURL:      "delta-url",
+	expectError:      false,
 }, {
-	// An error is returned if more than one matching delta is returned by the store,
-	// though this may be handled in the future.
 	info: snap.DownloadInfo{
 		Sha3_384: "sha3",
 		Deltas: []snap.DeltaInfo{
 			{DownloadURL: "xdelta3-delta-url", Format: "xdelta3", FromRevision: 24, ToRevision: 25},
-			{DownloadURL: "bsdiff-delta-url", Format: "xdelta3", FromRevision: 25, ToRevision: 26},
+			{DownloadURL: "bsdiff-delta-url", Format: "bsdiff", FromRevision: 24, ToRevision: 26},
 		},
 	},
-	format:      "xdelta3",
-	expectedURL: "",
-	expectError: true,
+	supportedFormats: []string{"bsdiff"},
+	expectedURL:      "bsdiff-delta-url",
+	expectError:      false,
 }, {
 	// If the supported format isn't available, an error is returned.
 	info: snap.DownloadInfo{
@@ -569,10 +614,35 @@ var downloadDeltaTests = []struct {
 			{DownloadURL: "xdelta3-delta-url", Format: "xdelta3", FromRevision: 24, ToRevision: 26},
 			{DownloadURL: "ydelta-delta-url", Format: "ydelta", FromRevision: 24, ToRevision: 26},
 		},
+		DownloadURL: "full-snap-url",
 	},
-	format:      "bsdiff",
-	expectedURL: "",
-	expectError: true,
+	supportedFormats: []string{"bsdiff"},
+	expectedURL:      "full-snap-url",
+	expectError:      true,
+}, {
+	// Order of supported formats is honored
+	info: snap.DownloadInfo{
+		Sha3_384: "sha3",
+		Deltas: []snap.DeltaInfo{
+			{DownloadURL: "xdelta3-delta-url", Format: "xdelta3", FromRevision: 24, ToRevision: 26},
+			{DownloadURL: "snap-delta-url", Format: "snap-1-1-xdelta3", FromRevision: 24, ToRevision: 26},
+		},
+	},
+	supportedFormats: []string{"snap-1-1-xdelta3", "xdelta3"},
+	expectedURL:      "snap-delta-url",
+	expectError:      false,
+}, {
+	// Order of supported formats is honored
+	info: snap.DownloadInfo{
+		Sha3_384: "sha3",
+		Deltas: []snap.DeltaInfo{
+			{DownloadURL: "xdelta3-delta-url", Format: "xdelta3", FromRevision: 24, ToRevision: 26},
+			{DownloadURL: "snap-delta-url", Format: "snap-1-1-xdelta3", FromRevision: 24, ToRevision: 26},
+		},
+	},
+	supportedFormats: []string{"xdelta3", "snap-1-1-xdelta3"},
+	expectedURL:      "xdelta3-delta-url",
+	expectError:      false,
 }}
 
 func (s *storeDownloadSuite) TestDownloadDelta(c *C) {
@@ -583,37 +653,73 @@ func (s *storeDownloadSuite) TestDownloadDelta(c *C) {
 	dauthCtx := &testDauthContext{c: c}
 	sto := store.New(nil, dauthCtx)
 
-	for _, testCase := range downloadDeltaTests {
-		sto.SetDeltaFormat(testCase.format)
-		restore := store.MockDownload(func(ctx context.Context, name, sha3, url string, user *auth.UserState, _ *store.Store, w io.ReadWriteSeeker, resume int64, pbar progress.Meter, dlOpts *store.DownloadOptions) error {
-			c.Check(dlOpts, DeepEquals, &store.DownloadOptions{Scheduled: true})
-			expectedUser := s.user
-			if !testCase.withUser {
-				expectedUser = nil
-			}
-			c.Check(user, Equals, expectedUser)
-			c.Check(url, Equals, testCase.expectedURL)
-			w.Write([]byte("I was downloaded"))
-			return nil
+	currentSnapName := fmt.Sprintf("%s_24.snap", "snapname")
+	currentSnapPath := filepath.Join(dirs.SnapBlobDir, currentSnapName)
+	err := os.MkdirAll(filepath.Dir(currentSnapPath), 0755)
+	c.Assert(err, IsNil)
+	err = os.WriteFile(currentSnapPath, nil, 0644)
+	c.Assert(err, IsNil)
+
+	for i, testCase := range downloadDeltaTests {
+		c.Log("tc:", i)
+		path := filepath.Join(dirs.GlobalRootDir, fmt.Sprintf("downloaded-file-%d", i))
+		defer os.Remove(path)
+
+		restore := store.MockSupportedDeltaFormats(func(squashfs.DeltaFormatOpts) []string {
+			return testCase.supportedFormats
 		})
 		defer restore()
+		restore = store.MockDownload(
+			func(ctx context.Context, name, sha3, url string, user *auth.UserState,
+				_ *store.Store, w io.ReadWriteSeeker, resume int64, pbar progress.Meter,
+				dlOpts *store.DownloadOptions,
+			) error {
+				c.Check(dlOpts, DeepEquals, &store.DownloadOptions{Scheduled: true})
+				expectedUser := s.user
+				if !testCase.withUser {
+					expectedUser = nil
+				}
+				c.Check(user, Equals, expectedUser)
+				// Checking the url checks that we have selected the right delta format
+				c.Check(url, Equals, testCase.expectedURL)
 
-		w, err := os.CreateTemp("", "")
-		c.Assert(err, IsNil)
-		defer os.Remove(w.Name())
+				if testCase.expectError {
+					// download is called for the full snap after we could not
+					// select a delta, error out as we are not testing that code
+					// path here
+					c.Check(name, Equals, "snapname")
+					return errors.New("won't download full snap")
+				}
+				c.Check(name, Equals, "snapname (delta)")
+				w.Write([]byte("delta content"))
+				return nil
+			})
+		defer restore()
+		restore = store.MockApplyDelta(
+			func(_ context.Context, _ *store.Store, name string, deltaPath string,
+				deltaInfo *snap.DeltaInfo, targetPath string, targetSha3_384 string,
+			) error {
+				c.Check(deltaPath, testutil.FileEquals, "delta content")
+				c.Check(targetPath, Equals, path)
+				err := os.WriteFile(targetPath, []byte("snap content via delta"), 0644)
+				c.Assert(err, IsNil)
+				return nil
+			})
+		defer restore()
 
 		authedUser := s.user
 		if !testCase.withUser {
 			authedUser = nil
 		}
 
-		err = sto.DownloadDelta("snapname", &testCase.info, w, nil, authedUser, &store.DownloadOptions{Scheduled: true})
+		err := sto.Download(context.Background(), "snapname", path, &testCase.info, nil,
+			authedUser, &store.DownloadOptions{Scheduled: true})
 
 		if testCase.expectError {
-			c.Assert(err, NotNil)
+			c.Assert(err, ErrorMatches, "won't download full snap")
 		} else {
 			c.Assert(err, IsNil)
-			c.Assert(w.Name(), testutil.FileEquals, "I was downloaded")
+			c.Assert(path, testutil.FileEquals, "snap content via delta")
 		}
 	}
 }
@@ -628,15 +734,15 @@ var applyDeltaTests = []struct {
 	currentRevision: 24,
 	error:           "",
 }, {
+	// A supported delta format can be applied.
+	deltaInfo:       snap.DeltaInfo{Format: "snap-1-1-xdelta3", FromRevision: 24, ToRevision: 26},
+	currentRevision: 24,
+	error:           "",
+}, {
 	// An error is returned if the expected current snap does not exist on disk.
 	deltaInfo:       snap.DeltaInfo{Format: "xdelta3", FromRevision: 24, ToRevision: 26},
 	currentRevision: 23,
 	error:           "snap \"foo\" revision 24 not found",
-}, {
-	// An error is returned if the format is not supported.
-	deltaInfo:       snap.DeltaInfo{Format: "nodelta", FromRevision: 24, ToRevision: 26},
-	currentRevision: 24,
-	error:           "cannot apply unsupported delta format \"nodelta\" (only xdelta3 currently)",
 }}
 
 func (s *storeDownloadSuite) TestApplyDelta(c *C) {
@@ -661,30 +767,28 @@ func (s *storeDownloadSuite) TestApplyDelta(c *C) {
 			c.Assert(err, IsNil)
 		}
 
-		// make a fresh store object to circumvent the caching of xdelta3 info
-		// between test cases
-		sto := &store.Store{}
-		err = store.ApplyDelta(sto, name, deltaPath, &testCase.deltaInfo, targetSnapPath, "")
+		// make a fresh store object
+		sto := store.New(nil, nil)
+		applyDeltaCalls := 0
+		restore := store.MockSquashfsApplyDelta(
+			func(ctx context.Context, sourceSnap, deltaFile, targetSnap string) error {
+				applyDeltaCalls++
+				c.Check(sourceSnap, Equals, currentSnapPath)
+				c.Check(deltaFile, Equals, deltaPath)
+				c.Check(targetSnap, Equals, targetSnapPath+".partial")
+				return nil
+			})
+		defer restore()
+
+		err = store.ApplyDelta(context.Background(), sto, name, deltaPath, &testCase.deltaInfo, targetSnapPath, "")
 
 		if testCase.error == "" {
 			c.Assert(err, IsNil)
-			c.Assert(s.mockXDelta.Calls(), DeepEquals, [][]string{
-				// since we don't cache xdelta3 in this test, we always check if
-				// xdelta3 config is successful before using xdelta3 (and at
-				// that point cache xdelta3 and don't call config again)
-				{"xdelta3", "config"},
-				{"xdelta3", "-d", "-s", currentSnapPath, deltaPath, targetSnapPath + ".partial"},
-			})
-			c.Assert(osutil.FileExists(targetSnapPath+".partial"), Equals, false)
-			st, err := os.Stat(targetSnapPath)
-			c.Assert(err, IsNil)
-			c.Check(st.Mode(), Equals, os.FileMode(0600))
-			c.Assert(os.Remove(targetSnapPath), IsNil)
+			c.Assert(applyDeltaCalls, Equals, 1)
 		} else {
 			c.Assert(err, NotNil)
 			c.Assert(err.Error()[0:len(testCase.error)], Equals, testCase.error)
-			c.Assert(osutil.FileExists(targetSnapPath+".partial"), Equals, false)
-			c.Assert(osutil.FileExists(targetSnapPath), Equals, false)
+			c.Assert(applyDeltaCalls, Equals, 0)
 		}
 		c.Assert(os.Remove(currentSnapPath), IsNil)
 		c.Assert(os.Remove(deltaPath), IsNil)
@@ -694,13 +798,44 @@ func (s *storeDownloadSuite) TestApplyDelta(c *C) {
 type cacheObserver struct {
 	inCache map[string]bool
 
-	gets []string
-	puts []string
+	gets  []string
+	puts  []string
+	drops []string
+
+	// list of errors to return on Put() to a specific key
+	putFailForKey map[string][]error
+	putErrHits    map[string]int
+
+	dropErr map[string]error
+
+	data map[string][]byte
+
+	cleanupCalls int
 }
 
 func (co *cacheObserver) Get(cacheKey, targetPath string) bool {
 	co.gets = append(co.gets, fmt.Sprintf("%s:%s", cacheKey, targetPath))
-	return co.inCache[cacheKey]
+	if co.inCache[cacheKey] {
+		// Simulate the real cache behavior of creating a hard link.
+		// If the target already exists, os.Link() would return EEXIST
+		// which the real cache silently ignores, returning true without
+		// overwriting.
+		if _, err := os.Lstat(targetPath); err == nil {
+			return true
+		}
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+			panic(fmt.Sprintf("cannot create directory: %v", err))
+		}
+		var data []byte
+		if co.data != nil {
+			data = co.data[cacheKey]
+		}
+		if err := os.WriteFile(targetPath, data, 0600); err != nil {
+			panic(fmt.Sprintf("cannot write file: %v", err))
+		}
+		return true
+	}
+	return false
 }
 
 func (co *cacheObserver) GetPath(cacheKey string) string {
@@ -709,11 +844,68 @@ func (co *cacheObserver) GetPath(cacheKey string) string {
 
 func (co *cacheObserver) Put(cacheKey, sourcePath string) error {
 	co.puts = append(co.puts, fmt.Sprintf("%s:%s", cacheKey, sourcePath))
+	if len(co.putFailForKey) != 0 {
+		if errs, ok := co.putFailForKey[cacheKey]; ok && len(errs) > 0 {
+			if co.putErrHits == nil {
+				co.putErrHits = map[string]int{}
+			}
+			co.putErrHits[cacheKey]++
+			// consume the error
+			co.putFailForKey[cacheKey] = errs[1:]
+			return errs[0]
+		}
+	}
+	co.inCache[cacheKey] = true
+	// Simulate real cache: store content for future Get() calls
+	data, err := os.ReadFile(sourcePath)
+	if err != nil {
+		panic(fmt.Sprintf("cacheObserver Put(): cannot read source %q: %v", sourcePath, err))
+	}
+	if co.data == nil {
+		co.data = make(map[string][]byte)
+	}
+	co.data[cacheKey] = data
 	return nil
 }
 
-func (s *storeDownloadSuite) TestDownloadCacheHit(c *C) {
-	obs := &cacheObserver{inCache: map[string]bool{"the-snaps-sha3_384": true}}
+func (co *cacheObserver) Drop(cacheKey string) error {
+	co.drops = append(co.drops, cacheKey)
+
+	if co.dropErr != nil {
+		return co.dropErr[cacheKey]
+	}
+	return nil
+}
+
+func (co *cacheObserver) Open(cacheKey string) (io.ReadSeekCloser, int64, error) {
+	if co.inCache[cacheKey] {
+		s := "content"
+
+		// strings.NewReader returns an *strings.Reader that implements io.{Reader,Seeker}
+		sr := strings.NewReader(s)
+
+		// io.NopCloser adds a no-op Close() method
+		var rsc io.ReadSeekCloser = struct {
+			*strings.Reader
+			io.Closer
+		}{sr, io.NopCloser(nil)}
+		return rsc, int64(len(s)), nil
+	}
+	return nil, 0, errors.New("not found in cache")
+}
+
+func (co *cacheObserver) Cleanup() error {
+	co.cleanupCalls++
+	return nil
+}
+
+func (s *storeDownloadSuite) TestDownloadCacheHitHappy(c *C) {
+	obs := &cacheObserver{
+		inCache: map[string]bool{"the-snaps-sha3_384": true},
+		data: map[string][]byte{
+			"the-snaps-sha3_384": []byte("happy-content"),
+		},
+	}
 	restore := s.store.MockCacher(obs)
 	defer restore()
 
@@ -723,15 +915,166 @@ func (s *storeDownloadSuite) TestDownloadCacheHit(c *C) {
 	})
 	defer restore()
 
-	snap := &snap.Info{}
-	snap.Sha3_384 = "the-snaps-sha3_384"
+	si := &snap.Info{}
+	si.Sha3_384 = "the-snaps-sha3_384"
+	// expected size is non-zero, so that we hit the non-download code path
+	si.DownloadInfo.Size = int64(len([]byte("happy-content")))
 
 	path := filepath.Join(c.MkDir(), "downloaded-file")
-	err := s.store.Download(s.ctx, "foo", path, &snap.DownloadInfo, nil, nil, nil)
+	err := s.store.Download(s.ctx, "foo", path, &si.DownloadInfo, nil, nil, nil)
 	c.Assert(err, IsNil)
 
-	c.Check(obs.gets, DeepEquals, []string{fmt.Sprintf("%s:%s", snap.Sha3_384, path)})
+	c.Check(obs.gets, DeepEquals, []string{fmt.Sprintf("%s:%s", si.Sha3_384, path)})
 	c.Check(obs.puts, IsNil)
+	c.Check(obs.drops, IsNil)
+	c.Check(obs.cleanupCalls, Equals, 0)
+}
+
+func (s *storeDownloadSuite) TestDownloadCacheHitNoSizeKnown(c *C) {
+	obs := &cacheObserver{
+		inCache: map[string]bool{"the-snaps-sha3_384": true},
+		data: map[string][]byte{
+			"the-snaps-sha3_384": []byte("happy-content"),
+		},
+	}
+	restore := s.store.MockCacher(obs)
+	defer restore()
+
+	restore = store.MockDownload(func(ctx context.Context, name, sha3, url string, user *auth.UserState, s *store.Store, w io.ReadWriteSeeker, resume int64, pbar progress.Meter, dlOpts *store.DownloadOptions) error {
+		c.Fatalf("download should not be called when results come from the cache")
+		return nil
+	})
+	defer restore()
+
+	si := &snap.Info{}
+	si.Sha3_384 = "the-snaps-sha3_384"
+	// download info has no size, so that we hit the size-mismatch path
+	si.DownloadInfo.Size = 0
+
+	path := filepath.Join(c.MkDir(), "downloaded-file")
+	err := s.store.Download(s.ctx, "foo", path, &si.DownloadInfo, nil, nil, nil)
+	c.Assert(err, IsNil)
+
+	c.Check(obs.gets, DeepEquals, []string{fmt.Sprintf("%s:%s", si.Sha3_384, path)})
+	c.Check(obs.puts, IsNil)
+	c.Check(obs.drops, IsNil)
+	c.Check(obs.cleanupCalls, Equals, 0)
+}
+
+func (s *storeDownloadSuite) TestDownloadCacheHitCorruptRedownloads(c *C) {
+	// Cache reports a hit but the file has size smaller than expected by store provided information.
+	obs := &cacheObserver{
+		inCache: map[string]bool{"the-snaps-sha3_384": true},
+		data:    map[string][]byte{"the-snaps-sha3_384": []byte("too-short")},
+	}
+	restore := s.store.MockCacher(obs)
+	defer restore()
+
+	downloadWasCalled := false
+	restore = store.MockDownload(func(ctx context.Context, name, sha3, url string, user *auth.UserState, s *store.Store, w io.ReadWriteSeeker, resume int64, pbar progress.Meter, dlOpts *store.DownloadOptions) error {
+		downloadWasCalled = true
+		return nil
+	})
+	defer restore()
+
+	si := &snap.Info{}
+	si.Sha3_384 = "the-snaps-sha3_384"
+	si.DownloadInfo.Size = 1024 // expected size is non-zero
+
+	path := filepath.Join(c.MkDir(), "downloaded-file")
+	err := s.store.Download(s.ctx, "foo", path, &si.DownloadInfo, nil, nil, nil)
+	c.Assert(err, IsNil)
+	c.Check(downloadWasCalled, Equals, true)
+
+	// The mock Get() writes mocked data, if any, to the target path. The file is
+	// shorter than the size reported by the store, so it's treated as corrupt and
+	// removed before re-downloading. Get() is called twice (initial + retry).
+	c.Check(obs.gets, DeepEquals, []string{
+		fmt.Sprintf("%s:%s", si.Sha3_384, path),
+		fmt.Sprintf("%s:%s", si.Sha3_384, path),
+	})
+	// The file is dropped.
+	c.Check(obs.drops, DeepEquals, []string{si.Sha3_384})
+}
+
+func (s *storeDownloadSuite) TestDownloadCacheHitCorruptRedownloads0Size(c *C) {
+	// Cache reports a hit but file has 0 size, and also the download info has
+	// no expected size information.
+	obs := &cacheObserver{
+		inCache: map[string]bool{"the-snaps-sha3_384": true},
+		data:    map[string][]byte{"the-snaps-sha3_384": nil},
+	}
+	restore := s.store.MockCacher(obs)
+	defer restore()
+
+	downloadWasCalled := false
+	restore = store.MockDownload(func(ctx context.Context, name, sha3, url string, user *auth.UserState, s *store.Store, w io.ReadWriteSeeker, resume int64, pbar progress.Meter, dlOpts *store.DownloadOptions) error {
+		downloadWasCalled = true
+		return nil
+	})
+	defer restore()
+
+	si := &snap.Info{}
+	si.Sha3_384 = "the-snaps-sha3_384"
+	si.DownloadInfo.Size = 0 // expected size is zero
+
+	path := filepath.Join(c.MkDir(), "downloaded-file")
+	err := s.store.Download(s.ctx, "foo", path, &si.DownloadInfo, nil, nil, nil)
+	c.Assert(err, IsNil)
+	c.Check(downloadWasCalled, Equals, true)
+
+	// The mock Get() creates a 0-byte file which lacking any additional hint on
+	// the expected size is clearly invalid. Get() is called twice (initial + retry).
+	c.Check(obs.gets, DeepEquals, []string{
+		fmt.Sprintf("%s:%s", si.Sha3_384, path),
+		fmt.Sprintf("%s:%s", si.Sha3_384, path),
+	})
+	// The file is dropped.
+	c.Check(obs.drops, DeepEquals, []string{si.Sha3_384})
+}
+
+func (s *storeDownloadSuite) TestDownloadCacheHitRecoveryFromPreexistingCorruptTarget(c *C) {
+	// A pre-existing corrupt (0-byte) file at targetPath causes the first
+	// Get() to return true without overwriting (simulating os.Link EEXIST).
+	// Download() detects the size mismatch, removes the target, retries
+	// Get() which now successfully writes the cached data, and recovery
+	// succeeds without re-downloading.
+	validData := []byte("valid-snap-data-1234567890")
+	obs := &cacheObserver{
+		inCache: map[string]bool{"the-snaps-sha3_384": true},
+		data:    map[string][]byte{"the-snaps-sha3_384": validData},
+	}
+	restore := s.store.MockCacher(obs)
+	defer restore()
+
+	restore = store.MockDownload(func(ctx context.Context, name, sha3, url string, user *auth.UserState, s *store.Store, w io.ReadWriteSeeker, resume int64, pbar progress.Meter, dlOpts *store.DownloadOptions) error {
+		// download not called, we recover from the cache
+		c.Fatalf("download should not be called when results come from the cache")
+		return nil
+	})
+	defer restore()
+
+	si := &snap.Info{}
+	si.Sha3_384 = "the-snaps-sha3_384"
+	si.DownloadInfo.Size = int64(len(validData))
+
+	path := filepath.Join(c.MkDir(), "downloaded-file")
+	// Create a pre-existing 0-byte file at targetPath to simulate a stale
+	// corrupt blob from a previous interrupted operation.
+	err := os.WriteFile(path, nil, 0600)
+	c.Assert(err, IsNil)
+
+	err = s.store.Download(s.ctx, "foo", path, &si.DownloadInfo, nil, nil, nil)
+	c.Assert(err, IsNil)
+
+	// Get() was called twice: first hit returns true but target is corrupt,
+	// second hit after removal writes valid data.
+	c.Check(obs.gets, DeepEquals, []string{
+		fmt.Sprintf("%s:%s", si.Sha3_384, path),
+		fmt.Sprintf("%s:%s", si.Sha3_384, path),
+	})
+	// No drops — the cache entry is valid.
+	c.Check(obs.drops, IsNil)
 }
 
 func (s *storeDownloadSuite) TestDownloadCacheMiss(c *C) {
@@ -756,6 +1099,181 @@ func (s *storeDownloadSuite) TestDownloadCacheMiss(c *C) {
 
 	c.Check(obs.gets, DeepEquals, []string{fmt.Sprintf("the-snaps-sha3_384:%s", path)})
 	c.Check(obs.puts, DeepEquals, []string{fmt.Sprintf("the-snaps-sha3_384:%s", path)})
+	c.Check(obs.drops, IsNil)
+}
+
+func (s *storeDownloadSuite) TestDownloadDeltaCacheMiss(c *C) {
+	obs := &cacheObserver{inCache: map[string]bool{}}
+	restore := s.store.MockCacher(obs)
+	defer restore()
+
+	var downloadURLs []string
+	restore = store.MockDownload(func(
+		ctx context.Context, name, sha3, url string, user *auth.UserState, s *store.Store,
+		w io.ReadWriteSeeker, resume int64, pbar progress.Meter, dlOpts *store.DownloadOptions,
+	) error {
+		c.Logf("url: %v -> %v", url, name)
+		downloadURLs = append(downloadURLs, url)
+
+		switch url {
+		case "http://delta.download.url/get":
+			// Must be magic xdelta3 number (0x00c4c3d6, little endian)
+			_, err := w.Write([]byte{0xd6, 0xc3, 0xc4, 00})
+			c.Assert(err, IsNil)
+			return err
+		}
+		panic(fmt.Sprintf("unexpected URL %v", url))
+	})
+	defer restore()
+
+	// mock a previous revision of the snap
+	oldRevBlob := filepath.Join(dirs.SnapBlobDir, "foo_0.snap")
+	c.Assert(os.MkdirAll(filepath.Dir(oldRevBlob), 0755), IsNil)
+	c.Assert(os.WriteFile(oldRevBlob, nil, 0644), IsNil)
+
+	// sha3-384256 of: foo\n
+	foo_sha3 := "a4d62fdfee48479a8951de809d9f3604309e8783d754d94c0842c89ddb544ee963bf64063644251e0521ca44aca97350"
+	snapInfo := &snap.Info{
+		SideInfo: snap.SideInfo{
+			Revision: snap.R(1),
+		},
+		DownloadInfo: snap.DownloadInfo{
+			DownloadURL: "http://download.url/get",
+			Deltas: []snap.DeltaInfo{
+				{
+					ToRevision:  1,
+					Format:      "xdelta3",
+					DownloadURL: "http://delta.download.url/get",
+					Sha3_384:    foo_sha3,
+				},
+			},
+			Sha3_384: foo_sha3,
+		},
+	}
+
+	downDir := c.MkDir()
+	path := filepath.Join(downDir, "downloaded-file")
+	pathDeltaPartial := filepath.Join(downDir, "downloaded-file.xdelta3-0-to-1.partial")
+
+	applyDeltaCalls := 0
+	restore = store.MockApplyDelta(func(_ context.Context, s *store.Store, name string, deltaPath string, deltaInfo *snap.DeltaInfo, targetPath string, targetSha3_384 string) error {
+		applyDeltaCalls++
+		c.Check(deltaPath, Equals, pathDeltaPartial)
+		// Simulate successful delta application by creating the target file
+		c.Assert(os.WriteFile(targetPath, []byte("rebuilt-snap"), 0600), IsNil)
+		return nil
+	})
+	defer restore()
+
+	err := s.store.Download(s.ctx, "foo", path, &snapInfo.DownloadInfo, nil, nil, nil)
+	c.Assert(err, IsNil)
+	c.Check(downloadURLs, DeepEquals, []string{"http://delta.download.url/get"})
+	c.Check(obs.gets, DeepEquals, []string{fmt.Sprintf("%s:%s", snapInfo.Sha3_384, path)})
+	c.Check(obs.puts, DeepEquals, []string{fmt.Sprintf("%s:%s", snapInfo.Sha3_384, path)})
+	c.Check(applyDeltaCalls, Equals, 1)
+
+	// subsequent download pulls the file from the cache
+	downloadURLs = nil
+	err = s.store.Download(s.ctx, "foo", path, &snapInfo.DownloadInfo, nil, nil, nil)
+	c.Assert(err, IsNil)
+	c.Check(downloadURLs, HasLen, 0)
+	c.Check(applyDeltaCalls, Equals, 1)
+
+	// we have another get
+	c.Check(obs.gets, DeepEquals, []string{
+		fmt.Sprintf("%s:%s", snapInfo.Sha3_384, path),
+		fmt.Sprintf("%s:%s", snapInfo.Sha3_384, path),
+	})
+	c.Check(obs.puts, DeepEquals, []string{fmt.Sprintf("%s:%s", snapInfo.Sha3_384, path)})
+	c.Check(obs.cleanupCalls, Equals, 0)
+	c.Check(obs.drops, IsNil)
+}
+
+func (s *storeDownloadSuite) TestDownloadDeltaRebuitlButCachePutFail(c *C) {
+	obs := &cacheObserver{inCache: map[string]bool{}}
+	restore := s.store.MockCacher(obs)
+	defer restore()
+
+	var downloadURLs []string
+	restore = store.MockDownload(func(
+		ctx context.Context, name, sha3, url string, user *auth.UserState, s *store.Store,
+		w io.ReadWriteSeeker, resume int64, pbar progress.Meter, dlOpts *store.DownloadOptions,
+	) error {
+		c.Logf("url: %v -> %v", url, name)
+		downloadURLs = append(downloadURLs, url)
+
+		switch url {
+		case "http://delta.download.url/get", "http://download.url/get":
+			// equivalent to `echo "foo"``
+			_, err := w.Write([]byte("foo\n"))
+			return err
+		}
+		panic(fmt.Sprintf("unexpected URL %v", url))
+	})
+	defer restore()
+
+	// mock xdelta to create an output file with a known checksum
+	applyDeltaCalls := 0
+	restore = store.MockApplyDelta(func(_ context.Context, s *store.Store, name string, deltaPath string, deltaInfo *snap.DeltaInfo, targetPath string, targetSha3_384 string) error {
+		applyDeltaCalls++
+		return os.WriteFile(targetPath, []byte("foo\n"), 0644)
+	})
+	defer restore()
+
+	// mock a previous revision of the snap
+	oldRevBlob := filepath.Join(dirs.SnapBlobDir, "foo_0.snap")
+	c.Assert(os.MkdirAll(filepath.Dir(oldRevBlob), 0755), IsNil)
+	c.Assert(os.WriteFile(oldRevBlob, nil, 0644), IsNil)
+
+	// sha3-384256 of: foo\n
+	foo_sha3 := "a4d62fdfee48479a8951de809d9f3604309e8783d754d94c0842c89ddb544ee963bf64063644251e0521ca44aca97350"
+	snap := &snap.Info{
+		SideInfo: snap.SideInfo{
+			Revision: snap.R(1),
+		},
+		DownloadInfo: snap.DownloadInfo{
+			DownloadURL: "http://download.url/get",
+			Deltas: []snap.DeltaInfo{
+				{
+					ToRevision:  1,
+					Format:      "xdelta3",
+					DownloadURL: "http://delta.download.url/get",
+					Sha3_384:    foo_sha3,
+				},
+			},
+			Sha3_384: foo_sha3,
+		},
+	}
+
+	downDir := c.MkDir()
+	path := filepath.Join(downDir, "downloaded-file")
+	// keys we use in cache observer when logging get/put
+	ckey := fmt.Sprintf("%s:%s", foo_sha3, path)
+	// make cache Put fail for the rebuilt file
+	obs.putFailForKey = map[string][]error{
+		// use actual key that store package uses
+		foo_sha3: {fmt.Errorf("mock error")},
+	}
+	err := s.store.Download(s.ctx, "foo", path, &snap.DownloadInfo, nil, nil, nil)
+	c.Assert(err, IsNil)
+	c.Check(downloadURLs, DeepEquals, []string{
+		// first download is delta
+		"http://delta.download.url/get",
+		// next download is the snap blob after falling back
+		"http://download.url/get",
+	})
+
+	c.Check(obs.puts, DeepEquals, []string{
+		// attempt after rebuilding from mockXDelta
+		ckey,
+		// attempt after successful download
+		ckey,
+	})
+	c.Check(obs.gets, DeepEquals, []string{ckey})
+	c.Check(obs.putErrHits, DeepEquals, map[string]int{
+		foo_sha3: 1,
+	})
+	c.Check(obs.cleanupCalls, Equals, 0)
 }
 
 func (s *storeDownloadSuite) TestDownloadStreamOK(c *C) {
@@ -806,7 +1324,7 @@ func (s *storeDownloadSuite) TestDownloadStreamCachedOK(c *C) {
 	c.Assert(os.MkdirAll(dirs.SnapDownloadCacheDir, 0700), IsNil)
 	c.Assert(os.WriteFile(filepath.Join(dirs.SnapDownloadCacheDir, "sha3_384-of-foo"), expectedContent, 0600), IsNil)
 
-	cache := store.NewCacheManager(dirs.SnapDownloadCacheDir, 1)
+	cache := store.NewCacheManager(dirs.SnapDownloadCacheDir, store.CachePolicy{MaxItems: 1})
 	defer s.store.MockCacher(cache)()
 
 	snap := &snap.Info{}
@@ -830,6 +1348,161 @@ func (s *storeDownloadSuite) TestDownloadStreamCachedOK(c *C) {
 	buf = new(bytes.Buffer)
 	buf.ReadFrom(stream)
 	c.Check(buf.String(), Equals, string(expectedContent[2:]))
+}
+
+func (s *storeDownloadSuite) TestDownloadBadCache(c *C) {
+	if os.Geteuid() == 0 {
+		c.Skip("test cannot be run by root")
+	}
+
+	expectedContent := []byte("I was downloaded")
+	restore := store.MockDoDownloadReq(func(ctx context.Context, url *url.URL, cdnHeader string, resume int64, s *store.Store, user *auth.UserState) (*http.Response, error) {
+		panic("unexpected call")
+	})
+	defer restore()
+
+	cache := store.NewCacheManager(dirs.SnapDownloadCacheDir, store.CachePolicy{MaxItems: 1})
+	defer s.store.MockCacher(cache)()
+
+	// mock something that OpenFile will fail on
+	c.Assert(os.MkdirAll(dirs.SnapDownloadCacheDir, 0700), IsNil)
+	c.Assert(os.WriteFile(filepath.Join(dirs.SnapDownloadCacheDir, "sha3_384-of-foo"), nil, 0000), IsNil)
+
+	snap := &snap.Info{}
+	snap.RealName = "foo"
+	snap.DownloadURL = "URL"
+	snap.Size = int64(len(expectedContent))
+	snap.Sha3_384 = "sha3_384-of-foo"
+
+	stream, status, err := s.store.DownloadStream(context.TODO(), "foo", &snap.DownloadInfo, 0, nil)
+	c.Assert(err, ErrorMatches, "open .*/sha3_384-of-foo: permission denied")
+	c.Check(status, Equals, 0)
+	c.Check(stream, IsNil)
+}
+
+func (s *storeDownloadSuite) TestDownloadCacheDropMocked(c *C) {
+	// sha3_384 of "content"
+	contentSha3 := "21e42a075b0d7bb6177c0eb3b3a1c8c6de6d4b4f902759eae5555e9cf3bebd21277a27102fd5426da989bde96c0cf848"
+	fakeSha3 := "fake-sha3"
+	obs := &cacheObserver{
+		inCache: map[string]bool{
+			contentSha3: true,
+			fakeSha3:    true,
+		},
+	}
+	defer s.store.MockCacher(obs)()
+
+	snapInCache := &snap.Info{}
+	snapInCache.RealName = "foo"
+	snapInCache.DownloadURL = "URL"
+	snapInCache.Size = int64(len("content"))
+	snapInCache.Sha3_384 = contentSha3
+	// Size and hash ok, do not drop
+	err := s.store.CleanupDownloadArtifacts("foo.snap", &snapInCache.DownloadInfo)
+	c.Assert(err, IsNil)
+	c.Check(obs.drops, IsNil)
+
+	// Size does not match, we drop
+	snapInCache.Size = int64(len("content")) + 1
+	obs.drops = nil
+	err = s.store.CleanupDownloadArtifacts("foo.snap", &snapInCache.DownloadInfo)
+	c.Assert(err, IsNil)
+	c.Check(obs.drops, DeepEquals, []string{contentSha3})
+
+	// Hash does not match, we drop
+	snapInCache.Size = int64(len("content"))
+	// This actually does not match "content", but it forces the hash check to fail
+	snapInCache.Sha3_384 = fakeSha3
+	obs.drops = nil
+	err = s.store.CleanupDownloadArtifacts("foo.snap", &snapInCache.DownloadInfo)
+	c.Assert(err, IsNil)
+	c.Check(obs.drops, DeepEquals, []string{fakeSha3})
+
+	// Error while dropping due to wrong size
+	snapInCache.Size = int64(len("content")) + 1
+	snapInCache.Sha3_384 = contentSha3
+	obs.dropErr = map[string]error{
+		contentSha3: errors.New("mock error"),
+	}
+	obs.drops = nil
+	err = s.store.CleanupDownloadArtifacts("foo.snap", &snapInCache.DownloadInfo)
+	c.Assert(err, ErrorMatches, "cannot drop cached download entry: cannot drop: mock error")
+	c.Check(obs.drops, DeepEquals, []string{contentSha3})
+
+	snapNotInCache := &snap.Info{}
+	snapNotInCache.RealName = "unhappy"
+	snapNotInCache.DownloadURL = "URL"
+	snapNotInCache.Size = 7
+	snapNotInCache.Sha3_384 = "sha3_384-of-unhappy"
+	obs.drops = nil
+
+	// Error, cannot open
+	err = s.store.CleanupDownloadArtifacts("unhappy.snap", &snapNotInCache.DownloadInfo)
+	c.Assert(err, ErrorMatches, "cannot drop cached download entry: cannot open: not found in cache")
+
+	c.Check(obs.drops, IsNil)
+}
+
+type fakeCacher struct {
+	getPathCalls []string
+}
+
+func (co *fakeCacher) Get(cacheKey, targetPath string) bool {
+	panic("unexpected call")
+}
+
+func (co *fakeCacher) GetPath(cacheKey string) string {
+	co.getPathCalls = append(co.getPathCalls, cacheKey)
+	return "not-found"
+}
+
+func (co *fakeCacher) Put(cacheKey, sourcePath string) error {
+	panic("unexpected call")
+}
+
+func (co *fakeCacher) Drop(cacheKey string) error {
+	panic("unexpected call")
+}
+
+func (co *fakeCacher) Open(cacheKey string) (io.ReadSeekCloser, int64, error) {
+	panic("unexpected call")
+}
+
+func (co *fakeCacher) Cleanup() error {
+	panic("unexpected call")
+}
+
+func (s *storeDownloadSuite) TestDownloadStreamGoneFromCache(c *C) {
+	expectedContent := []byte("I was downloaded")
+	restore := store.MockDoDownloadReq(func(ctx context.Context, url *url.URL, cdnHeader string, resume int64, s *store.Store, user *auth.UserState) (*http.Response, error) {
+		c.Check(url.String(), Equals, "URL")
+		r := &http.Response{
+			Body: io.NopCloser(bytes.NewReader(expectedContent[resume:])),
+		}
+
+		r.StatusCode = 200
+		return r, nil
+	})
+	defer restore()
+
+	fc := &fakeCacher{}
+	defer s.store.MockCacher(fc)()
+
+	snap := &snap.Info{}
+	snap.RealName = "foo"
+	snap.DownloadURL = "URL"
+	snap.Size = int64(len(expectedContent))
+	snap.Sha3_384 = "sha3_384-of-foo"
+
+	stream, status, err := s.store.DownloadStream(context.TODO(), "foo", &snap.DownloadInfo, 0, nil)
+	c.Assert(err, IsNil)
+	c.Assert(status, Equals, 200)
+
+	buf := new(bytes.Buffer)
+	buf.ReadFrom(stream)
+	c.Check(buf.String(), Equals, string(expectedContent))
+
+	c.Check(fc.getPathCalls, DeepEquals, []string{"sha3_384-of-foo"})
 }
 
 func (s *storeDownloadSuite) TestDownloadTimeout(c *C) {
@@ -1037,4 +1710,457 @@ func (s *storeDownloadSuite) TestDownloadInfiniteRedirect(c *C) {
 	targetFn := filepath.Join(c.MkDir(), "foo_1.0_all.snap")
 	err := s.store.Download(s.ctx, "foo", targetFn, &snap.DownloadInfo, nil, s.user, nil)
 	c.Assert(err, ErrorMatches, fmt.Sprintf("Get %q: stopped after 10 redirects", mockServer.URL))
+}
+
+func (s *storeDownloadSuite) TestDownloadSnapUsesProxy(c *C) {
+	// Verify store downloads use the configured proxy
+
+	theStore := store.New(&store.Config{
+		Proxy: func(r *http.Request) (*url.URL, error) {
+			c.Check(r.Method, Equals, "GET")
+			c.Check(r.URL.String(), Equals, "https://foo.internal/snap-now")
+			return nil, errors.New("mock proxy error")
+		},
+	}, nil)
+
+	snap := &snap.Info{}
+	snap.DownloadURL = "https://foo.internal/snap-now"
+
+	targetFn := filepath.Join(c.MkDir(), "foo_1.0_all.snap")
+	err := theStore.Download(s.ctx, "foo", targetFn, &snap.DownloadInfo, nil, s.user, nil)
+	c.Assert(err, ErrorMatches, ".* mock proxy error")
+}
+
+func (s *storeDownloadSuite) TestDownloadIconOK(c *C) {
+	const expectedName = "foo"
+	const expectedURL = "URL"
+	expectedContent := []byte("I was downloaded")
+
+	restore := store.MockDownloadIcon(func(ctx context.Context, name, etag, url string, sto *store.Store, w store.ReadWriteSeekTruncater) (string, error) {
+		c.Check(name, Equals, expectedName)
+		c.Check(url, Equals, expectedURL)
+		w.Write(expectedContent)
+		return "", nil
+	})
+	defer restore()
+
+	path := filepath.Join(c.MkDir(), "downloaded-file")
+	err := s.store.DownloadIcon(s.ctx, expectedName, path, expectedURL)
+	c.Assert(err, IsNil)
+
+	c.Assert(path, testutil.FileEquals, expectedContent)
+}
+
+func skipIfXattrsUnsupported(c *C) {
+	f, err := os.CreateTemp(c.MkDir(), "xattr-probe")
+	c.Assert(err, IsNil)
+	defer f.Close()
+	err = unix.Fsetxattr(int(f.Fd()), "user.xattr-probe", []byte("working"), 0)
+	if err != nil {
+		c.Skip("xattrs not supported on this system")
+	}
+}
+
+func (s *storeDownloadSuite) TestDownloadIconOKWithNewEtag(c *C) {
+	skipIfXattrsUnsupported(c)
+	const expectedName = "foo"
+	const expectedURL = "URL"
+	expectedContent := []byte("I was downloaded")
+	const newEtag = "some-unique-value"
+
+	restore := store.MockDownloadIcon(func(ctx context.Context, name, etag, url string, sto *store.Store, w store.ReadWriteSeekTruncater) (string, error) {
+		c.Check(name, Equals, expectedName)
+		c.Check(etag, Equals, "")
+		c.Check(url, Equals, expectedURL)
+		w.Write(expectedContent)
+		return newEtag, nil
+	})
+	defer restore()
+
+	path := filepath.Join(c.MkDir(), "downloaded-file")
+	err := s.store.DownloadIcon(s.ctx, expectedName, path, expectedURL)
+	c.Assert(err, IsNil)
+
+	c.Check(path, testutil.FileEquals, expectedContent)
+	etagBuf := make([]byte, 256)
+	size, err := unix.Getxattr(path, store.EtagXattrName, etagBuf)
+	c.Assert(err, IsNil)
+	writtenEtag := string(etagBuf[:size])
+	c.Check(writtenEtag, Equals, newEtag)
+}
+
+func (s *storeDownloadSuite) TestDownloadIconOKWithExistingEtag(c *C) {
+	skipIfXattrsUnsupported(c)
+	const expectedName = "foo"
+	const expectedURL = "URL"
+	existingContent := []byte("I was already here")
+	responseContent := []byte("I should not be written")
+	const existingEtag = "some-unique-value"
+	path := filepath.Join(c.MkDir(), "downloaded-file")
+
+	// Create existing file
+	c.Assert(os.WriteFile(path, existingContent, 0o644), IsNil)
+	// Set etag xattr
+	c.Assert(unix.Setxattr(path, store.EtagXattrName, []byte(existingEtag), 0), IsNil)
+
+	restore := store.MockDownloadIcon(func(ctx context.Context, name, etag, url string, sto *store.Store, w store.ReadWriteSeekTruncater) (string, error) {
+		c.Check(name, Equals, expectedName)
+		c.Check(etag, Equals, existingEtag)
+		c.Check(url, Equals, expectedURL)
+		w.Write(responseContent)
+		// Return errIconUnchanged, as if the store returned 304 Not Modified.
+		// Technically, a 304 would not write the response body, but do so to
+		// check that it is ignored and the existing file is left untouched.
+		return "", store.ErrIconUnchanged
+	})
+	defer restore()
+
+	err := s.store.DownloadIcon(s.ctx, expectedName, path, expectedURL)
+	c.Assert(err, IsNil)
+
+	// Existing file (and etag) should not have been overwritten
+	c.Check(path, testutil.FileEquals, existingContent)
+	etagBuf := make([]byte, 256)
+	size, err := unix.Getxattr(path, store.EtagXattrName, etagBuf)
+	c.Assert(err, IsNil)
+	writtenEtag := string(etagBuf[:size])
+	c.Check(writtenEtag, Equals, existingEtag)
+}
+
+func (s *storeDownloadSuite) TestDownloadIconOKWithChangedEtag(c *C) {
+	skipIfXattrsUnsupported(c)
+	const expectedName = "foo"
+	const expectedURL = "URL"
+	existingContent := []byte("I was already here")
+	expectedContent := []byte("I was downloaded")
+	const existingEtag = "some-unique-value"
+	const newEtag = "another-unique-value"
+	path := filepath.Join(c.MkDir(), "downloaded-file")
+
+	// Create existing file
+	c.Assert(os.WriteFile(path, existingContent, 0o644), IsNil)
+	// Set etag xattr
+	c.Assert(unix.Setxattr(path, store.EtagXattrName, []byte(existingEtag), 0), IsNil)
+
+	restore := store.MockDownloadIcon(func(ctx context.Context, name, etag, url string, sto *store.Store, w store.ReadWriteSeekTruncater) (string, error) {
+		c.Check(name, Equals, expectedName)
+		c.Check(etag, Equals, existingEtag)
+		c.Check(url, Equals, expectedURL)
+		w.Write(expectedContent)
+		return newEtag, nil
+	})
+	defer restore()
+
+	err := s.store.DownloadIcon(s.ctx, expectedName, path, expectedURL)
+	c.Assert(err, IsNil)
+
+	c.Check(path, testutil.FileEquals, expectedContent)
+	etagBuf := make([]byte, 256)
+	size, err := unix.Getxattr(path, store.EtagXattrName, etagBuf)
+	c.Assert(err, IsNil)
+	writtenEtag := string(etagBuf[:size])
+	c.Check(writtenEtag, Equals, newEtag)
+}
+
+func (s *storeDownloadSuite) TestDownloadIconOKWithEtagTooLong(c *C) {
+	skipIfXattrsUnsupported(c)
+	const expectedName = "foo"
+	const expectedURL = "URL"
+	existingContent := []byte("I was already here")
+	expectedContent := []byte("I was downloaded")
+	const existingEtag = "some-unique-value"
+	newEtag := strings.Repeat("a", store.MaxEtagSize+1) // too long
+	path := filepath.Join(c.MkDir(), "downloaded-file")
+
+	// Create existing file
+	c.Assert(os.WriteFile(path, existingContent, 0o644), IsNil)
+	// Set etag xattr
+	c.Assert(unix.Setxattr(path, store.EtagXattrName, []byte(existingEtag), 0), IsNil)
+
+	logbuf, restore := logger.MockDebugLogger()
+	defer restore()
+
+	restore = store.MockDownloadIcon(func(ctx context.Context, name, etag, url string, sto *store.Store, w store.ReadWriteSeekTruncater) (string, error) {
+		c.Check(name, Equals, expectedName)
+		c.Check(etag, Equals, existingEtag)
+		c.Check(url, Equals, expectedURL)
+		w.Write(expectedContent)
+		return newEtag, nil
+	})
+	defer restore()
+
+	err := s.store.DownloadIcon(s.ctx, expectedName, path, expectedURL)
+	c.Assert(err, IsNil)
+
+	c.Check(path, testutil.FileEquals, expectedContent)
+	// Etag exceeded max size, so no etag should have been written
+	etagBuf := make([]byte, 2*store.MaxEtagSize)
+	_, err = unix.Getxattr(path, store.EtagXattrName, etagBuf)
+	c.Check(err, testutil.ErrorIs, unix.ENODATA)
+	c.Check(logbuf.String(), testutil.Contains, "snap icon etag exceeds maximum etag length")
+}
+
+func (s *storeDownloadSuite) TestDownloadIconDoesNotOverwriteLinks(c *C) {
+	const expectedName = "foo"
+	const expectedURL = "URL"
+	oldContent := []byte("I was already here")
+	newContent := []byte("I was downloaded")
+
+	restore := store.MockDownloadIcon(func(ctx context.Context, name, etag, url string, sto *store.Store, w store.ReadWriteSeekTruncater) (string, error) {
+		c.Check(name, Equals, expectedName)
+		c.Check(etag, Equals, "")
+		c.Check(url, Equals, expectedURL)
+		w.Write(newContent)
+		return "", nil
+	})
+	defer restore()
+
+	path := filepath.Join(c.MkDir(), "downloaded-file")
+	linkPath := path + "-existing"
+
+	// Create an existing file at the path
+	err := os.MkdirAll(filepath.Dir(path), 0o755)
+	c.Assert(err, IsNil)
+	err = os.WriteFile(path, oldContent, 0o600)
+	c.Assert(err, IsNil)
+	// Create a hard link to the existing file
+	err = os.Link(path, linkPath)
+	c.Assert(err, IsNil)
+
+	err = s.store.DownloadIcon(s.ctx, expectedName, path, expectedURL)
+	c.Assert(err, IsNil)
+
+	c.Assert(path, testutil.FileEquals, newContent)
+	// Check that the contents of the existing hard-linked file were not overwritten
+	c.Assert(linkPath, testutil.FileEquals, oldContent)
+}
+
+func (s *storeDownloadSuite) TestDownloadIconFails(c *C) {
+	const fakeName = "foo"
+	fakePath := filepath.Join(c.MkDir(), "downloaded-file")
+	const fakeURL = "URL"
+
+	var tmpfile *osutil.AtomicFile
+	restore := store.MockDownloadIcon(func(ctx context.Context, name, etag, url string, sto *store.Store, w store.ReadWriteSeekTruncater) (string, error) {
+		c.Assert(name, Equals, fakeName)
+		c.Assert(url, Equals, fakeURL)
+		tmpfile = w.(*osutil.AtomicFile)
+		return "", fmt.Errorf("uh, it failed")
+	})
+	defer restore()
+
+	// simulate a failed download
+	err := s.store.DownloadIcon(s.ctx, fakeName, fakePath, fakeURL)
+	c.Assert(err, ErrorMatches, "uh, it failed")
+	// ... and ensure that the tempfile is removed
+	c.Assert(osutil.FileExists(tmpfile.Name()), Equals, false)
+	// ... and not because it succeeded either
+	c.Assert(osutil.FileExists(fakePath), Equals, false)
+}
+
+func (s *storeDownloadSuite) TestDownloadIconFailsDoesNotLeavePartial(c *C) {
+	const fakeName = "foo"
+	fakePath := filepath.Join(c.MkDir(), "downloaded-file")
+	const fakeURL = "URL"
+
+	var tmpfile *osutil.AtomicFile
+	restore := store.MockDownloadIcon(func(ctx context.Context, name, etag, url string, sto *store.Store, w store.ReadWriteSeekTruncater) (string, error) {
+		c.Assert(name, Equals, fakeName)
+		c.Assert(url, Equals, fakeURL)
+		tmpfile = w.(*osutil.AtomicFile)
+		w.Write([]byte{'X'}) // so it's not empty
+		return "", fmt.Errorf("uh, it failed")
+	})
+	defer restore()
+
+	// simulate a failed download
+	err := s.store.DownloadIcon(s.ctx, fakeName, fakePath, fakeURL)
+	c.Assert(err, ErrorMatches, "uh, it failed")
+	// ... and ensure that the tempfile is removed
+	c.Assert(osutil.FileExists(tmpfile.Name()), Equals, false)
+	// ... and the target path isn't there
+	c.Assert(osutil.FileExists(fakePath), Equals, false)
+}
+
+func (s *storeDownloadSuite) TestDownloadIconFailsWithExisting(c *C) {
+	const fakeName = "foo"
+	fakePath := filepath.Join(c.MkDir(), "downloaded-file")
+	const fakeURL = "URL"
+
+	// Create an existing file at the path
+	oldContent := []byte("I was already here")
+	err := os.MkdirAll(filepath.Dir(fakePath), 0o577)
+	c.Assert(err, IsNil)
+	err = os.WriteFile(fakePath, oldContent, 0o600)
+	c.Assert(err, IsNil)
+
+	s.testDownloadIconSyncFailsGeneric(c, fakeName, fakePath, fakeURL)
+
+	// Check that the existing file contents remain unchanged
+	c.Assert(fakePath, testutil.FileEquals, oldContent)
+}
+
+func (s *storeDownloadSuite) TestDownloadIconFailsWithoutExisting(c *C) {
+	const fakeName = "foo"
+	fakePath := filepath.Join(c.MkDir(), "downloaded-file")
+	const fakeURL = "URL"
+
+	s.testDownloadIconSyncFailsGeneric(c, fakeName, fakePath, fakeURL)
+
+	// Check that the file was not renamed to fakePath
+	c.Assert(osutil.FileExists(fakePath), Equals, false)
+}
+
+func (s *storeDownloadSuite) testDownloadIconSyncFailsGeneric(c *C, fakeName, fakePath, fakeURL string) {
+	var tmpfile *osutil.AtomicFile
+	restore := store.MockDownloadIcon(func(ctx context.Context, name, etag, url string, sto *store.Store, w store.ReadWriteSeekTruncater) (string, error) {
+		c.Assert(name, Equals, fakeName)
+		c.Assert(url, Equals, fakeURL)
+		tmpfile = w.(*osutil.AtomicFile)
+		w.Write([]byte("commit will fail"))
+		err := tmpfile.Close()
+		c.Assert(err, IsNil)
+		return "", nil
+	})
+	defer restore()
+
+	// simulate a failed sync
+	err := s.store.DownloadIcon(s.ctx, fakeName, fakePath, fakeURL)
+	c.Assert(err, ErrorMatches, "cannot commit snap icon file for snap foo: .* file already closed")
+	// ... and ensure that the tempfile is removed
+	c.Assert(osutil.FileExists(tmpfile.Name()), Equals, false)
+}
+
+func (s *storeDownloadSuite) TestDownloadIconInfiniteRedirect(c *C) {
+	n := 0
+	var mockServer *httptest.Server
+
+	mockServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// n = 0 -> initial request
+		// n = 10 -> max redirects
+		// n = 11 -> exceeded max redirects
+		c.Assert(n, testutil.IntNotEqual, 11)
+		n++
+		http.Redirect(w, r, mockServer.URL, 302)
+	}))
+	c.Assert(mockServer, NotNil)
+	defer mockServer.Close()
+
+	const fakeName = "foo"
+	fakePath := filepath.Join(c.MkDir(), "foo.icon")
+	fakeURL := mockServer.URL
+
+	err := s.store.DownloadIcon(s.ctx, fakeName, fakePath, fakeURL)
+	c.Assert(err, ErrorMatches, fmt.Sprintf("Get %q: stopped after 10 redirects", fakeURL))
+}
+
+func (s *storeDownloadSuite) TestDownloadIconProxyStoreUnsupported(c *C) {
+	// Using default store config & store proxy, download URL points to a URL
+	// **not** exposed through the proxy.
+
+	const expectedName = "foo"
+	expectedContent := []byte("I was downloaded")
+
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(expectedContent)
+	}))
+	c.Assert(mockServer, NotNil)
+	defer mockServer.Close()
+
+	mockServerURL, err := url.Parse(mockServer.URL)
+	c.Assert(err, IsNil)
+	device := createTestDevice()
+	configURL, err := url.Parse("http://foo.internal")
+	c.Assert(err, IsNil)
+	theStore := store.New(
+		&store.Config{
+			StoreBaseURL: configURL,
+		},
+		&testDauthContext{
+			c: c, device: device,
+			proxyStoreID: "my-proxy", proxyStoreURL: mockServerURL,
+		},
+	)
+
+	path := filepath.Join(c.MkDir(), "downloaded-file")
+	err = theStore.DownloadIcon(s.ctx, expectedName, path, "http://bar.internal/my/icon")
+	c.Assert(err, Equals, store.ErrProxyStoreIconDownloadUnsupported)
+
+	c.Assert(path, testutil.FileAbsent)
+}
+
+func (s *storeDownloadSuite) TestDownloadIconProxyStoreSameAsBase(c *C) {
+	// Using default store config & store proxy, download URL points to an
+	// address exposed through the proxy.
+
+	const expectedName = "foo"
+	expectedContent := []byte("I was downloaded")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/my/icon", func(w http.ResponseWriter, r *http.Request) {
+		w.Write(expectedContent)
+	})
+	mockServer := httptest.NewServer(mux)
+	c.Assert(mockServer, NotNil)
+	defer mockServer.Close()
+
+	mockServerURL, err := url.Parse(mockServer.URL)
+	c.Assert(err, IsNil)
+	device := createTestDevice()
+	theStore := store.New(nil, &testDauthContext{
+		c: c, device: device,
+		proxyStoreID: "my-proxy", proxyStoreURL: mockServerURL,
+	})
+
+	c.Logf("icon url: %v", mockServer.URL)
+	path := filepath.Join(c.MkDir(), "downloaded-file")
+	err = theStore.DownloadIcon(s.ctx, expectedName, path, mockServer.URL+"/my/icon")
+	c.Assert(err, IsNil)
+
+	c.Assert(path, testutil.FileEquals, expectedContent)
+}
+
+func (s *storeDownloadSuite) TestDownloadIconProxyStoreUnset(c *C) {
+	// Using default store config but **no** store proxy, download URL points to
+	// an address different than the base store URL.
+
+	const expectedName = "foo"
+	expectedContent := []byte("I was downloaded")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/my/icon", func(w http.ResponseWriter, r *http.Request) {
+		w.Write(expectedContent)
+	})
+	mockServer := httptest.NewServer(mux)
+	c.Assert(mockServer, NotNil)
+	defer mockServer.Close()
+
+	device := createTestDevice()
+	theStore := store.New(nil, &testDauthContext{
+		c: c, device: device,
+	})
+
+	path := filepath.Join(c.MkDir(), "downloaded-file")
+	err := theStore.DownloadIcon(s.ctx, expectedName, path, mockServer.URL+"/my/icon")
+	c.Assert(err, IsNil)
+
+	c.Assert(path, testutil.FileEquals, expectedContent)
+}
+
+func (s *storeDownloadSuite) TestDownloadIconUsesProxy(c *C) {
+	// Verify store downloads use the configured proxy
+
+	theStore := store.New(&store.Config{
+		Proxy: func(r *http.Request) (*url.URL, error) {
+			c.Check(r.Method, Equals, "GET")
+			c.Check(r.URL.String(), Equals, "https://foo.internal/icon-now")
+			return nil, errors.New("mock proxy error")
+		},
+	}, nil)
+
+	path := filepath.Join(c.MkDir(), "downloaded-file")
+	err := theStore.DownloadIcon(s.ctx, "icon-name", path, "https://foo.internal/icon-now")
+	c.Assert(err, ErrorMatches, ".* mock proxy error")
+
+	c.Assert(path, testutil.FileAbsent)
 }

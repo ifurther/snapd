@@ -29,18 +29,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"github.com/juju/ratelimit"
 	. "gopkg.in/check.v1"
 	"gopkg.in/retry.v1"
 
-	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/overlord/auth"
 	"github.com/snapcore/snapd/progress"
-	"github.com/snapcore/snapd/release"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/store"
 	"github.com/snapcore/snapd/testutil"
@@ -172,14 +170,13 @@ func (s *downloadSuite) TestActualDownloadLessDetailedCloudInfoFromAuthContext(c
 }
 
 func (s *downloadSuite) TestDownloadCancellation(c *C) {
-	// the channel used by mock server to request cancellation from the test
-	syncCh := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
 
 	n := 0
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n++
 		io.WriteString(w, "foo")
-		syncCh <- struct{}{}
+		cancel()
 		io.WriteString(w, "bar")
 		time.Sleep(10 * time.Millisecond)
 	}))
@@ -188,23 +185,12 @@ func (s *downloadSuite) TestDownloadCancellation(c *C) {
 
 	theStore := store.New(&store.Config{}, nil)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	sha3 := ""
+	var buf SillyBuffer
+	err := store.Download(ctx, "foo", sha3, mockServer.URL, nil, theStore, &buf, 0, nil, nil)
 
-	result := make(chan string)
-	go func() {
-		sha3 := ""
-		var buf SillyBuffer
-		err := store.Download(ctx, "foo", sha3, mockServer.URL, nil, theStore, &buf, 0, nil, nil)
-		result <- err.Error()
-		close(result)
-	}()
-
-	<-syncCh
-	cancel()
-
-	err := <-result
 	c.Check(n, Equals, 1)
-	c.Assert(err, Equals, "the download has been cancelled: context canceled")
+	c.Assert(err, ErrorMatches, "the download has been cancelled: context canceled")
 }
 
 type nopeSeeker struct{ io.ReadWriter }
@@ -291,8 +277,8 @@ func (s *downloadSuite) TestActualDownload500Once(c *C) {
 	c.Check(n, Equals, 2)
 }
 
-// SillyBuffer is a ReadWriteSeeker buffer with a limited size for the tests
-// (bytes does not implement an ReadWriteSeeker)
+// SillyBuffer is a ReadWriteSeekTruncater buffer with a limited size for the tests
+// (bytes does not implement an ReadWriteSeekTruncater)
 type SillyBuffer struct {
 	buf [1024]byte
 	pos int64
@@ -332,6 +318,13 @@ func (sb *SillyBuffer) Write(p []byte) (n int, err error) {
 		sb.end = sb.pos
 	}
 	return n, nil
+}
+func (sb *SillyBuffer) Truncate(size int64) error {
+	if size < 0 || size > int64(len(sb.buf)) {
+		return fmt.Errorf("truncate out of bounds: %d", size)
+	}
+	sb.end = size
+	return nil
 }
 func (sb *SillyBuffer) String() string {
 	return string(sb.buf[0:sb.pos])
@@ -389,215 +382,6 @@ func (s *downloadSuite) TestActualDownloadServerNoResumeHandeled(c *C) {
 	c.Check(n, Equals, 1)
 }
 
-func (s *downloadSuite) TestUseDeltas(c *C) {
-	// get rid of the mock xdelta3 because we mock all our own stuff
-	s.mockXdelta.Restore()
-	origPath := os.Getenv("PATH")
-	defer os.Setenv("PATH", origPath)
-	origUseDeltas := os.Getenv("SNAPD_USE_DELTAS_EXPERIMENTAL")
-	defer os.Setenv("SNAPD_USE_DELTAS_EXPERIMENTAL", origUseDeltas)
-	restore := release.MockOnClassic(false)
-	defer restore()
-
-	origSnapMountDir := dirs.SnapMountDir
-	defer func() { dirs.SnapMountDir = origSnapMountDir }()
-	dirs.SnapMountDir = c.MkDir()
-	exeInCorePath := filepath.Join(dirs.SnapMountDir, "/core/current/usr/bin/xdelta3")
-	interpInCorePath := filepath.Join(dirs.SnapMountDir, "/core/current/lib64/ld-linux-x86-64.so.2")
-
-	scenarios := []struct {
-		env       string
-		classic   bool
-		exeInHost bool
-		exeInCore bool
-
-		wantDelta bool
-	}{
-		{env: "", classic: false, exeInHost: false, exeInCore: false, wantDelta: false},
-		{env: "", classic: false, exeInHost: false, exeInCore: true, wantDelta: true},
-		{env: "", classic: false, exeInHost: true, exeInCore: false, wantDelta: true},
-		{env: "", classic: false, exeInHost: true, exeInCore: true, wantDelta: true},
-		{env: "", classic: true, exeInHost: false, exeInCore: false, wantDelta: false},
-		{env: "", classic: true, exeInHost: false, exeInCore: true, wantDelta: true},
-		{env: "", classic: true, exeInHost: true, exeInCore: false, wantDelta: true},
-		{env: "", classic: true, exeInHost: true, exeInCore: true, wantDelta: true},
-
-		{env: "0", classic: false, exeInHost: false, exeInCore: false, wantDelta: false},
-		{env: "0", classic: false, exeInHost: false, exeInCore: true, wantDelta: false},
-		{env: "0", classic: false, exeInHost: true, exeInCore: false, wantDelta: false},
-		{env: "0", classic: false, exeInHost: true, exeInCore: true, wantDelta: false},
-		{env: "0", classic: true, exeInHost: false, exeInCore: false, wantDelta: false},
-		{env: "0", classic: true, exeInHost: false, exeInCore: true, wantDelta: false},
-		{env: "0", classic: true, exeInHost: true, exeInCore: false, wantDelta: false},
-		{env: "0", classic: true, exeInHost: true, exeInCore: true, wantDelta: false},
-
-		{env: "1", classic: false, exeInHost: false, exeInCore: false, wantDelta: false},
-		{env: "1", classic: false, exeInHost: false, exeInCore: true, wantDelta: true},
-		{env: "1", classic: false, exeInHost: true, exeInCore: false, wantDelta: true},
-		{env: "1", classic: false, exeInHost: true, exeInCore: true, wantDelta: true},
-		{env: "1", classic: true, exeInHost: false, exeInCore: false, wantDelta: false},
-		{env: "1", classic: true, exeInHost: false, exeInCore: true, wantDelta: true},
-		{env: "1", classic: true, exeInHost: true, exeInCore: false, wantDelta: true},
-		{env: "1", classic: true, exeInHost: true, exeInCore: true, wantDelta: true},
-	}
-
-	for _, scenario := range scenarios {
-		var hostXdelta3Cmd, coreInterpCmd *testutil.MockCmd
-
-		var cleanups []func()
-
-		comment := Commentf("%#v", scenario)
-
-		// setup the env var for the scenario
-		os.Setenv("SNAPD_USE_DELTAS_EXPERIMENTAL", scenario.env)
-		release.MockOnClassic(scenario.classic)
-
-		// setup binaries for the scenario
-		if scenario.exeInCore {
-			// We need both the xdelta3 command for determining the interpreter
-			// as well as the actual interpreter for executing the basic
-			// "xdelta3 config" command.
-			// For the interpreter, since that's how we execute xdelta3, mock
-			// that as a command, but we don't need to mock the xdelta3 command
-			// in the core snap since that doesn't get executed by our fake
-			// interpreter. Mocking the interpreter and executing that as a
-			// MockCommand has the advantage that it avoids the specific ELF
-			// handling that is per-arch, etc. of the real CommandFromSystemSnap
-			// implementation.
-
-			coreInterpCmd = testutil.MockCommand(c, interpInCorePath, "")
-
-			r := store.MockSnapdtoolCommandFromSystemSnap(func(name string, args ...string) (*exec.Cmd, error) {
-				c.Assert(name, Equals, "/usr/bin/xdelta3")
-				c.Assert(args, DeepEquals, []string{"config"})
-
-				// use realistic arguments like what we actually get from
-				// snapdtool.CommandFromSystemSnap(), namely the interpreter and
-				// a library path which is derived from ld.so - this is
-				// artificial and we could use any mocked arguments here, but
-				// this more closely matches reality to return something like
-				// this.
-				interpArgs := append([]string{"--library-path", "/some/dir/from/etc/ld.so", exeInCorePath}, args...)
-				return exec.Command(coreInterpCmd.Exe(), interpArgs...), nil
-			})
-			cleanups = append(cleanups, r)
-
-			// Forget the calls to the interpreter at the end of the test - this
-			// deletes the log which otherwise would  continue to persist for
-			// each iteration leading to incorrect checks for the calls to the
-			// absolute binary that we mocked here, as the log file will be the
-			// same for each iteration.
-			// For the inverse reason, we don't need to forget calls for the
-			// hostXdelta3Cmd mock command, it gets a new dir with a new log
-			// file each iteration.
-			cleanups = append(cleanups, func() {
-				coreInterpCmd.ForgetCalls()
-				// note this is currently not needed, since Restore() just
-				// resets $PATH, but for an absolute path the $PATH doesn't get
-				// modified to begin with in MockCommand, but keep it here just
-				// to be safe in case something does ever change
-				coreInterpCmd.Restore()
-
-			})
-		}
-
-		if scenario.exeInHost {
-			// just mock the xdelta3 command directly
-			hostXdelta3Cmd = testutil.MockCommand(c, "xdelta3", "")
-
-			// note we don't add a Restore() to cleanups, it is called directly
-			// below after the first UseDeltas() but before the second
-			// UseDeltas() in order to properly test the caching behavior
-		}
-
-		// if there is not meant to be xdelta3 on the host or in core, then set
-		// PATH to be empty such that we won't find xdelta3 from the host
-		// running these tests
-		if !scenario.exeInHost && !scenario.exeInCore {
-			os.Setenv("PATH", "")
-
-			// also reset PATH at the end, otherwise an empty PATH leads
-			// testutil.MockCommand fails in future iterations that mock a
-			// command
-			cleanups = append(cleanups, func() {
-				os.Setenv("PATH", origPath)
-			})
-		}
-
-		// run the check for delta usage, we call it twice
-		sto := &store.Store{}
-		c.Check(sto.UseDeltas(), Equals, scenario.wantDelta, comment)
-
-		// cleanup the files we may have created before calling the function
-		// again to ensure that the caching works as expected
-		if scenario.exeInCore {
-			err := os.Remove(interpInCorePath)
-			c.Assert(err, IsNil)
-		}
-
-		if scenario.exeInHost {
-			hostXdelta3Cmd.Restore()
-		}
-
-		// also now that we have deleted the mock interpreter and unset the
-		// search path, we should still get the same result as above when
-		// we call UseDeltas() since it was cached, if it wasn't cached then
-		// this would fail
-		c.Check(sto.UseDeltas(), Equals, scenario.wantDelta, comment)
-
-		if scenario.wantDelta {
-			// if we should have been able to use deltas, make sure we picked
-			// the expected one, - if both were true we should have picked the
-			// one from core instead of the one from the host first
-			if scenario.exeInCore {
-				// check that during trying to check whether to use deltas or
-				// not, we called the interpreter with the xdelta3 config
-				// command too
-				c.Check(coreInterpCmd.Calls(), DeepEquals, [][]string{
-					{"ld-linux-x86-64.so.2", "--library-path", "/some/dir/from/etc/ld.so", exeInCorePath, "config"},
-				}, comment)
-
-				// also check that now after caching the xdelta3 command, it
-				// returns the expected format
-				expArgs := []string{
-					interpInCorePath,
-					"--library-path",
-					"/some/dir/from/etc/ld.so",
-					exeInCorePath,
-					"foo",
-					"bar",
-				}
-				// check that the Xdelta3Cmd function we cached uses the
-				// interpreter that was returned from CommandFromSystemSnap
-				c.Check(sto.Xdelta3Cmd("foo", "bar").Args, DeepEquals, expArgs, comment)
-
-			} else if scenario.exeInHost {
-				// similar checks for the host case, except in the host case we
-				// just called xdelta3 directly
-				c.Check(hostXdelta3Cmd.Calls(), DeepEquals, [][]string{
-					{"xdelta3", "config"},
-				}, comment)
-
-				// and args are passed to the command cached too
-				expArgs := []string{hostXdelta3Cmd.Exe(), "foo", "bar"}
-				c.Check(sto.Xdelta3Cmd("foo", "bar").Args, DeepEquals, expArgs, comment)
-			}
-		} else {
-			// quick check that the test case makes sense, if we didn't want
-			// deltas, the scenario should have either disabled via an env var,
-			// or had both exes missing
-			c.Assert((scenario.env == "0") ||
-				(!scenario.exeInCore && !scenario.exeInHost),
-				Equals, true)
-		}
-
-		// cleanup for the next iteration
-		for _, r := range cleanups {
-			r()
-		}
-	}
-}
-
 type downloadBehaviour []struct {
 	url   string
 	error bool
@@ -635,10 +419,9 @@ var deltaTests = []struct {
 	},
 	expectedContent: "full-snap-url-content",
 }, {
-	// If more than one matching delta is returned by the store
-	// we ignore deltas and do the full download.
+	// Use first delta when more than one is reported for the same format
 	downloads: downloadBehaviour{
-		{url: "full-snap-url"},
+		{url: "delta-url"},
 	},
 	info: snap.DownloadInfo{
 		DownloadURL: "full-snap-url",
@@ -647,7 +430,7 @@ var deltaTests = []struct {
 			{DownloadURL: "delta-url-2", Format: "xdelta3"},
 		},
 	},
-	expectedContent: "full-snap-url-content",
+	expectedContent: "snap-content-via-delta",
 }}
 
 func (s *downloadSuite) TestDownloadWithDelta(c *C) {
@@ -655,7 +438,8 @@ func (s *downloadSuite) TestDownloadWithDelta(c *C) {
 	defer os.Setenv("SNAPD_USE_DELTAS_EXPERIMENTAL", origUseDeltas)
 	c.Assert(os.Setenv("SNAPD_USE_DELTAS_EXPERIMENTAL", "1"), IsNil)
 
-	for _, testCase := range deltaTests {
+	for i, testCase := range deltaTests {
+		c.Log("tc:", i)
 		testCase.info.Size = int64(len(testCase.expectedContent))
 		downloadIndex := 0
 		restore := store.MockDownload(func(ctx context.Context, name, sha3, url string, user *auth.UserState, s *store.Store, w io.ReadWriteSeeker, resume int64, pbar progress.Meter, dlOpts *store.DownloadOptions) error {
@@ -669,8 +453,8 @@ func (s *downloadSuite) TestDownloadWithDelta(c *C) {
 			return nil
 		})
 		defer restore()
-		restore = store.MockApplyDelta(func(_ *store.Store, name string, deltaPath string, deltaInfo *snap.DeltaInfo, targetPath string, targetSha3_384 string) error {
-			c.Check(deltaInfo, Equals, &testCase.info.Deltas[0])
+		restore = store.MockApplyDelta(func(_ context.Context, _ *store.Store, name string, deltaPath string, deltaInfo *snap.DeltaInfo, targetPath string, targetSha3_384 string) error {
+			c.Check(*deltaInfo, Equals, testCase.info.Deltas[0])
 			err := os.WriteFile(targetPath, []byte("snap-content-via-delta"), 0644)
 			c.Assert(err, IsNil)
 			return nil
@@ -678,6 +462,11 @@ func (s *downloadSuite) TestDownloadWithDelta(c *C) {
 		defer restore()
 
 		theStore := store.New(&store.Config{}, nil)
+		squasgfsRestore := store.MockSquashfsApplyDelta(func(ctx context.Context, sourceSnap, deltaFile, targetSnap string) error {
+			return nil
+		})
+		defer squasgfsRestore()
+
 		path := filepath.Join(c.MkDir(), "subdir", "downloaded-file")
 		err := theStore.Download(context.TODO(), "foo", path, &testCase.info, nil, nil, nil)
 
@@ -707,4 +496,281 @@ func (s *downloadSuite) TestActualDownloadRateLimited(c *C) {
 	c.Assert(err, IsNil)
 	c.Check(buf.String(), Equals, canary)
 	c.Check(ratelimitReaderUsed, Equals, true)
+}
+
+func (s *downloadSuite) TestActualDownloadIcon(c *C) {
+	n := 0
+	const existingEtag = ""
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c.Check(r.Header.Get("Snap-CDN"), Equals, "")
+		c.Check(r.Header.Get("Snap-Device-Location"), Equals, "")
+		c.Check(r.Header.Get("Snap-Refresh-Reason"), Equals, "")
+		n++
+		io.WriteString(w, "response-data")
+	}))
+	c.Assert(mockServer, NotNil)
+	defer mockServer.Close()
+
+	theStore := store.New(&store.Config{}, nil)
+	var buf SillyBuffer
+	newEtag, err := store.DownloadIconImpl(context.TODO(), "foo", existingEtag, mockServer.URL, theStore, &buf)
+	c.Assert(err, IsNil)
+	c.Check(newEtag, Equals, "")
+	c.Check(buf.String(), Equals, "response-data")
+	c.Check(n, Equals, 1)
+}
+
+func (s *downloadSuite) TestActualDownloadIconWithNewEtag(c *C) {
+	s.testActualDownloadIconWithNewEtagVariant(c, "etag")
+	s.testActualDownloadIconWithNewEtagVariant(c, "Etag")
+	s.testActualDownloadIconWithNewEtagVariant(c, "ETag")
+}
+
+func (s *downloadSuite) testActualDownloadIconWithNewEtagVariant(c *C, etagSpelling string) {
+	n := 0
+	const existingEtag = ""
+	const newEtag = "some-unique-value"
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n++
+		c.Assert(r.Header.Get("If-None-Match"), Equals, existingEtag)
+
+		w.Header().Set(etagSpelling, newEtag) // set the http header according to etagSpelling
+		io.WriteString(w, "response-data")
+	}))
+	c.Assert(mockServer, NotNil)
+	defer mockServer.Close()
+
+	theStore := store.New(&store.Config{}, nil)
+	var buf SillyBuffer
+	receivedEtag, err := store.DownloadIconImpl(context.TODO(), "foo", existingEtag, mockServer.URL, theStore, &buf)
+	c.Assert(err, IsNil)
+	c.Check(receivedEtag, Equals, newEtag)
+	c.Check(buf.String(), Equals, "response-data")
+	c.Check(n, Equals, 1)
+}
+
+func (s *downloadSuite) TestActualDownloadIconWithExistingEtag(c *C) {
+	n := 0
+	const etag = "some-unique-value"
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n++
+		c.Assert(r.Header.Get("If-None-Match"), Equals, etag)
+
+		w.Header().Set("Etag", etag) // use correct etag case here
+		w.WriteHeader(304)           // 304 Not Modified
+	}))
+	c.Assert(mockServer, NotNil)
+	defer mockServer.Close()
+
+	theStore := store.New(&store.Config{}, nil)
+	var buf SillyBuffer
+	receivedEtag, err := store.DownloadIconImpl(context.TODO(), "foo", etag, mockServer.URL, theStore, &buf)
+	c.Check(err, Equals, store.ErrIconUnchanged)
+	c.Check(receivedEtag, Equals, "") // since we return an error, expect empty etag
+	c.Check(buf.String(), Equals, "")
+	c.Check(n, Equals, 1)
+}
+
+func (s *downloadSuite) TestActualDownloadIconWithChangedEtag(c *C) {
+	n := 0
+	const existingEtag = "some-unique-value"
+	const newEtag = "another-unique-value"
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n++
+		c.Assert(r.Header.Get("If-None-Match"), Equals, existingEtag)
+
+		w.Header().Set("ETag", newEtag) // use another etag variant here
+		// return 200, not 304, since etag is different
+		io.WriteString(w, "response-data")
+	}))
+	c.Assert(mockServer, NotNil)
+	defer mockServer.Close()
+
+	theStore := store.New(&store.Config{}, nil)
+	var buf SillyBuffer
+	receivedEtag, err := store.DownloadIconImpl(context.TODO(), "foo", existingEtag, mockServer.URL, theStore, &buf)
+	c.Assert(err, IsNil)
+	c.Check(receivedEtag, Equals, newEtag)
+	c.Check(buf.String(), Equals, "response-data")
+	c.Check(n, Equals, 1)
+}
+
+func (s *downloadSuite) TestActualDownloadIconTooLarge(c *C) {
+	var maxSize int64 = 1000 // Must be less than size of SillyBuffer, so we can write enough to exceed the limit
+	restore := store.MockMaxIconFilesize(maxSize)
+	defer restore()
+
+	n := 0
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n++
+		response := make([]byte, maxSize+1)
+		w.Write(response)
+	}))
+	c.Assert(mockServer, NotNil)
+	defer mockServer.Close()
+
+	theStore := store.New(&store.Config{}, nil)
+	var buf SillyBuffer
+	receivedEtag, err := store.DownloadIconImpl(context.TODO(), "foo", "fake-etag", mockServer.URL, theStore, &buf)
+	c.Assert(err, ErrorMatches, "unsupported Content-Length .*")
+	c.Check(receivedEtag, Equals, "")
+	c.Check(n, Equals, 1)
+}
+
+type BadWriter struct {
+	SillyBuffer
+}
+
+func (bw *BadWriter) Write(p []byte) (n int, err error) {
+	// Do the write
+	bw.SillyBuffer.Write(p)
+	// but return EOF
+	return -1, io.EOF
+}
+
+func (s *downloadSuite) TestActualDownloadIconCopyError(c *C) {
+	n := 0
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n++
+		response := make([]byte, 5)
+		for i := range response[:5] {
+			// respond with 5 'a' bytes so we can check that it's been seeked and truncated
+			response[i] = 'a'
+		}
+		w.Write(response)
+	}))
+	c.Assert(mockServer, NotNil)
+	defer mockServer.Close()
+
+	theStore := store.New(&store.Config{}, nil)
+	var buf BadWriter
+	receivedEtag, err := store.DownloadIconImpl(context.TODO(), "foo", "fake-etag", mockServer.URL, theStore, &buf)
+	c.Check(err, testutil.ErrorIs, io.EOF)
+	c.Check(receivedEtag, Equals, "")
+	c.Check(n, Equals, 5)
+	// Check that the buffer only has 5 'a' bytes, indicating that it was
+	// seeked/truncated after each failed attempt
+	c.Check(buf.buf[:15], DeepEquals, []byte{'a', 'a', 'a', 'a', 'a', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0})
+}
+
+func (s *downloadSuite) TestDownloadIconTimeout(c *C) {
+	const fakeTimeout = 50 * time.Millisecond
+	const fakeDelay = 10 * fakeTimeout
+	restore := store.MockDownloadIconTimeout(fakeTimeout)
+	defer restore()
+
+	n := int64(0)
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// the response is artificially delayed, which combined with retries on
+		// the client side may cause multiple requests to be in-progress at the
+		// mock server side
+
+		atomic.AddInt64(&n, 1)
+		// wait longer than the client timeout
+		time.Sleep(fakeDelay)
+		// response should never actually be received
+		io.WriteString(w, "response-data")
+	}))
+	c.Assert(mockServer, NotNil)
+	defer mockServer.Close()
+
+	startTime := time.Now()
+	theStore := store.New(&store.Config{}, nil)
+	var buf SillyBuffer
+	receivedEtag, err := store.DownloadIconImpl(context.TODO(), "foo", "fake-etag", mockServer.URL, theStore, &buf)
+	endTime := time.Now()
+
+	// timeout error will trigger a retry
+	c.Check(atomic.LoadInt64(&n) > 3, Equals, true)
+	// XXX: context deadline detection is racy, see httputil/retry_test.go in
+	// TestRetryRequestTimeoutHandling
+	c.Check(err, ErrorMatches, `.* (request canceled|context deadline exceeded)( \(Client.Timeout exceeded while awaiting headers\))?`)
+	c.Check(receivedEtag, Equals, "")
+	// Check that the timeout duration elapsed before the response returned
+	c.Check(endTime.After(startTime.Add(fakeTimeout)), Equals, true)
+	// Check that the response returned before waiting for the full response delay
+	c.Check(endTime.Before(startTime.Add(fakeDelay)), Equals, true)
+}
+
+func (s *downloadSuite) TestDownloadIconCancellation(c *C) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	n := 0
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n++
+		io.WriteString(w, "foo")
+		cancel()
+		io.WriteString(w, "bar")
+		time.Sleep(10 * time.Millisecond)
+	}))
+	c.Assert(mockServer, NotNil)
+	defer mockServer.Close()
+
+	theStore := store.New(&store.Config{}, nil)
+	var buf SillyBuffer
+	receivedEtag, err := store.DownloadIconImpl(ctx, "foo", "fake-etag", mockServer.URL, theStore, &buf)
+
+	c.Check(n, Equals, 1)
+	c.Assert(err, testutil.ErrorIs, context.Canceled)
+	c.Check(receivedEtag, Equals, "")
+}
+
+func (s *downloadSuite) TestActualDownloadIcon404(c *C) {
+	n := 0
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n++
+		w.WriteHeader(404)
+	}))
+	c.Assert(mockServer, NotNil)
+	defer mockServer.Close()
+
+	theStore := store.New(&store.Config{}, nil)
+	var buf SillyBuffer
+	receivedEtag, err := store.DownloadIconImpl(context.TODO(), "foo", "fake-etag", mockServer.URL, theStore, &buf)
+	c.Assert(err, NotNil)
+	c.Assert(err, FitsTypeOf, &store.DownloadError{})
+	c.Check(err.(*store.DownloadError).Code, Equals, 404)
+	c.Check(receivedEtag, Equals, "")
+	c.Check(n, Equals, 1)
+}
+
+func (s *downloadSuite) TestActualDownloadIcon500(c *C) {
+	n := 0
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n++
+		w.WriteHeader(500)
+	}))
+	c.Assert(mockServer, NotNil)
+	defer mockServer.Close()
+
+	theStore := store.New(&store.Config{}, nil)
+	var buf SillyBuffer
+	receivedEtag, err := store.DownloadIconImpl(context.TODO(), "foo", "fake-etag", mockServer.URL, theStore, &buf)
+	c.Assert(err, NotNil)
+	c.Assert(err, FitsTypeOf, &store.DownloadError{})
+	c.Check(err.(*store.DownloadError).Code, Equals, 500)
+	c.Check(receivedEtag, Equals, "")
+	c.Check(n, Equals, 5)
+}
+
+func (s *downloadSuite) TestActualDownloadIcon500Once(c *C) {
+	n := 0
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n++
+		if n == 1 {
+			w.WriteHeader(500)
+		} else {
+			io.WriteString(w, "response-data")
+		}
+	}))
+	c.Assert(mockServer, NotNil)
+	defer mockServer.Close()
+
+	theStore := store.New(&store.Config{}, nil)
+	var buf SillyBuffer
+	receivedEtag, err := store.DownloadIconImpl(context.TODO(), "foo", "fake-etag", mockServer.URL, theStore, &buf)
+	c.Assert(err, IsNil)
+	c.Check(buf.String(), Equals, "response-data")
+	c.Check(receivedEtag, Equals, "")
+	c.Check(n, Equals, 2)
 }

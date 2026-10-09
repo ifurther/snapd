@@ -34,6 +34,7 @@ import (
 	"github.com/snapcore/snapd/overlord/auth"
 	"github.com/snapcore/snapd/progress"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/squashfs"
 	"github.com/snapcore/snapd/testutil"
 )
 
@@ -41,6 +42,11 @@ var (
 	HardLinkCount = hardLinkCount
 	ApiURL        = apiURL
 	Download      = download
+
+	DownloadIconImpl = downloadIcon
+	ErrIconUnchanged = errIconUnchanged
+	MaxEtagSize      = maxEtagSize
+	EtagXattrName    = etagXattrName
 
 	ApplyDelta = applyDelta
 
@@ -116,15 +122,13 @@ func IsTransferSpeedError(err error) (ok bool, speed float64) {
 }
 
 func (w *TransferSpeedMonitoringWriter) MeasuredWindowsCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	return w.measuredWindows
 }
 
 func (cm *CacheManager) CacheDir() string {
 	return cm.cacheDir
-}
-
-func (cm *CacheManager) Cleanup() error {
-	return cm.cleanup()
 }
 
 func (cm *CacheManager) Count() int {
@@ -147,6 +151,18 @@ func MockDownload(f func(ctx context.Context, name, sha3_384, downloadURL string
 	}
 }
 
+func MockMaxIconFilesize(maxSize int64) (restore func()) {
+	return testutil.Mock(&maxIconFilesize, maxSize)
+}
+
+func MockDownloadIconTimeout(timeout time.Duration) (restore func()) {
+	return testutil.Mock(&downloadIconTimeout, timeout)
+}
+
+func MockDownloadIcon(f func(ctx context.Context, name, etag, downloadURL string, s *Store, w ReadWriteSeekTruncater) (string, error)) (restore func()) {
+	return testutil.Mock(&downloadIcon, f)
+}
+
 func MockDoDownloadReq(f func(ctx context.Context, storeURL *url.URL, cdnHeader string, resume int64, s *Store, user *auth.UserState) (*http.Response, error)) (restore func()) {
 	orig := doDownloadReq
 	doDownloadReq = f
@@ -155,11 +171,19 @@ func MockDoDownloadReq(f func(ctx context.Context, storeURL *url.URL, cdnHeader 
 	}
 }
 
-func MockApplyDelta(f func(s *Store, name string, deltaPath string, deltaInfo *snap.DeltaInfo, targetPath string, targetSha3_384 string) error) (restore func()) {
+func MockApplyDelta(f func(ctx context.Context, s *Store, name string, deltaPath string, deltaInfo *snap.DeltaInfo, targetPath string, targetSha3_384 string) error) (restore func()) {
 	origApplyDelta := applyDelta
 	applyDelta = f
 	return func() {
 		applyDelta = origApplyDelta
+	}
+}
+
+func MockSquashfsApplyDelta(f func(ctx context.Context, sourceSnap, deltaFile, targetSnap string) error) (restore func()) {
+	origSquashfsApplySnapDelta := squashfsApplyDelta
+	squashfsApplyDelta = f
+	return func() {
+		squashfsApplyDelta = origSquashfsApplySnapDelta
 	}
 }
 
@@ -179,12 +203,12 @@ func MockHttputilNewHTTPClient(f func(opts *httputil.ClientOptions) *http.Client
 	}
 }
 
-func (sto *Store) SetDeltaFormat(dfmt string) {
-	sto.deltaFormat = dfmt
-}
-
-func (sto *Store) DownloadDelta(deltaName string, downloadInfo *snap.DownloadInfo, w io.ReadWriteSeeker, pbar progress.Meter, user *auth.UserState, dlOpts *DownloadOptions) error {
-	return sto.downloadDelta(deltaName, downloadInfo, w, pbar, user, dlOpts)
+func MockSupportedDeltaFormats(f func(squashfs.DeltaFormatOpts) []string) (restore func()) {
+	old := squashfsSupportedDeltaFormats
+	squashfsSupportedDeltaFormats = f
+	return func() {
+		squashfsSupportedDeltaFormats = old
+	}
 }
 
 func (sto *Store) DoRequest(ctx context.Context, client *http.Client, reqOptions *requestOptions, user *auth.UserState) (*http.Response, error) {
@@ -213,14 +237,6 @@ func (sto *Store) SessionUnlock() {
 
 func (sto *Store) FindFields() []string {
 	return sto.findFields
-}
-
-func (sto *Store) UseDeltas() bool {
-	return sto.useDeltas()
-}
-
-func (sto *Store) Xdelta3Cmd(args ...string) *exec.Cmd {
-	return sto.xdelta3CmdFunc(args...)
 }
 
 func (cfg *Config) SetBaseURL(u *url.URL) error {

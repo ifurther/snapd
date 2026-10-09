@@ -25,8 +25,11 @@ import (
 	"github.com/snapcore/snapd/boot"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/overlord/state"
+	"github.com/snapcore/snapd/overlord/swfeats"
 	"github.com/snapcore/snapd/snap"
 )
+
+var updateRevisionsChangeKind = swfeats.RegisterChangeKind("update-revisions")
 
 // UpdateBootRevisions synchronizes the active kernel and OS snap versions
 // with the versions that actually booted. This is needed because a
@@ -64,7 +67,7 @@ func UpdateBootRevisions(st *state.State) error {
 		if err != nil {
 			return fmt.Errorf(errorPrefix+"%s", err)
 		}
-		info, err := CurrentInfo(st, actual.SnapName())
+		info, err := CurrentInfo(st, actual.SnapName().String())
 		if err != nil {
 			logger.Noticef("cannot get info for %q: %s", actual.SnapName(), err)
 			continue
@@ -72,11 +75,12 @@ func UpdateBootRevisions(st *state.State) error {
 		if actual.SnapRevision() != info.SideInfo.Revision {
 			// FIXME: check that there is no task
 			//        for this already in progress
-			ts, err := RevertToRevision(st, actual.SnapName(), actual.SnapRevision(), Flags{}, "")
+			const noRestartBoundaries = false
+			installTS, err := revertToRevisionTaskSet(st, actual.SnapName().String(), actual.SnapRevision(), Flags{}, "", noRestartBoundaries)
 			if err != nil {
 				return err
 			}
-			tsAll = append(tsAll, ts)
+			tsAll = append(tsAll, installTS.ts)
 		}
 	}
 
@@ -85,7 +89,7 @@ func UpdateBootRevisions(st *state.State) error {
 	}
 
 	msg := "Update kernel and core snap revisions"
-	chg := st.NewChange("update-revisions", msg)
+	chg := st.NewChange(updateRevisionsChangeKind, msg)
 	for _, ts := range tsAll {
 		chg.AddAll(ts)
 	}

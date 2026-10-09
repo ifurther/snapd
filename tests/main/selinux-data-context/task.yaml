@@ -4,7 +4,10 @@ details: |
     Verify that automatic file context transitions work and cover typical use cases
 
 # Only distros that support SELinux
-systems: [fedora-*, centos-*]
+systems:
+    - fedora-*
+    - centos-*
+    - opensuse-*-selinux-*
 
 prepare: |
     rm -rf /root/snap
@@ -12,6 +15,8 @@ prepare: |
     tests.session -u test prepare
 
 restore: |
+    snap remove --purge test-snapd-service-writer || true
+    snap remove --purge socket-activation || true
     tests.session -u test restore
 
 execute: |
@@ -24,11 +29,6 @@ execute: |
     test-snapd-sh.sh -c "mkdir -p \$SNAP_USER_DATA/foo && echo hello world > \$SNAP_USER_DATA/foo/bar"
 
     expected_label="unconfined_t"
-    if os.query is-centos 7; then
-        # on centos-7, the policy or systemd seems to lack the necessary transition
-        # for the user service
-        expected_label="unconfined_service_t"
-    fi
     tests.session -u test exec sh -c 'test-snapd-sh.sh -c "id -Z"' | MATCH ":${expected_label}:"
     tests.session -u test exec sh -c "test-snapd-sh.sh -c 'mkdir -p \$SNAP_USER_DATA/foo && echo hello world > \$SNAP_USER_DATA/foo/bar'"
 

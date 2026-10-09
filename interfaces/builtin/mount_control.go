@@ -29,6 +29,7 @@ import (
 	"github.com/snapcore/snapd/interfaces"
 	"github.com/snapcore/snapd/interfaces/apparmor"
 	"github.com/snapcore/snapd/interfaces/utils"
+	"github.com/snapcore/snapd/osutil/mount/libmount"
 	apparmor_sandbox "github.com/snapcore/snapd/sandbox/apparmor"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/strutil"
@@ -125,7 +126,6 @@ var allowedFilesystemSpecificMountOptions = map[string][]string{
 	"jfs":        {"iocharset=", "resize=", "nointegrity", "integrity", "errors=", "noquota", "quota", "usrquota", "grpquota"},
 	"msdos":      {"blocksize=", "uid=", "gid=", "umask=", "dmask=", "fmask=", "allow_utime=", "check=", "codepage=", "conv=", "cvf_format=", "cvf_option", "debug", "discard", "dos1xfloppy", "errors=", "fat=", "iocharset=", "nfs=", "tz=", "time_offset=", "quiet", "rodir", "showexec", "sys_immutable", "flush", "usefree", "dots", "nodots", "dotsOK="},
 	"nfs":        {"nfsvers=", "vers=", "soft", "hard", "softreval", "nosoftreval", "intr", "nointr", "timeo=", "retrans=", "rsize=", "wsize=", "ac", "noac", "acregmin=", "acregmax=", "acdirmin=", "acdirmax=", "actimeo=", "bg", "fg", "nconnect=", "max_connect=", "rdirplus", "nordirplus", "retry=", "sec=", "sharecache", "nosharecache", "revsport", "norevsport", "lookupcache=", "fsc", "nofsc", "sloppy", "proto=", "udp", "tcp", "rdma", "port=", "mountport=", "mountproto=", "mounthost=", "mountvers=", "namlen=", "lock", "nolock", "cto", "nocto", "acl", "noacl", "local_lock=", "minorversion=", "clientaddr=", "migration", "nomigration"},
-	"nfs4":       {"nfsvers=", "vers=", "soft", "hard", "softreval", "nosoftreval", "intr", "nointr", "timeo=", "retrans=", "rsize=", "wsize=", "ac", "noac", "acregmin=", "acregmax=", "acdirmin=", "acdirmax=", "actimeo=", "bg", "fg", "nconnect=", "max_connect=", "rdirplus", "nordirplus", "retry=", "sec=", "sharecache", "nosharecache", "revsport", "norevsport", "lookupcache=", "fsc", "nofsc", "sloppy", "proto=", "minorversion=", "port=", "cto", "nocto", "clientaddr=", "migration", "nomigration"},
 	"ntfs":       {"iocharset=", "nls=", "utf8", "uni_xlate=", "posix=", "uid=", "gid=", "umask="},
 	"ntfs-3g":    {"acl", "allow_other", "big_writes", "compression", "debug", "delay_mtime", "delay_mtime=", "dmask=", "efs_raw", "fmask=", "force", "hide_dot_files", "hide_hid_files", "inherit", "locale=", "max_read=", "no_def_opts", "no_detach", "nocompression", "norecover", "permissions", "posix_nlink", "recover", "remove_hiberfile", "show_sys_files", "silent", "special_files=", "streams_interface=", "uid=", "gid=", "umask=", "usermapping=", "user_xattr", "windows_names"},
 	"lowntfs-3g": {"acl", "allow_other", "big_writes", "compression", "debug", "delay_mtime", "delay_mtime=", "dmask=", "efs_raw", "fmask=", "force", "hide_dot_files", "hide_hid_files", "ignore_case", "inherit", "locale=", "max_read=", "no_def_opts", "no_detach", "nocompression", "norecover", "permissions", "posix_nlink", "recover", "remove_hiberfile", "show_sys_files", "silent", "special_files=", "streams_interface=", "uid=", "gid=", "umask=", "usermapping=", "user_xattr", "windows_names"},
@@ -212,6 +212,13 @@ var disallowedFSTypes = []string{
 	"tracefs",
 }
 
+// THe filesystems which are considered deprecated and for which a better
+// alternative exists.
+var deprecatedFSTypes = []string{
+	// use "nfs"
+	"nfs4",
+}
+
 // mountControlInterface allows creating transient and persistent mounts
 type mountControlInterface struct {
 	commonInterface
@@ -244,6 +251,11 @@ type mountControlInterface struct {
 // nearly any path, and due to the super-privileged nature of this interface it
 // is expected that sensible values of what are enforced by the store manual
 // review queue and security teams.
+//
+// Certain filesystem types impose additional restrictions on the allowed values
+// for "what" attribute:
+// - "tmpfs" - "what" must be set to "none"
+// - "nfs" - "what" must be unset
 var (
 	whatRegexp  = regexp.MustCompile(`^(none|/[^"@]*)$`)
 	whereRegexp = regexp.MustCompile(`^(\$SNAP_COMMON|\$SNAP_DATA)?/[^\$"@]+$`)
@@ -253,7 +265,15 @@ var (
 // malicious string like
 //
 //	auto) options=() /malicious/content /var/lib/snapd/hostfs/...,\n mount fstype=(
+//
+// The "type" attribute is an optional list of expected filesystem types. It is
+// most useful in situations when it is known upfront that only a handful of
+// types are accepted for a given mount.
 var typeRegexp = regexp.MustCompile(`^[a-z0-9]+$`)
+
+// Because of additional rules imposed on mount attributes, some filesystems can
+// only be specified as a single "type" entry.
+var exclusiveFsTypes = []string{"tmpfs", "nfs", "cifs"}
 
 type MountInfo struct {
 	what       string
@@ -271,11 +291,11 @@ func (mi *MountInfo) hasType() bool {
 	return len(mi.types) > 0
 }
 
-func parseStringList(mountEntry map[string]interface{}, fieldName string) ([]string, error) {
+func parseStringList(mountEntry map[string]any, fieldName string) ([]string, error) {
 	var list []string
 	value, ok := mountEntry[fieldName]
 	if ok {
-		interfaceList, ok := value.([]interface{})
+		interfaceList, ok := value.([]any)
 		if !ok {
 			return nil, fmt.Errorf(`mount-control "%s" must be an array of strings (got %q)`, fieldName, value)
 		}
@@ -291,15 +311,27 @@ func parseStringList(mountEntry map[string]interface{}, fieldName string) ([]str
 }
 
 func enumerateMounts(plug interfaces.Attrer, fn func(mountInfo *MountInfo) error) error {
-	var mounts []map[string]interface{}
+	var mounts []map[string]any
 	err := plug.Attr("mount", &mounts)
 	if err != nil && !errors.Is(err, snap.AttributeNotFoundError{}) {
 		return mountAttrTypeError
 	}
 
 	for _, mount := range mounts {
+		types, err := parseStringList(mount, "type")
+		if err != nil {
+			return err
+		}
+
+		disallowSource := false
+		if len(strutil.Intersection(types, []string{"nfs", "nfs4", "cifs"})) != 0 {
+			// one of the filesystems for which source is set implicitly and
+			// cannot be specified in an attribute
+			disallowSource = true
+		}
+
 		what, ok := mount["what"].(string)
-		if !ok {
+		if !ok && !disallowSource {
 			return fmt.Errorf(`mount-control "what" must be a string`)
 		}
 
@@ -314,11 +346,6 @@ func enumerateMounts(plug interfaces.Attrer, fn func(mountInfo *MountInfo) error
 			if persistent, ok = persistentValue.(bool); !ok {
 				return fmt.Errorf(`mount-control "persistent" must be a boolean`)
 			}
-		}
-
-		types, err := parseStringList(mount, "type")
-		if err != nil {
-			return err
 		}
 
 		options, err := parseStringList(mount, "options")
@@ -358,6 +385,19 @@ func validateWhatAttr(mountInfo *MountInfo) error {
 	// https://www.kernel.org/doc/html/latest/usb/functionfs.html
 	if mountInfo.isType("functionfs") {
 		return validateNoAppArmorRegexpWithError(`cannot use mount-control "what" attribute`, what)
+	}
+
+	if isNFS, isCIFS := mountInfo.isType("nfs"), mountInfo.isType("cifs"); isNFS || isCIFS {
+		// 'source' attribute of cifs and nfs entries is implicit and cannot be
+		// set in the plug declaration
+		kind := "nfs"
+		if isCIFS {
+			kind = "cifs"
+		}
+		if what != "" {
+			return fmt.Errorf(`mount-control "what" attribute must not be specified for %v mounts`, kind)
+		}
+		return nil
 	}
 
 	if !whatRegexp.MatchString(what) {
@@ -404,22 +444,33 @@ func validateWhereAttr(where string) error {
 }
 
 func validateMountTypes(types []string) error {
-	includesTmpfs := false
+	exclusiveFsType := ""
+
+	// multiple types specified in "type" are useful when the accepted
+	// filesystem type is known upfront or the mount uses one of the special
+	// types, such as "nfs" or "tmpfs"
 	for _, t := range types {
 		if !typeRegexp.MatchString(t) {
 			return fmt.Errorf(`mount-control filesystem type invalid: %q`, t)
 		}
+
 		if strutil.ListContains(disallowedFSTypes, t) {
 			return fmt.Errorf(`mount-control forbidden filesystem type: %q`, t)
 		}
-		if t == "tmpfs" {
-			includesTmpfs = true
+
+		if strutil.ListContains(deprecatedFSTypes, t) {
+			return fmt.Errorf(`mount-control deprecated filesystem type: %q`, t)
+		}
+
+		if exclusiveFsType == "" && strutil.ListContains(exclusiveFsTypes, t) {
+			exclusiveFsType = t
 		}
 	}
 
-	if includesTmpfs && len(types) > 1 {
-		return errors.New(`mount-control filesystem type "tmpfs" cannot be listed with other types`)
+	if exclusiveFsType != "" && len(types) > 1 {
+		return fmt.Errorf(`mount-control filesystem type %q cannot be listed with other types`, exclusiveFsType)
 	}
+
 	return nil
 }
 
@@ -439,8 +490,11 @@ func validateMountOptions(mountInfo *MountInfo) error {
 	} else {
 		types = defaultFSTypes
 	}
+
+	var optsToCheck []string // Kernel options to check for consistency.
 	for _, o := range mountInfo.options {
 		if strutil.ListContains(allowedKernelMountOptions, o) {
+			optsToCheck = append(optsToCheck, o)
 			continue
 		}
 		optionName := strings.SplitAfter(o, "=")[0] // for options with arguments, validate only option
@@ -452,6 +506,11 @@ func validateMountOptions(mountInfo *MountInfo) error {
 		}
 		return fmt.Errorf(`mount-control option unrecognized or forbidden: %q`, o)
 	}
+
+	if err := libmount.ValidateMountOptions(optsToCheck...); err != nil {
+		return fmt.Errorf("mount-control options are inconsistent: %w", err)
+	}
+
 	return nil
 }
 
@@ -480,15 +539,15 @@ func isAllowedFilesystemSpecificMountOption(types []string, optionName string) b
 }
 
 func validateMountInfo(mountInfo *MountInfo) error {
+	if err := validateMountTypes(mountInfo.types); err != nil {
+		return err
+	}
+
 	if err := validateWhatAttr(mountInfo); err != nil {
 		return err
 	}
 
 	if err := validateWhereAttr(mountInfo.where); err != nil {
-		return err
-	}
-
-	if err := validateMountTypes(mountInfo.types); err != nil {
 		return err
 	}
 
@@ -540,9 +599,30 @@ func (iface *mountControlInterface) BeforeConnectPlug(plug *interfaces.Connected
 	return nil
 }
 
+func expandMountWhereVariable(where string, si *snap.Info) (string, error) {
+	if where[0] != '$' {
+		return where, nil
+	}
+
+	matches := whereRegexp.FindStringSubmatchIndex(where)
+	if len(matches) < 4 {
+		// This cannot really happen, as the string wouldn't pass the validation
+		return "", fmt.Errorf(`internal error: "where" fails to match regexp: %q`, where)
+	}
+	// the first two elements in "matches" are the boundaries of the whole
+	// string; the next two are the boundaries of the first match, which is
+	// what we care about as it contains the environment variable we want
+	// to expand:
+	variableStart, variableEnd := matches[2], matches[3]
+	variable := where[variableStart:variableEnd]
+	expanded := si.ExpandSnapVariables(variable)
+	target := expanded + where[variableEnd:]
+	return target, nil
+}
+
 func (iface *mountControlInterface) AppArmorConnectedPlug(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	mountControlSnippet := bytes.NewBuffer(nil)
-	emit := func(f string, args ...interface{}) {
+	emit := func(f string, args ...any) {
 		fmt.Fprintf(mountControlSnippet, f, args...)
 	}
 	snapInfo := plug.Snap()
@@ -552,8 +632,6 @@ func (iface *mountControlInterface) AppArmorConnectedPlug(spec *apparmor.Specifi
   capability sys_admin,  # for mount
 
   owner @{PROC}/@{pid}/mounts r,
-  owner @{PROC}/@{pid}/mountinfo r,
-  owner @{PROC}/self/mountinfo r,
 
   /{,usr/}bin/mount ixr,
   /{,usr/}bin/umount ixr,
@@ -566,21 +644,23 @@ func (iface *mountControlInterface) AppArmorConnectedPlug(spec *apparmor.Specifi
 	enumerateMounts(plug, func(mountInfo *MountInfo) error {
 
 		source := mountInfo.what
-		target := mountInfo.where
-		if target[0] == '$' {
-			matches := whereRegexp.FindStringSubmatchIndex(target)
-			if matches == nil || len(matches) < 4 {
-				// This cannot really happen, as the string wouldn't pass the validation
-				return fmt.Errorf(`internal error: "where" fails to match regexp: %q`, mountInfo.where)
-			}
-			// the first two elements in "matches" are the boundaries of the whole
-			// string; the next two are the boundaries of the first match, which is
-			// what we care about as it contains the environment variable we want
-			// to expand:
-			variableStart, variableEnd := matches[2], matches[3]
-			variable := target[variableStart:variableEnd]
-			expanded := snapInfo.ExpandSnapVariables(variable)
-			target = expanded + target[variableEnd:]
+		target, err := expandMountWhereVariable(mountInfo.where, snapInfo)
+		if err != nil {
+			return err
+		}
+
+		if mountInfo.isType("nfs") {
+			// override NFS share source, also see 'nfs-mount' interface
+			source = "*:**"
+
+			// emit additional rule required by NFS
+			emit("  # Allow lookup of RPC program numbers (due to mount-control)\n")
+			emit("  /etc/rpc r,\n")
+		}
+
+		if mountInfo.isType("cifs") {
+			// override CIFS share source, also see 'cifs-mount' interface
+			source = "//**"
 		}
 
 		var typeRule string
@@ -606,6 +686,7 @@ func (iface *mountControlInterface) AppArmorConnectedPlug(spec *apparmor.Specifi
 	})
 
 	spec.AddSnippet(mountControlSnippet.String())
+	spec.AddPrioritizedSnippet(mountInfoSnippet, apparmor.MountInfoKey, mountInfoPriority)
 	return nil
 }
 
@@ -616,13 +697,14 @@ func (iface *mountControlInterface) AutoConnect(*snap.PlugInfo, *snap.SlotInfo) 
 func init() {
 	registerIface(&mountControlInterface{
 		commonInterface: commonInterface{
-			name:                 "mount-control",
-			summary:              mountControlSummary,
-			baseDeclarationPlugs: mountControlBaseDeclarationPlugs,
-			baseDeclarationSlots: mountControlBaseDeclarationSlots,
-			implicitOnCore:       true,
-			implicitOnClassic:    true,
-			connectedPlugSecComp: mountControlConnectedPlugSecComp,
+			name:                     "mount-control",
+			summary:                  mountControlSummary,
+			baseDeclarationPlugs:     mountControlBaseDeclarationPlugs,
+			baseDeclarationSlots:     mountControlBaseDeclarationSlots,
+			implicitOnCore:           true,
+			implicitOnClassic:        true,
+			connectedPlugSecComp:     mountControlConnectedPlugSecComp,
+			parallelInstancesSlotErr: errParallelInstancesSystemSlot,
 		},
 	})
 }

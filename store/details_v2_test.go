@@ -29,6 +29,7 @@ import (
 
 	"github.com/snapcore/snapd/jsonutil/safejson"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/integrity"
 	"github.com/snapcore/snapd/testutil"
 )
 
@@ -76,7 +77,48 @@ const (
   "type": "os",
   "version": "16-2.30",
   "website": "http://example.com/core",
-  "media": []
+  "media": [],
+  "resources": [
+    {
+      "download": {
+        "sha3-384": "6d001da919b965dc3a4672b9d7ddce374d165452a2285f2753988842092ea6b9946645375cff3ede89a991c9698bfcea",
+        "size": 20000021,
+        "url": "https://api.snapcraft.io/api/v1/snaps/download/ABCEfjn4WJYnm0FzDKwqqRZZI77awQEV_21.snap"
+      },
+      "type": "component/standard",
+      "name": "some-component",
+      "revision": 1,
+      "version": "1.0",
+      "created-at": "2018-01-26T11:38:35.536410+00:00",
+      "description": "Some component"
+    },
+    {
+      "download": {
+        "sha3-384": "6d001da919b965dc3a4672b9d7ddce374d165452a2285f2753988842092ea6b9946645375cff3ede89a991c9698bfcea",
+        "size": 20000021,
+        "url": "https://api.snapcraft.io/api/v1/snaps/download/ABCEfjn4WJYnm0FzDKwqqRZZI77awQEV_21.snap"
+      },
+      "type": "component/unknown-type",
+      "name": "unknown-component",
+      "revision": 1,
+      "version": "1.0",
+      "created-at": "2018-01-26T11:38:35.536410+00:00",
+      "description": "Unknown component"
+    },
+    {
+      "download": {
+        "sha3-384": "e6da7b15f767111ce34f22fa2059d23b43cb756e73256279e1d7f98a2eaab0d93725c2bfb25dd1deb1261223d961ee61",
+        "size": 20000023,
+        "url": "https://api.snapcraft.io/api/v1/snaps/download/123Efjn4WJYnm0FzDKwqqRZZI77awQEV_21.snap"
+      },
+      "type": "not-a-component/thing",
+      "name": "some-not-component",
+      "revision": 1,
+      "version": "1.0",
+      "created-at": "2018-01-26T11:38:35.536410+00:00",
+      "description": "Something that is not a component"
+    }
+  ]
 }`
 
 	thingyStoreJSON = `{
@@ -130,7 +172,7 @@ const (
   },
   "revision": 21,
   "snap-id": "XYZEfjn4WJYnm0FzDKwqqRZZI77awQEV",
-  "snap-yaml": "name: test-snapd-content-plug\nversion: 1.0\nassumes: [snapd2.49]\napps:\n    user-svc:\n        command: bin/user-svc\n        daemon-scope: user\n        daemon: simple\n    content-plug:\n        command: bin/content-plug\n        plugs: [shared-content-plug]\nplugs:\n    shared-content-plug:\n        interface: content\n        target: import\n        content: mylib\n        default-provider: test-snapd-content-slot\nslots:\n    shared-content-slot:\n        interface: content\n        content: mylib\n        read:\n            - /\nprovenance: prov\n",
+  "snap-yaml": "name: test-snapd-content-plug\nversion: 1.0\ngrade: stable\nassumes: [snapd2.49]\napps:\n    user-svc:\n        command: bin/user-svc\n        daemon-scope: user\n        daemon: simple\n    content-plug:\n        command: bin/content-plug\n        plugs: [shared-content-plug]\nplugs:\n    shared-content-plug:\n        interface: content\n        target: import\n        content: mylib\n        default-provider: test-snapd-content-slot\nslots:\n    shared-content-slot:\n        interface: content\n        content: mylib\n        read:\n            - /\nprovenance: prov\ncomponents:\n  some-component:\n    type: standard\n    name: some-component\n    description: Some component\n    summary: Component summary\n    hooks:\n      install:",
   "store-url": "https://snapcraft.io/thingy",
   "summary": "useful thingy",
   "title": "This Is The Most Fantastical Snap of Thingy",
@@ -141,6 +183,50 @@ const (
      {"type": "icon", "url": "https://dashboard.snapcraft.io/site_media/appmedia/2017/12/Thingy.png"},
      {"type": "screenshot", "url": "https://dashboard.snapcraft.io/site_media/appmedia/2018/01/Thingy_01.png"},
      {"type": "screenshot", "url": "https://dashboard.snapcraft.io/site_media/appmedia/2018/01/Thingy_02.png", "width": 600, "height": 200}
+  ],
+  "integrity": [
+    {
+      "type": "dm-verity",
+      "digest": "b113ea1005b1bdac956e6d4cdc25ec7a243cc1dd377e8a0cd2d4d3d578c5d28a",
+      "version": "1",
+      "salt": "5787e23693ccac46eaff840cd276f7f6557bdb2404204216888abe6b3a76bafb",
+      "hash-algorithm": "sha256",
+      "hash-block-size": 4096,
+      "data-block-size": 4096,
+      "download": {
+        "sha3-384": "d77e2c6c4474c887052acdea1746ac3b0e43736ce785b68ef95cef40cb432fd07...",
+        "size": 73728,
+        "url": "https://api.snapcraft.io/api/v1/snaps/dm-verity/download/snap_is5RHGsPRN5eXmkAraS0CA8UtV75loON_101.dmverity_b113ea1005b1bdac956e6d4cdc25ec7a243cc1dd377e8a0cd2d4d3d578c5d28a"
+      }
+    }
+  ],
+  "resources": [
+    {
+      "download": {
+          "sha3-384": "6d001da919b965dc3a4672b9d7ddce374d165452a2285f2753988842092ea6b9946645375cff3ede89a991c9698bfcea",
+          "size": 20000021,
+          "url": "https://api.snapcraft.io/api/v1/snaps/download/ABCEfjn4WJYnm0FzDKwqqRZZI77awQEV_21.snap"
+      },
+      "type": "component/standard",
+      "name": "some-component",
+      "revision": 1,
+      "version": "1.0",
+      "created-at": "2018-01-26T11:38:35.536410+00:00",
+      "description": "Some component"
+    },
+    {
+      "download": {
+          "sha3-384": "e6da7b15f767111ce34f22fa2059d23b43cb756e73256279e1d7f98a2eaab0d93725c2bfb25dd1deb1261223d961ee61",
+          "size": 20000023,
+          "url": "https://api.snapcraft.io/api/v1/snaps/download/123Efjn4WJYnm0FzDKwqqRZZI77awQEV_21.snap"
+      },
+      "type": "not-a-component/thing",
+      "name": "some-not-component",
+      "revision": 1,
+      "version": "1.0",
+      "created-at": "2018-01-26T11:38:35.536410+00:00",
+      "description": "Something that is not a component"
+    }
   ]
 }`
 )
@@ -193,6 +279,17 @@ func (s *detailsV2Suite) TestInfoFromStoreSnapSimpleAndLegacy(c *C) {
 		},
 		LegacyWebsite: "http://example.com/core",
 		StoreURL:      "https://snapcraft.io/core",
+
+		// components are derived from resources in this case, rather than
+		// snap-yaml. note that non-component resources are ignored and unknown
+		// components types are ignored
+		Components: map[string]*snap.Component{
+			"some-component": {
+				Name:        "some-component",
+				Type:        snap.StandardComponent,
+				Description: "Some component",
+			},
+		},
 	})
 }
 
@@ -213,6 +310,7 @@ func (s *detailsV2Suite) TestInfoFromStoreSnap(c *C) {
 	info2.Slots = nil
 	info2.Apps = nil
 	info2.Hooks = nil
+	info2.Components = nil
 	c.Check(&info2, DeepEquals, &snap.Info{
 		SuggestedName: "test-snapd-content-plug",
 		Architectures: []string{"amd64"},
@@ -241,6 +339,7 @@ func (s *detailsV2Suite) TestInfoFromStoreSnap(c *C) {
 		SnapType:    snap.TypeApp,
 		Version:     "9.50",
 		Confinement: snap.StrictConfinement,
+		Grade:       snap.StableGrade,
 		License:     "Proprietary",
 		Publisher: snap.StoreAccount{
 			ID:          "ZvtzsxbsHivZLdvzrt0iqW529riGLfXJ",
@@ -283,6 +382,22 @@ func (s *detailsV2Suite) TestInfoFromStoreSnap(c *C) {
 		SystemUsernames: map[string]*snap.SystemUsernameInfo{},
 		OriginalLinks:   map[string][]string{},
 		LegacyAliases:   map[string]*snap.AppInfo{},
+		IntegrityData: &snap.IntegrityDataInfo{
+			IntegrityDataParams: integrity.IntegrityDataParams{
+				Type:          "dm-verity",
+				Digest:        "b113ea1005b1bdac956e6d4cdc25ec7a243cc1dd377e8a0cd2d4d3d578c5d28a",
+				Version:       1,
+				Salt:          "5787e23693ccac46eaff840cd276f7f6557bdb2404204216888abe6b3a76bafb",
+				HashAlg:       "sha256",
+				HashBlockSize: 4096,
+				DataBlockSize: 4096,
+			},
+			DownloadInfo: snap.DownloadInfo{
+				Sha3_384:    "d77e2c6c4474c887052acdea1746ac3b0e43736ce785b68ef95cef40cb432fd07...",
+				Size:        73728,
+				DownloadURL: "https://api.snapcraft.io/api/v1/snaps/dm-verity/download/snap_is5RHGsPRN5eXmkAraS0CA8UtV75loON_101.dmverity_b113ea1005b1bdac956e6d4cdc25ec7a243cc1dd377e8a0cd2d4d3d578c5d28a",
+			},
+		},
 	})
 
 	// validate the plugs/slots
@@ -304,6 +419,21 @@ func (s *detailsV2Suite) TestInfoFromStoreSnap(c *C) {
 	c.Check(info.Apps["user-svc"].Command, Equals, "bin/user-svc")
 	c.Check(info.Apps["user-svc"].Daemon, Equals, "simple")
 	c.Check(info.Apps["user-svc"].DaemonScope, Equals, snap.UserDaemon)
+
+	// validate components
+	someComponent := *info.Components["some-component"]
+	c.Assert(someComponent, NotNil)
+
+	c.Check(someComponent.ExplicitHooks["install"].Explicit, Equals, true)
+	// clear recursive bits
+	someComponent.ExplicitHooks = nil
+
+	c.Check(someComponent, DeepEquals, snap.Component{
+		Name:        "some-component",
+		Type:        snap.StandardComponent,
+		Description: "Some component",
+		Summary:     "Component summary",
+	})
 
 	// private
 	err = json.Unmarshal([]byte(strings.Replace(thingyStoreJSON, `"private": false`, `"private": true`, 1)), &snp)
@@ -331,7 +461,7 @@ func (s *detailsV2Suite) TestInfoFromStoreSnap(c *C) {
 		"Layout",
 		"SideInfo.Channel",
 		"LegacyWebsite",
-		"Components",
+		"UbuntuCoreTracks",
 	}
 	var checker func(string, reflect.Value)
 	checker = func(pfx string, x reflect.Value) {
@@ -359,11 +489,92 @@ func (s *detailsV2Suite) TestInfoFromStoreSnap(c *C) {
 	checker("", x)
 }
 
+func (s *detailsV2Suite) TestInfoFromStoreSnapIgnoresOtherSnapYamlErrors(c *C) {
+	for _, snapYaml := range []string{
+		`name: snapd
+version: 1.0
+layouts: {}
+`,
+		`name: snapd
+version: 1.0
+snapd-info: []
+`,
+		`name: snapd
+version: 1.0
+snapd-info:
+  ubuntu-core-tracks:
+    "18": "18"
+`,
+		`name: snapd
+version: 1.0
+snapd-info:
+  ubuntu-core-tracks:
+    "18":
+      latest: "18/stable"
+`,
+	} {
+		snp := &storeSnap{
+			Name:     "snapd",
+			Type:     snap.TypeSnapd,
+			SnapYAML: snapYaml,
+		}
+
+		info, err := infoFromStoreSnap(snp)
+		c.Assert(err, IsNil, Commentf("yaml=%s", snapYaml))
+		c.Check(info.UbuntuCoreTracks, IsNil, Commentf("yaml=%s", snapYaml))
+		c.Check(info.RealName, Equals, "snapd", Commentf("yaml=%s", snapYaml))
+	}
+}
+
+func (s *detailsV2Suite) TestInfoFromStoreSnapUbuntuCoreTracks(c *C) {
+	snp := &storeSnap{
+		Name: "snapd",
+		Type: snap.TypeSnapd,
+		SnapYAML: `name: snapd
+version: 1.0
+snapd-info:
+  ubuntu-core-tracks:
+    "18":
+      latest: "18"
+      fips-updates: "18-fips"
+`,
+	}
+
+	info, err := infoFromStoreSnap(snp)
+	c.Assert(err, IsNil)
+	c.Check(info.UbuntuCoreTracks, DeepEquals, snap.UbuntuCoreTracks{
+		"18": {"latest": "18", "fips-updates": "18-fips"},
+	})
+}
+
+func (s *detailsV2Suite) TestInfoFromStoreSnapEmptyUbuntuCoreTracksSnapd(c *C) {
+	for _, snapYaml := range []string{
+		`name: snapd
+version: 1.0
+snapd-info:
+  ubuntu-core-tracks: {}
+`,
+		`name: snapd
+version: 1.0
+`,
+	} {
+		snp := &storeSnap{
+			Name:     "snapd",
+			Type:     snap.TypeSnapd,
+			SnapYAML: snapYaml,
+		}
+
+		info, err := infoFromStoreSnap(snp)
+		c.Assert(err, IsNil)
+		c.Check(info.UbuntuCoreTracks, IsNil)
+	}
+}
+
 // arg must be a pointer to a struct
-func fillStruct(a interface{}, c *C) {
-	if t := reflect.TypeOf(a); t.Kind() != reflect.Ptr || t.Elem().Kind() != reflect.Struct {
+func fillStruct(a any, c *C) {
+	if t := reflect.TypeOf(a); t.Kind() != reflect.Pointer || t.Elem().Kind() != reflect.Struct {
 		k := t.Kind()
-		if k == reflect.Ptr {
+		if k == reflect.Pointer {
 			k = t.Elem().Kind()
 		}
 		c.Fatalf("first argument must be expected a pointer to a struct, not %s", k)
@@ -372,7 +583,7 @@ func fillStruct(a interface{}, c *C) {
 	n := va.Elem().NumField()
 	for i := 0; i < n; i++ {
 		field := va.Elem().Field(i)
-		var x interface{}
+		var x any
 		switch field.Interface().(type) {
 		case string:
 			x = "foo"
@@ -386,8 +597,8 @@ func fillStruct(a interface{}, c *C) {
 			var p safejson.Paragraph
 			c.Assert(json.Unmarshal([]byte(`"foo"`), &p), IsNil)
 			x = p
-		case storeSnapDownload:
-			x = storeSnapDownload{
+		case storeDownload:
+			x = storeDownload{
 				URL:      "http://example.com/foo",
 				Size:     42,
 				Sha3_384: "foo",
@@ -423,6 +634,32 @@ func fillStruct(a interface{}, c *C) {
 			x = map[string][]string{
 				"contact": {"mailto:foo", "mailto:bar"},
 			}
+		case []storeResource:
+			x = []storeResource{{
+				Type: "component/standard",
+				Download: storeDownload{
+					URL:      "http://example.com/resource",
+					Size:     42,
+					Sha3_384: "sha",
+				},
+				Name:     "some-component",
+				Revision: 1,
+			}}
+		case []storeIntegrity:
+			x = []storeIntegrity{{
+				Type:          "dm-verity",
+				Digest:        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				Version:       "1",
+				Salt:          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				HashAlg:       "sha256",
+				HashBlockSize: 4096,
+				DataBlockSize: 4096,
+				Download: storeDownload{
+					URL:      "http://example.com/dm-verity/",
+					Size:     42,
+					Sha3_384: "sha",
+				},
+			}}
 		default:
 			c.Fatalf("unhandled field type %T", field.Interface())
 		}

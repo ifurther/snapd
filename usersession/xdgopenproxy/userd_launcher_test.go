@@ -25,7 +25,7 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/godbus/dbus"
+	"github.com/godbus/dbus/v5"
 	. "gopkg.in/check.v1"
 
 	"github.com/snapcore/snapd/testutil"
@@ -120,6 +120,9 @@ func (s *userdSuite) TestOpenMissingFile(c *C) {
 }
 
 func (s *userdSuite) TestOpenUnreadableFile(c *C) {
+	if os.Geteuid() == 0 {
+		c.Skip("this test cannot run as root (root can read files regardless of mode)")
+	}
 	launcher := &xdgopenproxy.UserdLauncher{}
 
 	path := filepath.Join(c.MkDir(), "test.txt")

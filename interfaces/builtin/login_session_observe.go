@@ -31,7 +31,8 @@ const loginSessionObserveBaseDeclarationSlots = `
 
 const loginSessionObserveConnectedPlugAppArmor = `
 # Allow reading login and session information
-/{,usr/}bin/who  ixr,
+# Support coreutils paths (LP: #2123870)
+@{SNAP_COREUTIL_DIRS}who  ixr,
 /var/log/wtmp    rk,
 /{,var/}run/utmp rk,
 
@@ -60,7 +61,7 @@ const loginSessionObserveConnectedPlugAppArmor = `
 # do not use peer=(label=unconfined) here since this is DBus activated
 dbus (send)
     bus=system
-    path=/org/freedesktop/login1
+    path=/org/freedesktop/login1{,/seat/*,/session/*,/user/*}
     interface=org.freedesktop.DBus.Introspectable
     member=Introspect,
 
@@ -117,11 +118,12 @@ type loginSessionObserveInterface struct {
 
 func init() {
 	registerIface(&loginSessionObserveInterface{commonInterface: commonInterface{
-		name:                  "login-session-observe",
-		summary:               loginSessionObserveSummary,
-		implicitOnCore:        true,
-		implicitOnClassic:     true,
-		baseDeclarationSlots:  loginSessionObserveBaseDeclarationSlots,
-		connectedPlugAppArmor: loginSessionObserveConnectedPlugAppArmor,
+		name:                     "login-session-observe",
+		summary:                  loginSessionObserveSummary,
+		implicitOnCore:           true,
+		implicitOnClassic:        true,
+		baseDeclarationSlots:     loginSessionObserveBaseDeclarationSlots,
+		connectedPlugAppArmor:    loginSessionObserveConnectedPlugAppArmor,
+		parallelInstancesSlotErr: errParallelInstancesSystemSlot,
 	}})
 }

@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2016-2018 Canonical Ltd
+ * Copyright (C) 2016-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -25,7 +25,9 @@
 package udev
 
 import (
+	"bufio"
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -35,22 +37,51 @@ import (
 
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/interfaces"
+	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/sandbox/cgroup"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
+	"github.com/snapcore/snapd/systemd"
 	"github.com/snapcore/snapd/timings"
 )
 
 // Backend is responsible for maintaining udev rules.
 type Backend struct {
-	preseed bool
+	preseed     bool
+	isContainer bool
 }
+
+// rulesSubsystemTriggersPrefix is the prefix of the comment written by Setup()
+// and parsed by Remove() to replay the right udevadm subsystem triggers.
+const rulesSubsystemTriggersPrefix = "# subsystem-triggers: "
 
 // Initialize does nothing.
 func (b *Backend) Initialize(opts *interfaces.SecurityBackendOptions) error {
 	if opts != nil && opts.Preseed {
 		b.preseed = true
 	}
+	// Since snapd 2.68 the udev backend, responsible for writing udev rules to
+	// /etc/udev/rules.d and for calling udevadm control --reload-rules, as
+	// well as udevadm trigger (with a number of options), is no longer enabled
+	// in containers. System administrators retain ability to manage access to
+	// real devices at the container level.
+	//
+	// For context:
+	//
+	// In Linux, devices are _not_ namespace aware so if a device is accessible
+	// in the container (and the container manager has allowed such access)
+	// then allow snaps to freely poke the device subject to still-enforced
+	// apparmor rules. In "traditional" containers such as docker or podman,
+	// where using systemd is unusual and unsupported this doesn't change
+	// anything. In system containers such as lxd and incus users may, with or
+	// without understanding the consequences, switch the container to
+	// privileged mode. In this mode udev does start inside the container, but
+	// actively configures devices on the host with undesirable consequences.
+	//
+	// But we want the backend active when preseeding so preseeded images
+	// actually have the files in /var/lib/snapd/cgroup.
+	b.isContainer = systemd.IsContainer()
 	return nil
 }
 
@@ -59,15 +90,15 @@ func (b *Backend) Name() interfaces.SecuritySystem {
 	return interfaces.SecurityUDev
 }
 
+func (b *Backend) Prepare(_ *interfaces.SnapAppSet) error {
+	// No preparation required.
+	return nil
+}
+
 // snapRulesFileName returns the path of the snap udev rules file.
 func snapRulesFilePath(snapName string) string {
 	rulesFileName := fmt.Sprintf("70-%s.rules", snap.SecurityTag(snapName))
 	return filepath.Join(dirs.SnapUdevRulesDir, rulesFileName)
-}
-
-func snapDeviceCgroupSelfManageFilePath(snapName string) string {
-	selfManageFileName := fmt.Sprintf("%s.device", snap.SecurityTag(snapName))
-	return filepath.Join(dirs.SnapCgroupPolicyDir, selfManageFileName)
 }
 
 // Setup creates udev rules specific to a given snap.
@@ -76,11 +107,11 @@ func snapDeviceCgroupSelfManageFilePath(snapName string) string {
 // UDev has no concept of a complain mode so confinement options are ignored.
 //
 // If the method fails it should be re-tried (with a sensible strategy) by the caller.
-func (b *Backend) Setup(appSet *interfaces.SnapAppSet, opts interfaces.ConfinementOptions, repo *interfaces.Repository, tm timings.Measurer) error {
-	snapName := appSet.InstanceName()
-	spec, err := repo.SnapSpecification(b.Name(), appSet)
+func (b *Backend) Setup(appSet *interfaces.SnapAppSet, opts interfaces.ConfinementOptions, sctx interfaces.SetupContext, repo *interfaces.Repository, tm timings.Measurer) error {
+	instanceName := appSet.InstanceName().String()
+	spec, err := repo.SnapSpecification(b.Name(), appSet, opts)
 	if err != nil {
-		return fmt.Errorf("cannot obtain udev specification for snap %q: %w", snapName, err)
+		return fmt.Errorf("cannot obtain udev specification for snap %q: %w", instanceName, err)
 	}
 
 	udevSpec := spec.(*Specification)
@@ -94,8 +125,9 @@ func (b *Backend) Setup(appSet *interfaces.SnapAppSet, opts interfaces.Confineme
 		return fmt.Errorf("cannot create directory for cgroup flags: %w", err)
 	}
 
-	rulesFilePath := snapRulesFilePath(snapName)
-	selfManageDeviceCgroupPath := snapDeviceCgroupSelfManageFilePath(snapName)
+	rulesFilePath := snapRulesFilePath(instanceName)
+	selfManageDeviceCgroupPath := cgroup.SnapDeviceFile(snap.SecurityTag(instanceName))
+	nonStrict := (opts.DevMode || opts.Classic) && !opts.JailMode
 
 	needReload := false
 	// content is always empty whenever the snap controls device
@@ -112,11 +144,18 @@ func (b *Backend) Setup(appSet *interfaces.SnapAppSet, opts interfaces.Confineme
 	} else {
 		var rulesBuf bytes.Buffer
 		rulesBuf.WriteString("# This file is automatically generated.\n")
-		if (opts.DevMode || opts.Classic) && !opts.JailMode {
+		if nonStrict {
 			rulesBuf.WriteString("# udev tagging/device cgroups disabled with non-strict mode snaps\n")
+		} else if len(subsystemTriggers) > 0 {
+			// lets Remove() replay the right udevadm triggers without access to the spec.
+			data, err := json.Marshal(subsystemTriggers)
+			if err != nil {
+				return fmt.Errorf("internal error: cannot marshal subsystem triggers: %v", err)
+			}
+			rulesBuf.WriteString(rulesSubsystemTriggersPrefix + string(data) + "\n")
 		}
 		for _, snippet := range content {
-			if (opts.DevMode || opts.Classic) && !opts.JailMode {
+			if nonStrict {
 				rulesBuf.WriteRune('#')
 				snippet = strings.Replace(snippet, "\n", "\n#", -1)
 			}
@@ -151,25 +190,27 @@ func (b *Backend) Setup(appSet *interfaces.SnapAppSet, opts interfaces.Confineme
 		}
 	}
 
-	var deviceBuf bytes.Buffer
-	deviceBuf.WriteString("# This file is automatically generated.\n")
-
+	var devCgroupOpts cgroup.SnapDeviceCgroupOptions
 	if udevSpec.ControlsDeviceCgroup() {
 		// The spec states that the snap can manage its own device
 		// cgroup (typically applies to container-like snaps), in which
 		// case leave a flag for snap-confine in at a known location.
-		deviceBuf.WriteString("# snap is allowed to manage own device cgroup.\n")
-		deviceBuf.WriteString("self-managed=true\n")
+		devCgroupOpts.SelfManaged = true
 	}
-	if (opts.DevMode || opts.Classic) && !opts.JailMode {
-		// Allow devmode
-		deviceBuf.WriteString("# snap uses non-strict confinement.\n")
-		deviceBuf.WriteString("non-strict=true\n")
+	if nonStrict {
+		// Set the non-strict flag which disables constraints on character
+		// and block devices based on their major:minor numbers.
+		devCgroupOpts.NonStrict = true
+	}
+
+	cgroupOptsBytes, err := devCgroupOpts.MarshalText()
+	if err != nil {
+		return err
 	}
 
 	// the file serves as a checkpoint that udev backend was set up
 	err = osutil.EnsureFileState(selfManageDeviceCgroupPath, &osutil.MemoryFileState{
-		Content: deviceBuf.Bytes(),
+		Content: cgroupOptsBytes,
 		Mode:    0644,
 	})
 	if err != nil && !errors.Is(err, osutil.ErrSameState) {
@@ -178,15 +219,69 @@ func (b *Backend) Setup(appSet *interfaces.SnapAppSet, opts interfaces.Confineme
 	return nil
 }
 
+// readRulesSubsystemTriggers reads the subsystem triggers that Setup() embeds as a comment:
+//
+//	# subsystem-triggers: ["input","input/key"]
+func readRulesSubsystemTriggers(rulesFilePath string) []string {
+	f, err := os.Open(rulesFilePath)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			logger.Noticef("cannot open udev rules file %s: %v", rulesFilePath, err)
+		}
+		return nil
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, rulesSubsystemTriggersPrefix) {
+			var triggers []string
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, rulesSubsystemTriggersPrefix)), &triggers); err != nil {
+				logger.Noticef("cannot unmarshal subsystem triggers in %s: %v", rulesFilePath, err)
+				return nil
+			}
+			for _, t := range triggers {
+				if !isKnownSubsystemTrigger(t) {
+					logger.Noticef("unknown subsystem trigger %q in %s", t, rulesFilePath)
+					return nil
+				}
+			}
+			return triggers
+		}
+		// stop once past the header comments to avoid scanning the whole file
+		if !strings.HasPrefix(line, "#") {
+			break
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		logger.Noticef("cannot read udev rules file %s: %v", rulesFilePath, err)
+	}
+	return nil
+}
+
+// isKnownSubsystemTrigger reports whether t is a known value that
+// spec.TriggerSubsystem() can produce.
+func isKnownSubsystemTrigger(t string) bool {
+	switch t {
+	case "input", "input/key", "input/joystick":
+		return true
+	}
+	return false
+}
+
 // Remove removes udev rules specific to a given snap.
 // If any of the rules are removed then udev database is reloaded.
 //
 // This method should be called after removing a snap.
 //
 // If the method fails it should be re-tried (with a sensible strategy) by the caller.
-func (b *Backend) Remove(snapName string) error {
-	rulesFilePath := snapRulesFilePath(snapName)
-	selfManageDeviceCgroupPath := snapDeviceCgroupSelfManageFilePath(snapName)
+func (b *Backend) Remove(instanceName naming.InstanceName) error {
+	rulesFilePath := snapRulesFilePath(instanceName.String())
+	selfManageDeviceCgroupPath := cgroup.SnapDeviceFile(snap.SecurityTag(instanceName.String()))
+
+	// Read subsystem triggers from the rules file before removing it,
+	// so that Remove() can reload the right subsystems.
+	subsystemTriggers := readRulesSubsystemTriggers(rulesFilePath)
 
 	// If file doesn't exist we avoid reloading the udev rules when we return here
 	needReload := false
@@ -200,11 +295,8 @@ func (b *Backend) Remove(snapName string) error {
 		return err
 	}
 
-	// FIXME: somehow detect the interfaces that were disconnected and set
-	// subsystemTriggers appropriately. ATM, it is always going to be empty
-	// on disconnect.
 	if needReload {
-		return b.reloadRules(nil)
+		return b.reloadRules(subsystemTriggers)
 	}
 	return nil
 }
@@ -214,7 +306,7 @@ func (b *Backend) deriveContent(spec *Specification) (content []string) {
 	return content
 }
 
-func (b *Backend) NewSpecification(appSet *interfaces.SnapAppSet) interfaces.Specification {
+func (b *Backend) NewSpecification(appSet *interfaces.SnapAppSet, opts interfaces.ConfinementOptions) interfaces.Specification {
 	return &Specification{appSet: appSet}
 }
 

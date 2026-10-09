@@ -21,6 +21,7 @@ package install
 
 import (
 	"github.com/snapcore/snapd/gadget"
+	"github.com/snapcore/snapd/gadget/device"
 	"github.com/snapcore/snapd/gadget/quantity"
 	"github.com/snapcore/snapd/secboot"
 	"github.com/snapcore/snapd/secboot/keys"
@@ -30,14 +31,14 @@ type Options struct {
 	// Also mount the filesystems after creation
 	Mount bool
 	// Encrypt the data/save partitions
-	EncryptionType secboot.EncryptionType
+	EncryptionType device.EncryptionType
 }
 
 // InstalledSystemSideData carries side data of an installed system, eg. secrets
 // to access its partitions.
 type InstalledSystemSideData struct {
 	// KeysForRoles contains key sets for the relevant structure roles.
-	KeyForRole map[string]keys.EncryptionKey
+	BootstrappedContainerForRole map[string]secboot.BootstrappedContainer
 	// DeviceForRole maps a roles to their corresponding device nodes. For
 	// structures with roles that require data to be encrypted, the device
 	// is the raw encrypted device node (eg. /dev/mmcblk0p1).
@@ -50,8 +51,8 @@ type partEncryptionData struct {
 	device          string
 	encryptedDevice string
 
-	volName       string
-	encryptionKey keys.EncryptionKey
+	volName    string
+	installKey secboot.BootstrappedContainer
 	// TODO: this is currently not used
 	encryptedSectorSize quantity.Size
 	encryptionParams    gadget.StructureEncryptionParameters
@@ -62,6 +63,21 @@ type partEncryptionData struct {
 type EncryptionSetupData struct {
 	// maps from partition label to data
 	parts map[string]partEncryptionData
+	// optional volume authentication options
+	volumesAuth *device.VolumesAuthOptions
+	// optional recovery key. if not nil, it indicates that the
+	// corresponding recovery key should be used for all relevant
+	// volumes during installation.
+	rkey *keys.RecoveryKey
+	// optional preinstall check context that includes the check result that
+	// reflects the outcome of the most recent check and contains information
+	// required for optimum PCR configuration and reseal post install
+	preinstallCheckContext *secboot.PreinstallCheckContext
+	// extraSnapdKernelCommandLineFragments holds extra snapd kernel command
+	// line fragments keyed by fragment ID (e.g. "xkb").
+	//
+	// TODO: use typed fragment IDs instead of string keys.
+	extraSnapdKernelCommandLineFragments map[string]string
 }
 
 // EncryptedDevices returns a map partition role -> LUKS mapper device.
@@ -73,6 +89,29 @@ func (esd *EncryptionSetupData) EncryptedDevices() map[string]string {
 	return m
 }
 
+// VolumesAuth returns attached volumes authentication options if any.
+func (esd *EncryptionSetupData) VolumesAuth() *device.VolumesAuthOptions {
+	return esd.volumesAuth
+}
+
+// ExtraSnapdKernelCommandLineFragments returns extra snapd kernel command line
+// fragments keyed by fragment ID.
+func (esd *EncryptionSetupData) ExtraSnapdKernelCommandLineFragments() map[string]string {
+	return esd.extraSnapdKernelCommandLineFragments
+}
+
+func (esd *EncryptionSetupData) SetRecoveryKey(rkey *keys.RecoveryKey) {
+	esd.rkey = rkey
+}
+
+func (esd *EncryptionSetupData) RecoveryKey() *keys.RecoveryKey {
+	return esd.rkey
+}
+
+func (esd *EncryptionSetupData) PreinstallCheckContext() *secboot.PreinstallCheckContext {
+	return esd.preinstallCheckContext
+}
+
 // MockEncryptedDeviceAndRole is meant to be used for unit tests from other
 // packages.
 type MockEncryptedDeviceAndRole struct {
@@ -82,14 +121,31 @@ type MockEncryptedDeviceAndRole struct {
 
 // MockEncryptionSetupData is meant to be used for unit tests from other
 // packages.
-func MockEncryptionSetupData(labelToEncDevice map[string]*MockEncryptedDeviceAndRole) *EncryptionSetupData {
+func MockEncryptionSetupData(
+	labelToEncDevice map[string]*MockEncryptedDeviceAndRole,
+	rkey *keys.RecoveryKey,
+	volumesAuth *device.VolumesAuthOptions,
+	checkContext *secboot.PreinstallCheckContext,
+	extraSnapdKernelCommandLineFragments map[string]string,
+) *EncryptionSetupData {
 	esd := &EncryptionSetupData{
-		parts: map[string]partEncryptionData{}}
+		parts:                                map[string]partEncryptionData{},
+		volumesAuth:                          volumesAuth,
+		rkey:                                 rkey,
+		preinstallCheckContext:               checkContext,
+		extraSnapdKernelCommandLineFragments: extraSnapdKernelCommandLineFragments,
+	}
 	for label, encryptData := range labelToEncDevice {
+		//TODO:FDEM: we should use a mock for the bootstrap key. However,
+		//this is still used in place where LegacyKeptKey will be
+		//called to write the save key to a file in
+		//overlord/install/install.go. Once we have removed that call,
+		// we can use mock object instead.
+		bootstrapKey := secboot.CreateMockBootstrappedContainer()
 		esd.parts[label] = partEncryptionData{
 			role:                encryptData.Role,
 			encryptedDevice:     encryptData.EncryptedDevice,
-			encryptionKey:       keys.EncryptionKey{1, 2, 3},
+			installKey:          bootstrapKey,
 			encryptedSectorSize: 512,
 		}
 	}

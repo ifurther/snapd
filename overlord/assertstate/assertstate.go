@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2016-2019 Canonical Ltd
+ * Copyright (C) 2016-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -25,16 +25,20 @@ package assertstate
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/snapcore/snapd/asserts"
 	"github.com/snapcore/snapd/asserts/snapasserts"
+	"github.com/snapcore/snapd/confdb"
 	"github.com/snapcore/snapd/httputil"
 	"github.com/snapcore/snapd/logger"
+	"github.com/snapcore/snapd/overlord/confdbstate"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/release"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/integrity"
 )
 
 // Add the given assertion to the system assertion database.
@@ -176,7 +180,7 @@ func ValidateRefreshes(s *state.State, snapInfos []*snap.Info, ignoreValidation 
 		if len(control) == 0 {
 			continue
 		}
-		gatingNames[gatingID] = decl.SnapName()
+		gatingNames[gatingID] = decl.SnapName().String()
 		for _, gatedID := range control {
 			controlled[gatedID] = append(controlled[gatedID], gatingID)
 		}
@@ -184,7 +188,7 @@ func ValidateRefreshes(s *state.State, snapInfos []*snap.Info, ignoreValidation 
 
 	var errs []error
 	for _, candInfo := range snapInfos {
-		if ignoreValidation[candInfo.InstanceName()] {
+		if ignoreValidation[candInfo.InstanceName().String()] {
 			validated = append(validated, candInfo)
 			continue
 		}
@@ -246,18 +250,21 @@ func ValidateRefreshes(s *state.State, snapInfos []*snap.Info, ignoreValidation 
 	return validated, nil
 }
 
-// BaseDeclaration returns the base-declaration assertion with policies governing all snaps.
+// BaseDeclaration returns the base-declaration assertion with policies
+// governing all snaps.
 func BaseDeclaration(s *state.State) (*asserts.BaseDeclaration, error) {
-	// TODO: switch keeping this in the DB and have it revisioned/updated
-	// via the store
-	baseDecl := asserts.BuiltinBaseDeclaration()
-	if baseDecl == nil {
-		return nil, &asserts.NotFoundError{Type: asserts.BaseDeclarationType}
+	db := DB(s)
+	a, err := db.Find(asserts.BaseDeclarationType, map[string]string{
+		"series": release.Series,
+	})
+	if err != nil {
+		return nil, err
 	}
-	return baseDecl, nil
+	return a.(*asserts.BaseDeclaration), nil
 }
 
-// SnapDeclaration returns the snap-declaration for the given snap-id if it is present in the system assertion database.
+// SnapDeclaration returns the snap-declaration for the given snap-id if it is
+// present in the system assertion database.
 func SnapDeclaration(s *state.State, snapID string) (*asserts.SnapDeclaration, error) {
 	db := DB(s)
 	a, err := db.Find(asserts.SnapDeclarationType, map[string]string{
@@ -268,6 +275,23 @@ func SnapDeclaration(s *state.State, snapID string) (*asserts.SnapDeclaration, e
 		return nil, err
 	}
 	return a.(*asserts.SnapDeclaration), nil
+}
+
+func SnapResourcePair(st *state.State, csi *snap.ComponentSideInfo, info *snap.Info) (*asserts.SnapResourcePair, error) {
+	db := DB(st)
+	headers := map[string]string{
+		"snap-id":           info.SnapID,
+		"resource-name":     csi.Component.ComponentName,
+		"resource-revision": csi.Revision.String(),
+		"snap-revision":     info.Revision.String(),
+		"provenance":        info.Provenance(),
+	}
+
+	a, err := db.Find(asserts.SnapResourcePairType, headers)
+	if err != nil {
+		return nil, err
+	}
+	return a.(*asserts.SnapResourcePair), nil
 }
 
 // Publisher returns the account assertion for publisher of the given snap-id if it is present in the system assertion database.
@@ -377,6 +401,11 @@ func delayedCrossMgrInit() {
 	snapstate.EnforceValidationSets = ApplyEnforcedValidationSets
 	// hook helper for enforcing already existing validation set assertions
 	snapstate.EnforceLocalValidationSets = ApplyLocalEnforcedValidationSets
+	// hook helper for getting validated integrity data
+	snapstate.ValidatedIntegrityData = ValidatedIntegrityData
+	// wire confdbstate helpers that look up confdb-schema assertions
+	confdbstate.AssertstateFetchConfdbSchemaAssertion = FetchConfdbSchemaAssertion
+	confdbstate.AssertstateConfdbSchema = ConfdbSchema
 }
 
 // AutoRefreshAssertions tries to refresh all assertions
@@ -385,40 +414,118 @@ func AutoRefreshAssertions(s *state.State, userID int) error {
 	if err := RefreshSnapDeclarations(s, userID, opts); err != nil {
 		return err
 	}
-	return RefreshValidationSetAssertions(s, userID, opts)
+	if err := RefreshValidationSetAssertions(s, userID, opts); err != nil {
+		return err
+	}
+
+	return refreshAllConfdbAssertions(s, userID, opts)
+}
+
+// autoRefreshConfdbAssertions fetches the newest revision of all stored
+// confdb assertions.
+func refreshAllConfdbAssertions(st *state.State, userID int, opts *RefreshAssertionsOptions) error {
+	db := cachedDB(st)
+	confdbAsserts, err := db.FindMany(asserts.ConfdbSchemaType, nil)
+	if err != nil {
+		if errors.Is(err, &asserts.NotFoundError{}) {
+			return nil
+		}
+		return err
+	}
+
+	var schemaIDs []confdb.SchemaID
+	for _, dbAs := range confdbAsserts {
+		schema := dbAs.(*asserts.ConfdbSchema).Schema()
+		schemaIDs = append(schemaIDs, schema.ID())
+	}
+
+	return refreshConfdbAssertions(st, schemaIDs, userID, opts)
+}
+
+// FetchConfdbSchemaAssertion fetches the confdb-schema assertion identified by
+// the account/name pair from the store and saves it to the db.
+func FetchConfdbSchemaAssertion(st *state.State, userID int, account, name string) error {
+	deviceCtx, err := snapstate.DevicePastSeeding(st, nil)
+	if err != nil {
+		return err
+	}
+
+	return doFetch(st, userID, deviceCtx, nil, func(f asserts.Fetcher) error {
+		return snapasserts.FetchConfdbSchema(f, account, name)
+	})
+}
+
+// refreshConfdbAssertions fetches new revisions for the assertions referenced
+// by the provided confdb schemas. It attempts a bulk refresh and if that
+// fails, it falls back to fetching the assertions one by one.
+func refreshConfdbAssertions(st *state.State, schemaIDs []confdb.SchemaID, userID int, opts *RefreshAssertionsOptions) error {
+	if opts == nil {
+		opts = &RefreshAssertionsOptions{}
+	}
+
+	deviceCtx, err := snapstate.DevicePastSeeding(st, nil)
+	if err != nil {
+		return err
+	}
+
+	err = bulkRefreshConfdbSchemas(st, schemaIDs, userID, deviceCtx, opts)
+	if err == nil {
+		return nil
+	}
+
+	if _, ok := err.(*bulkAssertionFallbackError); !ok {
+		// not an error that indicates the server rejecting/failing
+		// the bulk request itself
+		return err
+	}
+	logger.Noticef("bulk refresh of confdb assertions failed, falling back to one-by-one assertion fetching: %v", err)
+
+	return doFetch(st, userID, deviceCtx, nil, func(f asserts.Fetcher) error {
+		for _, id := range schemaIDs {
+			if err := snapasserts.FetchConfdbSchema(f, id.Account, id.Name); err != nil {
+				if errors.Is(err, &asserts.NotFoundError{}) {
+					logger.Noticef("ignoring not found error when refreshing confdb-schema: %v", err)
+					continue
+				}
+				return err
+			}
+		}
+
+		return nil
+	})
 }
 
 // RefreshSnapAssertions tries to refresh all snap-centered assertions
-func RefreshSnapAssertions(s *state.State, userID int, opts *RefreshAssertionsOptions) error {
+func RefreshSnapAssertions(st *state.State, userID int, opts *RefreshAssertionsOptions) error {
 	if opts == nil {
 		opts = &RefreshAssertionsOptions{}
 	}
 	opts.IsAutoRefresh = false
-	if err := RefreshSnapDeclarations(s, userID, opts); err != nil {
+	if err := RefreshSnapDeclarations(st, userID, opts); err != nil {
 		return err
 	}
 	if !opts.IsRefreshOfAllSnaps {
 		return nil
 	}
-	return RefreshValidationSetAssertions(s, userID, opts)
+
+	if err := RefreshValidationSetAssertions(st, userID, opts); err != nil {
+		return err
+	}
+
+	return refreshAllConfdbAssertions(st, userID, opts)
 }
 
-// RefreshValidationSetAssertions tries to refresh all validation set
-// assertions.
-func RefreshValidationSetAssertions(s *state.State, userID int, opts *RefreshAssertionsOptions) error {
+// FetchAllValidationSets updates the DB with new validation sets, if any exist.
+func FetchAllValidationSets(st *state.State, userID int, opts *RefreshAssertionsOptions) error {
 	if opts == nil {
 		opts = &RefreshAssertionsOptions{}
 	}
 
-	deviceCtx, err := snapstate.DevicePastSeeding(s, nil)
+	vsets, err := ValidationSets(st)
 	if err != nil {
 		return err
 	}
 
-	vsets, err := ValidationSets(s)
-	if err != nil {
-		return err
-	}
 	if len(vsets) == 0 {
 		return nil
 	}
@@ -433,33 +540,12 @@ func RefreshValidationSetAssertions(s *state.State, userID int, opts *RefreshAss
 		}
 	}
 
-	updateTracking := func(sets map[string]*ValidationSetTracking) error {
-		// update validation set tracking state
-		for _, vs := range sets {
-			if vs.PinnedAt == 0 {
-				headers := map[string]string{
-					"series":     release.Series,
-					"account-id": vs.AccountID,
-					"name":       vs.Name,
-				}
-				db := DB(s)
-				as, err := db.FindSequence(asserts.ValidationSetType, headers, -1, asserts.ValidationSetType.MaxSupportedFormat())
-				if err != nil {
-					return fmt.Errorf("internal error: cannot find assertion %v when refreshing validation-set assertions", headers)
-				}
-				if vs.Current != as.Sequence() {
-					vs.Current = as.Sequence()
-					UpdateValidationSet(s, vs)
-				}
-			}
-		}
-		return nil
-	}
-
-	if err := bulkRefreshValidationSetAsserts(s, monitorModeSets, nil, userID, deviceCtx, opts); err != nil {
+	deviceCtx, err := snapstate.DevicePastSeeding(st, nil)
+	if err != nil {
 		return err
 	}
-	if err := updateTracking(monitorModeSets); err != nil {
+
+	if err := bulkRefreshValidationSetAsserts(st, monitorModeSets, nil, userID, deviceCtx, opts); err != nil {
 		return err
 	}
 
@@ -496,7 +582,7 @@ func RefreshValidationSetAssertions(s *state.State, userID int, opts *RefreshAss
 			return err
 		}
 
-		snaps, ignoreValidation, err := snapstate.InstalledSnaps(s)
+		snaps, ignoreValidation, err := snapstate.InstalledSnaps(st)
 		if err != nil {
 			return err
 		}
@@ -511,7 +597,7 @@ func RefreshValidationSetAssertions(s *state.State, userID int, opts *RefreshAss
 		return err
 	}
 
-	if err := bulkRefreshValidationSetAsserts(s, enforceModeSets, checkConflictsAndPresence, userID, deviceCtx, opts); err != nil {
+	if err := bulkRefreshValidationSetAsserts(st, enforceModeSets, checkConflictsAndPresence, userID, deviceCtx, opts); err != nil {
 		if _, ok := err.(*snapasserts.ValidationSetsConflictError); ok {
 			logger.Noticef("cannot refresh to conflicting validation set assertions: %v", err)
 			return nil
@@ -522,8 +608,55 @@ func RefreshValidationSetAssertions(s *state.State, userID int, opts *RefreshAss
 		}
 		return err
 	}
-	if err := updateTracking(enforceModeSets); err != nil {
+
+	return nil
+}
+
+// RefreshValidationSetAssertions tries to refresh all validation set assertions,
+// updating the tracked validation sets accordingly.
+func RefreshValidationSetAssertions(s *state.State, userID int, opts *RefreshAssertionsOptions) error {
+	vsets, err := ValidationSets(s)
+	if err != nil {
 		return err
+	}
+
+	if len(vsets) == 0 {
+		return nil
+	}
+
+	err = FetchAllValidationSets(s, userID, opts)
+	if err != nil {
+		return err
+	}
+
+	monitorModeSets := make(map[string]*ValidationSetTracking)
+	enforceModeSets := make(map[string]*ValidationSetTracking)
+	for vk, vset := range vsets {
+		if vset.Mode == Monitor {
+			monitorModeSets[vk] = vset
+		} else {
+			enforceModeSets[vk] = vset
+		}
+	}
+
+	// update validation set tracking state
+	for _, vs := range vsets {
+		if vs.PinnedAt == 0 {
+			headers := map[string]string{
+				"series":     release.Series,
+				"account-id": vs.AccountID,
+				"name":       vs.Name,
+			}
+			db := DB(s)
+			as, err := db.FindSequence(asserts.ValidationSetType, headers, -1, asserts.ValidationSetType.MaxSupportedFormat())
+			if err != nil {
+				return fmt.Errorf("internal error: cannot find assertion %v when refreshing validation-set assertions", headers)
+			}
+			if vs.Current != as.Sequence() {
+				vs.Current = as.Sequence()
+				UpdateValidationSet(s, vs)
+			}
+		}
 	}
 
 	return nil
@@ -752,6 +885,10 @@ func validationSetAssertionForEnforce(st *state.State, accountID, name string, s
 // installed snaps, but doesn't update tracking information in case of an error.
 // It may return snapasserts.ValidationSetsValidationError which can be used to
 // install/remove snaps as required to satisfy validation sets constraints.
+//
+// On snapasserts.ValidationSetsValidationError, prerequisite assertions needed
+// by the fetched validation-set assertions will be committed, but not the
+// validation-set assertions themselves.
 func TryEnforcedValidationSets(st *state.State, validationSets []string, userID int, snaps []*snapasserts.InstalledSnap, ignoreValidation map[string]bool) error {
 	deviceCtx, err := snapstate.DevicePastSeeding(st, nil)
 	if err != nil {
@@ -841,6 +978,15 @@ func TryEnforcedValidationSets(st *state.State, validationSets []string, userID 
 		if err := valsets.CheckInstalledSnaps(snaps, ignoreValidation); err != nil {
 			// the returned error may be ValidationSetsValidationError which is normal and means we cannot enforce
 			// the new validation sets - the caller should resolve the error and retry.
+			if _, ok := err.(*snapasserts.ValidationSetsValidationError); ok {
+				// in the case validation sets cannot be enforced, we should
+				// still commit the prerequisite assertions. this eliminates a
+				// second trip to the store later, when validation sets are
+				// enforced by the "enforce-validation-sets" task.
+				if err := commitValidationSetPrerequisites(db, tmpDb, extraVs); err != nil {
+					return err
+				}
+			}
 			return err
 		}
 
@@ -876,6 +1022,33 @@ func TryEnforcedValidationSets(st *state.State, validationSets []string, userID 
 	}
 
 	return addCurrentTrackingToValidationSetsHistory(st)
+}
+
+func commitValidationSetPrerequisites(db, source *asserts.Database, valsets []*asserts.ValidationSet) error {
+	batch := asserts.NewBatch(handleUnsupported(db))
+	retrieve := func(ref *asserts.Ref) (asserts.Assertion, error) {
+		return ref.Resolve(source.Find)
+	}
+	save := func(a asserts.Assertion) error {
+		// ignore validation sets, only save the prereqs
+		if a.Type() == asserts.ValidationSetType {
+			return nil
+		}
+		return batch.Add(a)
+	}
+	f := asserts.NewFetcher(source, retrieve, save)
+
+	for _, vs := range valsets {
+		if err := f.Save(vs); err != nil {
+			return err
+		}
+	}
+
+	if err := batch.CommitTo(db, nil); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func resolveValidationSetPrimaryKeys(st *state.State, vsKeys map[string][]string) (map[string]*asserts.ValidationSet, error) {
@@ -959,9 +1132,12 @@ func ApplyLocalEnforcedValidationSets(st *state.State, vsKeys map[string][]strin
 	return addCurrentTrackingToValidationSetsHistory(st)
 }
 
-// ApplyEnforcedValidationSets enforces the supplied validation sets. It takes a map
-// of validation set keys to validation sets, pinned sequence numbers (if any),
-// installed snaps and ignored snaps. It fetches any pre-requisites necessary.
+// ApplyEnforcedValidationSets enforces the supplied validation sets. It takes a
+// map of validation set keys to validation sets, pinned sequence numbers (if
+// any), installed snaps and ignored snaps. It persists the supplied
+// validation-set assertions and required prerequisites. Prerequisites are
+// resolved from the local assertions database and only fetched from the store
+// when missing locally.
 func ApplyEnforcedValidationSets(st *state.State, valsets map[string]*asserts.ValidationSet, pinnedSeqs map[string]int, snaps []*snapasserts.InstalledSnap, ignoreValidation map[string]bool, userID int) error {
 	deviceCtx, err := snapstate.DevicePastSeeding(st, nil)
 	if err != nil {
@@ -970,13 +1146,30 @@ func ApplyEnforcedValidationSets(st *state.State, valsets map[string]*asserts.Va
 
 	db := cachedDB(st)
 	batch := asserts.NewBatch(handleUnsupported(db))
+	user, err := userFromUserID(st, userID)
+	if err != nil {
+		return err
+	}
+	sto := snapstate.Store(st, deviceCtx)
 
 	valsetsSlice, valsetsTracking, err := validationSetTrackings(valsets, pinnedSeqs)
 	if err != nil {
 		return err
 	}
 
-	err = doFetch(st, userID, deviceCtx, batch, func(f asserts.Fetcher) error {
+	retrieve := func(ref *asserts.Ref) (asserts.Assertion, error) {
+		a, err := ref.Resolve(db.Find)
+		if err == nil {
+			return a, nil
+		}
+		if !errors.Is(err, &asserts.NotFoundError{}) {
+			return nil, err
+		}
+
+		return sto.Assertion(ref.Type, ref.PrimaryKey, user)
+	}
+
+	err = doFetchWithRetrieve(st, batch, retrieve, func(f asserts.Fetcher) error {
 		for vsKey, vs := range valsets {
 			if err := f.Save(vs); err != nil {
 				return fmt.Errorf("cannot save assertion %q to batch: %v", vsKey, err)
@@ -1228,17 +1421,97 @@ func resolveValidationSetAssertion(seq *asserts.AtSequence, db asserts.RODatabas
 	return seq.Resolve(db.Find)
 }
 
-// AspectBundle returns the aspect-bundle for the given account and bundle name,
-// if it's present in the system assertion database.
-func AspectBundle(s *state.State, account, bundleName string) (*asserts.AspectBundle, error) {
+// ConfdbSchema returns the confdb-schema for the given account and confdb
+// schema name, if it's present in the system assertion database.
+func ConfdbSchema(s *state.State, account, schemaName string) (*asserts.ConfdbSchema, error) {
 	db := DB(s)
-	as, err := db.Find(asserts.AspectBundleType, map[string]string{
+	as, err := db.Find(asserts.ConfdbSchemaType, map[string]string{
 		"account-id": account,
-		"name":       bundleName,
+		"name":       schemaName,
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	return as.(*asserts.AspectBundle), nil
+	return as.(*asserts.ConfdbSchema), nil
+}
+
+var ErrNoRevisionFound = errors.New("no snap-revision assertion found")
+
+// snapRevisionFromSnapIdAndRevision is a helper that searches for a snap revision in the database given
+// a snap ID, and a revision number. This is to be used in cases when the sha3 hash which is the primary key
+// for revision assertions is not known or we don't want to incur the cost to compute it.
+func snapRevisionFromSnapIdAndRevision(db asserts.RODatabase, snapId string, rev snap.Revision) (*asserts.SnapRevision, error) {
+	// TODO: Given we don't GC snap-revisions atm, the following db lookup
+	// might need to be optimized by GCing unused snap-revisions.
+	found, err := db.FindMany(asserts.SnapRevisionType, map[string]string{
+		"snap-id":       snapId,
+		"snap-revision": strconv.Itoa(rev.N),
+	})
+	if err != nil && !errors.Is(err, &asserts.NotFoundError{}) {
+		return nil, err
+	}
+
+	if len(found) < 1 {
+		return nil, fmt.Errorf("%w that matches (snap-id=%s, snap-revision=%s).", ErrNoRevisionFound, snapId, rev)
+	}
+
+	// Despite the set (snap-id, snap-revision) not comprising a primary key for
+	// snap-revision assertions, none of the assertion backends currently support
+	// adding a revision with the same revision number for the same snap-id,
+	// therefore the check here should be redundant but we keep it to as a safeguard
+	// in case that behavior changes.
+	if len(found) > 1 {
+		return nil, fmt.Errorf("internal error: multiple snap-revision assertions found that match (snap-id=%s, snap-revision=%s).", snapId, rev)
+	}
+
+	return found[0].(*asserts.SnapRevision), nil
+}
+
+// ValidatedIntegrityData returns the integrity parameters found in the assertion database for a specific
+// snap's revision.
+//
+// ErrNoRevisionFound is returned if no matching revision assertion is found.
+//
+// integrity.ErrNoIntegrityDataFoundInRevision is returned if matching revision
+// assertion does not contain integrity data.
+func ValidatedIntegrityData(st *state.State, snapID string, rev snap.Revision) (*integrity.IntegrityDataParams, error) {
+	db := DB(st)
+
+	revAssertion, err := snapRevisionFromSnapIdAndRevision(db, snapID, rev)
+	if err != nil {
+		return nil, err
+	}
+
+	return integrity.NewIntegrityDataParamsFromRevision(revAssertion)
+}
+
+// AccountKey returns the account-key assertion for the given signing key ID,
+// if it's present in the system assertion database.
+func AccountKey(st *state.State, signKeyID string) (*asserts.AccountKey, error) {
+	db := DB(st)
+	as, err := db.Find(asserts.AccountKeyType, map[string]string{
+		"public-key-sha3-384": signKeyID,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return as.(*asserts.AccountKey), nil
+}
+
+// FetchAccountKey fetches the account-key assertion for the given signing key ID.
+func FetchAccountKey(st *state.State, userID int, signKeyID string) error {
+	deviceCtx, err := snapstate.DevicePastSeeding(st, nil)
+	if err != nil {
+		return err
+	}
+
+	return doFetch(st, userID, deviceCtx, nil, func(f asserts.Fetcher) error {
+		ref := &asserts.Ref{
+			Type:       asserts.AccountKeyType,
+			PrimaryKey: []string{signKeyID},
+		}
+		return f.Fetch(ref)
+	})
 }

@@ -20,12 +20,14 @@
 package devicestate
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"runtime"
 	"sort"
 
 	"github.com/snapcore/snapd/asserts"
+	"github.com/snapcore/snapd/client"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/i18n"
 	"github.com/snapcore/snapd/logger"
@@ -34,6 +36,7 @@ import (
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/release"
+	"github.com/snapcore/snapd/seclog"
 	"github.com/snapcore/snapd/seed"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/timings"
@@ -54,7 +57,34 @@ func installSeedSnap(st *state.State, sn *seed.Snap, flags snapstate.Flags, prqt
 		flags.DevMode = true
 	}
 
-	return snapstate.InstallPath(st, sn.SideInfo, sn.Path, "", sn.Channel, flags, prqt)
+	components := make([]snapstate.PathComponent, 0, len(sn.Components))
+	for _, comp := range sn.Components {
+		// Prevent reusing loop variable
+		comp := comp
+		components = append(components, snapstate.PathComponent{
+			Path:     comp.Path,
+			SideInfo: &comp.CompSideInfo,
+		})
+	}
+
+	flags.NoDelayedSideEffects = true
+
+	goal := snapstate.SeedingGoal(snapstate.PathSnap{
+		Path:       sn.Path,
+		SideInfo:   sn.SideInfo,
+		Components: components,
+		RevOpts:    snapstate.RevisionOptions{Channel: sn.Channel},
+	})
+	info, ts, err := snapstate.InstallOne(context.Background(), st, goal, snapstate.Options{
+		Flags:         flags,
+		PrereqTracker: prqt,
+		Seed:          true,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return ts, info, nil
 }
 
 func criticalTaskEdges(ts *state.TaskSet) (beginEdge, beforeHooksEdge, hooksEdge *state.Task, err error) {
@@ -156,7 +186,7 @@ func (m *DeviceManager) populateStateFromSeedImpl(tm timings.Measurer) ([]*state
 	// ack all initial assertions
 	timings.Run(tm, "import-assertions[finish]", "finish importing assertions from seed", func(nested timings.Measurer) {
 		isCoreBoot := hasModeenv || !release.OnClassic
-		deviceSeed, err = m.importAssertionsFromSeed(isCoreBoot)
+		deviceSeed, err = m.importAssertionsFromSeed(mode, isCoreBoot)
 	})
 	if err != nil && err != errNothingToDo {
 		return nil, err
@@ -245,7 +275,21 @@ func (m *DeviceManager) populateStateFromSeedImpl(tm timings.Measurer) ([]*state
 	}
 
 	chainSorted := func(infos []*snap.Info, infoToTs map[*snap.Info]*state.TaskSet) {
-		sort.Stable(snap.ByType(infos))
+		// This is the order in which snaps will be installed in the
+		// system. We want the boot base to be installed before the
+		// kernel so any existing kernel hook can execute with the boot
+		// base as rootfs.
+		effectiveType := func(info *snap.Info) snap.Type {
+			typ := info.Type()
+			if info.RealName == model.Base() {
+				typ = snap.InternalTypeBootBase
+			}
+			return typ
+		}
+		sort.SliceStable(infos, func(i, j int) bool {
+			return effectiveType(infos[i]).SortsBefore(effectiveType(infos[j]))
+		})
+
 		for _, info := range infos {
 			ts := infoToTs[info]
 			tsAll = chainTs(tsAll, ts)
@@ -266,6 +310,8 @@ func (m *DeviceManager) populateStateFromSeedImpl(tm timings.Measurer) ([]*state
 	}
 
 	modelIsDangerous := model.Grade() == asserts.ModelDangerous
+
+	essentialLane := st.NewLane()
 	for _, seedSnap := range essentialSeedSnaps {
 		flags := snapstate.Flags{
 			SkipConfigure: true,
@@ -276,7 +322,10 @@ func (m *DeviceManager) populateStateFromSeedImpl(tm timings.Measurer) ([]*state
 			// XXX: eventually we may need to allow specific snaps to be devmode for
 			// non-dangerous models, we can do that here since that information will
 			// probably be in the model assertion which we have here
-			ApplySnapDevMode: modelIsDangerous,
+			ApplySnapDevMode:     modelIsDangerous,
+			Lane:                 essentialLane,
+			Transaction:          client.TransactionAllSnaps,
+			NoDelayedSideEffects: true,
 		}
 
 		ts, info, err := installSeedSnap(st, seedSnap, flags, prqt)
@@ -284,7 +333,7 @@ func (m *DeviceManager) populateStateFromSeedImpl(tm timings.Measurer) ([]*state
 			return nil, err
 		}
 		if info.Type() == snap.TypeKernel || info.Type() == snap.TypeGadget {
-			configTs := snapstate.ConfigureSnap(st, info.SnapName(), snapstate.UseConfigDefaults)
+			configTs := snapstate.ConfigureSnap(st, info.SnapName().String(), snapstate.UseConfigDefaults)
 			// wait for the previous configTss
 			configTss = chainTs(configTss, configTs)
 		}
@@ -296,7 +345,7 @@ func (m *DeviceManager) populateStateFromSeedImpl(tm timings.Measurer) ([]*state
 	chainSorted(infos, infoToTs)
 
 	// chain together configuring core, kernel, and gadget after
-	// installing them so that defaults are availabble from gadget
+	// installing them so that defaults are available from gadget
 	if len(configTss) > 0 {
 		if preseed {
 			configTss[0].WaitFor(preseedDoneTask)
@@ -305,9 +354,19 @@ func (m *DeviceManager) populateStateFromSeedImpl(tm timings.Measurer) ([]*state
 		tsAll = append(tsAll, configTss...)
 	}
 
+	// all of the configure tasks are related to essential snaps, so they should
+	// also be in the essential snap lane
+	for _, ts := range configTss {
+		ts.JoinLane(essentialLane)
+	}
+
 	// ensure we install in the right order
 	infoToTs = make(map[*snap.Info]*state.TaskSet, len(seedSnaps))
 
+	// note, we use separate lanes for essential and non-essential snaps so that
+	// failures installing non-essential snaps do not cause essential snap
+	// installations to be undone.
+	nonEssentialLane := st.NewLane()
 	for _, seedSnap := range seedSnaps {
 		flags := snapstate.Flags{
 			// for dangerous models, allow all devmode snaps
@@ -317,7 +376,9 @@ func (m *DeviceManager) populateStateFromSeedImpl(tm timings.Measurer) ([]*state
 			ApplySnapDevMode: modelIsDangerous,
 			// for non-dangerous models snaps need to opt-in explicitly
 			// Classic is simply ignored for non-classic snaps, so we do not need to check further
-			Classic: release.OnClassic && modelIsDangerous,
+			Classic:     release.OnClassic && modelIsDangerous,
+			Lane:        nonEssentialLane,
+			Transaction: client.TransactionAllSnaps,
 		}
 
 		ts, info, err := installSeedSnap(st, seedSnap, flags, prqt)
@@ -336,7 +397,7 @@ func (m *DeviceManager) populateStateFromSeedImpl(tm timings.Measurer) ([]*state
 		return nil, errs[0]
 	}
 	// XXX do better, use the warnings to setup checks at end of the seeding
-	// and log onlys plug not connected or explicitly disconnected there
+	// and log only plug not connected or explicitly disconnected there
 	for _, w := range warns {
 		logger.Noticef("seed prerequisites: %v", w)
 	}
@@ -359,6 +420,14 @@ func (m *DeviceManager) populateStateFromSeedImpl(tm timings.Measurer) ([]*state
 		return nil, err
 	} else if trackVss != nil {
 		trackVss.WaitAll(ts)
+
+		// if this validation fails, we want to undo the tasks in the
+		// non-essential lane.
+		//
+		// TODO: currently, undoing seeding the essential set of snaps does not
+		// work properly. that's why we only add this to the non-essential lane.
+		trackVss.JoinLane(nonEssentialLane)
+
 		endTs.AddTask(trackVss)
 	}
 
@@ -385,10 +454,10 @@ func (m *DeviceManager) populateStateFromSeedImpl(tm timings.Measurer) ([]*state
 	return tsAll, nil
 }
 
-func (m *DeviceManager) importAssertionsFromSeed(isCoreBoot bool) (seed.Seed, error) {
+func (m *DeviceManager) importAssertionsFromSeed(mode string, isCoreBoot bool) (seed.Seed, error) {
 	st := m.state
 
-	// TODO: use some kind of context fo Device/SetDevice?
+	// TODO: use some kind of context for Device/SetDevice?
 	device, err := internal.Device(st)
 	if err != nil {
 		return nil, err
@@ -409,19 +478,15 @@ func (m *DeviceManager) importAssertionsFromSeed(isCoreBoot bool) (seed.Seed, er
 	if err != nil {
 		return nil, err
 	}
+
 	modelAssertion := deviceSeed.Model()
 
-	classicModel := modelAssertion.Classic()
-	// FIXME this will not be correct on classic with modes system when
-	// mode is not "run".
-	if release.OnClassic != classicModel {
-		var msg string
-		if classicModel {
-			msg = "cannot seed an all-snaps system with a classic model"
-		} else {
-			msg = "cannot seed a classic system with an all-snaps model"
-		}
-		return nil, fmt.Errorf(msg)
+	if release.OnClassic && !modelAssertion.Classic() {
+		return nil, errors.New("cannot seed a classic system with an all-snaps model")
+	}
+
+	if !release.OnClassic && modelAssertion.Classic() && mode != "recover" {
+		return nil, errors.New("can only seed an all-snaps system with a classic model in recovery mode")
 	}
 
 	// set device,model from the model assertion
@@ -451,7 +516,7 @@ func processAutoImportAssertions(st *state.State, deviceSeed seed.Seed, db asser
 	}
 	// automatic user creation is meant to imply sudoers
 	const sudoer = true
-	_, err = createAllKnownSystemUsers(st, db, deviceSeed.Model(), nil, sudoer)
+	_, err = createAllKnownSystemUsers(st, db, deviceSeed.Model(), nil, sudoer, seclog.AddReasonFirstbootSeedAutoImport)
 	return err
 }
 

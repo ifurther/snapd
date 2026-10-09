@@ -1,14 +1,22 @@
 summary: Check that correct SELinux file contexts were assigned on upgrade
 
+details: |
+    On classic systems using SELinux, installing the local package applies
+    specific labels to programs related to snapd.
+
 # Only distros that support SELinux and have snapd in their repositories
-systems: [fedora-*, centos-*]
+# TODO: add opensuse-tumbleweed-selinux-* once snapd is in repositories
+systems:
+    - fedora-*
+    - centos-*
+
+skip:
+    - reason: Snapd and snap-confine are not upoloaded to CentOS Stream 9 repo yet
+      if: |
+        # TODO: remove this when snapd and snap-confine are uploaded to CentOS Stream 9 repo
+        os.query is-centos 9
 
 execute: |
-    # TODO: remove this when snapd and snap-confine are uploaded to CentOS Stream 9 repo
-    if os.query is-centos 9; then
-        exit 0
-    fi
-
     # only runs on distros with SELinux enabled
     selinuxenabled
 

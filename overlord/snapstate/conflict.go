@@ -24,7 +24,10 @@ import (
 	"fmt"
 	"reflect"
 
+	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/overlord/state"
+	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/strutil"
 )
 
@@ -66,24 +69,29 @@ var (
 	affectedSnapsByKind = make(map[string]AffectedSnapsFunc)
 )
 
-// RegisterAffectedSnapsByAttr registers an AffectedSnapsFunc for returning the affected snaps for tasks sporting the given identifying attribute, to use in conflicts detection.
+// RegisterAffectedSnapsByAttr registers an AffectedSnapsFunc for returning the
+// affected snaps for tasks sporting the given identifying attribute, to use in
+// conflicts detection.
 func RegisterAffectedSnapsByAttr(attr string, f AffectedSnapsFunc) {
 	affectedSnapsByAttr[attr] = f
 }
 
-// RegisterAffectedSnapsByKind registers an AffectedSnapsFunc for returning the affected snaps for tasks of the given kind, to use in conflicts detection. Whenever possible using RegisterAffectedSnapsByAttr should be preferred.
+// RegisterAffectedSnapsByKind registers an AffectedSnapsFunc for returning the
+// affected snaps for tasks of the given kind, to use in conflicts detection.
+// Whenever possible using RegisterAffectedSnapsByAttr should be preferred.
 func RegisterAffectedSnapsByKind(kind string, f AffectedSnapsFunc) {
 	affectedSnapsByKind[kind] = f
 }
 
-func affectedSnaps(t *state.Task) ([]string, error) {
+// SnapsAffectedByTask returns a list of names of snaps affected by the given task.
+func SnapsAffectedByTask(t *state.Task) ([]string, error) {
 	// snapstate's own styled tasks
 	if t.Has("snap-setup") || t.Has("snap-setup-task") {
 		snapsup, err := TaskSnapSetup(t)
 		if err != nil {
 			return nil, fmt.Errorf("internal error: cannot obtain snap setup from task: %s", t.Summary())
 		}
-		return []string{snapsup.InstanceName()}, nil
+		return []string{snapsup.InstanceName().String()}, nil
 	}
 
 	if f := affectedSnapsByKind[t.Kind()]; f != nil {
@@ -123,7 +131,7 @@ func changeIsSnapdDowngrade(st *state.State, chg *state.Change) (bool, error) {
 	}
 
 	var snapst SnapState
-	if err := Get(st, snapsup.InstanceName(), &snapst); err != nil {
+	if err := Get(st, snapsup.InstanceName().String(), &snapst); err != nil {
 		return false, err
 	}
 
@@ -144,11 +152,21 @@ func changeIsSnapdDowngrade(st *state.State, chg *state.Change) (bool, error) {
 	return res == 1, nil
 }
 
+func changeCreatesRecoverySystem(chg *state.Change) bool {
+	for _, t := range chg.Tasks() {
+		if t.Kind() == "create-recovery-system" {
+			return true
+		}
+	}
+	return false
+}
+
 func checkChangeConflictExclusiveKinds(st *state.State, newExclusiveChangeKind, ignoreChangeID string) error {
 	for _, chg := range st.Changes() {
-		if chg.Status().Ready() {
+		if chg.Status().Ready() || (ignoreChangeID != "" && chg.ID() == ignoreChangeID) {
 			continue
 		}
+
 		switch chg.Kind() {
 		case "transition-ubuntu-core":
 			return &ChangeConflictError{
@@ -163,18 +181,12 @@ func checkChangeConflictExclusiveKinds(st *state.State, newExclusiveChangeKind, 
 				ChangeID:   chg.ID(),
 			}
 		case "remodel":
-			if ignoreChangeID != "" && chg.ID() == ignoreChangeID {
-				continue
-			}
 			return &ChangeConflictError{
 				Message:    "remodeling in progress, no other changes allowed until this is done",
 				ChangeKind: "remodel",
 				ChangeID:   chg.ID(),
 			}
 		case "create-recovery-system":
-			if ignoreChangeID != "" && chg.ID() == ignoreChangeID {
-				continue
-			}
 			return &ChangeConflictError{
 				Message:    "creating recovery system in progress, no other changes allowed until this is done",
 				ChangeKind: "create-recovery-system",
@@ -184,44 +196,59 @@ func checkChangeConflictExclusiveKinds(st *state.State, newExclusiveChangeKind, 
 			// TODO: it is not totally necessary for this to be an exclusive
 			// change, we should probably make more fine-grained exclusivity
 			// rules
-			if ignoreChangeID != "" && chg.ID() == ignoreChangeID {
-				continue
-			}
 			return &ChangeConflictError{
 				Message:    "removing recovery system in progress, no other changes allowed until this is done",
 				ChangeKind: "remove-recovery-system",
 				ChangeID:   chg.ID(),
 			}
-		case "revert-snap", "refresh-snap":
-			// Snapd downgrades are exclusive changes
-			if ignoreChangeID != "" && chg.ID() == ignoreChangeID {
-				continue
-			}
-			if downgrading, err := changeIsSnapdDowngrade(st, chg); err != nil {
+		case "revert-snap", "refresh-snap", "install-snap":
+			downgrading, err := changeIsSnapdDowngrade(st, chg)
+			if err != nil {
 				return err
-			} else if !downgrading {
-				continue
 			}
-			return &ChangeConflictError{
-				Message:    "snapd downgrade in progress, no other changes allowed until this is done",
-				ChangeKind: chg.Kind(),
-				ChangeID:   chg.ID(),
-			}
-		default:
-			if newExclusiveChangeKind != "" {
-				// we want to run a new exclusive change, but other
-				// changes are in progress already
-				msg := fmt.Sprintf("other changes in progress (conflicting change %q), change %q not allowed until they are done", chg.Kind(),
-					newExclusiveChangeKind)
+
+			if downgrading {
 				return &ChangeConflictError{
-					Message:    msg,
+					Message:    "snapd downgrade in progress, no other changes allowed until this is done",
+					ChangeKind: chg.Kind(),
+					ChangeID:   chg.ID(),
+				}
+			}
+
+			if changeCreatesRecoverySystem(chg) {
+				// TODO: make this less strict once we model conflicts for
+				// seed-managing changes more precisely
+				return &ChangeConflictError{
+					Message:    "seed refresh in progress, no other changes allowed until this is done",
 					ChangeKind: chg.Kind(),
 					ChangeID:   chg.ID(),
 				}
 			}
 		}
+
+		// caller didn't specify the new change kind. in that case, the new
+		// change isn't exclusive
+		if newExclusiveChangeKind == "" {
+			continue
+		}
+
+		// we want to run a new exclusive change, but other changes are in
+		// progress already
+		msg := fmt.Sprintf("other changes in progress (conflicting change %q), change %q not allowed until they are done", chg.Kind(),
+			newExclusiveChangeKind)
+		return &ChangeConflictError{
+			Message:    msg,
+			ChangeKind: chg.Kind(),
+			ChangeID:   chg.ID(),
+		}
 	}
 	return nil
+}
+
+// CheckChangeConflictExclusiveKinds checks whether there are other changes that
+// need to run exclusively.
+func CheckChangeConflictExclusiveKinds(st *state.State, ignoreChangeID string) error {
+	return checkChangeConflictExclusiveKinds(st, "", ignoreChangeID)
 }
 
 // CheckChangeConflictRunExclusively checks for conflicts with a new change which
@@ -230,16 +257,24 @@ func CheckChangeConflictRunExclusively(st *state.State, newChangeKind string) er
 	return checkChangeConflictExclusiveKinds(st, newChangeKind, "")
 }
 
-// isIrrelevantChange checks if a change is ready or it can be ignored
-// if matching the passed ID, for conflict checking purposes.
-func isIrrelevantChange(chg *state.Change, ignoreChangeID string) bool {
+// isIrrelevantChange checks if a change is ready or it can be ignored if it
+// matches the ID in the given options. We will still consider this change if
+// the given options indicates that we must still consider the given change ID.
+func isIrrelevantChange(chg *state.Change, opts ConflictOptions) bool {
 	if chg == nil || chg.IsReady() {
 		return true
 	}
-	if ignoreChangeID != "" && chg.ID() == ignoreChangeID {
+	if opts.FromChange != "" && chg.ID() == opts.FromChange && !opts.DoNotIgnoreFromChangeInTaskConflictCheck {
 		return true
 	}
 	switch chg.Kind() {
+	case "get-confdb":
+		// confdb hooks can conflict with tasks unlinking custodian/base snaps but
+		// those are prevented using task blockers (before hooks/unlinking snaps).
+		// We also prevent concurrent accesses to the same confdb in confdbstate/
+		fallthrough
+	case "set-confdb":
+		fallthrough
 	case "pre-download":
 		// pre-download changes only have pre-download tasks
 		// which don't generate conflicts because they only
@@ -265,23 +300,27 @@ func isIrrelevantChange(chg *state.Change, ignoreChangeID string) bool {
 // It's like CheckChangeConflict, but for multiple snaps, and does not
 // check snapst.
 func CheckChangeConflictMany(st *state.State, instanceNames []string, ignoreChangeID string) error {
+	return checkChangeConflictManyWithOptions(st, instanceNames, ConflictOptions{FromChange: ignoreChangeID})
+}
+
+func checkChangeConflictManyWithOptions(st *state.State, instanceNames []string, opts ConflictOptions) error {
 	snapMap := make(map[string]bool, len(instanceNames))
 	for _, k := range instanceNames {
 		snapMap[k] = true
 	}
 
 	// check whether there are other changes that need to run exclusively
-	if err := checkChangeConflictExclusiveKinds(st, "", ignoreChangeID); err != nil {
+	if err := CheckChangeConflictExclusiveKinds(st, opts.FromChange); err != nil {
 		return err
 	}
 
 	for _, task := range st.Tasks() {
 		chg := task.Change()
-		if isIrrelevantChange(chg, ignoreChangeID) {
+		if isIrrelevantChange(chg, opts) {
 			continue
 		}
 
-		snaps, err := affectedSnaps(task)
+		snaps, err := SnapsAffectedByTask(task)
 		if err != nil {
 			return err
 		}
@@ -304,12 +343,12 @@ func CheckChangeConflictMany(st *state.State, instanceNames []string, ignoreChan
 // changes that alters the snap (like remove, install, refresh) are in
 // progress. It also ensures that snapst (if not nil) did not get
 // modified. If a conflict is detected an error is returned.
-func CheckChangeConflict(st *state.State, instanceName string, snapst *SnapState) error {
-	return checkChangeConflictIgnoringOneChange(st, instanceName, snapst, "")
+func CheckChangeConflict(st *state.State, instanceName naming.InstanceName, snapst *SnapState) error {
+	return checkChangeConflictIgnoringOneChange(st, instanceName, snapst, ConflictOptions{})
 }
 
-func checkChangeConflictIgnoringOneChange(st *state.State, instanceName string, snapst *SnapState, ignoreChangeID string) error {
-	if err := CheckChangeConflictMany(st, []string{instanceName}, ignoreChangeID); err != nil {
+func checkChangeConflictIgnoringOneChange(st *state.State, instanceName naming.InstanceName, snapst *SnapState, opts ConflictOptions) error {
+	if err := checkChangeConflictManyWithOptions(st, []string{instanceName.String()}, opts); err != nil {
 		return err
 	}
 
@@ -321,49 +360,70 @@ func checkChangeConflictIgnoringOneChange(st *state.State, instanceName string, 
 		// install, while getting the snap info; for refresh, when
 		// getting what needs refreshing).
 		var cursnapst SnapState
-		if err := Get(st, instanceName, &cursnapst); err != nil && !errors.Is(err, state.ErrNoState) {
+		if err := Get(st, instanceName.String(), &cursnapst); err != nil && !errors.Is(err, state.ErrNoState) {
 			return err
 		}
 
 		// TODO: implement the rather-boring-but-more-performant SnapState.Equals
 		if !reflect.DeepEqual(snapst, &cursnapst) {
-			return &ChangeConflictError{Snap: instanceName}
+			return &ChangeConflictError{Snap: instanceName.String()}
 		}
 	}
 
 	return nil
 }
 
-// CheckUpdateKernelCommandLineConflict checks that no active change other
-// than ignoreChangeID has a task that touches the kernel command
-// line.
-func CheckUpdateKernelCommandLineConflict(st *state.State, ignoreChangeID string) error {
-	// check whether there are other changes that need to run exclusively
-	if err := checkChangeConflictExclusiveKinds(st, "", ignoreChangeID); err != nil {
-		return err
+var resealingTaskKindCheckers = make(map[string]func(t *state.Task) bool)
+
+// RegisterResealingTaskKind marks a task kind as unconditionally causing a reseal.
+func RegisterResealingTaskKind(kind string) {
+	if _, exists := resealingTaskKindCheckers[kind]; exists {
+		logger.Panicf("internal error: resealing task kind %q is already registered", kind)
+	}
+	resealingTaskKindCheckers[kind] = func(t *state.Task) bool { return true }
+}
+
+// RegisterResealingTaskCheckerForKind marks a task kind as conditionally causing a reseal.
+func RegisterResealingTaskCheckerForKind(kind string, checker func(t *state.Task) bool) {
+	if _, exists := resealingTaskKindCheckers[kind]; exists {
+		logger.Panicf("internal error: resealing task kind %q is already registered", kind)
+	}
+	resealingTaskKindCheckers[kind] = checker
+}
+
+func isResealingTask(t *state.Task) bool {
+	check := resealingTaskKindCheckers[t.Kind()]
+	if check == nil {
+		return false
+	}
+	return check(t)
+}
+
+func resealingTaskBlocked(t *state.Task, running []*state.Task) (block bool) {
+	if !isResealingTask(t) {
+		return false
 	}
 
-	for _, task := range st.Tasks() {
-		chg := task.Change()
-		if isIrrelevantChange(chg, ignoreChangeID) {
-			continue
-		}
-
-		switch task.Kind() {
-		case "update-gadget-cmdline":
-			return &ChangeConflictError{
-				Message:    "kernel command line already being updated, no additional changes for it allowed meanwhile",
-				ChangeKind: task.Kind(),
-				ChangeID:   chg.ID(),
-			}
-		case "update-managed-boot-config":
-			return &ChangeConflictError{
-				Message:    "boot config is being updated, no change in kernel command line is allowed meanwhile",
-				ChangeKind: task.Kind(),
-				ChangeID:   chg.ID(),
-			}
+	// Simple symmetric blocking of resealing tasks, No resealing
+	// task can run if another resealing task is running.
+	for _, tRunning := range running {
+		if isResealingTask(tRunning) {
+			return true
 		}
 	}
 
-	return nil
+	return false
+}
+
+func isLinkTaskResealing(t *state.Task) bool {
+	snapsup, err := TaskSnapSetup(t)
+	if err != nil {
+		logger.Debugf("internal error: cannot obtain snap setup: %v", err)
+		return false
+	}
+	switch snapsup.Type {
+	case snap.TypeKernel, snap.TypeGadget, snap.TypeBase:
+		return true
+	}
+	return false
 }

@@ -30,9 +30,9 @@ import (
 
 	update "github.com/snapcore/snapd/cmd/snap-update-ns"
 	"github.com/snapcore/snapd/dirs"
-	"github.com/snapcore/snapd/features"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
+	"github.com/snapcore/snapd/osutil/sys"
 	"github.com/snapcore/snapd/sandbox/cgroup"
 	"github.com/snapcore/snapd/testutil"
 )
@@ -67,6 +67,8 @@ func (s *mainSuite) TestExecuteMountProfileUpdate(c *C) {
 
 	restore := update.MockChangePerform(func(chg *update.Change, as *update.Assumptions) ([]*update.Change, error) {
 		return nil, nil
+	}, func(chg *update.Change, as *update.Assumptions) error {
+		return nil
 	})
 	defer restore()
 
@@ -87,10 +89,19 @@ func (s *mainSuite) TestExecuteMountProfileUpdate(c *C) {
 	c.Assert(err, IsNil)
 
 	upCtx := update.NewSystemProfileUpdateContext(snapName, false)
+	var profilePath string
+	var savedProfile string
+	restore = update.MockSaveMountProfile(func(p *osutil.MountProfile, fname string, uid sys.UserID, gid sys.GroupID) (err error) {
+		profilePath = fname
+		savedProfile, err = osutil.SaveMountProfileText(p)
+		return err
+	})
+	defer restore()
 	err = update.ExecuteMountProfileUpdate(upCtx)
 	c.Assert(err, IsNil)
 
-	c.Check(currentProfilePath, testutil.FileEquals, `/var/lib/snapd/hostfs/usr/local/share/fonts /usr/local/share/fonts none bind,ro 0 0
+	c.Check(profilePath, Equals, currentProfilePath)
+	c.Check(savedProfile, Equals, `/var/lib/snapd/hostfs/usr/local/share/fonts /usr/local/share/fonts none bind,ro 0 0
 /var/lib/snapd/hostfs/usr/share/fonts /usr/share/fonts none bind,ro 0 0
 `)
 }
@@ -151,13 +162,25 @@ func (s *mainSuite) TestAddingSyntheticChanges(c *C) {
 				Options: []string{"bind", "ro", "x-snapd.synthetic", "x-snapd.needed-by=/usr/share/mysnap"}}},
 		}
 		return synthetic, nil
+	}, func(chg *update.Change, as *update.Assumptions) error {
+		// This is the doPerform side of the mock that is doing nothing in this test.
+		return nil
 	})
 	defer restore()
 
 	upCtx := update.NewSystemProfileUpdateContext(snapName, false)
+	var profilePath string
+	var savedProfile string
+	restore = update.MockSaveMountProfile(func(p *osutil.MountProfile, fname string, uid sys.UserID, gid sys.GroupID) (err error) {
+		profilePath = fname
+		savedProfile, err = osutil.SaveMountProfileText(p)
+		return err
+	})
+	defer restore()
 	c.Assert(update.ExecuteMountProfileUpdate(upCtx), IsNil)
 
-	c.Check(currentProfilePath, testutil.FileEquals,
+	c.Check(profilePath, Equals, currentProfilePath)
+	c.Check(savedProfile, Equals,
 		`tmpfs /usr/share tmpfs x-snapd.synthetic,x-snapd.needed-by=/usr/share/mysnap 0 0
 /usr/share/adduser /usr/share/adduser none bind,ro,x-snapd.synthetic,x-snapd.needed-by=/usr/share/mysnap 0 0
 /usr/share/awk /usr/share/awk none bind,ro,x-snapd.synthetic,x-snapd.needed-by=/usr/share/mysnap 0 0
@@ -168,9 +191,6 @@ func (s *mainSuite) TestAddingSyntheticChanges(c *C) {
 func (s *mainSuite) TestRemovingSyntheticChanges(c *C) {
 	dirs.SetRootDir(c.MkDir())
 	defer dirs.SetRootDir("/")
-
-	c.Assert(os.MkdirAll(dirs.FeaturesDir, 0755), IsNil)
-	c.Assert(os.WriteFile(features.RobustMountNamespaceUpdates.ControlFile(), []byte(nil), 0644), IsNil)
 
 	// The snap `mysnap` no longer wishes to export it's usr/share/mysnap
 	// directory. All the synthetic changes that were associated with that mount
@@ -232,13 +252,25 @@ func (s *mainSuite) TestRemovingSyntheticChanges(c *C) {
 			panic(fmt.Sprintf("unexpected call n=%d, chg: %v", n, *chg))
 		}
 		return nil, nil
+	}, func(chg *update.Change, as *update.Assumptions) error {
+		// This is the doPerform side of the mock that is doing nothing in this test.
+		return nil
 	})
 	defer restore()
 
 	upCtx := update.NewSystemProfileUpdateContext(snapName, false)
+	var profilePath string
+	var savedProfile string
+	restore = update.MockSaveMountProfile(func(p *osutil.MountProfile, fname string, uid sys.UserID, gid sys.GroupID) (err error) {
+		profilePath = fname
+		savedProfile, err = osutil.SaveMountProfileText(p)
+		return err
+	})
+	defer restore()
 	c.Assert(update.ExecuteMountProfileUpdate(upCtx), IsNil)
 
-	c.Check(currentProfilePath, testutil.FileEquals, "")
+	c.Check(profilePath, Equals, currentProfilePath)
+	c.Check(savedProfile, Equals, "")
 }
 
 func (s *mainSuite) TestApplyingLayoutChanges(c *C) {
@@ -274,6 +306,9 @@ func (s *mainSuite) TestApplyingLayoutChanges(c *C) {
 		default:
 			panic(fmt.Sprintf("unexpected call n=%d, chg: %v", n, *chg))
 		}
+	}, func(chg *update.Change, as *update.Assumptions) error {
+		// This is the doPerform side of the mock that is doing nothing in this test.
+		return nil
 	})
 	defer restore()
 
@@ -302,7 +337,11 @@ func (s *mainSuite) TestApplyingParallelInstanceChanges(c *C) {
 
 	n := -1
 	restore := update.MockChangePerform(func(chg *update.Change, as *update.Assumptions) ([]*update.Change, error) {
+		return nil, nil
+	}, func(chg *update.Change, as *update.Assumptions) error {
+		// This is the doPerform side of the mock that is doing nothing in this test.
 		n++
+		c.Logf("call: %s, n %v", chg, n)
 		switch n {
 		case 0:
 			c.Assert(chg, DeepEquals, &update.Change{
@@ -313,7 +352,7 @@ func (s *mainSuite) TestApplyingParallelInstanceChanges(c *C) {
 					Options: []string{"rbind", "x-snapd.origin=overname"},
 				},
 			})
-			return nil, fmt.Errorf("testing")
+			return fmt.Errorf("testing")
 		default:
 			panic(fmt.Sprintf("unexpected call n=%d, chg: %v", n, *chg))
 		}
@@ -345,6 +384,8 @@ func (s *mainSuite) TestApplyIgnoredMissingMount(c *C) {
 
 	n := -1
 	restore := update.MockChangePerform(func(chg *update.Change, as *update.Assumptions) ([]*update.Change, error) {
+		return nil, nil
+	}, func(chg *update.Change, as *update.Assumptions) error {
 		n++
 		switch n {
 		case 0:
@@ -357,7 +398,7 @@ func (s *mainSuite) TestApplyIgnoredMissingMount(c *C) {
 					Options: []string{"bind", "x-snapd.ignore-missing"},
 				},
 			})
-			return nil, update.ErrIgnoredMissingMount
+			return update.ErrIgnoredMissingMount
 		default:
 			panic(fmt.Sprintf("unexpected call n=%d, chg: %v", n, *chg))
 		}
@@ -366,9 +407,18 @@ func (s *mainSuite) TestApplyIgnoredMissingMount(c *C) {
 
 	// The error was ignored, and no mount was recorded in the profile
 	upCtx := update.NewSystemProfileUpdateContext(snapName, false)
+	var profilePath string
+	var savedProfile string
+	restore = update.MockSaveMountProfile(func(p *osutil.MountProfile, fname string, uid sys.UserID, gid sys.GroupID) (err error) {
+		profilePath = fname
+		savedProfile, err = osutil.SaveMountProfileText(p)
+		return err
+	})
+	defer restore()
 	c.Assert(update.ExecuteMountProfileUpdate(upCtx), IsNil)
 	c.Check(s.log.String(), Equals, "")
-	c.Check(currentProfilePath, testutil.FileEquals, "")
+	c.Check(profilePath, Equals, currentProfilePath)
+	c.Check(savedProfile, Equals, "")
 }
 
 func (s *mainSuite) TestApplyUserFstabHomeRequiredAndValid(c *C) {
@@ -379,6 +429,9 @@ func (s *mainSuite) TestApplyUserFstabHomeRequiredAndValid(c *C) {
 	restore := update.MockChangePerform(func(chg *update.Change, as *update.Assumptions) ([]*update.Change, error) {
 		changes = append(changes, *chg)
 		return nil, nil
+	}, func(chg *update.Change, as *update.Assumptions) error {
+		// This is the doPerform side of the mock that is doing nothing in this test.
+		return nil
 	})
 	defer restore()
 
@@ -417,6 +470,9 @@ func (s *mainSuite) TestApplyUserFstabErrorHomeRequiredAndMissing(c *C) {
 	restore := update.MockChangePerform(func(chg *update.Change, as *update.Assumptions) ([]*update.Change, error) {
 		changes = append(changes, *chg)
 		return nil, nil
+	}, func(chg *update.Change, as *update.Assumptions) error {
+		// This is the doPerform side of the mock that is doing nothing in this test.
+		return nil
 	})
 	defer restore()
 

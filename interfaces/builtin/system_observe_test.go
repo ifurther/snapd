@@ -33,7 +33,6 @@ import (
 	"github.com/snapcore/snapd/interfaces/mount"
 	"github.com/snapcore/snapd/interfaces/seccomp"
 	"github.com/snapcore/snapd/snap"
-	"github.com/snapcore/snapd/snap/snaptest"
 	"github.com/snapcore/snapd/testutil"
 )
 
@@ -53,20 +52,21 @@ apps:
   plugs: [system-observe]
 `
 
+const sysobsMockSlotSnapInfoYaml = `name: core
+version: 1.0
+type: os
+slots:
+ system-observe:
+  interface: system-observe
+`
+
 var _ = Suite(&SystemObserveInterfaceSuite{
 	iface: builtin.MustInterface("system-observe"),
 })
 
 func (s *SystemObserveInterfaceSuite) SetUpTest(c *C) {
-	s.slotInfo = &snap.SlotInfo{
-		Snap:      &snap.Info{SuggestedName: "core", SnapType: snap.TypeOS},
-		Name:      "system-observe",
-		Interface: "system-observe",
-	}
-	s.slot = interfaces.NewConnectedSlot(s.slotInfo, nil, nil)
-	plugSnap := snaptest.MockInfo(c, sysobsMockPlugSnapInfoYaml, nil)
-	s.plugInfo = plugSnap.Plugs["system-observe"]
-	s.plug = interfaces.NewConnectedPlug(s.plugInfo, nil, nil)
+	s.slot, s.slotInfo = MockConnectedSlot(c, sysobsMockSlotSnapInfoYaml, nil, "system-observe")
+	s.plug, s.plugInfo = MockConnectedPlug(c, sysobsMockPlugSnapInfoYaml, nil, "system-observe")
 }
 
 func (s *SystemObserveInterfaceSuite) TestName(c *C) {
@@ -83,7 +83,7 @@ func (s *SystemObserveInterfaceSuite) TestSanitizePlug(c *C) {
 
 func (s *SystemObserveInterfaceSuite) TestUsedSecuritySystems(c *C) {
 	// connected plugs have a non-nil security snippet for apparmor
-	apparmorSpec := apparmor.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	apparmorSpec := apparmor.NewSpecification(s.plug.AppSet())
 	err := apparmorSpec.AddConnectedPlug(s.iface, s.plug, s.slot)
 	c.Assert(err, IsNil)
 	c.Assert(apparmorSpec.SecurityTags(), DeepEquals, []string{"snap.other.app2"})
@@ -99,10 +99,11 @@ func (s *SystemObserveInterfaceSuite) TestUsedSecuritySystems(c *C) {
 	c.Assert(strings.Join(updateNS[:], "\n"), Equals, expectedUpdateNS)
 
 	// connected plugs have a non-nil security snippet for seccomp
-	seccompSpec := seccomp.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	seccompSpec := seccomp.NewSpecification(s.plug.AppSet())
 	err = seccompSpec.AddConnectedPlug(s.iface, s.plug, s.slot)
 	c.Assert(err, IsNil)
 	c.Assert(seccompSpec.SecurityTags(), DeepEquals, []string{"snap.other.app2"})
+	c.Check(seccompSpec.SnippetForTag("snap.other.app2"), testutil.Contains, "lsm_get_self_attr\n")
 	c.Check(seccompSpec.SnippetForTag("snap.other.app2"), testutil.Contains, "ptrace\n")
 }
 
@@ -114,9 +115,7 @@ func (s *SystemObserveInterfaceSuite) TestMountPermanentPlug(c *C) {
 	// mount for it
 	fakeBootDir := filepath.Join(tmpdir, "/boot")
 	c.Assert(os.MkdirAll(fakeBootDir, 0777), IsNil)
-	file, err := os.OpenFile(filepath.Join(fakeBootDir, "config-5.10"), os.O_CREATE, 0644)
-	c.Assert(err, IsNil)
-	c.Assert(file.Close(), IsNil)
+	c.Assert(os.WriteFile(filepath.Join(fakeBootDir, "config-5.10"), nil, 0o644), IsNil)
 
 	mountSpec := &mount.Specification{}
 	c.Assert(mountSpec.AddPermanentPlug(s.iface, s.plugInfo), IsNil)

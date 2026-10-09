@@ -1,19 +1,26 @@
 summary: Ensure "snapctl is-connected" --pid and --apparmor-label options work.
 
+details: |
+    This test uses the "snapctl is-connected" command to verify that the "--pid"
+    and "--apparmor-label" options work as expected.
+
+    The "--pid" option is tested by connecting a plug and slot and verifying
+    that the slot is connected to the process ID of the service running in the
+    snap.
+
+    The "--apparmor-label" option is tested by verifying that the slot is
+    connected to the AppArmor label of the service running in the snap.
+
 prepare: |
     "$TESTSTOOLS"/snaps-state install-local test-snap1
     "$TESTSTOOLS"/snaps-state install-local test-snap2
 
-    case "$SPREAD_SYSTEM" in
-        fedora-*|arch-*|centos-*)
-            # although classic snaps do not work out of the box on fedora,
-            # we still want to verify if the basics do work if the user
-            # symlinks /snap to $SNAP_MOUNT_DIR themselves
-            SNAP_MOUNT_DIR="$(os.paths snap-mount-dir)"
-            ln -sf "$SNAP_MOUNT_DIR" /snap
-            tests.cleanup defer rm -f /snap
-        ;;
-    esac
+    SNAP_MOUNT_DIR="$(os.paths snap-mount-dir)"
+    if [ "$SNAP_MOUNT_DIR" = "/var/lib/snapd/snap" ] && [ ! -L /snap ]; then
+        ln -s "$SNAP_MOUNT_DIR" /snap
+        # remove it when we are done
+        tests.cleanup defer rm -rf /snap
+    fi
 
 execute: |
     echo "The test-snap1 service is running"

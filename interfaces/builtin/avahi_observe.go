@@ -437,7 +437,7 @@ func (iface *avahiObserveInterface) AppArmorConnectedPlug(spec *apparmor.Specifi
 		// with stock apparmor 2.13.2+ profiles the label is avahi-daemon
 		new = "\"{unconfined,/usr/sbin/avahi-daemon,avahi-daemon}\""
 	} else {
-		new = spec.SnapAppSet().SlotLabelExpression(slot)
+		new = slot.LabelExpression()
 	}
 	snippet := strings.Replace(avahiObserveConnectedPlugAppArmor, old, new, -1)
 	spec.AddSnippet(snippet)
@@ -458,7 +458,7 @@ func (iface *avahiObserveInterface) AppArmorConnectedSlot(spec *apparmor.Specifi
 	// on classic, slot side can be system or application
 	if !implicitSystemConnectedSlot(slot) {
 		old := "###PLUG_SECURITY_TAGS###"
-		new := spec.SnapAppSet().PlugLabelExpression(plug)
+		new := plug.LabelExpression()
 		snippet := strings.Replace(avahiObserveConnectedSlotAppArmor, old, new, -1)
 		spec.AddSnippet(snippet)
 	}
@@ -477,6 +477,12 @@ func (iface *avahiObserveInterface) DBusPermanentSlot(spec *dbus.Specification, 
 func (iface *avahiObserveInterface) AutoConnect(*snap.PlugInfo, *snap.SlotInfo) bool {
 	// allow what declarations allowed
 	return true
+}
+
+func (iface *avahiObserveInterface) ParallelInstancesSupportedForSlot(_ *snap.SlotInfo) error {
+	// avahi-daemon owns the well-known bus name org.freedesktop.Avahi on the
+	// system bus; only one snap instance can hold it at a time.
+	return errParallelInstancesUniqueResourceOwner
 }
 
 func init() {

@@ -89,7 +89,7 @@ get_assets() {
         cp "$BASE_IMAGE_PATH" "$CACHE"
     else
         echo "mkimage-uc22: downloading the ubuntu classic base"
-        wget -c -P "$CACHE" "$BASE_IMAGE_URL"
+        wget -q -c -P "$CACHE" "$BASE_IMAGE_URL"
     fi    
 
     echo "mkimage-uc22: image assets ready"
@@ -149,10 +149,15 @@ install_data_partition() {
     [ -e "$DESTDIR"/dev/random ] || sudo mknod -m 666 "$DESTDIR"/dev/random c 1 8
     [ -e "$DESTDIR"/dev/urandom ] || sudo mknod -m 666 "$DESTDIR"/dev/urandom c 1 9
 
-    # ensure resolving works inside the chroot
-    echo "nameserver 8.8.8.8" | sudo tee -a "$DESTDIR"/etc/resolv.conf
-    
-    local pkgs="snapd ssh openssh-server sudo iproute2 iputils-ping isc-dhcp-client netplan.io vim-tiny kmod cloud-init jq update-notifier-common"
+    # ensure the proxy and resolv configuration is set inside the chroot
+    if [ "${SNAPD_USE_PROXY:-}" = true ]; then
+        cp /etc/resolv.conf "$DESTDIR"/etc/resolv.conf
+        cp /etc/environment "$DESTDIR"/etc/environment
+    else
+        echo "nameserver 8.8.8.8" | sudo tee -a "$DESTDIR"/etc/resolv.conf
+    fi
+
+    local pkgs="snapd ssh openssh-server sudo iproute2 iputils-ping isc-dhcp-client netplan.io vim-tiny kmod cloud-init jq update-notifier-common systemd-timesyncd"
     echo "mkimage-uc22: installing additional packages: $pkgs"
     sudo chroot "$DESTDIR" /usr/bin/sh -c "DEBIAN_FRONTEND=noninteractive apt -qq update"    
     sudo chroot "$DESTDIR" /usr/bin/sh -c \
@@ -406,7 +411,7 @@ replace_images_files() {
 
     # when no snapd deb package provided, the prebuilt one from master is used
     if [ -z "$SNAPD_DEB" ]; then
-        wget -c -P "$CACHE" "$DEFAULT_SNAPD_DEB_URL"
+        wget -q -c -P "$CACHE" "$DEFAULT_SNAPD_DEB_URL"
         tar -xvf "$CACHE"/"$(basename "$DEFAULT_SNAPD_DEB_URL")" -C "$CACHE"
         SNAPD_DEB="$CACHE"/"$(find "$CACHE" -maxdepth 1 -name "snapd_*.deb" -printf "%f\n")"
     fi
@@ -428,10 +433,12 @@ show_how_to_run_qemu() {
     local IMG="$1"
 
     echo "mkimage-uc22: mage ready, run as: "
-    echo kvm -m 1500 -snapshot \
+    echo cp /usr/share/OVMF/OVMF_VARS_4M.fd .
+    echo qemu-system-x86_64 -m q35,accel=kvm -m 1500 -snapshot \
         -netdev user,id=net.0,hostfwd=tcp::10022-:22 \
         -device rtl8139,netdev=net.0 \
-        -bios /usr/share/OVMF/OVMF_CODE.fd \
+        -drive file=/usr/share/OVMF/OVMF_CODE_4M.fd,if=pflash,format=raw,readonly=on \
+        -drive file=OVMF_VARS_4M.fd,if=pflash,format=raw \
         -drive file="$1",if=virtio \
         -serial stdio
 

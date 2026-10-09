@@ -30,6 +30,7 @@ import (
 	"github.com/snapcore/snapd/asserts"
 	"github.com/snapcore/snapd/asserts/assertstest"
 	"github.com/snapcore/snapd/dirs"
+	"github.com/snapcore/snapd/dirs/dirstest"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/overlord"
@@ -68,7 +69,9 @@ type baseServiceMgrTestSuite struct {
 func (s *baseServiceMgrTestSuite) SetUpTest(c *C) {
 	s.BaseTest.SetUpTest(c)
 
-	dirs.SetRootDir(c.MkDir())
+	r := c.MkDir()
+	dirstest.MustMockCanonicalSnapMountDir(r)
+	dirs.SetRootDir(r)
 	s.AddCleanup(func() { dirs.SetRootDir("") })
 
 	s.restartRequests = nil
@@ -77,7 +80,7 @@ func (s *baseServiceMgrTestSuite) SetUpTest(c *C) {
 	s.o = overlord.Mock()
 	s.state = s.o.State()
 	s.state.Lock()
-	_, err := restart.Manager(s.state, "boot-id-0", snapstatetest.MockRestartHandler(func(req restart.RestartType) {
+	_, err := restart.Manager(s.state, "boot-id-0", snapstatetest.MockRestartHandler(func(req restart.RestartType, _ restart.RestartReason) {
 		s.restartRequests = append(s.restartRequests, req)
 		if s.restartObserve != nil {
 			s.restartObserve()
@@ -99,7 +102,7 @@ func (s *baseServiceMgrTestSuite) SetUpTest(c *C) {
 	s.state.Set("seeded", true)
 	s.state.Unlock()
 
-	s.uc18Model = assertstest.FakeAssertion(map[string]interface{}{
+	s.uc18Model = assertstest.FakeAssertion(map[string]any{
 		"type":         "model",
 		"authority-id": "canonical",
 		"series":       "16",
@@ -111,7 +114,7 @@ func (s *baseServiceMgrTestSuite) SetUpTest(c *C) {
 		"base":         "core18",
 	}).(*asserts.Model)
 
-	s.uc16Model = assertstest.FakeAssertion(map[string]interface{}{
+	s.uc16Model = assertstest.FakeAssertion(map[string]any{
 		"type":         "model",
 		"authority-id": "canonical",
 		"series":       "16",
@@ -156,17 +159,17 @@ Description=Service for snap application test-snap.svc1
 Requires=%[1]s
 Wants=network.target
 After=%[1]s network.target snapd.apparmor.service
-%[3]sX-Snappy=yes
+%[2]sX-Snappy=yes
 
 [Service]
 EnvironmentFile=-/etc/environment
 ExecStart=/usr/bin/snap run test-snap.svc1
 SyslogIdentifier=test-snap.svc1
 Restart=on-failure
-WorkingDirectory=%[2]s/var/snap/test-snap/42
-TimeoutStopSec=30
+WorkingDirectory=/var/snap/test-snap/42
+TimeoutStopSec=30s
 Type=simple
-%[4]s
+%[3]s
 [Install]
 WantedBy=multi-user.target
 `
@@ -216,8 +219,7 @@ After=usr-lib-snapd.mount
 	}
 
 	return fmt.Sprintf(unitTempl,
-		systemd.EscapeUnitNamePath(filepath.Join(dirs.SnapMountDir, opts.snapName, opts.snapRev+".mount")),
-		dirs.GlobalRootDir,
+		systemd.EscapeUnitNamePath(dirs.StripRootDir(filepath.Join(dirs.SnapMountDir, opts.snapName, opts.snapRev+".mount"))),
 		usrLibSnapdSnippet,
 		oomScoreAdjust,
 	)
@@ -284,6 +286,14 @@ func (s *ensureSnapServiceSuite) TestEnsureSnapServicesNotSeeded(c *C) {
 
 	// we did not request a restart
 	c.Assert(s.restartRequests, HasLen, 0)
+}
+
+func (s *ensureSnapServiceSuite) TestEnsureSnapServicesMissingContextAfterSeed(c *C) {
+	restore := snapstatetest.MockDeviceContext(nil)
+	defer restore()
+
+	err := s.mgr.Ensure()
+	c.Check(err, testutil.ErrorIs, state.ErrNoState)
 }
 
 func (s *ensureSnapServiceSuite) TestEnsureSnapServicesSimpleWritesServicesFilesUC16(c *C) {

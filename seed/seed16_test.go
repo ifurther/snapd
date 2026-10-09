@@ -65,13 +65,13 @@ func (s *seed16Suite) SetUpTest(c *C) {
 
 	s.TestingSeed16 = &seedtest.TestingSeed16{}
 	s.SetupAssertSigning("canonical")
-	s.Brands.Register("my-brand", brandPrivKey, map[string]interface{}{
+	s.Brands.Register("my-brand", brandPrivKey, map[string]any{
 		"verification": "verified",
 	})
 
 	s.SeedDir = c.MkDir()
 
-	s.devAcct = assertstest.NewAccount(s.StoreSigning, "developer", map[string]interface{}{
+	s.devAcct = assertstest.NewAccount(s.StoreSigning, "developer", map[string]any{
 		"account-id": "developerid",
 	}, "")
 	assertstest.AddMany(s.StoreSigning, s.devAcct)
@@ -109,7 +109,7 @@ func (s *seed16Suite) TestLoadAssertionsTwoModelAssertionsError(c *C) {
 	err := os.Mkdir(s.AssertsDir(), 0755)
 	c.Assert(err, IsNil)
 
-	headers := map[string]interface{}{
+	headers := map[string]any{
 		"architecture": "amd64",
 		"kernel":       "pc-kernel",
 		"gadget":       "pc",
@@ -127,7 +127,7 @@ func (s *seed16Suite) TestLoadAssertionsConsistencyError(c *C) {
 	c.Assert(err, IsNil)
 
 	// write out only the model assertion
-	headers := map[string]interface{}{
+	headers := map[string]any{
 		"architecture": "amd64",
 		"kernel":       "pc-kernel",
 		"gadget":       "pc",
@@ -142,7 +142,7 @@ func (s *seed16Suite) TestLoadAssertionsModelHappy(c *C) {
 	err := os.Mkdir(s.AssertsDir(), 0755)
 	c.Assert(err, IsNil)
 
-	headers := map[string]interface{}{
+	headers := map[string]any{
 		"architecture": "amd64",
 		"kernel":       "pc-kernel",
 		"gadget":       "pc",
@@ -171,7 +171,7 @@ func (s *seed16Suite) TestLoadAssertionsModelTempDBHappy(c *C) {
 	err := os.Mkdir(s.AssertsDir(), 0755)
 	c.Assert(err, IsNil)
 
-	headers := map[string]interface{}{
+	headers := map[string]any{
 		"architecture": "amd64",
 		"kernel":       "pc-kernel",
 		"gadget":       "pc",
@@ -195,7 +195,7 @@ func (s *seed16Suite) TestLoadMetaNoMeta(c *C) {
 	err := os.Mkdir(s.AssertsDir(), 0755)
 	c.Assert(err, IsNil)
 
-	headers := map[string]interface{}{
+	headers := map[string]any{
 		"architecture": "amd64",
 		"kernel":       "pc-kernel",
 		"gadget":       "pc",
@@ -214,7 +214,7 @@ func (s *seed16Suite) TestLoadMetaInvalidSeedYaml(c *C) {
 	err := os.Mkdir(s.AssertsDir(), 0755)
 	c.Assert(err, IsNil)
 
-	headers := map[string]interface{}{
+	headers := map[string]any{
 		"architecture": "amd64",
 		"kernel":       "pc-kernel",
 		"gadget":       "pc",
@@ -226,7 +226,7 @@ func (s *seed16Suite) TestLoadMetaInvalidSeedYaml(c *C) {
 	c.Assert(err, IsNil)
 
 	// create a seed.yaml
-	content, err := yaml.Marshal(map[string]interface{}{
+	content, err := yaml.Marshal(map[string]any{
 		"snaps": []*seed.InternalSnap16{{
 			Name:    "core",
 			Channel: "track/not-a-risk",
@@ -351,8 +351,8 @@ var (
 	}
 )
 
-func (s *seed16Suite) makeSeed(c *C, modelHeaders map[string]interface{}, seedSnaps ...*seed.InternalSnap16) []*seed.InternalSnap16 {
-	coreHeaders := map[string]interface{}{
+func (s *seed16Suite) makeSeed(c *C, modelHeaders map[string]any, seedSnaps ...*seed.InternalSnap16) []*seed.InternalSnap16 {
+	coreHeaders := map[string]any{
 		"architecture": "amd64",
 	}
 
@@ -375,16 +375,16 @@ func (s *seed16Suite) makeSeed(c *C, modelHeaders map[string]interface{}, seedSn
 		completeSeedSnap := *seedSnap
 		var snapFname string
 		if seedSnap.Unasserted {
-			mockSnapFile := snaptest.MakeTestSnapWithFiles(c, snapYaml[seedSnap.Name], snapFiles[seedSnap.Name])
+			mockSnapFile := snaptest.MakeTestSnapWithFiles(c, snapYaml[seedSnap.Name.String()], snapFiles[seedSnap.Name.String()])
 			snapFname = filepath.Base(mockSnapFile)
 			err := os.Rename(mockSnapFile, filepath.Join(s.SeedDir, "snaps", snapFname))
 			c.Assert(err, IsNil)
 		} else {
-			publisher := snapPublishers[seedSnap.Name]
+			publisher := snapPublishers[seedSnap.Name.String()]
 			if publisher == "" {
 				publisher = "canonical"
 			}
-			whichYaml := seedSnap.Name
+			whichYaml := seedSnap.Name.String()
 			if seedSnap.Channel != "stable" {
 				whichYaml = whichYaml + "=" + seedSnap.Channel
 			}
@@ -405,7 +405,7 @@ func (s *seed16Suite) makeSeed(c *C, modelHeaders map[string]interface{}, seedSn
 
 func (s *seed16Suite) writeSeed(c *C, seedSnaps []*seed.InternalSnap16) {
 	// create a seed.yaml
-	content, err := yaml.Marshal(map[string]interface{}{
+	content, err := yaml.Marshal(map[string]any{
 		"snaps": seedSnaps,
 	})
 	c.Assert(err, IsNil)
@@ -462,8 +462,8 @@ func (s *seed16Suite) TestLoadMetaCore16Minimal(c *C) {
 }
 
 func (s *seed16Suite) TestLoadMetaCore16(c *C) {
-	s.makeSeed(c, map[string]interface{}{
-		"required-snaps": []interface{}{"required"},
+	s.makeSeed(c, map[string]any{
+		"required-snaps": []any{"required"},
 	}, coreSeed, kernelSeed, gadgetSeed, requiredSeed)
 
 	err := s.seed16.LoadAssertions(s.db, s.commitTo)
@@ -487,18 +487,29 @@ func (s *seed16Suite) TestLoadMetaCore16(c *C) {
 	pi = essSnaps[2].PlaceInfo()
 	c.Check(pi.Filename(), Equals, "pc_1.snap")
 
-	c.Check(runSnaps, DeepEquals, []*seed.Snap{
-		{
-			Path:     s.expectedPath("required"),
-			SideInfo: &s.AssertedSnapInfo("required").SideInfo,
-			Required: true,
-			Channel:  "stable",
-		},
-	})
+	requiredExpect := &seed.Snap{
+		Path:     s.expectedPath("required"),
+		SideInfo: &s.AssertedSnapInfo("required").SideInfo,
+		Required: true,
+		Channel:  "stable",
+	}
+	c.Check(runSnaps, DeepEquals, []*seed.Snap{requiredExpect})
+
+	requiredSnap, err := s.seed16.ModeSnap("required", "run")
+	c.Assert(err, IsNil)
+	c.Check(requiredSnap, DeepEquals, requiredExpect)
+
+	notExistsSnap, err := s.seed16.ModeSnap("not-exists", "run")
+	c.Assert(notExistsSnap, IsNil)
+	c.Assert(err, ErrorMatches, "snap not-exists not found in seed")
+
+	requiredSnap, err = s.seed16.ModeSnap("required", "ephemeral")
+	c.Assert(requiredSnap, IsNil)
+	c.Assert(err, ErrorMatches, "internal error: Core 16/18 have only run mode, got: ephemeral")
 }
 
 func (s *seed16Suite) TestLoadMetaCore18Minimal(c *C) {
-	s.makeSeed(c, map[string]interface{}{
+	s.makeSeed(c, map[string]any{
 		"base":   "core18",
 		"kernel": "pc-kernel=18",
 		"gadget": "pc=18",
@@ -553,11 +564,11 @@ func (s *seed16Suite) TestLoadMetaCore18Minimal(c *C) {
 }
 
 func (s *seed16Suite) TestLoadMetaCore18(c *C) {
-	s.makeSeed(c, map[string]interface{}{
+	s.makeSeed(c, map[string]any{
 		"base":           "core18",
 		"kernel":         "pc-kernel=18",
 		"gadget":         "pc=18",
-		"required-snaps": []interface{}{"core", "required", "required18"},
+		"required-snaps": []any{"core", "required", "required18"},
 	}, snapdSeed, core18Seed, kernel18Seed, gadget18Seed, requiredSeed, coreSeed, required18Seed)
 
 	err := s.seed16.LoadAssertions(s.db, s.commitTo)
@@ -627,7 +638,7 @@ func (s *seed16Suite) TestLoadMetaCore18(c *C) {
 }
 
 func (s *seed16Suite) TestLoadMetaClassicNothing(c *C) {
-	s.makeSeed(c, map[string]interface{}{
+	s.makeSeed(c, map[string]any{
 		"classic": "true",
 	})
 
@@ -648,7 +659,7 @@ func (s *seed16Suite) TestLoadMetaClassicNothing(c *C) {
 }
 
 func (s *seed16Suite) TestLoadMetaClassicCore(c *C) {
-	s.makeSeed(c, map[string]interface{}{
+	s.makeSeed(c, map[string]any{
 		"classic": "true",
 	}, coreSeed, classicSnapSeed)
 
@@ -688,7 +699,7 @@ func (s *seed16Suite) TestLoadMetaClassicCore(c *C) {
 }
 
 func (s *seed16Suite) TestLoadMetaClassicCoreWithGadget(c *C) {
-	s.makeSeed(c, map[string]interface{}{
+	s.makeSeed(c, map[string]any{
 		"classic": "true",
 		"gadget":  "classic-gadget",
 	}, coreSeed, classicGadgetSeed)
@@ -728,9 +739,9 @@ func (s *seed16Suite) TestLoadMetaClassicCoreWithGadget(c *C) {
 }
 
 func (s *seed16Suite) TestLoadMetaClassicSnapd(c *C) {
-	s.makeSeed(c, map[string]interface{}{
+	s.makeSeed(c, map[string]any{
 		"classic":        "true",
-		"required-snaps": []interface{}{"core18", "required18"},
+		"required-snaps": []any{"core18", "required18"},
 	}, snapdSeed, core18Seed, required18Seed)
 
 	err := s.seed16.LoadAssertions(s.db, s.commitTo)
@@ -773,7 +784,7 @@ func (s *seed16Suite) TestLoadMetaClassicSnapd(c *C) {
 }
 
 func (s *seed16Suite) TestLoadMetaClassicSnapdWithGadget(c *C) {
-	s.makeSeed(c, map[string]interface{}{
+	s.makeSeed(c, map[string]any{
 		"classic": "true",
 		"gadget":  "classic-gadget",
 	}, snapdSeed, classicGadgetSeed, coreSeed)
@@ -822,10 +833,10 @@ func (s *seed16Suite) TestLoadMetaClassicSnapdWithGadget(c *C) {
 }
 
 func (s *seed16Suite) TestLoadMetaClassicSnapdWithGadget18(c *C) {
-	s.makeSeed(c, map[string]interface{}{
+	s.makeSeed(c, map[string]any{
 		"classic":        "true",
 		"gadget":         "classic-gadget18",
-		"required-snaps": []interface{}{"core", "required"},
+		"required-snaps": []any{"core", "required"},
 	}, snapdSeed, coreSeed, requiredSeed, classicGadget18Seed, core18Seed)
 
 	err := s.seed16.LoadAssertions(s.db, s.commitTo)
@@ -890,11 +901,11 @@ func (s *seed16Suite) TestLoadMetaCore18Local(c *C) {
 		Unasserted: true,
 		DevMode:    true,
 	}
-	s.makeSeed(c, map[string]interface{}{
+	s.makeSeed(c, map[string]any{
 		"base":           "core18",
 		"kernel":         "pc-kernel=18",
 		"gadget":         "pc=18",
-		"required-snaps": []interface{}{"core", "required18"},
+		"required-snaps": []any{"core", "required18"},
 	}, snapdSeed, core18Seed, kernel18Seed, gadget18Seed, localRequired18Seed)
 
 	err := s.seed16.LoadAssertions(s.db, s.commitTo)
@@ -958,11 +969,11 @@ func (s *seed16Suite) TestLoadMetaCore18SnapHandler(c *C) {
 		Unasserted: true,
 		DevMode:    true,
 	}
-	s.makeSeed(c, map[string]interface{}{
+	s.makeSeed(c, map[string]any{
 		"base":           "core18",
 		"kernel":         "pc-kernel=18",
 		"gadget":         "pc=18",
-		"required-snaps": []interface{}{"core", "required18"},
+		"required-snaps": []any{"core", "required18"},
 	}, snapdSeed, core18Seed, kernel18Seed, gadget18Seed, localRequired18Seed)
 
 	err := s.seed16.LoadAssertions(s.db, s.commitTo)
@@ -1022,10 +1033,10 @@ func (s *seed16Suite) TestLoadMetaCore18SnapHandler(c *C) {
 	})
 
 	c.Check(h.asserted, DeepEquals, map[string]string{
-		"snapd":     "snaps/snapd_1.0_all.snap:snapd:1",
-		"pc-kernel": "snaps/pc-kernel_1.0_all.snap:kernel:1",
-		"core18":    "snaps/core18_1.0_all.snap:base:1",
-		"pc":        "snaps/pc_1.0_all.snap:gadget:1",
+		"snapd":     "snaps/snapd_1.0_all.snap",
+		"pc-kernel": "snaps/pc-kernel_1.0_all.snap",
+		"core18":    "snaps/core18_1.0_all.snap",
+		"pc":        "snaps/pc_1.0_all.snap",
 	})
 	c.Check(h.unasserted, DeepEquals, map[string]string{
 		"required18": "snaps/required18_1.0_all.snap",
@@ -1038,11 +1049,11 @@ func (s *seed16Suite) TestLoadMetaCore18SnapHandlerChangePath(c *C) {
 		Unasserted: true,
 		DevMode:    true,
 	}
-	s.makeSeed(c, map[string]interface{}{
+	s.makeSeed(c, map[string]any{
 		"base":           "core18",
 		"kernel":         "pc-kernel=18",
 		"gadget":         "pc=18",
-		"required-snaps": []interface{}{"core", "required18"},
+		"required-snaps": []any{"core", "required18"},
 	}, snapdSeed, core18Seed, kernel18Seed, gadget18Seed, localRequired18Seed)
 
 	err := s.seed16.LoadAssertions(s.db, s.commitTo)
@@ -1103,10 +1114,10 @@ func (s *seed16Suite) TestLoadMetaCore18SnapHandlerChangePath(c *C) {
 	})
 
 	c.Check(h.asserted, DeepEquals, map[string]string{
-		"snapd":     "snaps/snapd_1.0_all.snap:snapd:1",
-		"pc-kernel": "snaps/pc-kernel_1.0_all.snap:kernel:1",
-		"core18":    "snaps/core18_1.0_all.snap:base:1",
-		"pc":        "snaps/pc_1.0_all.snap:gadget:1",
+		"snapd":     "snaps/snapd_1.0_all.snap",
+		"pc-kernel": "snaps/pc-kernel_1.0_all.snap",
+		"core18":    "snaps/core18_1.0_all.snap",
+		"pc":        "snaps/pc_1.0_all.snap",
 	})
 	c.Check(h.unasserted, DeepEquals, map[string]string{
 		"required18": "snaps/required18_1.0_all.snap",
@@ -1114,7 +1125,7 @@ func (s *seed16Suite) TestLoadMetaCore18SnapHandlerChangePath(c *C) {
 }
 
 func (s *seed16Suite) TestLoadMetaCore18StoreInfo(c *C) {
-	s.makeSeed(c, map[string]interface{}{
+	s.makeSeed(c, map[string]any{
 		"base":   "core18",
 		"kernel": "pc-kernel=18",
 		"gadget": "pc=18",
@@ -1153,7 +1164,7 @@ func (s *seed16Suite) TestLoadMetaCore18StoreInfo(c *C) {
 }
 
 func (s *seed16Suite) TestLoadMetaCore18EnforcePinnedTracks(c *C) {
-	seedSnaps := s.makeSeed(c, map[string]interface{}{
+	seedSnaps := s.makeSeed(c, map[string]any{
 		"base":   "core18",
 		"kernel": "pc-kernel=18",
 		"gadget": "pc=18",
@@ -1219,11 +1230,11 @@ func (s *seed16Suite) TestLoadMetaCore18EnforcePinnedTracks(c *C) {
 }
 
 func (s *seed16Suite) TestLoadMetaBrokenSeed(c *C) {
-	seedSnap16s := s.makeSeed(c, map[string]interface{}{
+	seedSnap16s := s.makeSeed(c, map[string]any{
 		"base":           "core18",
 		"kernel":         "pc-kernel=18",
 		"gadget":         "pc=18",
-		"required-snaps": []interface{}{"required18"},
+		"required-snaps": []any{"required18"},
 	}, snapdSeed, core18Seed, kernel18Seed, gadget18Seed, required18Seed)
 
 	otherSnapFile := snaptest.MakeTestSnapWithFiles(c, `name: other
@@ -1255,7 +1266,7 @@ version: other-base
 	replaceFile := func(snapName, fname string) func([]*seed.InternalSnap16) []*seed.InternalSnap16 {
 		return func(snaps []*seed.InternalSnap16) []*seed.InternalSnap16 {
 			for i := range snaps {
-				if snaps[i].Name != snapName {
+				if snaps[i].Name.String() != snapName {
 					continue
 				}
 				sn := *snaps[i]
@@ -1302,11 +1313,11 @@ func (s *seed16Suite) TestLoadEssentialMetaCore18(c *C) {
 	r := seed.MockTrusted(s.StoreSigning.Trusted)
 	defer r()
 
-	s.makeSeed(c, map[string]interface{}{
+	s.makeSeed(c, map[string]any{
 		"base":           "core18",
 		"kernel":         "pc-kernel=18",
 		"gadget":         "pc=18",
-		"required-snaps": []interface{}{"core", "required", "required18"},
+		"required-snaps": []any{"core", "required", "required18"},
 	}, snapdSeed, core18Seed, kernel18Seed, gadget18Seed, requiredSeed, coreSeed, required18Seed)
 
 	snapdSnap := &seed.Snap{
@@ -1407,11 +1418,11 @@ func (s *seed16Suite) TestLoadEssentialMetaWithSnapHandlerCore18(c *C) {
 	r := seed.MockTrusted(s.StoreSigning.Trusted)
 	defer r()
 
-	s.makeSeed(c, map[string]interface{}{
+	s.makeSeed(c, map[string]any{
 		"base":           "core18",
 		"kernel":         "pc-kernel=18",
 		"gadget":         "pc=18",
-		"required-snaps": []interface{}{"core", "required", "required18"},
+		"required-snaps": []any{"core", "required", "required18"},
 	}, snapdSeed, core18Seed, kernel18Seed, gadget18Seed, requiredSeed, coreSeed, required18Seed)
 
 	snapdSnap := &seed.Snap{
@@ -1467,10 +1478,10 @@ func (s *seed16Suite) TestLoadEssentialMetaWithSnapHandlerCore18(c *C) {
 	c.Check(essSnaps, DeepEquals, expected)
 
 	c.Check(h.asserted, DeepEquals, map[string]string{
-		"snapd":     "snaps/snapd_1.0_all.snap:snapd:1",
-		"pc-kernel": "snaps/pc-kernel_1.0_all.snap:kernel:1",
-		"core18":    "snaps/core18_1.0_all.snap:base:1",
-		"pc":        "snaps/pc_1.0_all.snap:gadget:1",
+		"snapd":     "snaps/snapd_1.0_all.snap",
+		"pc-kernel": "snaps/pc-kernel_1.0_all.snap",
+		"core18":    "snaps/core18_1.0_all.snap",
+		"pc":        "snaps/pc_1.0_all.snap",
 	})
 }
 
@@ -1478,11 +1489,11 @@ func (s *seed16Suite) TestLoadEssentialAndMetaCore18(c *C) {
 	r := seed.MockTrusted(s.StoreSigning.Trusted)
 	defer r()
 
-	s.makeSeed(c, map[string]interface{}{
+	s.makeSeed(c, map[string]any{
 		"base":           "core18",
 		"kernel":         "pc-kernel=18",
 		"gadget":         "pc=18",
-		"required-snaps": []interface{}{"core", "required", "required18"},
+		"required-snaps": []any{"core", "required", "required18"},
 	}, snapdSeed, core18Seed, kernel18Seed, gadget18Seed, requiredSeed, coreSeed, required18Seed)
 
 	snapdSnap := &seed.Snap{

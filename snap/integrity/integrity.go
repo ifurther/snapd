@@ -20,144 +20,152 @@
 package integrity
 
 import (
-	"bytes"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"os"
+	"strings"
 
-	"github.com/snapcore/snapd/logger"
+	"github.com/snapcore/snapd/asserts"
 	"github.com/snapcore/snapd/snap/integrity/dmverity"
 )
 
-const (
-	blockSize = 4096
-	// For now that the header only includes a fixed-size string and a fixed-size hash,
-	// the header size is always gonna be less than blockSize and will always get aligned
-	// to blockSize.
-	HeaderSize = 4096
-)
-
 var (
-	// magic is the magic prefix of snap extension blocks.
-	magic = []byte{'s', 'n', 'a', 'p', 'e', 'x', 't'}
+	readDmVeritySuperblock = dmverity.ReadSuperblock
 )
 
-// align aligns input `size` to closest `blockSize` value
-func align(size uint64) uint64 {
-	return (size + blockSize - 1) / blockSize * blockSize
+// IntegrityDataParams struct includes all the parameters that are necessary
+// to generate or lookup integrity data. Currently only data of type "dm-verity"
+// is supported via LookupDmVerityData.
+type IntegrityDataParams struct {
+	// Type is the type of integrity data (Currently only "dm-verity" is supported).
+	// TODO: switch to typed value e.g. IntegrityDataType
+	Type string `json:"type"`
+	// Version is the type-specific format type.
+	Version uint `json:"version"`
+	// HashAlg is the hash algorithm used for integrity data.
+	HashAlg string `json:"hash-algorithm"`
+	// DataBlocks is the number of data blocks on the data/target device. Blocks after
+	// DataBlocks are inaccessible. This is not included in the assertion and is generated
+	// by dividing the entire snap's size by the DataBlockSize field.
+	DataBlocks uint64 `json:"data-blocks"`
+	// DataBlockSize is the block size in bytes on a data/target device.
+	DataBlockSize uint64 `json:"data-block-size"`
+	// HashBlockSize is the size of a hash block in bytes.
+	HashBlockSize uint64 `json:"hash-block-size"`
+	// Digest (for the dm-verity type) is the hash of the root hash block in
+	// hexadecimanl encoding.
+	Digest string `json:"digest"`
+	// Salt is the salt value used during generation in hexadecimal encoding.
+	Salt string `json:"salt"`
 }
 
-// IntegrityDataHeader gets appended first at the end of a squashfs packed snap
-// before the dm-verity data. Size field includes the header size
-type IntegrityDataHeader struct {
-	Type     string        `json:"type"`
-	Size     uint64        `json:"size,string"`
-	DmVerity dmverity.Info `json:"dm-verity"`
-}
+func (params *IntegrityDataParams) crossCheck(vsb *dmverity.VeritySuperblock) error {
 
-// newIntegrityDataHeader constructs a new IntegrityDataHeader struct from a dmverity.Info struct.
-func newIntegrityDataHeader(dmVerityBlock *dmverity.Info, integrityDataSize uint64) *IntegrityDataHeader {
-	return &IntegrityDataHeader{
-		Type:     "integrity",
-		Size:     HeaderSize + integrityDataSize,
-		DmVerity: *dmVerityBlock,
+	// Check if the verity data that were found match the passed parameters
+	alg := strings.ReplaceAll(string(vsb.Algorithm[:]), "\x00", "")
+	if alg != params.HashAlg {
+		return fmt.Errorf("unexpected algorithm: %s != %s", alg, params.HashAlg)
 	}
-}
-
-// Encode serializes an IntegrityDataHeader struct to a null terminated json string.
-func (integrityDataHeader IntegrityDataHeader) Encode() ([]byte, error) {
-	jsonHeader, err := json.Marshal(integrityDataHeader)
-	if err != nil {
-		return nil, err
+	if vsb.DataBlockSize != uint32(params.DataBlockSize) {
+		return fmt.Errorf("unexpected data block size: %d != %d", vsb.DataBlockSize, uint32(params.DataBlockSize))
 	}
-	logger.Debugf("integrity data header:\n%s", string(jsonHeader))
-
-	// \0 terminate
-	jsonHeader = append(jsonHeader, 0)
-
-	actualHeaderSize := align(uint64(len(magic) + len(jsonHeader) + 1))
-	if actualHeaderSize > HeaderSize {
-		return nil, fmt.Errorf("internal error: invalid integrity data header: wrong size")
+	if vsb.HashBlockSize != uint32(params.HashBlockSize) {
+		return fmt.Errorf("unexpected hash block size: %d != %d", vsb.HashBlockSize, uint32(params.HashBlockSize))
 	}
 
-	header := make([]byte, HeaderSize)
-
-	copy(header, append(magic, jsonHeader...))
-
-	return header, nil
-}
-
-// Decode unserializes an null-terminated byte array containing JSON data to an
-// IntegrityDataHeader struct.
-func (integrityDataHeader *IntegrityDataHeader) Decode(input []byte) error {
-	if !bytes.HasPrefix(input, magic) {
-		return fmt.Errorf("invalid integrity data header: invalid magic value")
-	}
-
-	firstNull := bytes.IndexByte(input, '\x00')
-	if firstNull == -1 {
-		return fmt.Errorf("invalid integrity data header: no null byte found at end of input")
-	}
-
-	err := json.Unmarshal(input[len(magic):firstNull], &integrityDataHeader)
-	if err != nil {
-		return err
+	encSalt := vsb.EncodedSalt()
+	if encSalt != params.Salt {
+		return fmt.Errorf("unexpected salt: %s != %s", encSalt, params.Salt)
 	}
 
 	return nil
 }
 
-// GenerateAndAppend generates integrity data for a snap file and appends them
-// to it.
-// Integrity data are formed from a fixed-size header aligned to blockSize which
-// includes the root hash followed by the generated dm-verity hash data.
-func GenerateAndAppend(snapPath string) (err error) {
-	// Generate verity metadata
-	hashFileName := snapPath + ".verity"
-	dmVerityBlock, err := dmverity.Format(snapPath, hashFileName)
+// IntegrityFile returns the integrity file name corresponding to the integrity
+// type. Currently, only dm-verity is supported.
+func (params *IntegrityDataParams) IntegrityFile(snapPath string) (string, error) {
+	switch params.Type {
+	case "dm-verity":
+		// TODO: change dm-verity file name to <instance_name>_<revision>_<root_hash>.dm-verity
+		return fmt.Sprintf("%s.dmverity_%s", snapPath, params.Digest), nil
+	default:
+		return "", fmt.Errorf("unexpected integrity data type %q", params.Type)
+	}
+}
+
+// ErrNoIntegrityDataFoundInRevision is returned when a snap revision doesn't contain integrity data.
+var ErrNoIntegrityDataFoundInRevision = errors.New("no integrity data found in revision")
+
+// NewIntegrityDataParamsFromRevision will parse a revision for integrity data and return them as
+// a new IntegrityDataParams object.
+//
+// An ErrNoIntegrityDataFoundInRevision error will be returned if there is no integrity data in the revision.
+func NewIntegrityDataParamsFromRevision(rev *asserts.SnapRevision) (*IntegrityDataParams, error) {
+	snapIntegrityData := rev.SnapIntegrityData()
+
+	if len(snapIntegrityData) == 0 {
+		return nil, ErrNoIntegrityDataFoundInRevision
+	}
+
+	// XXX: The first item in the snap-revision integrity data list is selected.
+	// In future versions, extra logic will be required here to decide which integrity data
+	// should be used based on extra information (i.e from the model).
+	sid := snapIntegrityData[0]
+
+	return &IntegrityDataParams{
+		Type:          sid.Type,
+		Version:       sid.Version,
+		HashAlg:       sid.HashAlg,
+		DataBlockSize: uint64(sid.DataBlockSize),
+		HashBlockSize: uint64(sid.HashBlockSize),
+		Digest:        sid.Digest,
+		Salt:          sid.Salt,
+		DataBlocks:    rev.SnapSize() / uint64(sid.DataBlockSize),
+	}, nil
+}
+
+// ErrDmVerityDataParamsNotFound is returned when the passed in integrityDataParams object is empty.
+var ErrIntegrityDataParamsNotFound = errors.New("integrity data parameters not found")
+
+// ErrUnexpectedIntegrityDataType is returned when the type of the passed in integrityDataParams is not
+// the one expected by this particular function.
+var ErrUnexpectedIntegrityDataType = errors.New("unexpected integrity data type")
+
+// ErrDmVerityDataNotFound is returned when dm-verity data for a snap are not found next to it.
+var ErrDmVerityDataNotFound = errors.New("dm-verity data not found")
+
+// ErrUnexpectedDmVerityData is returned when dm-verity data for a snap are available but don't match
+// the parameters passed to LookupDmVerityDataAndCrossCheck.
+var ErrUnexpectedDmVerityData = errors.New("unexpected dm-verity data")
+
+// LookupDmVerityDataAndCrossCheck looks up dm-verity data for a snap based on its file name and validates
+// that the superblock properties of the discovered dm-verity data match the passed parameters.
+func LookupDmVerityDataAndCrossCheck(snapPath string, params *IntegrityDataParams) (string, error) {
+	if params == nil {
+		return "", ErrIntegrityDataParamsNotFound
+	}
+
+	if params.Type != "dm-verity" {
+		return "", fmt.Errorf("%w: expected %q but found %q.", ErrUnexpectedIntegrityDataType, "dm-verity", params.Type)
+	}
+
+	hashFileName, err := params.IntegrityFile(snapPath)
 	if err != nil {
-		return err
+		return "", err
 	}
 
-	hashFile, err := os.OpenFile(hashFileName, os.O_RDONLY, 0644)
+	vsb, err := readDmVeritySuperblock(hashFileName)
+	if os.IsNotExist(err) {
+		return "", fmt.Errorf("%w: %q doesn't exist.", ErrDmVerityDataNotFound, hashFileName)
+	}
 	if err != nil {
-		return err
+		return "", err
 	}
-	defer func() {
-		hashFile.Close()
-		if e := os.Remove(hashFileName); e != nil {
-			err = e
-		}
-	}()
 
-	fi, err := hashFile.Stat()
+	err = params.crossCheck(vsb)
 	if err != nil {
-		return err
+		return "", fmt.Errorf("%w %q: %s", ErrUnexpectedDmVerityData, hashFileName, err.Error())
 	}
 
-	integrityDataHeader := newIntegrityDataHeader(dmVerityBlock, uint64(fi.Size()))
-
-	// Append header to snap
-	header, err := integrityDataHeader.Encode()
-	if err != nil {
-		return err
-	}
-
-	snapFile, err := os.OpenFile(snapPath, os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		return err
-	}
-	defer snapFile.Close()
-
-	if _, err = snapFile.Write(header); err != nil {
-		return err
-	}
-
-	// Append verity metadata to snap
-	if _, err := io.Copy(snapFile, hashFile); err != nil {
-		return err
-	}
-
-	return err
+	return hashFileName, nil
 }

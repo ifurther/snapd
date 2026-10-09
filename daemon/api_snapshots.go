@@ -33,6 +33,7 @@ import (
 	"github.com/snapcore/snapd/overlord/auth"
 	"github.com/snapcore/snapd/overlord/snapshotstate"
 	"github.com/snapcore/snapd/overlord/state"
+	"github.com/snapcore/snapd/overlord/swfeats"
 	"github.com/snapcore/snapd/strutil"
 )
 
@@ -41,6 +42,7 @@ var snapshotCmd = &Command{
 	Path:        "/v2/snapshots",
 	GET:         listSnapshots,
 	POST:        changeSnapshots,
+	Actions:     []string{"check", "restore", "forget"},
 	ReadAccess:  openAccess{},
 	WriteAccess: authenticatedAccess{Polkit: polkitActionManage},
 }
@@ -61,6 +63,12 @@ var (
 	snapshotImport  = snapshotstate.Import
 )
 
+var (
+	checkSnapshotChangeKind   = swfeats.RegisterChangeKind("check-snapshot")
+	restoreSnapshotChangeKind = swfeats.RegisterChangeKind("restore-snapshot")
+	forgetSnapshotChangeKind  = swfeats.RegisterChangeKind("forget-snapshot")
+)
+
 func listSnapshots(c *Command, r *http.Request, user *auth.UserState) Response {
 	query := r.URL.Query()
 	var setID uint64
@@ -75,7 +83,7 @@ func listSnapshots(c *Command, r *http.Request, user *auth.UserState) Response {
 	st := c.d.overlord.State()
 	st.Lock()
 	defer st.Unlock()
-	sets, err := snapshotList(context.TODO(), st, setID, strutil.CommaSeparatedList(r.URL.Query().Get("snaps")))
+	sets, err := snapshotList(r.Context(), st, setID, strutil.CommaSeparatedList(r.URL.Query().Get("snaps")))
 	if err != nil {
 		return InternalError("%v", err)
 	}
@@ -135,16 +143,20 @@ func changeSnapshots(c *Command, r *http.Request, user *auth.UserState) Response
 	st.Lock()
 	defer st.Unlock()
 
+	var changeKind string
 	switch action.Action {
 	case "check":
 		affected, ts, err = snapshotCheck(st, action.SetID, action.Snaps, action.Users)
+		changeKind = checkSnapshotChangeKind
 	case "restore":
 		affected, ts, err = snapshotRestore(st, action.SetID, action.Snaps, action.Users)
+		changeKind = restoreSnapshotChangeKind
 	case "forget":
 		if len(action.Users) != 0 {
 			return BadRequest(`snapshot "forget" operation cannot specify users`)
 		}
 		affected, ts, err = snapshotForget(st, action.SetID, action.Snaps)
+		changeKind = forgetSnapshotChangeKind
 	default:
 		return BadRequest("unknown snapshot operation %q", action.Action)
 	}
@@ -158,8 +170,8 @@ func changeSnapshots(c *Command, r *http.Request, user *auth.UserState) Response
 		return InternalError("%v", err)
 	}
 
-	chg := newChange(st, action.Action+"-snapshot", action.String(), []*state.TaskSet{ts}, affected)
-	chg.Set("api-data", map[string]interface{}{"snap-names": affected})
+	chg := newChange(st, changeKind, action.String(), []*state.TaskSet{ts}, affected)
+	chg.Set("api-data", map[string]any{"snap-names": affected})
 	ensureStateSoon(st)
 
 	return AsyncResponse(nil, chg.ID())
@@ -181,7 +193,7 @@ func getSnapshotExport(c *Command, r *http.Request, user *auth.UserState) Respon
 		return BadRequest("'id' must be a positive base 10 number; got %q", sid)
 	}
 
-	export, err := snapshotExport(context.TODO(), st, setID)
+	export, err := snapshotExport(r.Context(), st, setID)
 	if err != nil {
 		return BadRequest("cannot export %v: %v", setID, err)
 	}
@@ -208,16 +220,16 @@ func doSnapshotImport(c *Command, r *http.Request, user *auth.UserState) Respons
 
 	// XXX: check that we have enough space to import the compressed snapshots
 	st := c.d.overlord.State()
-	setID, snapNames, err := snapshotImport(context.TODO(), st, limitedBodyReader)
+	setID, snapNames, err := snapshotImport(r.Context(), st, limitedBodyReader)
 	if err != nil {
 		return BadRequest(err.Error())
 	}
 
-	result := map[string]interface{}{"set-id": setID, "snaps": snapNames}
+	result := map[string]any{"set-id": setID, "snaps": snapNames}
 	return SyncResponse(result)
 }
 
-func snapshotMany(inst *snapInstruction, st *state.State) (*snapInstructionResult, error) {
+func snapshotMany(_ context.Context, inst *snapInstruction, st *state.State) (*snapInstructionResult, error) {
 	setID, snapshotted, ts, err := snapshotSave(st, inst.Snaps, inst.Users, inst.SnapshotOptions)
 	if err != nil {
 		return nil, err
@@ -235,6 +247,6 @@ func snapshotMany(inst *snapInstruction, st *state.State) (*snapInstructionResul
 		Summary:  msg,
 		Affected: snapshotted,
 		Tasksets: []*state.TaskSet{ts},
-		Result:   map[string]interface{}{"set-id": setID},
+		Result:   map[string]any{"set-id": setID},
 	}, nil
 }

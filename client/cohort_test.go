@@ -24,7 +24,6 @@ import (
 	"errors"
 	"io"
 
-	"golang.org/x/xerrors"
 	"gopkg.in/check.v1"
 )
 
@@ -35,12 +34,12 @@ func (cs *clientSuite) TestClientCreateCohortsEndpoint(c *check.C) {
 
 	body, err := io.ReadAll(cs.req.Body)
 	c.Assert(err, check.IsNil)
-	var jsonBody map[string]interface{}
+	var jsonBody map[string]any
 	err = json.Unmarshal(body, &jsonBody)
 	c.Assert(err, check.IsNil)
-	c.Check(jsonBody, check.DeepEquals, map[string]interface{}{
+	c.Check(jsonBody, check.DeepEquals, map[string]any{
 		"action": "create",
-		"snaps":  []interface{}{"foo", "bar"},
+		"snaps":  []any{"foo", "bar"},
 	})
 }
 
@@ -59,18 +58,18 @@ func (cs *clientSuite) TestClientCreateCohorts(c *check.C) {
 
 	body, err := io.ReadAll(cs.req.Body)
 	c.Assert(err, check.IsNil)
-	var jsonBody map[string]interface{}
+	var jsonBody map[string]any
 	err = json.Unmarshal(body, &jsonBody)
 	c.Assert(err, check.IsNil)
-	c.Check(jsonBody, check.DeepEquals, map[string]interface{}{
+	c.Check(jsonBody, check.DeepEquals, map[string]any{
 		"action": "create",
-		"snaps":  []interface{}{"foo", "bar"},
+		"snaps":  []any{"foo", "bar"},
 	})
 }
 
 func (cs *clientSuite) TestClientCreateCohortsErrIsWrapped(c *check.C) {
 	cs.err = errors.New("boom")
 	_, err := cs.cli.CreateCohorts([]string{"foo", "bar"})
-	var e xerrors.Wrapper
+	var e interface{ Unwrap() error }
 	c.Assert(err, check.Implements, &e)
 }

@@ -1,5 +1,15 @@
 summary: Test journal.persistent core config option is honored by journal namespaces
 
+details: |
+  In Ubuntu Core systems journal.persistent core config option can be used to
+  enable and disable the journal persistence. If persistent journals were previously
+  enabled by this setting, changing the value to false will delete all saved logs.
+
+  This test verifies that when journal.persistent core config is set to true, the
+  journal logs are written and those are deleted when the config is set to false.
+  Also it is verified that a journal quota group can be created, and the presence
+  of its corresponding namespace log.
+
 # these systems do not support journal quota groups due to their old systemd versions.
 # requires systemd v245+
 systems:
@@ -8,8 +18,6 @@ systems:
 
 prepare: |
   "$TESTSTOOLS"/snaps-state install-local test-snapd-journal-quota
-  snap set system experimental.quota-groups=true
-  tests.cleanup defer snap unset system experimental.quota-groups
 
 restore: |
   # Stop test service and cleanup
@@ -18,7 +26,8 @@ restore: |
 
   # disable persistent journal and reload the journal
   rm -rf /var/log/journal
-  systemctl kill --signal=SIGUSR1 systemd-journald
+  snap set core journal.persistent=false
+  systemctl restart systemd-journald
     
 execute: |
   echo "Wait for first boot to be done"

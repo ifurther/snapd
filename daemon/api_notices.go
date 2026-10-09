@@ -21,7 +21,9 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/overlord/auth"
@@ -31,9 +33,11 @@ import (
 )
 
 var noticeReadInterfaces = map[state.NoticeType][]string{
-	state.ChangeUpdateNotice:   {"snap-refresh-observe"},
-	state.RefreshInhibitNotice: {"snap-refresh-observe"},
-	state.SnapRunInhibitNotice: {"snap-refresh-observe"},
+	state.ChangeUpdateNotice:                 {"snap-refresh-observe"},
+	state.RefreshInhibitNotice:               {"snap-refresh-observe"},
+	state.SnapRunInhibitNotice:               {"snap-refresh-observe"},
+	state.InterfacesRequestsPromptNotice:     {"snap-interfaces-requests-control"},
+	state.InterfacesRequestsRuleUpdateNotice: {"snap-interfaces-requests-control"},
 }
 
 var (
@@ -41,14 +45,15 @@ var (
 		Path:        "/v2/notices",
 		GET:         getNotices,
 		POST:        postNotices,
-		ReadAccess:  interfaceOpenAccess{Interfaces: []string{"snap-refresh-observe"}},
+		Actions:     []string{"add"},
+		ReadAccess:  interfaceOpenAccess{Interfaces: []string{"snap-refresh-observe", "snap-interfaces-requests-control"}},
 		WriteAccess: openAccess{},
 	}
 
 	noticeCmd = &Command{
 		Path:       "/v2/notices/{id}",
 		GET:        getNotice,
-		ReadAccess: interfaceOpenAccess{Interfaces: []string{"snap-refresh-observe"}},
+		ReadAccess: interfaceOpenAccess{Interfaces: []string{"snap-refresh-observe", "snap-interfaces-requests-control"}},
 	}
 )
 
@@ -122,20 +127,23 @@ func getNotices(c *Command, r *http.Request, user *auth.UserState) Response {
 		return BadRequest("invalid timeout: %v", err)
 	}
 
-	st := c.d.overlord.State()
-	st.Lock()
-	defer st.Unlock()
+	// State lock is not required to get or use the notice manager. The notice
+	// manager will decide whether it's necessary to query the state for
+	// notices, and if so, it is responsible for acquiring the state lock.
+	noticeMgr := c.d.overlord.NoticeManager()
 
 	var notices []*state.Notice
 
 	if timeout != 0 {
 		// Wait up to timeout for notices matching given filter to occur
-		ctx, cancel := context.WithTimeout(r.Context(), timeout)
+		// Use daemon's tomb context so that the request will get canceled as well
+		// when the tomb gets killed when shutting down the daemon
+		ctx, cancel := context.WithTimeout(c.d.tomb.Context(r.Context()), timeout)
 		defer cancel()
 
-		notices, err = st.WaitNotices(ctx, filter)
+		notices, err = noticeMgr.WaitNotices(ctx, filter)
 		if errors.Is(err, context.Canceled) {
-			return BadRequest("request canceled")
+			return InternalError("request canceled")
 		}
 		// DeadlineExceeded will occur if timeout elapses; in that case return
 		// an empty list of notices, not an error.
@@ -144,7 +152,7 @@ func getNotices(c *Command, r *http.Request, user *auth.UserState) Response {
 		}
 	} else {
 		// No timeout given, fetch currently-available notices
-		notices = st.Notices(filter)
+		notices = noticeMgr.Notices(filter)
 	}
 
 	if notices == nil {
@@ -155,14 +163,14 @@ func getNotices(c *Command, r *http.Request, user *auth.UserState) Response {
 
 // Get the UID of the request. If the UID is not known, return an error.
 func uidFromRequest(r *http.Request) (uint32, error) {
-	cred, err := ucrednetGet(r.RemoteAddr)
+	cred, err := ucrednetGet(r.Context())
 	if err != nil {
-		return 0, fmt.Errorf("could not parse request UID")
+		return 0, fmt.Errorf("could not determine request UID")
 	}
 	return cred.Uid, nil
 }
 
-// Construct the user IDs filter which will be passed to state.Notices.
+// Construct the user IDs filter which will be passed to noticeMgr.Notices.
 // Must only be called if the query user ID argument is set.
 func sanitizeNoticeUserIDFilter(queryUserID []string) (*uint32, error) {
 	userIDStrs := strutil.MultiCommaSeparatedList(queryUserID)
@@ -180,7 +188,7 @@ func sanitizeNoticeUserIDFilter(queryUserID []string) (*uint32, error) {
 	return &userID, nil
 }
 
-// Construct the types filter which will be passed to state.Notices.
+// Construct the types filter which will be passed to noticeMgr.Notices.
 func sanitizeNoticeTypesFilter(queryTypes []string, r *http.Request) ([]state.NoticeType, error) {
 	typeStrs := strutil.MultiCommaSeparatedList(queryTypes)
 	alreadySeen := make(map[state.NoticeType]bool, len(typeStrs))
@@ -204,7 +212,7 @@ func sanitizeNoticeTypesFilter(queryTypes []string, r *http.Request) ([]state.No
 		}
 		// No types were specified, populate with notice types snap can view
 		// with its connected interface.
-		ucred, ifaces, err := ucrednetGetWithInterfaces(r.RemoteAddr)
+		ucred, ifaces, err := ucrednetGetWithInterfaces(r.Context())
 		if err != nil {
 			return nil, err
 		}
@@ -255,13 +263,13 @@ func postNotices(c *Command, r *http.Request, user *auth.UserState) Response {
 		return BadRequest("cannot decode request body into notice instruction: %v", err)
 	}
 
+	if err := inst.validate(r); err != nil {
+		return BadRequest(`%v (can only record notices from the "snap" command)`, err)
+	}
+
 	st := c.d.overlord.State()
 	st.Lock()
 	defer st.Unlock()
-
-	if err := inst.validate(r); err != nil {
-		return err
-	}
 
 	noticeId, err := st.AddNotice(&requestUID, state.SnapRunInhibitNotice, inst.Key, nil)
 	if err != nil {
@@ -278,31 +286,77 @@ type noticeInstruction struct {
 	// NOTE: Data and RepeatAfter fields are not needed for snap-run-inhibit notices.
 }
 
-func (inst *noticeInstruction) validate(r *http.Request) *apiError {
+func (inst *noticeInstruction) validate(r *http.Request) error {
 	if inst.Action != "add" {
-		return BadRequest("invalid action %q", inst.Action)
+		return fmt.Errorf("invalid action %q", inst.Action)
 	}
 	if err := state.ValidateNotice(inst.Type, inst.Key, nil); err != nil {
-		return BadRequest("%s", err)
+		return err
 	}
 
 	switch inst.Type {
 	case state.SnapRunInhibitNotice:
 		return inst.validateSnapRunInhibitNotice(r)
 	default:
-		return BadRequest(`cannot add notice with invalid type %q (can only add "snap-run-inhibit" notices)`, inst.Type)
+		return fmt.Errorf(`cannot add notice with invalid type %q`, inst.Type)
 	}
 }
 
-func (inst *noticeInstruction) validateSnapRunInhibitNotice(r *http.Request) *apiError {
+// isRequestFromSnapCmd checks that the request is coming from snap command.
+//
+// It checks that the executable path captured when accepting the connection
+// is one of the known locations of the snap command. This is not a
+// security-oriented check.
+func isRequestFromSnapCmd(r *http.Request) (bool, error) {
+	ucred, err := ucrednetGet(r.Context())
+	if err != nil {
+		return false, err
+	}
+
+	processExeName, err := ucred.UntrustedProcessExeName()
+	if err != nil {
+		return false, errors.New("cannot determine executable of calling process")
+	}
+
+	// There aren't too many options, but overall possibilities are:
+	// - we are re-executed and the client isn't
+	// - the client re-executed but we did not
+
+	switch filepath.Base(processExeName) {
+	case "snap", "snap-fips": // the standalone snap binary, or its FIPS build variant
+	case "snapd", "snapd-fips": // the merged snap binary
+	default:
+		return false, nil
+	}
+
+	if strings.HasPrefix(processExeName, filepath.Join(dirs.SnapMountDir, "snapd")+"/") ||
+		strings.HasPrefix(processExeName, filepath.Join(dirs.SnapMountDir, "core")+"/") {
+		// client with expected name from snap or core snap
+		return true, nil
+	}
+
+	if strings.HasPrefix(processExeName, filepath.Join(dirs.GlobalRootDir, "usr/bin")+"/") ||
+		strings.HasPrefix(processExeName, dirs.DistroLibExecDir+"/") {
+		// client with expected name from one of the system locations
+		return true, nil
+	}
+
+	return false, nil
+}
+
+func (inst *noticeInstruction) validateSnapRunInhibitNotice(r *http.Request) error {
+	// double check that the request comes from snap so we can produce a
+	// reasonable error for misguided requests to this currently non-public API.
+	// Note this is not a security check, but merely a low key effort to prevent
+	// misuse of the API.
 	if fromSnapCmd, err := isRequestFromSnapCmd(r); err != nil {
-		return InternalError("cannot check request source: %v", err)
+		return fmt.Errorf("internal error: cannot check request source: %v", err)
 	} else if !fromSnapCmd {
-		return Forbidden("only snap command can record notices")
+		return fmt.Errorf(`unexpected command of the calling process`)
 	}
 
 	if err := naming.ValidateInstance(inst.Key); err != nil {
-		return BadRequest("invalid key: %v", err)
+		return err
 	}
 
 	return nil
@@ -314,10 +368,8 @@ func getNotice(c *Command, r *http.Request, user *auth.UserState) Response {
 		return Forbidden("cannot determine UID of request, so cannot retrieve notice")
 	}
 	noticeID := muxVars(r)["id"]
-	st := c.d.overlord.State()
-	st.Lock()
-	defer st.Unlock()
-	notice := st.Notice(noticeID)
+	noticeMgr := c.d.overlord.NoticeManager()
+	notice := noticeMgr.Notice(noticeID)
 	if notice == nil {
 		return NotFound("cannot find notice with id %q", noticeID)
 	}
@@ -349,7 +401,7 @@ func noticeViewableByUser(notice *state.Notice, requestUID uint32) bool {
 // noticeTypesViewableBySnap checks if passed interface allows the snap
 // to have read-access for the passed notice types.
 func noticeTypesViewableBySnap(types []state.NoticeType, r *http.Request) bool {
-	ucred, ifaces, err := ucrednetGetWithInterfaces(r.RemoteAddr)
+	ucred, ifaces, err := ucrednetGetWithInterfaces(r.Context())
 	if err != nil {
 		return false
 	}

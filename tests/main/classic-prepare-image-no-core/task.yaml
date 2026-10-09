@@ -1,5 +1,11 @@
 summary: Check that prepare-image --classic works.
 
+details: |
+    Use prepare-image to build a classic image with a gadget and a application
+    snap. Wait for the system to be seeded, and then make sure that all snaps are
+    accounted for. Additionally, specifically check that the "core" snap is not
+    installed, as no snaps in the image require it.
+
 backends: [-autopkgtest]
 
 # building images is only supported on classic ubuntu, but ubuntu 14.04 does not have systemd-run to perform the test
@@ -13,12 +19,12 @@ environment:
     STORE_ADDR: localhost:11028
     SEED_DIR: /var/lib/snapd/seed
 
-prepare: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
+skip:
+    - reason: This test needs test keys to be trusted
+      if: |
+       [ "$TRUST_TEST_KEYS" = "false" ] || tests.info is-snapd-from-archive
 
+prepare: |
     "$TESTSTOOLS"/store-state setup-fake-store "$STORE_DIR"
 
     snap pack "$TESTSLIB/snaps/basic18"
@@ -43,10 +49,6 @@ prepare: |
     systemd-run --unit fakedevicesvc fakedevicesvc localhost:11029
 
 restore: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
     systemctl stop snapd.service snapd.socket fakedevicesvc
 
     rm -rf "$SEED_DIR"
@@ -55,11 +57,6 @@ restore: |
     rm -rf "$ROOT"
 
 execute: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
-
     #shellcheck source=tests/lib/core-config.sh
     . "$TESTSLIB"/core-config.sh
 

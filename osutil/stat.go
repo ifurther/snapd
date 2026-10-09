@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2014-2015 Canonical Ltd
+ * Copyright (C) 2014-2025 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -22,6 +22,7 @@ package osutil
 import (
 	"os"
 	"os/exec"
+	"path/filepath"
 	"syscall"
 )
 
@@ -87,6 +88,19 @@ func LookPathDefault(name string, defaultPath string) string {
 	return p
 }
 
+// LookInPaths is a simplified version of exec.LookPath which looks for am
+// executable in caller provided list of colon separated paths. Returns empty
+// string if executable was not found.
+func LookInPaths(name string, searchPath string) string {
+	for _, dir := range filepath.SplitList(searchPath) {
+		p := filepath.Join(dir, name)
+		if IsExecutable(p) {
+			return p
+		}
+	}
+	return ""
+}
+
 // IsWritable checks if the given file/directory can be written by
 // the current user
 func IsWritable(path string) bool {
@@ -132,4 +146,19 @@ func RegularFileExists(fn string) (exists, isReg bool, err error) {
 		return false, false, err
 	}
 	return true, fileStat.Mode().IsRegular(), nil
+}
+
+// ComparePathsByDeviceInode compares the devices and inodes of the given paths, following symlinks.
+func ComparePathsByDeviceInode(a, b string) (match bool, err error) {
+	fi1, err := os.Stat(a)
+	if err != nil {
+		return false, err
+	}
+
+	fi2, err := os.Stat(b)
+	if err != nil {
+		return false, err
+	}
+
+	return os.SameFile(fi1, fi2), nil
 }

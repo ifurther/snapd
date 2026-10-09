@@ -84,6 +84,10 @@ owner @{HOME}/.local/share/jupyter/** rw,
 # miscellaneous accesses
 @{PROC}/vmstat r,
 
+# Allow reading pressure stall info
+# https://docs.kernel.org/accounting/psi.html
+@{PROC}/pressure/{memory,cpu,io} r,
+
 # Chromium content api sometimes queries about huge pages. Allow status of
 # hugepages and transparent_hugepage, but not the pages themselves.
 /sys/kernel/mm/{hugepages,transparent_hugepage}/{,**} r,
@@ -106,7 +110,6 @@ deny @{PROC}/@{pid}/attr/{,apparmor/}current r,
 # when using the chromium content api file chooser due to a (harmless) glib
 # warning and the noisy AppArmor denial.
 owner @{PROC}/@{pid}/mounts r,
-owner @{PROC}/@{pid}/mountinfo r,
 
 # Since snapd still uses SECCOMP_RET_KILL, we have added a workaround rule to
 # allow mknod on character devices since chromium unconditionally performs
@@ -406,6 +409,7 @@ func (iface *browserSupportInterface) AppArmorConnectedPlug(spec *apparmor.Speci
 	} else {
 		spec.SetSuppressPtraceTrace()
 	}
+	spec.AddPrioritizedSnippet(mountInfoSnippet, apparmor.MountInfoKey, mountInfoPriority)
 	return nil
 }
 
@@ -422,6 +426,10 @@ func (iface *browserSupportInterface) SecCompConnectedPlug(spec *seccomp.Specifi
 
 func (iface *browserSupportInterface) AutoConnect(*snap.PlugInfo, *snap.SlotInfo) bool {
 	return true
+}
+
+func (iface *browserSupportInterface) ParallelInstancesSupportedForSlot(_ *snap.SlotInfo) error {
+	return errParallelInstancesSystemSlot
 }
 
 func init() {

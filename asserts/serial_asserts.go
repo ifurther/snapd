@@ -22,16 +22,25 @@ package asserts
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/snapcore/snapd/release"
 	"github.com/snapcore/snapd/strutil"
 )
 
+var (
+	// validSerialStrict enforces a strict serial number format for new serials and
+	// features. This is stricter than the unconstrained format allowed in "legacy"
+	// serials. New snapd features that rely on serials (e.g., confdb-control) should
+	// use this format to gradually migrate the ecosystem to well-formed serials.
+	validSerialStrict = regexp.MustCompile("^[a-zA-Z0-9](?:[:+-]?[a-zA-Z0-9])*$")
+)
+
 // Serial holds a serial assertion, which is a statement binding a
 // device identity with the device public key.
 type Serial struct {
-	assertionBase
+	AssertionBase
 	timestamp time.Time
 	pubKey    PublicKey
 }
@@ -52,6 +61,15 @@ func (ser *Serial) Serial() string {
 	return ser.HeaderString("serial")
 }
 
+// DeviceID returns the device identifier for this serial assertion.
+func (ser *Serial) DeviceID() DeviceID {
+	return DeviceID{
+		Serial:  ser.Serial(),
+		Model:   ser.Model(),
+		BrandID: ser.BrandID(),
+	}
+}
+
 // DeviceKey returns the public key of the device.
 func (ser *Serial) DeviceKey() PublicKey {
 	return ser.pubKey
@@ -62,7 +80,8 @@ func (ser *Serial) Timestamp() time.Time {
 	return ser.timestamp
 }
 
-func (ser *Serial) checkConsistency(db RODatabase, acck *AccountKey) error {
+// CheckConsistency performs further checks using the assertion database.
+func (ser *Serial) CheckConsistency(db RODatabase, acck *AccountKey) error {
 	if ser.AuthorityID() != ser.BrandID() {
 		// serial authority and brand do not match, check the model
 		a, err := db.Find(ModelType, map[string]string{
@@ -80,7 +99,7 @@ func (ser *Serial) checkConsistency(db RODatabase, acck *AccountKey) error {
 	return nil
 }
 
-func assembleSerial(assert assertionBase) (Assertion, error) {
+func assembleSerial(assert AssertionBase) (Assertion, error) {
 	// brand-id and authority-id can diverge if the model allows
 	// for it via serial-authority, check for brand-id well-formedness
 	_, err := checkStringMatches(assert.headers, "brand-id", validAccountID)
@@ -116,7 +135,7 @@ func assembleSerial(assert assertionBase) (Assertion, error) {
 
 	// ignore extra headers and non-empty body for future compatibility
 	return &Serial{
-		assertionBase: assert,
+		AssertionBase: assert,
 		timestamp:     timestamp,
 		pubKey:        pubKey,
 	}, nil
@@ -124,7 +143,7 @@ func assembleSerial(assert assertionBase) (Assertion, error) {
 
 // SerialRequest holds a serial-request assertion, which is a self-signed request to obtain a full device identity bound to the device public key.
 type SerialRequest struct {
-	assertionBase
+	AssertionBase
 	pubKey PublicKey
 }
 
@@ -153,7 +172,7 @@ func (sreq *SerialRequest) DeviceKey() PublicKey {
 	return sreq.pubKey
 }
 
-func assembleSerialRequest(assert assertionBase) (Assertion, error) {
+func assembleSerialRequest(assert AssertionBase) (Assertion, error) {
 	_, err := checkNotEmptyString(assert.headers, "brand-id")
 	if err != nil {
 		return nil, err
@@ -189,14 +208,14 @@ func assembleSerialRequest(assert assertionBase) (Assertion, error) {
 
 	// ignore extra headers and non-empty body for future compatibility
 	return &SerialRequest{
-		assertionBase: assert,
+		AssertionBase: assert,
 		pubKey:        pubKey,
 	}, nil
 }
 
 // DeviceSessionRequest holds a device-session-request assertion, which is a request wrapping a store-provided nonce to start a session by a device signed with its key.
 type DeviceSessionRequest struct {
-	assertionBase
+	AssertionBase
 	timestamp time.Time
 }
 
@@ -227,7 +246,7 @@ func (req *DeviceSessionRequest) Timestamp() time.Time {
 	return req.timestamp
 }
 
-func assembleDeviceSessionRequest(assert assertionBase) (Assertion, error) {
+func assembleDeviceSessionRequest(assert AssertionBase) (Assertion, error) {
 	_, err := checkModel(assert.headers)
 	if err != nil {
 		return nil, err
@@ -245,7 +264,7 @@ func assembleDeviceSessionRequest(assert assertionBase) (Assertion, error) {
 
 	// ignore extra headers and non-empty body for future compatibility
 	return &DeviceSessionRequest{
-		assertionBase: assert,
+		AssertionBase: assert,
 		timestamp:     timestamp,
 	}, nil
 }

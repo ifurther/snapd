@@ -34,6 +34,9 @@ const (
 	TypeKernel Type = "kernel"
 	TypeBase   Type = "base"
 	TypeSnapd  Type = "snapd"
+	// This is used internally so we can install the boot base for
+	// a system before the kernel.
+	InternalTypeBootBase Type = "internal-boot-base"
 
 	// FIXME: this really should be TypeCore
 	TypeOS Type = "os"
@@ -43,12 +46,13 @@ const (
 // types. On e.g. firstboot this will be used to order the snaps this
 // way.
 var typeOrder = map[Type]int{
-	TypeApp:    50,
-	TypeGadget: 40,
-	TypeBase:   30,
-	TypeKernel: 20,
-	TypeOS:     10,
-	TypeSnapd:  0,
+	TypeApp:              50,
+	TypeGadget:           40,
+	TypeBase:             30,
+	TypeKernel:           20,
+	InternalTypeBootBase: 11,
+	TypeOS:               10,
+	TypeSnapd:            0,
 }
 
 func (m Type) SortsBefore(other Type) bool {
@@ -66,7 +70,7 @@ func (m *Type) UnmarshalJSON(data []byte) error {
 }
 
 // UnmarshalYAML so Type implements yaml's Unmarshaler interface
-func (m *Type) UnmarshalYAML(unmarshal func(interface{}) error) error {
+func (m *Type) UnmarshalYAML(unmarshal func(any) error) error {
 	var str string
 	if err := unmarshal(&str); err != nil {
 		return err
@@ -116,7 +120,7 @@ func (confinementType *ConfinementType) UnmarshalJSON(data []byte) error {
 }
 
 // UnmarshalYAML so ConfinementType implements yaml's Unmarshaler interface
-func (confinementType *ConfinementType) UnmarshalYAML(unmarshal func(interface{}) error) error {
+func (confinementType *ConfinementType) UnmarshalYAML(unmarshal func(any) error) error {
 	var s string
 	if err := unmarshal(&s); err != nil {
 		return err
@@ -136,6 +140,31 @@ func (confinementType *ConfinementType) fromString(str string) error {
 	return nil
 }
 
+// GradeType represents the grade of the snap.
+type GradeType string
+
+const (
+	DevelGrade  GradeType = "devel"
+	StableGrade GradeType = "stable"
+	EmptyGrade  GradeType = ""
+)
+
+// UnmarshalText sets *gradeType to a copy of data, after ensuring value is valid.
+func (gt *GradeType) UnmarshalText(data []byte) error {
+	g := GradeType(string(data))
+
+	// Validate the grade field, if it doesn't match a supported grade constant,
+	// return an error informing the user what value caused the validation to fail.
+	switch g {
+	case EmptyGrade, DevelGrade, StableGrade:
+		*gt = g
+	default:
+		return fmt.Errorf("unknown grade type: %q", g)
+	}
+
+	return nil
+}
+
 type ServiceStopReason string
 
 const (
@@ -143,6 +172,15 @@ const (
 	StopReasonRemove  ServiceStopReason = "remove"
 	StopReasonDisable ServiceStopReason = "disable"
 	StopReasonOther   ServiceStopReason = ""
+)
+
+// TODO: merge ServiceStopReason, AppKillReason and removeAliasesReason
+type AppKillReason string
+
+const (
+	KillReasonRemove      AppKillReason = "remove"
+	KillReasonForceRemove AppKillReason = "force-remove"
+	KillReasonOther       AppKillReason = ""
 )
 
 // DaemonScope represents the scope of the daemon running under systemd
@@ -164,7 +202,7 @@ func (daemonScope *DaemonScope) UnmarshalJSON(data []byte) error {
 }
 
 // UnmarshalYAML so DaemonScope implements yaml's Unmarshaler interface
-func (daemonScope *DaemonScope) UnmarshalYAML(unmarshal func(interface{}) error) error {
+func (daemonScope *DaemonScope) UnmarshalYAML(unmarshal func(any) error) error {
 	var s string
 	if err := unmarshal(&s); err != nil {
 		return err
@@ -188,12 +226,26 @@ type ComponentType string
 
 const (
 	// TestComponent is just for testing purposes.
+	// TO BE DEPRECATED, please do not use in tests
 	TestComponent ComponentType = "test"
+	// StandardComponent is for vanilla components with no special behavior.
+	StandardComponent ComponentType = "standard"
 	// KernelModulesComponent is for components containing modules/firmware
 	KernelModulesComponent ComponentType = "kernel-modules"
 )
 
-var validComponentTypes = [...]ComponentType{TestComponent, KernelModulesComponent}
+var validComponentTypes = [...]ComponentType{TestComponent, StandardComponent, KernelModulesComponent}
+
+// ComponentTypeFromString converts a string to a ComponentType. An error is
+// returned if the string is not a valid ComponentType.
+func ComponentTypeFromString(t string) (ComponentType, error) {
+	for _, valid := range validComponentTypes {
+		if t == string(valid) {
+			return valid, nil
+		}
+	}
+	return "", fmt.Errorf("invalid component type %q", t)
+}
 
 // Component represents a snap component.
 type Component struct {
@@ -204,7 +256,7 @@ type Component struct {
 	ExplicitHooks map[string]*HookInfo
 }
 
-func (ct *ComponentType) UnmarshalYAML(unmarshall func(interface{}) error) error {
+func (ct *ComponentType) UnmarshalYAML(unmarshall func(any) error) error {
 	typeStr := ""
 	if err := unmarshall(&typeStr); err != nil {
 		return err

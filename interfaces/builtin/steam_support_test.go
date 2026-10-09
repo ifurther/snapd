@@ -28,6 +28,7 @@ import (
 	"github.com/snapcore/snapd/interfaces/seccomp"
 	"github.com/snapcore/snapd/interfaces/udev"
 	"github.com/snapcore/snapd/release"
+	apparmor_sandbox "github.com/snapcore/snapd/sandbox/apparmor"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/testutil"
 )
@@ -75,18 +76,64 @@ func (s *SteamSupportInterfaceSuite) TestSanitizePlug(c *C) {
 	c.Assert(interfaces.BeforePreparePlug(s.iface, s.plugInfo), IsNil)
 }
 
-func (s *SteamSupportInterfaceSuite) TestAppArmorSpec(c *C) {
-
-	spec := apparmor.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+func (s *SteamSupportInterfaceSuite) TestAppArmorSpecWithAllowAll(c *C) {
+	restore := apparmor_sandbox.MockFeatures(nil, nil, []string{"allow-all"}, nil)
+	defer restore()
+	appSet, err := interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec := apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.slot), IsNil)
 	c.Assert(spec.SecurityTags(), DeepEquals, []string{"snap.consumer.app"})
-	c.Check(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "mount options=(rw, rbind) /tmp/newroot/ -> /tmp/newroot/,\n")
+	snippet := spec.SnippetForTag("snap.consumer.app")
+	c.Check(snippet, testutil.Contains, "allow all,\n")
+}
+
+func (s *SteamSupportInterfaceSuite) TestAppArmorSpecWithoutAllowAll(c *C) {
+	restore := apparmor_sandbox.MockFeatures(nil, nil, nil, nil)
+	defer restore()
+	appSet, err := interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec := apparmor.NewSpecification(appSet)
+	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.slot), IsNil)
+	c.Assert(spec.SecurityTags(), DeepEquals, []string{"snap.consumer.app"})
+	snippet := spec.SnippetForTag("snap.consumer.app")
+	c.Check(snippet, testutil.Contains, "Mimic allow all")
+}
+
+func (s *SteamSupportInterfaceSuite) TestPrioritizedSnippetMountInfo(c *C) {
+	restore := apparmor_sandbox.MockFeatures(nil, nil, []string{"allow-all"}, nil)
+	defer restore()
+	appSet, err := interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec := apparmor.NewSpecification(appSet)
+	spec.AddBasePrioritizedSnippet(`
+deny @{PROC}/self/mountinfo r,
+deny @{PROC}/@{pid}/mountinfo r,
+`, apparmor.MountInfoKey)
+
+	snippet := spec.SnippetForTag("snap.consumer.app")
+	// contains the denials but not the allows
+	c.Assert(snippet, testutil.Contains, "deny @{PROC}/@{pid}/mountinfo r,")
+	c.Assert(snippet, testutil.Contains, "deny @{PROC}/self/mountinfo r,")
+	c.Assert(snippet, Not(testutil.Contains), "owner @{PROC}/@{pid}/mountinfo r,")
+	c.Assert(snippet, Not(testutil.Contains), "owner @{PROC}/self/mountinfo r,")
+
+	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.slot), IsNil)
+
+	snippet = spec.SnippetForTag("snap.consumer.app")
+	// contains the allows but not the denials
+	c.Assert(snippet, testutil.Contains, "owner @{PROC}/@{pid}/mountinfo r,")
+	c.Assert(snippet, testutil.Contains, "owner @{PROC}/self/mountinfo r,")
+	c.Assert(snippet, Not(Matches), "(?s).*\ndeny [^\n]*/mountinfo [^\n]*.*")
+	c.Assert(snippet, Not(Matches), "(?s).*\ndeny [^\n]*/mountinfo [^\n]*.*")
 }
 
 func (s *SteamSupportInterfaceSuite) TestSecCompSpec(c *C) {
-	spec := seccomp.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	appSet, err := interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec := seccomp.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.slot), IsNil)
-	c.Check(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "# Allow Steam to set up \"pressure-vessel\" containers to run games in.\nmount\numount2\npivot_root\n")
+	c.Check(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "@unrestricted\n")
 }
 
 func (s *SteamSupportInterfaceSuite) TestInterfaces(c *C) {
@@ -94,10 +141,12 @@ func (s *SteamSupportInterfaceSuite) TestInterfaces(c *C) {
 }
 
 func (s *SteamSupportInterfaceSuite) TestUDevSpec(c *C) {
-	spec := udev.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	appSet, err := interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec := udev.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.slot), IsNil)
 	c.Assert(spec.Snippets(), HasLen, 2)
-	c.Assert(spec.Snippets()[0], testutil.Contains, `SUBSYSTEM=="usb", ATTRS{idVendor}=="28de", MODE="0660", TAG+="uaccess"`)
+	c.Assert(spec.Snippets()[0], testutil.Contains, `SUBSYSTEMS=="usb", ATTRS{idVendor}=="28de", MODE="0660", TAG+="uaccess"`)
 	c.Assert(spec.Snippets()[1], testutil.Contains, `KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="114d", ATTRS{idProduct}=="8a12", MODE="0660", TAG+="uaccess"`)
 }
 
@@ -105,6 +154,6 @@ func (s *SteamSupportInterfaceSuite) TestStaticInfo(c *C) {
 	si := interfaces.StaticInfoOf(s.iface)
 	c.Assert(si.ImplicitOnCore, Equals, release.OnCoreDesktop)
 	c.Assert(si.ImplicitOnClassic, Equals, true)
-	c.Assert(si.Summary, Equals, `allow Steam to configure pressure-vessel containers`)
+	c.Assert(si.Summary, Equals, `allows Steam to configure pressure-vessel containers`)
 	c.Assert(si.BaseDeclarationSlots, testutil.Contains, "steam-support")
 }

@@ -14,7 +14,6 @@ backends: [-autopkgtest]
 
 # Only run this on ubuntu 16+, lxd will not work on !ubuntu systems
 # currently nor on ubuntu 14.04
-# ubuntu-18.04-32: i386 is not supported by lxd
 systems: [ubuntu-16.04-64, ubuntu-18.04-64, ubuntu-2*, ubuntu-core-*]
 
 # Start before anything else as it can take a really long time.
@@ -23,15 +22,11 @@ priority: 1000
 # lxd downloads can be quite slow
 kill-timeout: 25m
 
-environment:
-    REFRESH_APP_AWARENESS_OUTER/snapd_cgroup_just_inside: false
-    REFRESH_APP_AWARENESS_INNER/snapd_cgroup_just_inside: true
-    REFRESH_APP_AWARENESS_OUTER/snapd_cgroup_just_outside: true
-    REFRESH_APP_AWARENESS_INNER/snapd_cgroup_just_outside: false
-    REFRESH_APP_AWARENESS_OUTER/snapd_cgroup_both: true
-    REFRESH_APP_AWARENESS_INNER/snapd_cgroup_both: true
-    REFRESH_APP_AWARENESS_OUTER/snapd_cgroup_neither: false
-    REFRESH_APP_AWARENESS_INNER/snapd_cgroup_neither: false
+skip:
+    - reason: Requires snapd .deb files built for testing
+      if: |
+        # "$GOHOME"/snapd_*.deb is used in the lxd container
+        [[ "$(find "$GOHOME" -name 'snapd_*.deb' | wc -l || echo 0)" -eq 0 ]]
 
 prepare: |
     # using apt here is ok because this test only runs on ubuntu
@@ -40,15 +35,7 @@ prepare: |
     if command -v apt && apt -v; then
         apt autoremove -y lxd
     fi
-    # Depending on test variant, enable refresh-app-awareness outside to test
-    # the interaction between lxd and cgroup-based application tracking.
-    snap set system experimental.refresh-app-awareness=$REFRESH_APP_AWARENESS_OUTER
-
 restore: |
-    if  [[ "$(find "$GOHOME" -name 'snapd_*.deb' | wc -l || echo 0)" -eq 0 ]]; then
-        exit
-    fi
-
     for cont_name in my-nesting-ubuntu my-ubuntu; do
         lxd.lxc stop $cont_name --force || true
         lxd.lxc delete $cont_name || true
@@ -58,8 +45,6 @@ restore: |
 
     "$TESTSTOOLS"/lxd-state undo-mount-changes
 
-    # unset refresh-app-awareness, this means it's enabled by default.
-    snap unset system experimental.refresh-app-awareness
     # Stop the dbus.service of the user session of the root user. This test
     # runs in several configurations, not all of which have this capability.
     # Where supported the test code below causes socket activation, through the
@@ -68,16 +53,18 @@ restore: |
     # invariant checker.
     systemctl --user stop dbus.service || true
 
+    if os.query is-xenial || os.query is-bionic; then
+        # old system is not doing cleanups
+        find /sys/fs/cgroup/ -type d -name "snap.*" -prune | while read -r svc; do
+             rmdir "$svc" || true
+        done
+    fi
+
 debug: |
     # debug output from lxd
     "$TESTSTOOLS"/journal-state get-log -u snap.lxd.daemon.service
 
 execute: |
-    if  [[ "$(find "$GOHOME" -name 'snapd_*.deb' | wc -l || echo 0)" -eq 0 ]]; then
-        echo "No run lxd test when there are not .deb files built"
-        exit
-    fi
-
     echo "Install lxd"
     "$TESTSTOOLS"/lxd-state prepare-snap
 
@@ -86,16 +73,9 @@ execute: |
     # prep two containers, the my-ubuntu normal container and the
     # my-nesting-ubuntu nesting container
 
-    # There isn't an official image for noble yet, let's use the community one
-    REMOTE=ubuntu
-    # There isn't an official image for noble yet, let's use the daily one
-    if os.query is-ubuntu 24.04; then
-        REMOTE=ubuntu-daily
-    fi
-    VERSION_ID="$(. /etc/os-release && echo "$VERSION_ID" )"
-    lxd.lxc launch --quiet "$REMOTE:$VERSION_ID" my-ubuntu
-    lxc launch --quiet "$REMOTE:$VERSION_ID" my-nesting-ubuntu -c security.nesting=true
-
+    "$TESTSTOOLS"/lxd-state launch --name my-ubuntu
+    "$TESTSTOOLS"/lxd-state launch --name my-nesting-ubuntu --params "-c security.nesting=true"
+    
     if os.query is-pc-amd64 && lxd.lxc info my-ubuntu | grep "Architecture: i686"; then
         echo "LXD spawned 32bit userspace container on a 64bit host, WAT?"
         snap info lxd
@@ -115,17 +95,10 @@ execute: |
         lxd.lxc file push --quiet prep-snapd-in-lxd.sh "$cont_name/root/"
         lxd.lxc file push --quiet "$GOHOME"/snapd_*.deb "$cont_name/root/"
 
-        echo "Setting up proxy *inside* the container"
-        if [ -n "${http_proxy:-}" ]; then
-            lxd.lxc exec $cont_name -- sh -c "echo http_proxy=$http_proxy >> /etc/environment"
-        fi
-        if [ -n "${https_proxy:-}" ]; then
-            lxd.lxc exec $cont_name -- sh -c "echo https_proxy=$https_proxy >> /etc/environment"
-        fi
-
         echo "Install snapd in container"
         lxd.lxc exec $cont_name -- /root/prep-snapd-in-lxd.sh
-        lxd.lxc exec $cont_name -- snap set system experimental.refresh-app-awareness=$REFRESH_APP_AWARENESS_INNER
+        lxd.lxc file push "$(find "$SNAPD_WORK_DIR/snapd_snap" -name 'snapd_*.snap')" "$cont_name"/
+        lxd.lxc exec $cont_name -- sh -c 'snap install --dangerous /snapd_*.snap'
     done
 
     # FIXME: ensure that the kernel running is recent enough, this
@@ -137,7 +110,7 @@ execute: |
     lxd.lxc exec my-ubuntu -- apt-get update
     lxd.lxc exec my-ubuntu -- apt-get install -y dbus-user-session
     lxd.lxc exec my-ubuntu -- su -l ubuntu -c "systemctl --user enable dbus.socket"
-    lxd.lxc exec my-ubuntu -- su -l ubuntu -c "/snap/bin/test-snapd-sh.sh -c 'echo from-the-inside'" | MATCH from-the-inside
+    lxd.lxc exec my-ubuntu -- su -l ubuntu -c "SNAP_CONFINE_DEBUG=yes /snap/bin/test-snapd-sh.sh -c 'echo from-the-inside'" | MATCH from-the-inside
     echo "And as root"
     lxd.lxc exec my-ubuntu -- test-snapd-sh.sh -c 'echo from-the-inside' | MATCH from-the-inside
     echo "We can also remove snaps successfully"
@@ -168,7 +141,10 @@ execute: |
     lxd.lxc exec my-nesting-ubuntu -- lxd waitready
     lxd.lxc exec my-nesting-ubuntu -- lxd init --auto
 
-    lxd.lxc exec my-nesting-ubuntu -- lxd.lxc launch --quiet "$REMOTE:$VERSION_ID" my-inner-ubuntu
+    # There isn't an official image for noble yet, let's use the community one
+    REMOTE="$("$TESTSTOOLS"/lxd-state default-remote)"
+    IMAGE="$("$TESTSTOOLS"/lxd-state default-image)"
+    lxd.lxc exec my-nesting-ubuntu -- lxd.lxc launch --quiet "$REMOTE:$IMAGE" my-inner-ubuntu --config=user.user-data="$(cat lxd_proxy.yaml)"
     lxd.lxc exec my-nesting-ubuntu -- lxd.lxc exec my-inner-ubuntu -- echo "from-the-INSIDE-inside" | MATCH from-the-INSIDE-inside
 
     echo "Install lxd-demo server to exercise the lxd interface"

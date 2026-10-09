@@ -19,7 +19,7 @@
 
 package builtin
 
-const rosOptDataSummary = `Allows read-only access to the static data such as xacro,yaml,urdf,stl,... in the standard /opt/ros folder`
+const rosOptDataSummary = `allows read-only access to the static data such as xacro,yaml,urdf,stl,... in the standard /opt/ros folder`
 
 const rosOptDataBaseDeclarationSlots = `
   ros-opt-data:
@@ -54,11 +54,12 @@ type rosOptDataInterface struct {
 
 func init() {
 	registerIface(&rosOptDataInterface{commonInterface{
-		name:                  "ros-opt-data",
-		summary:               rosOptDataSummary,
-		implicitOnCore:        false,
-		implicitOnClassic:     true,
-		baseDeclarationSlots:  rosOptDataBaseDeclarationSlots,
-		connectedPlugAppArmor: rosOptDataConnectedPlugAppArmor,
+		name:                     "ros-opt-data",
+		summary:                  rosOptDataSummary,
+		implicitOnCore:           false,
+		implicitOnClassic:        true,
+		baseDeclarationSlots:     rosOptDataBaseDeclarationSlots,
+		connectedPlugAppArmor:    rosOptDataConnectedPlugAppArmor,
+		parallelInstancesSlotErr: errParallelInstancesSystemSlot,
 	}})
 }

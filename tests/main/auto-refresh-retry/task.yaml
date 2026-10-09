@@ -6,8 +6,11 @@ details: |
 
 systems: [-ubuntu-14.04-*]
 
-prepare: |
-    snap install --devmode jq
+skip:
+    - reason: This test fails when proxy is set for snapd
+      if: |
+        # TODO: Fix the issue
+        [ "${SNAPD_USE_PROXY:-}" = true ]
 
 restore: |
     rm -f /etc/systemd/system/snapd.service.d/override.conf

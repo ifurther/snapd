@@ -60,7 +60,18 @@ func (s *updateSuite) TestUpdateFlow(c *C) {
 	// - the needed changes are performed (one by one)
 	// - the updated current profile is saved
 	var funcsCalled []string
-	var nChanges int
+	expectedChanges := []*update.Change{
+		{Action: update.Keep},
+		{Action: update.Unmount},
+		{Action: update.Mount}}
+	findChangeIdx := func(change *update.Change) int {
+		for i := range expectedChanges {
+			if change == expectedChanges[i] {
+				return i
+			}
+		}
+		return -1
+	}
 	upCtx := &testProfileUpdateContext{
 		loadCurrentProfile: func() (*osutil.MountProfile, error) {
 			funcsCalled = append(funcsCalled, "loaded-current")
@@ -72,12 +83,15 @@ func (s *updateSuite) TestUpdateFlow(c *C) {
 		},
 		neededChanges: func(old, new *osutil.MountProfile) []*update.Change {
 			funcsCalled = append(funcsCalled, "changes-computed")
-			return []*update.Change{{}, {}}
+			return expectedChanges
 		},
-		performChange: func(change *update.Change, as *update.Assumptions) ([]*update.Change, error) {
-			nChanges++
-			funcsCalled = append(funcsCalled, fmt.Sprintf("change-%d-performed", nChanges))
+		prepareToPerformChange: func(change *update.Change, as *update.Assumptions) ([]*update.Change, error) {
+			funcsCalled = append(funcsCalled, fmt.Sprintf("change-%d-%s-prepared", findChangeIdx(change), change.Action))
 			return nil, nil
+		},
+		doPerformChange: func(change *update.Change, as *update.Assumptions) error {
+			funcsCalled = append(funcsCalled, fmt.Sprintf("change-%d-%s-performed", findChangeIdx(change), change.Action))
+			return nil
 		},
 		saveCurrentProfile: func(*osutil.MountProfile) error {
 			funcsCalled = append(funcsCalled, "saved-current")
@@ -87,8 +101,16 @@ func (s *updateSuite) TestUpdateFlow(c *C) {
 	restore := upCtx.MockRelatedFunctions()
 	defer restore()
 	c.Assert(update.ExecuteMountProfileUpdate(upCtx), IsNil)
-	c.Assert(funcsCalled, DeepEquals, []string{"loaded-desired", "loaded-current",
-		"changes-computed", "change-1-performed", "change-2-performed", "saved-current"})
+	c.Assert(funcsCalled, DeepEquals, []string{
+		"loaded-desired",
+		"loaded-current",
+		"changes-computed",
+		"change-0-keep-performed",
+		"change-1-unmount-performed",
+		"change-2-mount-prepared",
+		"change-2-mount-performed",
+		"saved-current",
+	})
 	c.Assert(update.ExecuteMountProfileUpdate(upCtx), IsNil)
 }
 
@@ -166,7 +188,7 @@ func (s *updateSuite) TestSyntheticChanges(c *C) {
 				{Action: update.Mount, Entry: osutil.MountEntry{Dir: "/subdir/mount"}},
 			}
 		},
-		performChange: func(change *update.Change, as *update.Assumptions) ([]*update.Change, error) {
+		prepareToPerformChange: func(change *update.Change, as *update.Assumptions) ([]*update.Change, error) {
 			// If we are trying to mount /subdir/mount then synthesize a change
 			// for making a tmpfs on /subdir.
 			if change.Action == update.Mount && change.Entry.Dir == "/subdir/mount" {
@@ -204,16 +226,16 @@ func (s *updateSuite) TestCannotPerformContentInterfaceChange(c *C) {
 				{Action: update.Mount, Entry: osutil.MountEntry{Dir: "/dir-4"}},
 			}
 		},
-		performChange: func(change *update.Change, as *update.Assumptions) ([]*update.Change, error) {
+		doPerformChange: func(change *update.Change, as *update.Assumptions) error {
 			// The change to /dir-2 cannot be made.
 			if change.Action == update.Mount && change.Entry.Dir == "/dir-2" {
-				return nil, errTesting
+				return errTesting
 			}
 			// The change to /dir-4 cannot be made either but with a special reason.
 			if change.Action == update.Mount && change.Entry.Dir == "/dir-4" {
-				return nil, update.ErrIgnoredMissingMount
+				return update.ErrIgnoredMissingMount
 			}
-			return nil, nil
+			return nil
 		},
 	}
 	restore := upCtx.MockRelatedFunctions()
@@ -243,7 +265,7 @@ func (s *updateSuite) TestCannotPerformLayoutChange(c *C) {
 				{Action: update.Mount, Entry: osutil.MountEntry{Dir: "/dir-3"}},
 			}
 		},
-		performChange: func(change *update.Change, as *update.Assumptions) ([]*update.Change, error) {
+		prepareToPerformChange: func(change *update.Change, as *update.Assumptions) ([]*update.Change, error) {
 			// The change to /dir-2 cannot be made.
 			if change.Action == update.Mount && change.Entry.Dir == "/dir-2" {
 				return nil, errTesting
@@ -269,11 +291,11 @@ func (s *updateSuite) TestCannotPerformOvermountChange(c *C) {
 		neededChanges: func(old, new *osutil.MountProfile) []*update.Change {
 			return []*update.Change{
 				{Action: update.Mount, Entry: osutil.MountEntry{Dir: "/dir-1"}},
-				{Action: update.Mount, Entry: osutil.MountEntry{Dir: "/dir-2", Options: []string{"x-snapd.origin=overname"}}},
+				{Action: update.Mount, Entry: osutil.MountEntry{Dir: "/dir-2", Options: []string{"rbind", "x-snapd.origin=overname"}}},
 				{Action: update.Mount, Entry: osutil.MountEntry{Dir: "/dir-3"}},
 			}
 		},
-		performChange: func(change *update.Change, as *update.Assumptions) ([]*update.Change, error) {
+		prepareToPerformChange: func(change *update.Change, as *update.Assumptions) ([]*update.Change, error) {
 			// The change to /dir-2 cannot be made.
 			if change.Action == update.Mount && change.Entry.Dir == "/dir-2" {
 				return nil, errTesting
@@ -363,14 +385,70 @@ func (s *updateSuite) TestKeepSyntheticMountsLP2043993(c *C) {
 
 	c.Assert(update.ExecuteMountProfileUpdate(upCtx), IsNil)
 	c.Assert(saved.Entries, HasLen, 2)
-	// TODO: the change of order is a bit unexpected, but that is a larger issue
-	// synth mount kept because it is needed by a desired mount
-	c.Check(saved.Entries[1].Type, Equals, "tmpfs")
-	c.Check(saved.Entries[1].Name, Equals, "tmpfs")
-	c.Check(saved.Entries[1].Dir, Equals, filepath.Join(baseSourceDir, "rofs"))
-	c.Check(saved.Entries[1].XSnapdSynthetic(), Equals, true)
-	c.Check(saved.Entries[1].XSnapdNeededBy(), Equals, "test-id")
-	c.Check(saved.Entries[0], DeepEquals, desiredMountEntry)
+	c.Check(saved.Entries[0].Type, Equals, "tmpfs")
+	c.Check(saved.Entries[0].Name, Equals, "tmpfs")
+	c.Check(saved.Entries[0].Dir, Equals, filepath.Join(baseSourceDir, "rofs"))
+	c.Check(saved.Entries[0].XSnapdSynthetic(), Equals, true)
+	c.Check(saved.Entries[0].XSnapdNeededBy(), Equals, "test-id")
+	c.Check(saved.Entries[1], DeepEquals, desiredMountEntry)
+}
+
+func (s *updateSuite) TestCurrentProfileFromChangesMade(c *C) {
+	// Changes are computed back-to-front, starting from the last entry in
+	// the mount profile.
+	changes := []*update.Change{
+		{Action: update.Mount, Entry: osutil.MountEntry{Dir: "/dir-1"}},
+		{Action: update.Mount, Entry: osutil.MountEntry{Dir: "/dir-2"}},
+		{Action: update.Mount, Entry: osutil.MountEntry{Dir: "/dir-3"}},
+	}
+	profile := update.CurrentProfileFromChangesMade(changes)
+	c.Check(profile, DeepEquals, osutil.MountProfile{Entries: []osutil.MountEntry{
+		{Dir: "/dir-1"},
+		{Dir: "/dir-2"},
+		{Dir: "/dir-3"},
+	}})
+
+	// When we keep a number of entries we are not still processing them
+	// back-to-front but the order of actual changes is front-to-back.
+	changes = []*update.Change{
+		{Action: update.Keep, Entry: osutil.MountEntry{Dir: "/dir-3"}},
+		{Action: update.Keep, Entry: osutil.MountEntry{Dir: "/dir-2"}},
+		{Action: update.Keep, Entry: osutil.MountEntry{Dir: "/dir-1"}},
+	}
+	profile = update.CurrentProfileFromChangesMade(changes)
+	c.Check(profile, DeepEquals, osutil.MountProfile{Entries: []osutil.MountEntry{
+		{Dir: "/dir-1"},
+		{Dir: "/dir-2"},
+		{Dir: "/dir-3"},
+	}})
+
+	// When we unmount things they just don't appear in the resulting profile.
+	changes = []*update.Change{
+		{Action: update.Unmount, Entry: osutil.MountEntry{Dir: "/dir-1"}},
+		{Action: update.Unmount, Entry: osutil.MountEntry{Dir: "/dir-2"}},
+		{Action: update.Unmount, Entry: osutil.MountEntry{Dir: "/dir-3"}},
+	}
+	profile = update.CurrentProfileFromChangesMade(changes)
+	c.Check(profile, DeepEquals, osutil.MountProfile{})
+
+	// When we have a mixture of changes unmount entries are removed, keep
+	// entries are retained first, back to front and then mount entries are
+	// retained in the order in which they were executed.
+	changes = []*update.Change{
+		{Action: update.Unmount, Entry: osutil.MountEntry{Dir: "/old-2"}},
+		{Action: update.Unmount, Entry: osutil.MountEntry{Dir: "/old-1"}},
+		{Action: update.Keep, Entry: osutil.MountEntry{Dir: "/same-2"}},
+		{Action: update.Keep, Entry: osutil.MountEntry{Dir: "/same-1"}},
+		{Action: update.Mount, Entry: osutil.MountEntry{Dir: "/new-1"}},
+		{Action: update.Mount, Entry: osutil.MountEntry{Dir: "/new-2"}},
+	}
+	profile = update.CurrentProfileFromChangesMade(changes)
+	c.Check(profile, DeepEquals, osutil.MountProfile{Entries: []osutil.MountEntry{
+		{Dir: "/same-1"},
+		{Dir: "/same-2"},
+		{Dir: "/new-1"},
+		{Dir: "/new-2"},
+	}})
 }
 
 // testProfileUpdateContext implements MountProfileUpdateContext and is suitable for testing.
@@ -382,8 +460,9 @@ type testProfileUpdateContext struct {
 
 	// The remaining functions are defined for consistency but are installed by
 	// calling their mock helpers. They are not a part of the interface.
-	neededChanges func(*osutil.MountProfile, *osutil.MountProfile) []*update.Change
-	performChange func(*update.Change, *update.Assumptions) ([]*update.Change, error)
+	neededChanges          func(*osutil.MountProfile, *osutil.MountProfile) []*update.Change
+	prepareToPerformChange func(*update.Change, *update.Assumptions) ([]*update.Change, error)
+	doPerformChange        func(*update.Change, *update.Assumptions) error
 }
 
 // MockRelatedFunctions mocks NeededChanges and Change.Perform for the purpose of testing.
@@ -394,11 +473,15 @@ func (upCtx *testProfileUpdateContext) MockRelatedFunctions() (restore func()) {
 	}
 	restore1 := update.MockNeededChanges(neededChanges)
 
-	performChange := func(*update.Change, *update.Assumptions) ([]*update.Change, error) { return nil, nil }
-	if upCtx.performChange != nil {
-		performChange = upCtx.performChange
+	prepareToPerformChange := func(*update.Change, *update.Assumptions) ([]*update.Change, error) { return nil, nil }
+	if upCtx.prepareToPerformChange != nil {
+		prepareToPerformChange = upCtx.prepareToPerformChange
 	}
-	restore2 := update.MockChangePerform(performChange)
+	doPerformChange := func(*update.Change, *update.Assumptions) error { return nil }
+	if upCtx.doPerformChange != nil {
+		doPerformChange = upCtx.doPerformChange
+	}
+	restore2 := update.MockChangePerform(prepareToPerformChange, doPerformChange)
 
 	return func() {
 		restore1()

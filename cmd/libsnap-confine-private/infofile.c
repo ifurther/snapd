@@ -100,9 +100,9 @@ int sc_infofile_get_ini_section_key(FILE *stream, const char *section, const cha
                 goto out;
             }
             section_matched = false;
-            char *start_section_name = line_buf + 1;
             // skip the leading [ and trailing \0
-            char *end_section_name = memchr(start_section_name, ']', nread - 2);
+            char *start_section_name = line_buf + 1;
+            char *end_section_name = strchr(start_section_name, ']');
             if (end_section_name == NULL) {
                 err = sc_error_init_simple("line %d is not a valid ini section", lineno);
                 goto out;
@@ -122,7 +122,7 @@ int sc_infofile_get_ini_section_key(FILE *stream, const char *section, const cha
         }
 
         /* Guard against malformed input that does not contain '=' byte */
-        char *eq_ptr = memchr(line_buf, '=', nread);
+        char *eq_ptr = strchr(line_buf, '=');
         if (eq_ptr == NULL) {
             err = sc_error_init_simple("line %d is not a key=value assignment", lineno);
             goto out;

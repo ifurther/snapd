@@ -26,25 +26,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/godbus/dbus"
+	"github.com/godbus/dbus/v5"
 	. "gopkg.in/check.v1"
 
 	"github.com/snapcore/snapd/dbusutil"
 	"github.com/snapcore/snapd/dbusutil/dbustest"
 	"github.com/snapcore/snapd/dirs"
-	"github.com/snapcore/snapd/features"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/sandbox/cgroup"
 	"github.com/snapcore/snapd/systemd"
 	"github.com/snapcore/snapd/testutil"
 )
-
-func enableFeatures(c *C, ff ...features.SnapdFeature) {
-	c.Assert(os.MkdirAll(dirs.FeaturesDir, 0755), IsNil)
-	for _, f := range ff {
-		c.Assert(os.WriteFile(f.ControlFile(), nil, 0755), IsNil)
-	}
-}
 
 type trackingSuite struct{}
 
@@ -57,22 +49,6 @@ func (s *trackingSuite) SetUpTest(c *C) {
 
 func (s *trackingSuite) TearDownTest(c *C) {
 	dirs.SetRootDir("")
-}
-
-// CreateTransientScopeForTracking always attempts to track, even when refresh app awareness flag is off.
-func (s *trackingSuite) TestCreateTransientScopeForTrackingFeatureDisabled(c *C) {
-	noDBus := func() (*dbus.Conn, error) {
-		return nil, fmt.Errorf("dbus not available")
-	}
-	restore := dbusutil.MockConnections(noDBus, noDBus)
-	defer restore()
-
-	// The feature is disabled but we still track applications. The feature
-	// flag is now only observed in side snapd snap manager, while considering
-	// snap refreshes.
-	c.Assert(features.RefreshAppAwareness.IsEnabled(), Equals, false)
-	err := cgroup.CreateTransientScopeForTracking("snap.pkg.app", nil)
-	c.Assert(err, ErrorMatches, "cannot track application process")
 }
 
 // TestCreateTransientScopeForTrackingUUIDFailure tests the UUID error path
@@ -91,11 +67,7 @@ func (s *trackingSuite) TestCreateTransientScopeForTrackingUUIDFailure(c *C) {
 	c.Assert(err, ErrorMatches, "mocked uuid error")
 }
 
-// CreateTransientScopeForTracking does stuff when refresh app awareness is on
-func (s *trackingSuite) TestCreateTransientScopeForTrackingFeatureEnabled(c *C) {
-	// Pretend that refresh app awareness is enabled
-	enableFeatures(c, features.RefreshAppAwareness)
-	c.Assert(features.RefreshAppAwareness.IsEnabled(), Equals, true)
+func (s *trackingSuite) TestCreateTransientScopeForTracking(c *C) {
 	// Pretend we are a non-root user so that session bus is used.
 	restore := cgroup.MockOsGetuid(12345)
 	defer restore()
@@ -125,10 +97,8 @@ func (s *trackingSuite) TestCreateTransientScopeForTrackingFeatureEnabled(c *C) 
 		return nil, fmt.Errorf("unexpected message #%d: %s", n, msg)
 	})
 	go func() {
-		select {
-		case <-signalChan:
-			inject(mockJobRemovedSignal("snap.pkg.app-"+uuid+".scope", "done"))
-		}
+		<-signalChan
+		inject(mockJobRemovedSignal("snap.pkg.app-"+uuid+".scope", "done"))
 	}()
 	c.Assert(err, IsNil)
 	restore = dbusutil.MockOnlySessionBusAvailable(conn)
@@ -144,9 +114,6 @@ func (s *trackingSuite) TestCreateTransientScopeForTrackingFeatureEnabled(c *C) 
 }
 
 func (s *trackingSuite) TestCreateTransientScopeForTrackingUnhappyNotRootGeneric(c *C) {
-	// Pretend that refresh app awareness is enabled
-	enableFeatures(c, features.RefreshAppAwareness)
-
 	// Hand out stub connections to both the system and session bus.
 	// Neither is really used here but they must appear to be available.
 	restore := dbusutil.MockConnections(dbustest.StubConnection, dbustest.StubConnection)
@@ -203,9 +170,6 @@ func (s *trackingSuite) TestCreateTransientScopeForTrackingUnhappyNotRootGeneric
 }
 
 func (s *trackingSuite) TestCreateTransientScopeForTrackingUnhappyRootFallback(c *C) {
-	// Pretend that refresh app awareness is enabled
-	enableFeatures(c, features.RefreshAppAwareness)
-
 	// Hand out stub connections to both the system and session bus.
 	// Neither is really used here but they must appear to be available.
 	restore := dbusutil.MockConnections(dbustest.StubConnection, dbustest.StubConnection)
@@ -257,9 +221,6 @@ func (s *trackingSuite) TestCreateTransientScopeForTrackingUnhappyRootFallback(c
 }
 
 func (s *trackingSuite) TestCreateTransientScopeForTrackingUnhappyRootFailedFallback(c *C) {
-	// Pretend that refresh app awareness is enabled
-	enableFeatures(c, features.RefreshAppAwareness)
-
 	// Make it appear that session bus is there but system bus is not.
 	noSystemBus := func() (*dbus.Conn, error) {
 		return nil, fmt.Errorf("system bus is not available for testing")
@@ -300,9 +261,6 @@ func (s *trackingSuite) TestCreateTransientScopeForTrackingUnhappyRootFailedFall
 }
 
 func (s *trackingSuite) TestCreateTransientScopeForTrackingUnhappyNoDBus(c *C) {
-	// Pretend that refresh app awareness is enabled
-	enableFeatures(c, features.RefreshAppAwareness)
-
 	// Make it appear that DBus is entirely unavailable.
 	noBus := func() (*dbus.Conn, error) {
 		return nil, fmt.Errorf("dbus is not available for testing")
@@ -345,9 +303,6 @@ func (s *trackingSuite) TestCreateTransientScopeForTrackingUnhappyNoDBus(c *C) {
 }
 
 func (s *trackingSuite) TestCreateTransientScopeForTrackingSilentlyFails(c *C) {
-	// Pretend that refresh app awareness is enabled
-	enableFeatures(c, features.RefreshAppAwareness)
-
 	// Hand out stub connections to both the system and session bus.
 	// Neither is really used here but they must appear to be available.
 	restore := dbusutil.MockConnections(dbustest.StubConnection, dbustest.StubConnection)
@@ -392,9 +347,6 @@ func (s *trackingSuite) TestCreateTransientScopeForTrackingSilentlyFails(c *C) {
 }
 
 func (s *trackingSuite) TestCreateTransientScopeForRootOnSystemBus(c *C) {
-	// Pretend that refresh app awareness is enabled
-	enableFeatures(c, features.RefreshAppAwareness)
-
 	// Hand out stub connections to both the system and session bus. Remember
 	// the identity of the system bus to that we can verify access later.
 	// Neither is really used here but they must appear to be available.
@@ -448,7 +400,6 @@ type testTransientScopeConfirm struct {
 }
 
 func (s *trackingSuite) testCreateTransientScopeConfirm(c *C, tc testTransientScopeConfirm) {
-	enableFeatures(c, features.RefreshAppAwareness)
 
 	logBuf, restore := logger.MockLogger()
 	defer restore()
@@ -577,7 +528,7 @@ func checkAndRespondToStartTransientUnit(c *C, msg *dbus.Message, scopeName stri
 	// XXX: Those types might live in a package somewhere
 	type Property struct {
 		Name  string
-		Value interface{}
+		Value any
 	}
 	type Unit struct {
 		Name  string
@@ -595,13 +546,13 @@ func checkAndRespondToStartTransientUnit(c *C, msg *dbus.Message, scopeName stri
 		dbus.FieldMember:      dbus.MakeVariant("StartTransientUnit"),
 		dbus.FieldSignature:   dbus.MakeVariant(requestSig),
 	})
-	c.Check(msg.Body, DeepEquals, []interface{}{
+	c.Check(msg.Body, DeepEquals, []any{
 		scopeName,
 		"fail",
-		[][]interface{}{
+		[][]any{
 			{"PIDs", dbus.MakeVariant([]uint32{uint32(pid)})},
 		},
-		[][]interface{}{},
+		[][]any{},
 	})
 
 	responseSig := dbus.SignatureOf(dbus.ObjectPath(""))
@@ -614,7 +565,7 @@ func checkAndRespondToStartTransientUnit(c *C, msg *dbus.Message, scopeName stri
 			dbus.FieldSignature: dbus.MakeVariant(responseSig),
 		},
 		// The object path returned in the body is not used by snap run yet.
-		Body: []interface{}{dbus.ObjectPath("/org/freedesktop/systemd1/job/1462")},
+		Body: []any{dbus.ObjectPath("/org/freedesktop/systemd1/job/1462")},
 	}
 }
 
@@ -643,7 +594,7 @@ func mockJobRemovedSignal(unit, result string) *dbus.Message {
 			dbus.FieldSignature: dbus.MakeVariant(
 				dbus.SignatureOf(uint32(0), dbus.ObjectPath(""), "", "")),
 		},
-		Body: []interface{}{
+		Body: []any{
 			uint32(1),
 			dbus.ObjectPath("/org/freedesktop/systemd1/job/1462"),
 			unit,
@@ -653,7 +604,6 @@ func mockJobRemovedSignal(unit, result string) *dbus.Message {
 }
 
 func (s *trackingSuite) TestCreateTransientScopeHappyWithRetriedCheckCgroupV1(c *C) {
-	enableFeatures(c, features.RefreshAppAwareness)
 
 	restore := cgroup.MockVersion(cgroup.V1, nil)
 	defer restore()
@@ -714,7 +664,6 @@ func (s *trackingSuite) TestCreateTransientScopeHappyWithRetriedCheckCgroupV1(c 
 }
 
 func (s *trackingSuite) TestCreateTransientScopeUnhappyJobFailed(c *C) {
-	enableFeatures(c, features.RefreshAppAwareness)
 
 	restore := cgroup.MockOsGetuid(12345)
 	defer restore()
@@ -742,10 +691,8 @@ func (s *trackingSuite) TestCreateTransientScopeUnhappyJobFailed(c *C) {
 		return nil, fmt.Errorf("unexpected message #%d: %s", n, msg)
 	})
 	go func() {
-		select {
-		case <-signalChan:
-			inject(mockJobRemovedSignal("snap.pkg.app-"+uuid+".scope", "failed"))
-		}
+		<-signalChan
+		inject(mockJobRemovedSignal("snap.pkg.app-"+uuid+".scope", "failed"))
 	}()
 
 	c.Assert(err, IsNil)
@@ -764,7 +711,6 @@ func (s *trackingSuite) TestCreateTransientScopeUnhappyJobFailed(c *C) {
 }
 
 func (s *trackingSuite) TestCreateTransientScopeUnhappyJobTimeout(c *C) {
-	enableFeatures(c, features.RefreshAppAwareness)
 
 	restore := cgroup.MockOsGetuid(12345)
 	defer restore()
@@ -824,10 +770,8 @@ func (s *trackingSuite) TestDoCreateTransientScopeHappyCgroupV2(c *C) {
 		return nil, fmt.Errorf("unexpected message #%d: %s", n, msg)
 	})
 	go func() {
-		select {
-		case <-signalChan:
-			inject(mockJobRemovedSignal("foo.scope", "done"))
-		}
+		<-signalChan
+		inject(mockJobRemovedSignal("foo.scope", "done"))
 	}()
 
 	c.Assert(err, IsNil)
@@ -1123,4 +1067,85 @@ func (s *trackingSuite) TestConfirmSystemdAppTrackingSad3(c *C) {
 	// With the cgroup path faked as above, tracking is not effective.
 	err := cgroup.ConfirmSystemdAppTracking("snap.pkg.app")
 	c.Assert(err, Equals, cgroup.ErrCannotTrackProcess)
+}
+
+type SnapDeviceCgroupOptionsSuite struct{}
+
+var _ = Suite(&SnapDeviceCgroupOptionsSuite{})
+
+func (SnapDeviceCgroupOptionsSuite) TestMarshalText(c *C) {
+	opts := cgroup.SnapDeviceCgroupOptions{}
+	text, err := opts.MarshalText()
+	c.Assert(err, IsNil)
+	c.Assert(string(text), Equals, "# This file is automatically generated.\n")
+
+	opts = cgroup.SnapDeviceCgroupOptions{NonStrict: true}
+	text, err = opts.MarshalText()
+	c.Assert(err, IsNil)
+	c.Assert(string(text), Equals, "# This file is automatically generated.\n"+
+		"# snap uses non-strict confinement.\n"+
+		"non-strict=true\n")
+
+	opts = cgroup.SnapDeviceCgroupOptions{SelfManaged: true}
+	text, err = opts.MarshalText()
+	c.Assert(err, IsNil)
+	c.Assert(string(text), Equals, "# This file is automatically generated.\n"+
+		"# snap is allowed to manage own device cgroup.\n"+
+		"self-managed=true\n")
+
+	opts = cgroup.SnapDeviceCgroupOptions{NonStrict: true, SelfManaged: true}
+	text, err = opts.MarshalText()
+	c.Assert(err, IsNil)
+	c.Assert(string(text), Equals, "# This file is automatically generated.\n"+
+		"# snap is allowed to manage own device cgroup.\n"+
+		"self-managed=true\n"+
+		"# snap uses non-strict confinement.\n"+
+		"non-strict=true\n")
+}
+
+func (SnapDeviceCgroupOptionsSuite) TestUnmarshalText(c *C) {
+	// We can parse the "non-strict" option..
+	var opts cgroup.SnapDeviceCgroupOptions
+	err := opts.UnmarshalText([]byte("non-strict=true\n"))
+	c.Assert(err, IsNil)
+	c.Check(opts.SelfManaged, Equals, false)
+	c.Check(opts.NonStrict, Equals, true)
+
+	err = opts.UnmarshalText([]byte("non-strict=false\n"))
+	c.Assert(err, IsNil)
+	c.Check(opts.SelfManaged, Equals, false)
+	c.Check(opts.NonStrict, Equals, false)
+
+	// We can parse the "self-managed" option.
+	opts = cgroup.SnapDeviceCgroupOptions{}
+	err = opts.UnmarshalText([]byte("self-managed=true\n"))
+	c.Assert(err, IsNil)
+	c.Check(opts.SelfManaged, Equals, true)
+	c.Check(opts.NonStrict, Equals, false)
+
+	err = opts.UnmarshalText([]byte("self-managed=false\n"))
+	c.Assert(err, IsNil)
+	c.Check(opts.SelfManaged, Equals, false)
+	c.Check(opts.NonStrict, Equals, false)
+
+	// We can parse both "self-managed" and "non-strict" options.
+	opts = cgroup.SnapDeviceCgroupOptions{}
+	err = opts.UnmarshalText([]byte("non-strict=true\nself-managed=true\n"))
+	c.Assert(err, IsNil)
+	c.Assert(opts.NonStrict, Equals, true)
+	c.Assert(opts.SelfManaged, Equals, true)
+
+	// Comments are ignored.
+	opts = cgroup.SnapDeviceCgroupOptions{}
+	err = opts.UnmarshalText([]byte("# comments are ignored\nnon-strict=true\nself-managed=true\n"))
+	c.Assert(err, IsNil)
+	c.Assert(opts.NonStrict, Equals, true)
+	c.Assert(opts.SelfManaged, Equals, true)
+
+	// Unrecognized fields are ignored.
+	opts = cgroup.SnapDeviceCgroupOptions{}
+	err = opts.UnmarshalText([]byte("unrecognized=true\nnon-strict=true\nself-managed=true\n"))
+	c.Assert(err, IsNil)
+	c.Assert(opts.NonStrict, Equals, true)
+	c.Assert(opts.SelfManaged, Equals, true)
 }

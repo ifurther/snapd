@@ -5,18 +5,8 @@ details: |
     error messages and that the snapd API is only available via the snapd socket.
 
 prepare: |
-    snap pack "$TESTSLIB"/snaps/snapctl-hooks
-    snap install --dangerous snapctl-hooks_1.0_all.snap
-    # ensure curl is available (needed for e.g. core18)
-    if ! command -v curl; then
-        snap install --devmode --edge test-snapd-curl
-        snap alias test-snapd-curl.curl curl
-    fi
-
-restore: |
-    if snap list test-snapd-curl; then
-        snap remove --purge test-snapd-curl
-    fi
+    "$TESTSTOOLS"/snaps-state install-local snapctl-hooks
+    "$TESTSTOOLS"/snaps-state install-local test-snapd-sh-core24
 
 execute: |
     echo "Verify that snapctl -h runs without a context"
@@ -47,7 +37,7 @@ execute: |
     echo "Verify that the snapd API is only available via the snapd socket"
     if ! printf 'GET /v2/snaps HTTP/1.0\r\n\r\n' | nc -U -w 1 /run/snapd.socket | grep '200 OK'; then
         echo "Expected snapd API to be available on the snapd socket"
-        echo "Got: $(curl -s --unix-socket /run/snapd.socket http:/v2/snaps)"
+        echo "Got: $(snap debug api /v2/snaps)"
         exit 1
     fi
 
@@ -55,3 +45,21 @@ execute: |
         echo "Expected snapd API to be forbidden on the snap socket"
         exit 1
     fi
+
+    echo "Verify snapctl version reports the same version as snap version"
+
+    snapd_version="$(snap version | awk '/snapd / { print $2 }')"
+    test -n "$snapd_version"
+    snapctl_version="$(snapctl version |   awk '/snapd / { print $2 }')"
+    snapctl_user_version="$(su -c 'snapctl version' test | awk '/snapd / { print $2 }')"
+    snapctl_snap_shell_version="$(test-snapd-sh-core24.sh -c 'snapctl version' | awk '/snapd / { print $2 }')"
+
+    test "$snapd_version" = "$snapctl_version"
+    test "$snapd_version" = "$snapctl_user_version"
+    test "$snapd_version" = "$snapctl_snap_shell_version"
+
+    snapd_series="$(snap version | awk '/series / { print $2 }')"
+    snapctl_snap_shell_series="$(test-snapd-sh-core24.sh -c 'snapctl version' | awk '/series / { print $2 }')"
+
+    test -n "$snapd_series"
+    test "$snapd_series" = "$snapctl_snap_shell_series"

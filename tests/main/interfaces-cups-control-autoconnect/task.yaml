@@ -1,15 +1,14 @@
-summary: Test the auto-connect behaviour of the cups-control interface.
+summary: Test the auto-connect behavior of the cups-control interface.
 
 details: |
-    The cups-control interface is provided as an implicit slot on
-    classic systems. It is also provided as a slot by the cups
-    snap. Normally snapd will not auto-connect a plug if there are
-    multiple candidate slots available.
+    The cups-control interface is provided as an implicit slot on classic
+    systems. It is also provided as a slot by the cups snap. Normally snapd will
+    not auto-connect a plug if there are multiple candidate slots available.
 
-    However the cups-control interface is set up to only make one slot
-    a candidate: if a non-snap cupsd appears to be on the system then
-    system:cups-control is favoured. And if there is no non-snap
-    cupsd, the reverse is true.
+    However the cups-control interface is set up to only make one slot a
+    candidate: if a non-snap cupsd appears to be on the system then
+    system:cups-control is favoured. And if there is no non-snap cupsd, the
+    reverse is true.
 
 systems:
     - -ubuntu-core-*
@@ -18,12 +17,12 @@ systems:
 environment:
     BLOB_DIR: $(pwd)/fake-store-blobdir
 
-prepare: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
+skip:
+    - reason: This test needs test keys to be trusted
+      if: |
+        [ "$TRUST_TEST_KEYS" = "false" ]
 
+prepare: |
     snap debug can-manage-refreshes | MATCH false
 
     snap ack "$TESTSLIB/assertions/testrootorg-store.account-key"
@@ -57,10 +56,6 @@ prepare: |
     fi
 
 restore: |
-    if [ "$TRUST_TEST_KEYS" = false ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
     "$TESTSTOOLS"/store-state teardown-fake-store "$BLOB_DIR"
 
     rm -f /etc/cups/cupsd.conf
@@ -69,11 +64,6 @@ restore: |
     fi
 
 execute: |
-    if [ "$TRUST_TEST_KEYS" = false ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
-
     echo "Install the cups-provider snap"
     "$TESTSTOOLS"/snaps-state install-local cups-provider
 

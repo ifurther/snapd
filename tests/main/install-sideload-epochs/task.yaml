@@ -1,10 +1,20 @@
-summary: Checks for snap sideload install w/mismatched epochs
+summary: Checks for snap sideload install w/ mismatched epochs
+
+details: |
+    Check that updating a snap via a sideload install fails if snapd can't read
+    the previous version's epoch. This ensures that an update can't result in
+    the snap not being able to read previous version's data.
 
 environment:
     # Ensure that running purely from the deb (without re-exec) works
     # correctly
     SNAP_REEXEC/reexec0: 0
     SNAP_REEXEC/reexec1: 1
+
+skip:
+    - reason: No need to test when the snapd pkg is from the repository and reexec is disabled
+      if: |
+        [ "$SNAP_REEXEC" = "0" ] && tests.info is-snapd-from-archive
 
 prepare: |
     snap pack test-snapd-epoch-1

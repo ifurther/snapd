@@ -38,10 +38,15 @@ import (
 // pidsOfSnap is a mockable version of PidsOfSnap
 var pidsOfSnap = cgroup.PidsOfSnap
 
+// IsConfdbHookname is a hook set by confdbstate (see confdbstate.go).
+var IsConfdbHookname = func(string) bool {
+	panic("internal error: snapstate.IsConfdbHookname is unset")
+}
+
 // refreshAppsCheck returns an error if the snap has processes running that aren't
 // services and aren't marked to be ignored (refresh-mode: "ignore-running").
 var refreshAppsCheck = func(info *snap.Info) error {
-	knownPids, err := pidsOfSnap(info.InstanceName())
+	knownPids, err := pidsOfSnap(info.InstanceName().String())
 	if err != nil {
 		return err
 	}
@@ -51,11 +56,10 @@ var refreshAppsCheck = func(info *snap.Info) error {
 	var busyHookNames []string
 	var busyPIDs []int
 
-	// Currently there are no situations when hooks might be allowed to run
-	// during the refresh process. The function exists to make the next two
-	// chunks of code symmetric.
 	canHookRunDuringRefresh := func(hook *snap.HookInfo) bool {
-		return false
+		// changes that unlink snaps can conflict with confdb accesses that run those
+		// snaps' hooks, but we deal with that in the unlink/run-hook tasks
+		return IsConfdbHookname(hook.Name)
 	}
 
 	for name, app := range info.Apps {
@@ -107,7 +111,7 @@ type BusySnapError struct {
 // and the snapd-generated desktop file name.
 func (err *BusySnapError) PendingSnapRefreshInfo() *userclient.PendingSnapRefreshInfo {
 	refreshInfo := &userclient.PendingSnapRefreshInfo{
-		InstanceName: err.SnapInfo.InstanceName(),
+		InstanceName: err.SnapInfo.InstanceName().String(),
 	}
 	for _, appName := range err.busyAppNames {
 		if app, ok := err.SnapInfo.Apps[appName]; ok {
@@ -175,7 +179,7 @@ func (err BusySnapError) Pids() []int {
 // the refresh change and continue running existing app processes.
 func hardEnsureNothingRunningDuringRefresh(backend managerBackend, st *state.State, snapst *SnapState, snapsup *SnapSetup, info *snap.Info) (bool, *osutil.FileLock, error) {
 	var inhibitionTimeout bool
-	lock, err := backend.RunInhibitSnapForUnlink(info, runinhibit.HintInhibitedForRefresh, func() error {
+	lock, err := backend.RunInhibitSnapForUnlink(info, runinhibit.HintInhibitedForRefresh, st.Unlocker(), func() error {
 		// In case of successful refresh inhibition the snap state is modified
 		// to indicate when the refresh was first inhibited. If the first
 		// refresh inhibition is outside of a grace period then refresh

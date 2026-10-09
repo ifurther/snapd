@@ -34,9 +34,12 @@ debug: |
 
 execute: |
     "$TESTSTOOLS"/lxd-state prepare-snap
-    ausearch -i --checkpoint stamp --start checkpoint -m AVC 2>&1 | MATCH 'no matches'
+    ausearch -i --checkpoint stamp --start checkpoint -m AVC > avc-before 2>&1 || true
+    grep -v -E 'avc:  denied  \{ .* \} .* scontext=.*:syslogd_t:s0 .* tclass=netlink_tcpdiag_socket' < avc-before | \
+        NOMATCH 'type=AVC'
 
-    lxd.lxc launch --quiet "ubuntu:18.04" my-ubuntu
+    "$TESTSTOOLS"/lxd-state launch --remote ubuntu --image 22.04 --name my-ubuntu
+
     if os.query is-pc-amd64 && lxd.lxc info my-ubuntu | grep "Architecture: i686"; then
         echo "LXD spawned 32bit userspace container on a 64bit host, WAT?"
         snap info lxd
@@ -50,7 +53,7 @@ execute: |
     lxd.lxc stop --force my-ubuntu
     lxd.lxc delete --force my-ubuntu
 
-    snap remove lxd
+    snap remove --purge lxd
 
     # there is a known problem with the reference policy that disallows systemd
     # from creating a BPF map for unconfined_service_t, see:
@@ -58,8 +61,9 @@ execute: |
     # also network manager dispatcher service is raising a denial
     #
     # ausearch exits with 1 when there are no denials, which we expect on
-    # centos-8, but not on centos-7
+    # centos-9
     ausearch --checkpoint stamp --start checkpoint -m AVC > avc-after 2>&1 || true
     grep -v -E 'avc:  denied  { map_create } for  pid=[0-9]+ comm="systemd"' < avc-after | \
     grep -v -E 'avc:  denied  { getattr } for  pid=[0-9]+ comm="which" path="/usr/bin/hostname" .*NetworkManager_dispatcher_dhclient_t' | \
+    grep -v -E 'avc:  denied  \{ .* \} .* scontext=.*:syslogd_t:s0 .* tclass=netlink_tcpdiag_socket' | \
         NOMATCH 'type=AVC'

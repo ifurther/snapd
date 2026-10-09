@@ -9,9 +9,10 @@ details: |
 systems: [ubuntu-22.04-64, ubuntu-24.04-64]
 
 environment:
-  # Test both encrypted and unencrypted install using the muinstaller
-  NESTED_ENABLE_TPM/encrypted: true
-  NESTED_ENABLE_SECURE_BOOT/encrypted: true
+  # default (encrypted) case. all of the install_optional_* variants exercise
+  # the encrypted case
+  NESTED_ENABLE_TPM: true
+  NESTED_ENABLE_SECURE_BOOT: true
 
   # unencrypted case
   NESTED_ENABLE_TPM/plain: false
@@ -20,21 +21,33 @@ environment:
   # ensure we use our latest code
   NESTED_BUILD_SNAPD_FROM_CURRENT: true
   NESTED_REPACK_KERNEL_SNAP: true
-  NESTED_ENABLE_OVMF: true
   # image
   IMAGE_MOUNTPOINT: /mnt/cloudimg
 
-prepare: |
-  if [ "$TRUST_TEST_KEYS" = "false" ]; then
-      echo "This test needs test keys to be trusted"
-      exit
-  fi
-  apt install dosfstools
-  snap install jq
-  snap install yq
+  # by default, we don't specify any optional installs. this means we should
+  # install all snaps and components
+  INSTALL_OPTIONAL_SNAP: false
+  INSTALL_OPTIONAL_COMPONENT: false
+  INSTALL_OPTIONAL_ALL: false
+  INSTALL_OPTIONAL_EXPECT_ALL: true
+
+  INSTALL_OPTIONAL_SNAP/install_optional_snap: true
+  INSTALL_OPTIONAL_EXPECT_ALL/install_optional_snap: false
+
+  INSTALL_OPTIONAL_SNAP/install_optional_snap_and_comp: true
+  INSTALL_OPTIONAL_COMPONENT/install_optional_snap_and_comp: true
+  INSTALL_OPTIONAL_EXPECT_ALL/install_optional_snap_and_comp: true
+
+  INSTALL_OPTIONAL_ALL/install_optional_all: true
+  INSTALL_OPTIONAL_EXPECT_ALL/install_optional_all: true
+
+skip:
+    - reason: This test needs test keys to be trusted
+      if: |
+        [ "$TRUST_TEST_KEYS" = "false" ]
 
 restore: |
-  rm -rf ./classic-root
+  rm -rf pc-kernel.* pc.* initrd* linux* kernel* tmp* pc-gadget snap-with-comps.snap snap-with-comps+comp1.comp core-seed fake-disk.img
 
 execute: |
   # shellcheck source=tests/lib/prepare.sh
@@ -45,7 +58,7 @@ execute: |
   version="$(nested_get_version)"
 
   # Retrieve the gadget
-  snap download --basename=pc --channel="$version/edge" pc
+  snap download --basename=pc --channel="$version/${KERNEL_CHANNEL}" pc
 
   # Modify gadget, making sure we can access the device (we are not building
   # the image in the usual way in snapd spread tests).
@@ -53,7 +66,7 @@ execute: |
   echo 'console=ttyS0' > pc-gadget/cmdline.extra
   cat <<EOF > pc-gadget/cloud.conf
   #cloud-config
-  datasource_list: [NoCloud]
+  datasource_list: [None]
   ssh_pwauth: True
   users:
    - name: user1
@@ -71,23 +84,33 @@ execute: |
   SNAKEOIL_CERT="$PWD/$KEY_NAME.pem"
   tests.nested secboot-sign gadget pc-gadget "$SNAKEOIL_KEY" "$SNAKEOIL_CERT"
   snap pack --filename=pc.snap pc-gadget/
+  rm -rf pc-gadget
 
-  # Retrieve kernel
-  snap download --basename=pc-kernel --channel="$version/edge" pc-kernel
-  # Build kernel with initramfs with the compiled snap-bootstrap
-  uc20_build_initramfs_kernel_snap "$PWD/pc-kernel.snap" "$NESTED_ASSETS_DIR"
-  mv "${NESTED_ASSETS_DIR}"/pc-kernel_*.snap pc-kernel.snap
+  # Retrieve kernel through repack-kernel tool
+  "$TESTSTOOLS"/repack-kernel --mode initramfs --core-version "$version" --kernel-branch "$version" --kernel-channel "$KERNEL_CHANNEL" --output-snap "$PWD/pc-kernel.snap"
+
+  # shellcheck source=tests/lib/prepare.sh
+  . "$TESTSLIB"/prepare.sh
+  build_snapd_snap "$PWD"
+  mv snapd_*.snap snapd.snap
+
+  sed -i "s/\$BASE/core${version}/" ./snap-with-comps/meta/snap.yaml
+  snap pack ./snap-with-comps --filename=snap-with-comps.snap
+  snap pack ./comp1 --filename=snap-with-comps+comp1.comp
+
+  # TODO: refactor preparation/hacks in a reusable script
+  # similar to setup_nested_hybrid_system.sh
 
   # prepare a core seed
-  # TODO:
-  # - repacked snapd snap
-  # (should be as simple as adding "--snap=./local-snapd.snap ...")
   SEED_DIR="core-seed"
-  wget -q https://raw.githubusercontent.com/snapcore/models/master/ubuntu-core-22-amd64-dangerous.model -O my.model
+  wget -q https://raw.githubusercontent.com/snapcore/models/master/ubuntu-core-"$version"-amd64-dangerous.model -O my.model
   snap prepare-image \
       --channel=edge \
       --snap ./pc-kernel.snap \
       --snap ./pc.snap \
+      --snap ./snapd.snap \
+      --snap ./snap-with-comps.snap \
+      --comp ./snap-with-comps+comp1.comp \
       my.model \
       ./"$SEED_DIR"
 
@@ -97,12 +120,12 @@ execute: |
   cp -a ./"$SEED_DIR"/system-seed/ /var/lib/snapd/seed
 
   # build the muinstaller snap
-  # TODO: Consider reverting to latest/candidate when Snapcraft 8.0.5, which includes the fix to deal with LXD 5.21.0 version naming change, becomes available
-  snap install snapcraft --edge --classic
-  "$TESTSTOOLS"/lxd-state prepare-snap
-  (cd "$TESTSLIB"/muinstaller && snapcraft)
-  MUINSTALLER_SNAP="$(find "$TESTSLIB"/muinstaller/ -maxdepth 1 -name '*.snap')"
-  echo "found $MUINSTALLER_SNAP"
+  MUINSTALLER_SNAP="$PWD/muinstaller.snap"
+  (
+      cd "$TESTSLIB"/muinstaller
+      CGO_ENABLED=0 go build -o bin/muinstaller .
+      snap pack --filename="$MUINSTALLER_SNAP" .
+  )
 
   # create new disk for the installer to work on and attach to VM
   truncate --size=4G fake-disk.img
@@ -136,7 +159,7 @@ execute: |
 
   remote.exec "sudo sh -c 'echo SNAPD_DEBUG=1 >> /etc/environment'"
   # push our snap down
-  remote.push "$SPREAD_PATH"/../snapd_*.deb
+  remote.push "$GOHOME"/snapd_*.deb
   remote.exec "sudo apt install -y ./snapd_*.deb"
 
   # push our seed down
@@ -153,14 +176,8 @@ execute: |
   tests.nested vm stop
   sync
 
-  # HACK: convert "classic" qcow2 to raw "core" image because we need
-  # to boot with OVMF we really should fix this so that classic and
-  # core VMs are more similar
-  qemu-img convert -f qcow2 -O raw \
-      "$NESTED_IMAGES_DIR/$(nested_get_image_name classic)" \
+  mv "$NESTED_IMAGES_DIR/$(nested_get_image_name classic)" \
       "$NESTED_IMAGES_DIR/$(nested_get_image_name core)"
-  # and we don't need the classic image anymore
-  rm -f  "$NESTED_IMAGES_DIR/$(nested_get_image_name classic)"
   # TODO: this prevents "nested_prepare_ssh" inside nested_start_core_vm
   #       from running, we already have a user so this is not needed
   IMAGE_NAME="$(nested_get_image_name core)"
@@ -168,13 +185,42 @@ execute: |
   tests.nested create-vm core --extra-param "$NESTED_PARAM_EXTRA"
 
   # bind mount new seed
+  remote.exec sudo mkdir -p /var/lib/snapd/seed
   remote.exec "sudo mount -o bind /var/lib/snapd/install-seed /var/lib/snapd/seed"
   # push and install muinstaller
   remote.push "$MUINSTALLER_SNAP"
   remote.exec "sudo snap install --classic --dangerous $(basename "$MUINSTALLER_SNAP")"
   # Run installation
   install_disk=$(remote.exec "readlink -f /dev/disk/by-id/virtio-target")
-  remote.exec "sudo muinstaller $LABEL $install_disk"
+
+  if [ "$INSTALL_OPTIONAL_ALL" = "true" ]; then
+    echo '{"all": true}' > optional-install.json
+  elif [ "$INSTALL_OPTIONAL_COMPONENT" = "true" ]; then
+    echo '{"snaps": ["snap-with-comps"], "components": {"snap-with-comps": ["comp1"]}}' > optional-install.json
+  elif [ "$INSTALL_OPTIONAL_SNAP" = "true" ]; then
+    echo '{"snaps": ["snap-with-comps"]}' > optional-install.json
+  fi
+
+  # make sure that the system reports the expected available optional snaps
+  remote.exec "sudo snap debug api /v2/systems/$LABEL" > system-info.json
+  cat <<EOF > expected-available.json
+  {
+    "snaps": ["snap-with-comps"],
+    "components": {
+      "snap-with-comps": ["comp1"]
+    }
+  }
+  EOF
+  # gojq sorts keys by default
+  diff -u <(gojq  '.result.["available-optional"]' system-info.json) <(gojq . expected-available.json)
+
+  muinstaller_args="-label $LABEL -device $install_disk"
+  if [ -f optional-install.json ]; then
+    remote.push optional-install.json
+    muinstaller_args="$muinstaller_args -optional ./optional-install.json"
+  fi
+
+  remote.exec "sudo muinstaller $muinstaller_args"
 
   remote.exec "sudo sync"
 
@@ -188,15 +234,27 @@ execute: |
   mv fake-disk.img "$NESTED_IMAGES_DIR/$IMAGE_NAME"
 
   # Start installed image
-  tests.nested create-vm core --tpm-no-restart
+  tests.nested create-vm core --keep-firmware-state
 
   # things look fine
   remote.exec "cat /etc/os-release" | MATCH 'NAME="Ubuntu Core"'
   remote.exec "snap changes" | MATCH "Done.* Initialize system state"
   remote.exec "snap list" | MATCH pc-kernel
 
+  api_get_v2_system_info_storage_encrypted() {
+      remote.exec "sudo snap debug api /v2/system-info/storage-encrypted 2>/dev/null"
+  }
+
   # check encryption
-  if [ "$NESTED_ENABLE_TPM" = true ]; then
+  remote.exec "sudo snap install test-snapd-tools"
+  remote.exec "snap list" | MATCH "test-snapd-tools"
+  if [ "$NESTED_ENABLE_TPM" = false ]; then
+      remote.exec "test-snapd-tools.cmd snapctl system-mode" | NOMATCH "storage-encrypted"
+      api_get_v2_system_info_storage_encrypted | gojq '.result.status' | MATCH "inactive"
+  else
+      remote.exec "test-snapd-tools.cmd snapctl system-mode" | MATCH "storage-encrypted: managed"
+      api_get_v2_system_info_storage_encrypted | gojq '.result.status' | MATCH "active"
+
       remote.exec "sudo test -d /var/lib/snapd/device/fde"
       remote.exec "sudo test -e /var/lib/snapd/device/fde/marker"
       remote.exec "sudo test -e /var/lib/snapd/device/fde/marker"
@@ -207,29 +265,45 @@ execute: |
       MATCH 'recovery:\s+[0-9]{5}-[0-9]{5}-[0-9]{5}-[0-9]{5}-[0-9]{5}-[0-9]{5}-[0-9]{5}-[0-9]{5}' < show-keys.out
 
       # check disk mappings
-      remote.exec "sudo snap install jq"
       DISK_MAPPINGS=(/run/mnt/ubuntu-save/device/disk-mapping.json
                      /run/mnt/data/system-data/var/lib/snapd/device/disk-mapping.json)
       for DM in "${DISK_MAPPINGS[@]}"; do
-          remote.exec "sudo cat $DM |
-              jq '.pc.\"structure-encryption\".\"ubuntu-save\".method'" | MATCH '"LUKS"'
-          remote.exec "sudo cat $DM |
-              jq '.pc.\"structure-encryption\".\"ubuntu-data\".method'" | MATCH '"LUKS"'
+          remote.exec "sudo cat $DM" | \
+              gojq '.pc."structure-encryption"."ubuntu-save".method' | MATCH '"LUKS"'
+          remote.exec "sudo cat $DM" | \
+              gojq '.pc."structure-encryption"."ubuntu-data".method' | MATCH '"LUKS"'
       done
   fi
 
   # check that seed is properly installed
   remote.exec test -d "/run/mnt/ubuntu-seed/systems/${LABEL}"
-  remote.exec "sudo snap recovery" | MATCH "${LABEL}\s+canonical\*\*\s+ubuntu-core-22-amd64-dangerous\s+current"
+  remote.exec "sudo snap recovery" | MATCH "${LABEL}\s+canonical\*\*\s+ubuntu-core-$version-amd64-dangerous\s+current"
 
   # check for unasserted snaps
-  for sn in pc pc-kernel; do
-      version=$(remote.exec "snap list ${sn}" | awk 'NR != 1 { print $2 }')
-      remote.exec "test -f /run/mnt/ubuntu-seed/systems/${LABEL}/snaps/${sn}_${version}.snap"
+  for sn in snapd pc pc-kernel; do
+      sn_version=$(remote.exec "snap list ${sn}" | awk 'NR != 1 { print $2 }')
+      remote.exec "test -f /run/mnt/ubuntu-seed/systems/${LABEL}/snaps/${sn}_${sn_version}.snap"
   done
 
+  if [ "$INSTALL_OPTIONAL_SNAP" = "true" ] || [ "$INSTALL_OPTIONAL_EXPECT_ALL" = "true" ]; then
+      sn_version=$(remote.exec "snap list snap-with-comps" | awk 'NR != 1 { print $2 }')
+
+      # snap isn't asserted, but it is not in the model so it should end up here
+      remote.exec "test -f /run/mnt/ubuntu-seed/systems/${LABEL}/snaps/snap-with-comps_${sn_version}.snap"
+
+      if [ "$INSTALL_OPTIONAL_EXPECT_ALL" = "true" ]; then
+          # make sure our component is there too
+          remote.exec "snap run snap-with-comps.test comp1"
+      else
+          not remote.exec "snap run snap-with-comps.test comp1"
+      fi
+  else
+      not remote.exec "snap list snap-with-comps"
+  fi
+
   # check for asserted snaps
-  for sn in snapd core22; do
+  #shellcheck disable=SC2043
+  for sn in core"$version"; do
       rev=$(remote.exec "snap list ${sn}" | awk 'NR != 1 { print $3 }')
       remote.exec "test -f /run/mnt/ubuntu-seed/snaps/${sn}_${rev}.snap"
   done

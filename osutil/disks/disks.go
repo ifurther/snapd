@@ -20,6 +20,7 @@
 package disks
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -34,6 +35,11 @@ type Options struct {
 
 // Disk is a single physical disk device that contains partitions.
 type Disk interface {
+	// FindMatchingPartitionWithUUID finds a partition with a matching
+	// partition UUID on the disk. If no matching partition is found,
+	// a PartitionNotFoundError will be returned.
+	FindMatchingPartitionWithPartUUID(string) (Partition, error)
+
 	// FindMatchingPartitionWithFsLabel finds the partition with a matching
 	// filesystem label on the disk. Note that for non-ascii labels like
 	// "Some label", the label will be encoded using \x<hex> for potentially
@@ -126,6 +132,10 @@ type Disk interface {
 	// the case for DOS disks, but not for GPT disks. GPT disks have a backup
 	// header section at the end of the disk that is not usable for partitions.
 	UsableSectorsEnd() (uint64, error)
+
+	// Model is the model name of the disk as an identifier that can
+	// be recognized by a user.
+	Model() string
 }
 
 // Partition represents a partition on a Disk device.
@@ -206,6 +216,8 @@ func (e PartitionNotFoundError) Error() string {
 		t = "partition label"
 	case "filesystem-label":
 		t = "filesystem label"
+	case "partition-uuid":
+		t = "partition uuid"
 	default:
 		return fmt.Sprintf("searching with unknown search type %q and search query %q did not return a partition", e.SearchType, e.SearchQuery)
 	}
@@ -236,4 +248,24 @@ func RegisterDeviceMapperBackResolver(name string, f func(dmUUID, dmName []byte)
 // mainly for tests to un-register and re-register handlers
 func unregisterDeviceMapperBackResolver(name string) {
 	delete(deviceMapperBackResolvers, name)
+}
+
+// ErrNoDmUUID is returned by DMCryptUUIDFromMountPoint when the device
+// at the mount point is not a device mapper device.
+var ErrNoDmUUID = errors.New("device has no DM_UUID")
+
+// ErrMountPointNotFound is returned by DMCryptUUIDFromMountPoint a path
+// is not a mount point.
+var ErrMountPointNotFound = errors.New("cannot find mount point")
+
+type errMountPointNotFoundImpl struct {
+	path string
+}
+
+func (e errMountPointNotFoundImpl) Error() string {
+	return fmt.Sprintf("cannot find mountpoint %q", e.path)
+}
+
+func (e errMountPointNotFoundImpl) Unwrap() error {
+	return ErrMountPointNotFound
 }

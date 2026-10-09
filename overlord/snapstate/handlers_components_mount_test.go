@@ -21,6 +21,7 @@ package snapstate_test
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/overlord/snapstate"
@@ -50,7 +51,7 @@ func (s *mountCompSnapSuite) TestDoMountComponent(c *C) {
 	ci, compPath := createTestComponent(c, snapName, compName, si)
 	ssu := createTestSnapSetup(si, snapstate.Flags{})
 	s.AddCleanup(snapstate.MockReadComponentInfo(func(
-		compMntDir string, snapInfo *snap.Info) (*snap.ComponentInfo, error) {
+		compMntDir string, snapInfo *snap.Info, csi *snap.ComponentSideInfo) (*snap.ComponentInfo, error) {
 		return ci, nil
 	}))
 
@@ -59,7 +60,7 @@ func (s *mountCompSnapSuite) TestDoMountComponent(c *C) {
 	t := s.state.NewTask("mount-component", "task desc")
 	cref := naming.NewComponentRef(snapName, compName)
 	csi := snap.NewComponentSideInfo(cref, compRev)
-	t.Set("component-setup", snapstate.NewComponentSetup(csi, snap.TestComponent, compPath))
+	t.Set("component-setup", snapstate.NewComponentSetup(csi, snap.StandardComponent, compPath))
 	t.Set("snap-setup", ssu)
 	chg := s.state.NewChange("test change", "change desc")
 	chg.AddTask(t)
@@ -76,11 +77,79 @@ func (s *mountCompSnapSuite) TestDoMountComponent(c *C) {
 	// Ensure backend calls have happened with the expected data
 	c.Check(s.fakeBackend.ops, DeepEquals, fakeOps{
 		{
-			op: "setup-component",
+			op:                "setup-component",
+			containerName:     "mysnap+mycomp",
+			containerFileName: "mysnap+mycomp_7.comp",
 		},
 	})
 	// File not removed
 	c.Assert(osutil.FileExists(compPath), Equals, true)
+}
+
+func (s *mountCompSnapSuite) TestDoMountComponentFailsUnassertedComponentAssertedSnap(c *C) {
+	const snapName = "mysnap"
+	const compName = "mycomp"
+	snapRev := snap.R(1)
+	compRev := snap.Revision{}
+	si := createTestSnapInfoForComponent(c, snapName, snapRev, compName)
+	ci, compPath := createTestComponent(c, snapName, compName, si)
+	ssu := createTestSnapSetup(si, snapstate.Flags{})
+	s.AddCleanup(snapstate.MockReadComponentInfo(func(
+		compMntDir string, snapInfo *snap.Info, csi *snap.ComponentSideInfo) (*snap.ComponentInfo, error) {
+		return ci, nil
+	}))
+
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	t := s.state.NewTask("mount-component", "task desc")
+	cref := naming.NewComponentRef(snapName, compName)
+	csi := snap.NewComponentSideInfo(cref, compRev)
+	t.Set("component-setup", snapstate.NewComponentSetup(csi, snap.StandardComponent, compPath))
+	t.Set("snap-setup", ssu)
+	chg := s.state.NewChange("test change", "change desc")
+	chg.AddTask(t)
+
+	s.state.Unlock()
+	s.se.Ensure()
+	s.se.Wait()
+	s.state.Lock()
+
+	c.Check(chg.Err().Error(), Equals, "cannot perform the following tasks:\n"+
+		"- task desc (cannot mix asserted snap and unasserted components)")
+}
+
+func (s *mountCompSnapSuite) TestDoMountComponentFailsAssertedComponentUnassertedSnap(c *C) {
+	const snapName = "mysnap"
+	const compName = "mycomp"
+	snapRev := snap.R(-1)
+	compRev := snap.R(7)
+	si := createTestSnapInfoForComponent(c, snapName, snapRev, compName)
+	ci, compPath := createTestComponent(c, snapName, compName, si)
+	ssu := createTestSnapSetup(si, snapstate.Flags{})
+	s.AddCleanup(snapstate.MockReadComponentInfo(func(
+		compMntDir string, snapInfo *snap.Info, csi *snap.ComponentSideInfo) (*snap.ComponentInfo, error) {
+		return ci, nil
+	}))
+
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	t := s.state.NewTask("mount-component", "task desc")
+	cref := naming.NewComponentRef(snapName, compName)
+	csi := snap.NewComponentSideInfo(cref, compRev)
+	t.Set("component-setup", snapstate.NewComponentSetup(csi, snap.StandardComponent, compPath))
+	t.Set("snap-setup", ssu)
+	chg := s.state.NewChange("test change", "change desc")
+	chg.AddTask(t)
+
+	s.state.Unlock()
+	s.se.Ensure()
+	s.se.Wait()
+	s.state.Lock()
+
+	c.Check(chg.Err().Error(), Equals, "cannot perform the following tasks:\n"+
+		"- task desc (cannot mix unasserted snap and asserted components)")
 }
 
 func (s *mountCompSnapSuite) TestDoUndoMountComponent(c *C) {
@@ -92,7 +161,7 @@ func (s *mountCompSnapSuite) TestDoUndoMountComponent(c *C) {
 	ci, compPath := createTestComponent(c, snapName, compName, si)
 	ssu := createTestSnapSetup(si, snapstate.Flags{})
 	s.AddCleanup(snapstate.MockReadComponentInfo(func(
-		compMntDir string, snapInfo *snap.Info) (*snap.ComponentInfo, error) {
+		compMntDir string, snapInfo *snap.Info, csi *snap.ComponentSideInfo) (*snap.ComponentInfo, error) {
 		return ci, nil
 	}))
 
@@ -102,7 +171,7 @@ func (s *mountCompSnapSuite) TestDoUndoMountComponent(c *C) {
 	t := s.state.NewTask("mount-component", "task desc")
 	cref := naming.NewComponentRef(snapName, compName)
 	csi := snap.NewComponentSideInfo(cref, compRev)
-	t.Set("component-setup", snapstate.NewComponentSetup(csi, snap.TestComponent, compPath))
+	t.Set("component-setup", snapstate.NewComponentSetup(csi, snap.StandardComponent, compPath))
 	t.Set("snap-setup", ssu)
 
 	chg := s.state.NewChange("sample", "...")
@@ -127,13 +196,19 @@ func (s *mountCompSnapSuite) TestDoUndoMountComponent(c *C) {
 	// ensure undo was called the right way
 	c.Check(s.fakeBackend.ops, DeepEquals, fakeOps{
 		{
-			op: "setup-component",
+			op:                "setup-component",
+			containerName:     "mysnap+mycomp",
+			containerFileName: "mysnap+mycomp_7.comp",
 		},
 		{
-			op: "undo-setup-component",
+			op:                "undo-setup-component",
+			containerName:     "mysnap+mycomp",
+			containerFileName: "mysnap+mycomp_7.comp",
 		},
 		{
-			op: "remove-component-dir",
+			op:                "remove-component-dir",
+			containerName:     "mysnap+mycomp",
+			containerFileName: "mysnap+mycomp_7.comp",
 		},
 	})
 }
@@ -148,7 +223,7 @@ func (s *mountCompSnapSuite) TestDoMountComponentSetupFails(c *C) {
 	ci, compPath := createTestComponent(c, snapName, compName, si)
 	ssu := createTestSnapSetup(si, snapstate.Flags{})
 	s.AddCleanup(snapstate.MockReadComponentInfo(func(
-		compMntDir string, snapInfo *snap.Info) (*snap.ComponentInfo, error) {
+		compMntDir string, snapInfo *snap.Info, csi *snap.ComponentSideInfo) (*snap.ComponentInfo, error) {
 		return ci, nil
 	}))
 
@@ -158,7 +233,7 @@ func (s *mountCompSnapSuite) TestDoMountComponentSetupFails(c *C) {
 	t := s.state.NewTask("mount-component", "task desc")
 	cref := naming.NewComponentRef(snapName, compName)
 	csi := snap.NewComponentSideInfo(cref, compRev)
-	t.Set("component-setup", snapstate.NewComponentSetup(csi, snap.TestComponent, compPath))
+	t.Set("component-setup", snapstate.NewComponentSetup(csi, snap.StandardComponent, compPath))
 	t.Set("snap-setup", ssu)
 
 	chg := s.state.NewChange("sample", "...")
@@ -177,10 +252,14 @@ func (s *mountCompSnapSuite) TestDoMountComponentSetupFails(c *C) {
 	// ensure undo was called the right way
 	c.Check(s.fakeBackend.ops, DeepEquals, fakeOps{
 		{
-			op: "setup-component",
+			op:                "setup-component",
+			containerName:     "mysnap+broken",
+			containerFileName: "mysnap+broken_7.comp",
 		},
 		{
-			op: "remove-component-dir",
+			op:                "remove-component-dir",
+			containerName:     "mysnap+broken",
+			containerFileName: "mysnap+broken_7.comp",
 		},
 	})
 }
@@ -195,7 +274,7 @@ func (s *mountCompSnapSuite) TestDoUndoMountComponentFails(c *C) {
 	ci, compPath := createTestComponent(c, snapName, compName, si)
 	ssu := createTestSnapSetup(si, snapstate.Flags{})
 	s.AddCleanup(snapstate.MockReadComponentInfo(func(
-		compMntDir string, snapInfo *snap.Info) (*snap.ComponentInfo, error) {
+		compMntDir string, snapInfo *snap.Info, csi *snap.ComponentSideInfo) (*snap.ComponentInfo, error) {
 		return ci, nil
 	}))
 
@@ -205,7 +284,7 @@ func (s *mountCompSnapSuite) TestDoUndoMountComponentFails(c *C) {
 	t := s.state.NewTask("mount-component", "task desc")
 	cref := naming.NewComponentRef(snapName, compName)
 	csi := snap.NewComponentSideInfo(cref, compRev)
-	t.Set("component-setup", snapstate.NewComponentSetup(csi, snap.TestComponent, compPath))
+	t.Set("component-setup", snapstate.NewComponentSetup(csi, snap.StandardComponent, compPath))
 	t.Set("snap-setup", ssu)
 
 	chg := s.state.NewChange("sample", "...")
@@ -231,10 +310,14 @@ func (s *mountCompSnapSuite) TestDoUndoMountComponentFails(c *C) {
 	// ensure undo was called the right way
 	c.Check(s.fakeBackend.ops, DeepEquals, fakeOps{
 		{
-			op: "setup-component",
+			op:                "setup-component",
+			containerName:     "mysnap+brokenundo",
+			containerFileName: "mysnap+brokenundo_7.comp",
 		},
 		{
-			op: "undo-setup-component",
+			op:                "undo-setup-component",
+			containerName:     "mysnap+brokenundo",
+			containerFileName: "mysnap+brokenundo_7.comp",
 		},
 	})
 }
@@ -248,9 +331,11 @@ func (s *mountCompSnapSuite) TestDoMountComponentMountFails(c *C) {
 	ci, compPath := createTestComponent(c, snapName, compName, si)
 	ssu := createTestSnapSetup(si, snapstate.Flags{})
 	s.AddCleanup(snapstate.MockReadComponentInfo(func(
-		compMntDir string, snapInfo *snap.Info) (*snap.ComponentInfo, error) {
+		compMntDir string, snapInfo *snap.Info, csi *snap.ComponentSideInfo) (*snap.ComponentInfo, error) {
 		return ci, fmt.Errorf("cannot read component")
 	}))
+	restore := snapstate.MockMountPollInterval(10 * time.Millisecond)
+	defer restore()
 
 	s.state.Lock()
 	defer s.state.Unlock()
@@ -258,7 +343,7 @@ func (s *mountCompSnapSuite) TestDoMountComponentMountFails(c *C) {
 	t := s.state.NewTask("mount-component", "task desc")
 	cref := naming.NewComponentRef(snapName, compName)
 	csi := snap.NewComponentSideInfo(cref, compRev)
-	t.Set("component-setup", snapstate.NewComponentSetup(csi, snap.TestComponent, compPath))
+	t.Set("component-setup", snapstate.NewComponentSetup(csi, snap.StandardComponent, compPath))
 	t.Set("snap-setup", ssu)
 
 	chg := s.state.NewChange("sample", "...")
@@ -278,13 +363,19 @@ func (s *mountCompSnapSuite) TestDoMountComponentMountFails(c *C) {
 	// ensure undo was called the right way
 	c.Check(s.fakeBackend.ops, DeepEquals, fakeOps{
 		{
-			op: "setup-component",
+			op:                "setup-component",
+			containerName:     "mysnap+mycomp",
+			containerFileName: "mysnap+mycomp_7.comp",
 		},
 		{
-			op: "undo-setup-component",
+			op:                "undo-setup-component",
+			containerName:     "mysnap+mycomp",
+			containerFileName: "mysnap+mycomp_7.comp",
 		},
 		{
-			op: "remove-component-dir",
+			op:                "remove-component-dir",
+			containerName:     "mysnap+mycomp",
+			containerFileName: "mysnap+mycomp_7.comp",
 		},
 	})
 }

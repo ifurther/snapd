@@ -1,33 +1,36 @@
 summary: Test that snap-confine is run from core on re-exec
 
+details: |
+    This test verifies that snap-confine is executed from core snap on re-exec.
+    First, it is checked we re-exec by default, then that the profiles in
+    /var/lib/snapd/apparmor/profiles/snap-confine.* are regenerated when the snapd
+    system-key is updated and snapd is restarted.
+
 # Disable for Fedora, openSUSE, Arch and Amazon Linux 2 as re-exec is not support there yet
 systems: [-ubuntu-core-*, -fedora-*, -opensuse-*, -arch-*, -amazon-*, -centos-*]
+
+skip:
+    - if: |
+        [ "$SNAP_REEXEC" = "0" ]
+      reason: "This tests re-exec functionality and is skipped if re-exec is disabled"
 
 prepare: |
     echo "Installing test-snapd-sh"
     snap install test-snapd-sh
     echo "Breaking host snap-confine"
-    chmod 0755 /usr/lib/snapd/snap-confine
-
-restore: |
-    echo "Restoring host snap-confine"
-    chmod 4755 /usr/lib/snapd/snap-confine
+    mv /usr/lib/snapd/snap-confine /usr/lib/snapd/snap-confine.bak
+    cp "$(type -P false)" /usr/lib/snapd/snap-confine
+    tests.cleanup defer mv /usr/lib/snapd/snap-confine.bak /usr/lib/snapd/snap-confine
 
 execute: |
-    if [ "${SNAP_REEXEC:-}" = "0" ]; then
-        echo "skipping test when SNAP_REEXEC is disabled"
-        exit 0
-    fi
-
     echo "Ensure we re-exec by default"
     # It is not possible to check by using journal-state tools because the
     # reexec "DEBUG: restarting into" line appears before the snapd state is
     # saved, which is outside the scope of this test
-    /usr/bin/env SNAPD_DEBUG=1 snap list 2>&1 | MATCH "DEBUG: restarting into"
+    /usr/bin/env SNAPD_LOG_SNAP_TO_JOURNAL=false SNAPD_DEBUG=1 snap list 2>&1 | MATCH "DEBUG: restarting into"
 
     echo "Ensure snap-confine from the core snap is run"
     test-snapd-sh.sh -c 'echo hello'
-
 
     echo "Check if snap-confine profile generation test is applicable"
     if [ "$(aa-enabled)" != "Yes" ]; then

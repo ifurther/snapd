@@ -28,11 +28,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/snapcore/snapd/asserts"
+	"github.com/snapcore/snapd/asserts/snapasserts"
 	"github.com/snapcore/snapd/jsonutil"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/randutil"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 )
 
 // Context represents the context under which the snap is calling back into snapd.
@@ -46,7 +49,7 @@ type Context struct {
 	id      string
 	handler Handler
 
-	cache  map[interface{}]interface{}
+	cache  map[any]any
 	onDone []func() error
 
 	mutex        sync.Mutex
@@ -72,11 +75,11 @@ func NewContext(task *state.Task, state *state.State, setup *HookSetup, handler 
 		setup:   setup,
 		id:      contextID,
 		handler: handler,
-		cache:   make(map[interface{}]interface{}),
+		cache:   make(map[any]any),
 	}, nil
 }
 
-func newEphemeralHookContextWithData(st *state.State, setup *HookSetup, contextData map[string]interface{}) (*Context, error) {
+func newEphemeralHookContextWithData(st *state.State, setup *HookSetup, contextData map[string]any) (*Context, error) {
 	context, err := NewContext(nil, st, setup, nil, "")
 	if err != nil {
 		return nil, err
@@ -96,8 +99,36 @@ func newEphemeralHookContextWithData(st *state.State, setup *HookSetup, contextD
 }
 
 // InstanceName returns the name of the snap instance containing the hook.
-func (c *Context) InstanceName() string {
-	return c.setup.Snap
+func (c *Context) InstanceName() naming.InstanceName {
+	return naming.InstanceName(c.setup.Snap)
+}
+
+// HookSource returns a string that identifies the source of a hook. This could
+// either be a snap or a component. Snaps will be in the form "<snap_instance>".
+// Components will be in the form "<snap_instance>+<component_name>".
+func (c *Context) HookSource() string {
+	if c.setup.Component == "" {
+		return c.setup.Snap
+	}
+
+	return snap.SnapComponentName(c.setup.Snap, c.setup.Component)
+}
+
+// IsComponentHook returns true if this context is associated with a component
+// hook.
+func (c *Context) IsComponentHook() bool {
+	return !c.IsSnapHook()
+}
+
+// IsSnapHook returns true if this context is associated with a snap hook.
+func (c *Context) IsSnapHook() bool {
+	return c.setup.Component == ""
+}
+
+// ComponentName returns the name of the component containing the hook. If the
+// hook is not associated with a component, it returns an empty string.
+func (c *Context) ComponentName() string {
+	return c.setup.Component
 }
 
 // SnapRevision returns the revision of the snap containing the hook.
@@ -105,10 +136,76 @@ func (c *Context) SnapRevision() snap.Revision {
 	return c.setup.Revision
 }
 
+// ComponentRevision returns the revision of the snap component containing the
+// hook. This returned revision is only valid if the hook is a component hook.
+func (c *Context) ComponentRevision() snap.Revision {
+	return c.setup.ComponentRevision
+}
+
 // Task returns the task associated with the hook or (nil, false) if the context is ephemeral
 // and task is not available.
 func (c *Context) Task() (*state.Task, bool) {
 	return c.task, c.task != nil
+}
+
+// PendingValidationSets returns the validation sets that are being enforced by
+// the current change, if there are any. The change associated with the hook's
+// task is introspected for an "enforce-validation-sets" task and decodes the
+// assertions stored in the "validation-sets" field. If no such task exists, or
+// the field is missing, the function returns (nil, nil).
+//
+// Ephemeral hooks always return (nil, nil).
+func (c *Context) PendingValidationSets() (*snapasserts.ValidationSets, error) {
+	task, ok := c.Task()
+	if !ok {
+		return nil, nil
+	}
+
+	change := task.Change()
+	if change == nil {
+		return nil, nil
+	}
+
+	var enforce *state.Task
+	for _, t := range change.Tasks() {
+		if t.Kind() == "enforce-validation-sets" {
+			enforce = t
+			break
+		}
+	}
+	if enforce == nil {
+		return nil, nil
+	}
+
+	encoded := make(map[string][]byte)
+	if err := enforce.Get("validation-sets", &encoded); err != nil {
+		if errors.Is(err, &state.NoStateError{}) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	if len(encoded) == 0 {
+		return nil, nil
+	}
+
+	sets := snapasserts.NewValidationSets()
+	for _, data := range encoded {
+		decoded, err := asserts.Decode(data)
+		if err != nil {
+			return nil, err
+		}
+
+		vs, ok := decoded.(*asserts.ValidationSet)
+		if !ok {
+			return nil, errors.New("expected encoded assertion to be of type ValidationSet")
+		}
+
+		if err := sets.Add(vs); err != nil {
+			return nil, err
+		}
+	}
+	return sets, nil
 }
 
 // HookName returns the name of the hook in this context.
@@ -161,7 +258,7 @@ func (c *Context) writing() {
 // Set associates value with key. The provided value must properly marshal and
 // unmarshal with encoding/json. Note that the context needs to be locked and
 // unlocked by the caller.
-func (c *Context) Set(key string, value interface{}) {
+func (c *Context) Set(key string, value any) {
 	c.writing()
 
 	var data map[string]*json.RawMessage
@@ -193,7 +290,7 @@ func (c *Context) Set(key string, value interface{}) {
 // Get unmarshals the stored value associated with the provided key into the
 // value parameter. Note that the context needs to be locked/unlocked by the
 // caller.
-func (c *Context) Get(key string, value interface{}) error {
+func (c *Context) Get(key string, value any) error {
 	c.reading()
 
 	var data map[string]*json.RawMessage
@@ -229,7 +326,7 @@ func (c *Context) State() *state.State {
 // Cached returns the cached value associated with the provided key. It returns
 // nil if there is no entry for key. Note that the context needs to be locked
 // and unlocked by the caller.
-func (c *Context) Cached(key interface{}) interface{} {
+func (c *Context) Cached(key any) any {
 	c.reading()
 
 	return c.cache[key]
@@ -237,7 +334,7 @@ func (c *Context) Cached(key interface{}) interface{} {
 
 // Cache associates value with key. The cached value is not persisted. Note that
 // the context needs to be locked/unlocked by the caller.
-func (c *Context) Cache(key, value interface{}) {
+func (c *Context) Cache(key, value any) {
 	c.writing()
 
 	c.cache[key] = value
@@ -289,7 +386,7 @@ func (c *Context) ChangeID() string {
 // or the task log.
 //
 // Context must be locked.
-func (c *Context) Logf(fmt string, args ...interface{}) {
+func (c *Context) Logf(fmt string, args ...any) {
 	c.writing()
 	if c.IsEphemeral() {
 		logger.Noticef(fmt, args...)
@@ -302,7 +399,7 @@ func (c *Context) Logf(fmt string, args ...interface{}) {
 // ephemeral contexts or the task log.
 //
 // Context must be locked.
-func (c *Context) Errorf(format string, args ...interface{}) {
+func (c *Context) Errorf(format string, args ...any) {
 	c.writing()
 	if c.IsEphemeral() {
 		// XXX: loger has no Errorf() :/

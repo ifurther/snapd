@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2016 Canonical Ltd
+ * Copyright (C) 2016-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -22,6 +22,7 @@ package ifacetest
 import (
 	"github.com/snapcore/snapd/interfaces"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/timings"
 )
 
@@ -31,11 +32,11 @@ type TestSecurityBackend struct {
 	// SetupCalls stores information about all calls to Setup
 	SetupCalls []TestSetupCall
 	// RemoveCalls stores information about all calls to Remove
-	RemoveCalls []string
+	RemoveCalls []naming.InstanceName
 	// SetupCallback is an callback that is optionally called in Setup
-	SetupCallback func(appSet *interfaces.SnapAppSet, opts interfaces.ConfinementOptions, repo *interfaces.Repository) error
+	SetupCallback func(appSet *interfaces.SnapAppSet, opts interfaces.ConfinementOptions, sctx interfaces.SetupContext, repo *interfaces.Repository) error
 	// RemoveCallback is a callback that is optionally called in Remove
-	RemoveCallback func(snapName string) error
+	RemoveCallback func(instanceName naming.InstanceName) error
 	// SandboxFeaturesCallback is a callback that is optionally called in SandboxFeatures
 	SandboxFeaturesCallback func() []string
 }
@@ -46,6 +47,8 @@ type TestSetupCall struct {
 	AppSet *interfaces.SnapAppSet
 	// Options is a copy of the confinement options to a particular call to Setup
 	Options interfaces.ConfinementOptions
+	// SetupContext is a copy of the setup context to a particular call to Setup
+	SetupContext interfaces.SetupContext
 }
 
 // Initialize does nothing.
@@ -58,25 +61,29 @@ func (b *TestSecurityBackend) Name() interfaces.SecuritySystem {
 	return b.BackendName
 }
 
+func (b *TestSecurityBackend) Prepare(_ *interfaces.SnapAppSet) error {
+	return nil
+}
+
 // Setup records information about the call and calls the setup callback if one is defined.
-func (b *TestSecurityBackend) Setup(appSet *interfaces.SnapAppSet, opts interfaces.ConfinementOptions, repo *interfaces.Repository, tm timings.Measurer) error {
-	b.SetupCalls = append(b.SetupCalls, TestSetupCall{AppSet: appSet, Options: opts})
+func (b *TestSecurityBackend) Setup(appSet *interfaces.SnapAppSet, opts interfaces.ConfinementOptions, sctx interfaces.SetupContext, repo *interfaces.Repository, tm timings.Measurer) error {
+	b.SetupCalls = append(b.SetupCalls, TestSetupCall{AppSet: appSet, Options: opts, SetupContext: sctx})
 	if b.SetupCallback == nil {
 		return nil
 	}
-	return b.SetupCallback(appSet, opts, repo)
+	return b.SetupCallback(appSet, opts, sctx, repo)
 }
 
 // Remove records information about the call and calls the remove callback if one is defined
-func (b *TestSecurityBackend) Remove(snapName string) error {
-	b.RemoveCalls = append(b.RemoveCalls, snapName)
+func (b *TestSecurityBackend) Remove(instanceName naming.InstanceName) error {
+	b.RemoveCalls = append(b.RemoveCalls, instanceName)
 	if b.RemoveCallback == nil {
 		return nil
 	}
-	return b.RemoveCallback(snapName)
+	return b.RemoveCallback(instanceName)
 }
 
-func (b *TestSecurityBackend) NewSpecification(*interfaces.SnapAppSet) interfaces.Specification {
+func (b *TestSecurityBackend) NewSpecification(*interfaces.SnapAppSet, interfaces.ConfinementOptions) interfaces.Specification {
 	return &Specification{}
 }
 
@@ -95,7 +102,12 @@ type TestSecurityBackendSetupMany struct {
 	SetupManyCalls []TestSetupManyCall
 
 	// SetupManyCallback is an callback that is optionally called in Setup
-	SetupManyCallback func(appSets []*interfaces.SnapAppSet, confinement func(snapName string) interfaces.ConfinementOptions, repo *interfaces.Repository, tm timings.Measurer) []error
+	SetupManyCallback func(appSets []*interfaces.SnapAppSet,
+		confinement func(instanceName naming.InstanceName) interfaces.ConfinementOptions,
+		sctx func(instanceName naming.InstanceName) interfaces.SetupContext,
+		repo *interfaces.Repository,
+		tm timings.Measurer,
+	) []error
 }
 
 // TestSetupManyCall stores details about calls to TestSecurityBackendMany.SetupMany
@@ -104,12 +116,12 @@ type TestSetupManyCall struct {
 	AppSets []*interfaces.SnapAppSet
 }
 
-func (b *TestSecurityBackendSetupMany) SetupMany(appSets []*interfaces.SnapAppSet, confinement func(snapName string) interfaces.ConfinementOptions, repo *interfaces.Repository, tm timings.Measurer) []error {
+func (b *TestSecurityBackendSetupMany) SetupMany(appSets []*interfaces.SnapAppSet, confinement func(instanceName naming.InstanceName) interfaces.ConfinementOptions, sctx func(instanceName naming.InstanceName) interfaces.SetupContext, repo *interfaces.Repository, tm timings.Measurer) []error {
 	b.SetupManyCalls = append(b.SetupManyCalls, TestSetupManyCall{AppSets: appSets})
 	if b.SetupManyCallback == nil {
 		return nil
 	}
-	return b.SetupManyCallback(appSets, confinement, repo, tm)
+	return b.SetupManyCallback(appSets, confinement, sctx, repo, tm)
 }
 
 // TestSecurityBackendDiscardingLate implements RemoveLate on top of TestSecurityBackend.
@@ -117,15 +129,59 @@ type TestSecurityBackendDiscardingLate struct {
 	TestSecurityBackend
 
 	RemoveLateCalledFor [][]string
-	RemoveLateCallback  func(snapName string, rev snap.Revision, typ snap.Type) error
+	RemoveLateCallback  func(instanceName naming.InstanceName, rev snap.Revision, typ snap.Type) error
 }
 
-func (b *TestSecurityBackendDiscardingLate) RemoveLate(snapName string, rev snap.Revision, typ snap.Type) error {
+func (b *TestSecurityBackendDiscardingLate) RemoveLate(instanceName naming.InstanceName, rev snap.Revision, typ snap.Type) error {
 	b.RemoveLateCalledFor = append(b.RemoveLateCalledFor, []string{
-		snapName, rev.String(), string(typ),
+		instanceName.String(), rev.String(), string(typ),
 	})
 	if b.RemoveLateCallback == nil {
 		return nil
 	}
-	return b.RemoveLateCallback(snapName, rev, typ)
+	return b.RemoveLateCallback(instanceName, rev, typ)
+}
+
+// TestSecurityBackendReinitializable implements Reinitialize on top of
+// TestSecurityBackend.
+type TestSecurityBackendReinitializable struct {
+	TestSecurityBackend
+
+	ReinitializeCalls int
+
+	ReinitializeCallback func() error
+}
+
+var (
+	_ interfaces.ReinitializableSecurityBackend = (*TestSecurityBackendReinitializable)(nil)
+)
+
+func (b *TestSecurityBackendReinitializable) Reinitialize() error {
+	b.ReinitializeCalls++
+	if b.ReinitializeCallback == nil {
+		return nil
+	}
+	return b.ReinitializeCallback()
+}
+
+// TestSecurityBackendDelayedEffects implements DelayedSideEffectsBackend on top
+// of TestSecurityBackend.
+type TestSecurityBackendDelayedEffects struct {
+	TestSecurityBackend
+
+	ApplyDelayedEffectsCalls int
+
+	ApplyDelayedEffectsCallback func(appSet *interfaces.SnapAppSet, effs []interfaces.DelayedSideEffect) error
+}
+
+var (
+	_ interfaces.DelayedSideEffectsBackend = (*TestSecurityBackendDelayedEffects)(nil)
+)
+
+func (b *TestSecurityBackendDelayedEffects) ApplyDelayedEffects(appSet *interfaces.SnapAppSet, effs []interfaces.DelayedSideEffect, tm timings.Measurer) error {
+	b.ApplyDelayedEffectsCalls++
+	if b.ApplyDelayedEffectsCallback == nil {
+		return nil
+	}
+	return b.ApplyDelayedEffectsCallback(appSet, effs)
 }

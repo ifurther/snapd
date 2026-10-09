@@ -72,9 +72,9 @@ owner /{,var/}run/user/*/pulse/pid r,
 `
 
 const pulseaudioConnectedPlugAppArmorCore = `
-owner /run/user/[0-9]*/###PLUG_SECURITY_TAGS###/pulse/ r,
-owner /run/user/[0-9]*/###PLUG_SECURITY_TAGS###/pulse/native rwk,
-owner /run/user/[0-9]*/###PLUG_SECURITY_TAGS###/pulse/pid r,
+owner /run/user/[0-9]*/###SLOT_SECURITY_TAGS###/pulse/ r,
+owner /run/user/[0-9]*/###SLOT_SECURITY_TAGS###/pulse/native rwk,
+owner /run/user/[0-9]*/###SLOT_SECURITY_TAGS###/pulse/pid r,
 `
 
 const pulseaudioConnectedPlugSecComp = `
@@ -160,8 +160,8 @@ func (iface *pulseAudioInterface) AppArmorConnectedPlug(spec *apparmor.Specifica
 		spec.AddSnippet(pulseaudioConnectedPlugAppArmorDesktop)
 	}
 	if !implicitSystemConnectedSlot(slot) {
-		old := "###PLUG_SECURITY_TAGS###"
-		new := "snap." + slot.Snap().InstanceName() // forms the snap-instance-specific subdirectory name of /run/user/*/ used for XDG_RUNTIME_DIR
+		old := "###SLOT_SECURITY_TAGS###"
+		new := "snap." + slot.Snap().InstanceName().String() // forms the snap-instance-specific subdirectory name of /run/user/*/ used for XDG_RUNTIME_DIR
 		snippet := strings.Replace(pulseaudioConnectedPlugAppArmorCore, old, new, -1)
 		spec.AddSnippet(snippet)
 	}
@@ -192,6 +192,12 @@ func (iface *pulseAudioInterface) SecCompPermanentSlot(spec *seccomp.Specificati
 
 func (iface *pulseAudioInterface) AutoConnect(*snap.PlugInfo, *snap.SlotInfo) bool {
 	return true
+}
+
+func (iface *pulseAudioInterface) ParallelInstancesSupportedForSlot(_ *snap.SlotInfo) error {
+	// PulseAudio owns the well-known /run/pulse/native (or per-user
+	// /run/user/*/pulse/native) socket; only one snap instance can hold it.
+	return errParallelInstancesUniqueResourceOwner
 }
 
 func init() {

@@ -22,6 +22,7 @@ package daemon_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -32,17 +33,27 @@ import (
 	"gopkg.in/check.v1"
 
 	"github.com/snapcore/snapd/arch"
+	"github.com/snapcore/snapd/asserts"
 	"github.com/snapcore/snapd/boot"
 	"github.com/snapcore/snapd/daemon"
 	"github.com/snapcore/snapd/dirs"
+	"github.com/snapcore/snapd/dirs/dirstest"
 	"github.com/snapcore/snapd/features"
+	"github.com/snapcore/snapd/interfaces"
 	"github.com/snapcore/snapd/interfaces/ifacetest"
+	"github.com/snapcore/snapd/overlord/assertstate/assertstatetest"
 	"github.com/snapcore/snapd/overlord/auth"
 	"github.com/snapcore/snapd/overlord/configstate/config"
+	"github.com/snapcore/snapd/overlord/devicestate"
+	"github.com/snapcore/snapd/overlord/fdestate"
+	"github.com/snapcore/snapd/overlord/hookstate"
+	"github.com/snapcore/snapd/overlord/hookstate/ctlcmd"
+	"github.com/snapcore/snapd/overlord/install"
+	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/release"
 	"github.com/snapcore/snapd/sandbox"
-	"github.com/snapcore/snapd/systemd"
+	"github.com/snapcore/snapd/snap"
 )
 
 var _ = check.Suite(&generalSuite{})
@@ -51,8 +62,24 @@ type generalSuite struct {
 	apiBaseSuite
 }
 
+func (s *generalSuite) expectSystemInfoReadAccess() {
+	s.expectReadAccess(daemon.InterfaceOpenAccess{Interfaces: []string{"snap-interfaces-requests-control"}})
+}
+
+func (s *generalSuite) expectSystemInfoWriteAccess() {
+	s.expectWriteAccess(daemon.OpenAccess{})
+}
+
 func (s *generalSuite) expectChangesReadAccess() {
 	s.expectReadAccess(daemon.InterfaceOpenAccess{Interfaces: []string{"snap-refresh-observe"}})
+}
+
+func (s *generalSuite) expectChangeReadAccess() {
+	s.expectReadAccess(daemon.InterfaceOpenAccess{Interfaces: []string{"snap-refresh-observe", "ros-snapd-support"}})
+}
+
+func (s *generalSuite) expectSystemInfoStorageEncReadAccess() {
+	s.expectReadAccess(daemon.OpenAccess{})
 }
 
 func (s *generalSuite) TestRoot(c *check.C) {
@@ -65,11 +92,11 @@ func (s *generalSuite) TestRoot(c *check.C) {
 	s.checkGetOnly(c, req)
 
 	rec := httptest.NewRecorder()
-	s.req(c, req, nil).ServeHTTP(rec, nil)
+	s.req(c, req, nil, actionIsExpected).ServeHTTP(rec, nil)
 	c.Check(rec.Code, check.Equals, 200)
 	c.Check(rec.Header().Get("Content-Type"), check.Equals, "application/json")
 
-	expected := []interface{}{"TBD"}
+	expected := []any{"TBD"}
 	var rsp daemon.RespJSON
 	c.Assert(json.Unmarshal(rec.Body.Bytes(), &rsp), check.IsNil)
 	c.Check(rsp.Status, check.Equals, 200)
@@ -77,14 +104,33 @@ func (s *generalSuite) TestRoot(c *check.C) {
 }
 
 func (s *generalSuite) TestSysInfo(c *check.C) {
+	s.expectSystemInfoReadAccess()
 	req, err := http.NewRequest("GET", "/v2/system-info", nil)
 	c.Assert(err, check.IsNil)
 
+	// use Ubuntu 14.04 so UserDaemons is unsupported
+	restore := release.MockReleaseInfo(&release.OS{ID: "ubuntu", VersionID: "14.04"})
+	defer restore()
+	restore = release.MockOnClassic(true)
+	defer restore()
+	restore = sandbox.MockForceDevMode(true)
+	defer restore()
+
+	r := c.MkDir()
+	// using unknown distro, set up
+	dirstest.MustMockAltSnapMountDir(r)
+	dirstest.MustMockClassicConfinementAltDirSupport(r)
+	// reload dirs for release info to have effect
+	dirs.SetRootDir(r)
+
+	restore = daemon.MockSystemdVirt("magic")
+	defer restore()
+	buildID := "this-is-my-build-id"
+	restore = daemon.MockBuildID(buildID)
+	defer restore()
+
 	d := s.daemon(c)
 	d.Version = "42b1"
-
-	// check it only does GET
-	s.checkGetOnly(c, req)
 
 	// set both legacy and new refresh schedules. new one takes priority
 	st := d.Overlord().State()
@@ -93,56 +139,41 @@ func (s *generalSuite) TestSysInfo(c *check.C) {
 	tr.Set("core", "refresh.schedule", "00:00-9:00/12:00-13:00")
 	tr.Set("core", "refresh.timer", "8:00~9:00/2")
 	tr.Set("core", "experimental.parallel-instances", "false")
-	tr.Set("core", "experimental.quota-groups", "true")
+	tr.Set("core", "experimental.user-daemons", "true")
 	tr.Commit()
 	st.Unlock()
 
-	restore := release.MockReleaseInfo(&release.OS{ID: "distro-id", VersionID: "1.2"})
-	defer restore()
-	restore = release.MockOnClassic(true)
-	defer restore()
-	restore = sandbox.MockForceDevMode(true)
-	defer restore()
-	// reload dirs for release info to have effect
-	dirs.SetRootDir(dirs.GlobalRootDir)
-	restore = daemon.MockSystemdVirt("magic")
-	defer restore()
-	// Set systemd version <230 so QuotaGroups feature unsupported
-	restore = systemd.MockSystemdVersion(229, nil)
-	defer restore()
-
-	buildID := "this-is-my-build-id"
-	restore = daemon.MockBuildID(buildID)
-	defer restore()
+	s.expectSystemInfoReadAccess()
 
 	rec := httptest.NewRecorder()
-	s.req(c, req, nil).ServeHTTP(rec, nil)
+	s.req(c, req, nil, actionIsExpected).ServeHTTP(rec, nil)
 	c.Check(rec.Code, check.Equals, 200)
 	c.Check(rec.Header().Get("Content-Type"), check.Equals, "application/json")
 
-	expected := map[string]interface{}{
+	expected := map[string]any{
 		"series":  "16",
 		"version": "42b1",
-		"os-release": map[string]interface{}{
-			"id":         "distro-id",
-			"version-id": "1.2",
+		"os-release": map[string]any{
+			"id":         "ubuntu",
+			"version-id": "14.04",
 		},
 		"build-id":   buildID,
 		"on-classic": true,
 		"managed":    false,
-		"locations": map[string]interface{}{
+		"locations": map[string]any{
 			"snap-mount-dir": dirs.SnapMountDir,
 			"snap-bin-dir":   dirs.SnapBinariesDir,
 		},
-		"refresh": map[string]interface{}{
+		"refresh": map[string]any{
 			// only the "timer" field
 			"timer": "8:00~9:00/2",
 		},
 		"confinement":      "partial",
-		"sandbox-features": map[string]interface{}{"confinement-options": []interface{}{"classic", "devmode"}},
+		"sandbox-features": map[string]any{"confinement-options": []any{"classic", "devmode"}},
 		"architecture":     arch.DpkgArchitecture(),
 		"virtualization":   "magic",
 		"system-mode":      "run",
+		"snapd-bin-from":   "native-package",
 	}
 	var rsp daemon.RespJSON
 	c.Assert(json.Unmarshal(rec.Body.Bytes(), &rsp), check.IsNil)
@@ -150,58 +181,46 @@ func (s *generalSuite) TestSysInfo(c *check.C) {
 	c.Check(rsp.Type, check.Equals, daemon.ResponseTypeSync)
 	// Ensure that we had a kernel-verrsion but don't check the actual value.
 	const kernelVersionKey = "kernel-version"
-	c.Check(rsp.Result.(map[string]interface{})[kernelVersionKey], check.Not(check.Equals), "")
-	delete(rsp.Result.(map[string]interface{}), kernelVersionKey)
+	c.Check(rsp.Result.(map[string]any)[kernelVersionKey], check.Not(check.Equals), "")
+	delete(rsp.Result.(map[string]any), kernelVersionKey)
 	// Extract "features" field and remove it from result; check it later.
 	const featuresKey = "features"
-	resultFeatures := rsp.Result.(map[string]interface{})[featuresKey]
+	resultFeatures := rsp.Result.(map[string]any)[featuresKey]
 	c.Check(resultFeatures, check.Not(check.Equals), "")
-	delete(rsp.Result.(map[string]interface{}), featuresKey)
+	delete(rsp.Result.(map[string]any), featuresKey)
 
 	c.Check(rsp.Result, check.DeepEquals, expected)
 
 	// Check that "features" is map
-	featuresAll, ok := resultFeatures.(map[string]interface{})
+	featuresAll, ok := resultFeatures.(map[string]any)
 	c.Assert(ok, check.Equals, true)
-	// Ensure that Layouts exists and is feature.FeatureInfo
-	layoutsInfoRaw, exists := featuresAll[features.Layouts.String()]
-	c.Assert(exists, check.Equals, true)
-	layoutsInfo, ok := layoutsInfoRaw.(map[string]interface{})
-	c.Assert(ok, check.Equals, true, check.Commentf("%+v", layoutsInfoRaw))
-	// Ensure that Layouts is supported and enabled
-	c.Check(layoutsInfo["supported"], check.Equals, true)
-	_, exists = layoutsInfo["unsupported-reason"]
-	c.Check(exists, check.Equals, false)
-	c.Check(layoutsInfo["enabled"], check.Equals, true)
 	// Ensure that ParallelInstances exists and is a feature.FeatureInfo
 	parallelInstancesInfoRaw, exists := featuresAll[features.ParallelInstances.String()]
 	c.Assert(exists, check.Equals, true)
-	parallelInstancesInfo, ok := parallelInstancesInfoRaw.(map[string]interface{})
+	parallelInstancesInfo, ok := parallelInstancesInfoRaw.(map[string]any)
 	c.Assert(ok, check.Equals, true)
 	// Ensure that ParallelInstances is supported and not enabled
 	c.Check(parallelInstancesInfo["supported"], check.Equals, true)
 	_, exists = parallelInstancesInfo["unsupported-reason"]
 	c.Check(exists, check.Equals, false)
 	c.Check(parallelInstancesInfo["enabled"], check.Equals, false)
-	// Ensure that QuotaGroups exists and is a feature.FeatureInfo
-	quotaGroupsInfoRaw, exists := featuresAll[features.QuotaGroups.String()]
+	// ensure that UserDaemons exists and is a feature.FeatureInfo.
+	userDaemonsInfoRaw, exists := featuresAll[features.UserDaemons.String()]
 	c.Assert(exists, check.Equals, true)
-	quotaGroupsInfo, ok := quotaGroupsInfoRaw.(map[string]interface{})
+	userDaemonsInfo, ok := userDaemonsInfoRaw.(map[string]any)
 	c.Assert(ok, check.Equals, true)
-	// Ensure that QuotaGroups is unsupported but enabled
-	c.Check(quotaGroupsInfo["supported"], check.Equals, false)
-	unsupportedReason, exists := quotaGroupsInfo["unsupported-reason"]
+	// ensure that UserDaemons is unsupported but enabled.
+	c.Check(userDaemonsInfo["supported"], check.Equals, false)
+	unsupportedReason, exists := userDaemonsInfo["unsupported-reason"]
 	c.Check(exists, check.Equals, true)
 	c.Check(unsupportedReason, check.Not(check.Equals), "")
-	c.Check(quotaGroupsInfo["enabled"], check.Equals, true)
+	c.Check(userDaemonsInfo["enabled"], check.Equals, true)
 }
 
 func (s *generalSuite) TestSysInfoLegacyRefresh(c *check.C) {
+	s.expectSystemInfoReadAccess()
 	req, err := http.NewRequest("GET", "/v2/system-info", nil)
 	c.Assert(err, check.IsNil)
-
-	d := s.daemon(c)
-	d.Version = "42b1"
 
 	restore := release.MockReleaseInfo(&release.OS{ID: "distro-id", VersionID: "1.2"})
 	defer restore()
@@ -211,8 +230,20 @@ func (s *generalSuite) TestSysInfoLegacyRefresh(c *check.C) {
 	defer restore()
 	restore = daemon.MockSystemdVirt("kvm")
 	defer restore()
+
+	buildID := "this-is-my-build-id"
+	restore = daemon.MockBuildID(buildID)
+	defer restore()
+
+	r := c.MkDir()
+	// using unknown distro, set up
+	dirstest.MustMockAltSnapMountDir(r)
+	dirstest.MustMockClassicConfinementAltDirSupport(r)
 	// reload dirs for release info to have effect
-	dirs.SetRootDir(dirs.GlobalRootDir)
+	dirs.SetRootDir(r)
+
+	d := s.daemon(c)
+	d.Version = "42b1"
 
 	// set the legacy refresh schedule
 	st := d.Overlord().State()
@@ -230,54 +261,128 @@ func (s *generalSuite) TestSysInfoLegacyRefresh(c *check.C) {
 	})
 	c.Assert(err, check.IsNil)
 
-	buildID := "this-is-my-build-id"
-	restore = daemon.MockBuildID(buildID)
-	defer restore()
+	s.expectSystemInfoReadAccess()
 
 	rec := httptest.NewRecorder()
-	s.req(c, req, nil).ServeHTTP(rec, nil)
+	s.req(c, req, nil, actionIsExpected).ServeHTTP(rec, nil)
 	c.Check(rec.Code, check.Equals, 200)
 	c.Check(rec.Header().Get("Content-Type"), check.Equals, "application/json")
 
-	expected := map[string]interface{}{
+	expected := map[string]any{
 		"series":  "16",
 		"version": "42b1",
-		"os-release": map[string]interface{}{
+		"os-release": map[string]any{
 			"id":         "distro-id",
 			"version-id": "1.2",
 		},
 		"build-id":   buildID,
 		"on-classic": true,
 		"managed":    false,
-		"locations": map[string]interface{}{
+		"locations": map[string]any{
 			"snap-mount-dir": dirs.SnapMountDir,
 			"snap-bin-dir":   dirs.SnapBinariesDir,
 		},
-		"refresh": map[string]interface{}{
+		"refresh": map[string]any{
 			// only the "schedule" field
 			"schedule": "00:00-9:00/12:00-13:00",
 		},
 		"confinement": "partial",
-		"sandbox-features": map[string]interface{}{
-			"apparmor":            []interface{}{"feature-1", "feature-2"},
-			"confinement-options": []interface{}{"classic", "devmode"}, // we know it's this because of the release.Mock... calls above
+		"sandbox-features": map[string]any{
+			"apparmor":            []any{"feature-1", "feature-2"},
+			"confinement-options": []any{"classic", "devmode"}, // we know it's this because of the release.Mock... calls above
 		},
 		"architecture":   arch.DpkgArchitecture(),
 		"virtualization": "kvm",
 		"system-mode":    "run",
+		"snapd-bin-from": "native-package",
 	}
 	var rsp daemon.RespJSON
 	c.Assert(json.Unmarshal(rec.Body.Bytes(), &rsp), check.IsNil)
 	c.Check(rsp.Status, check.Equals, 200)
 	c.Check(rsp.Type, check.Equals, daemon.ResponseTypeSync)
 	const kernelVersionKey = "kernel-version"
-	delete(rsp.Result.(map[string]interface{}), kernelVersionKey)
+	delete(rsp.Result.(map[string]any), kernelVersionKey)
 	const featuresKey = "features"
-	delete(rsp.Result.(map[string]interface{}), featuresKey)
+	delete(rsp.Result.(map[string]any), featuresKey)
 	c.Check(rsp.Result, check.DeepEquals, expected)
 }
 
+func (s *generalSuite) testSysInfoBinOrigin(c *check.C, exp string, expErr string) {
+	s.expectSystemInfoReadAccess()
+	req, err := http.NewRequest("GET", "/v2/system-info", nil)
+	c.Assert(err, check.IsNil)
+
+	restore := release.MockReleaseInfo(&release.OS{ID: "distro-id", VersionID: "1.2"})
+	defer restore()
+	restore = release.MockOnClassic(true)
+	defer restore()
+	restore = sandbox.MockForceDevMode(true)
+	defer restore()
+
+	r := c.MkDir()
+	// using unknown distro, set up
+	dirstest.MustMockAltSnapMountDir(r)
+	dirstest.MustMockClassicConfinementAltDirSupport(r)
+	// reload dirs for release info to have effect
+	dirs.SetRootDir(r)
+
+	restore = daemon.MockSystemdVirt("magic")
+	defer restore()
+	buildID := "this-is-my-build-id"
+	restore = daemon.MockBuildID(buildID)
+	defer restore()
+
+	d := s.daemon(c)
+	d.Version = "42b1"
+
+	s.expectSystemInfoReadAccess()
+
+	rec := httptest.NewRecorder()
+	s.req(c, req, nil, actionIsExpected).ServeHTTP(rec, nil)
+	if expErr == "" {
+		c.Check(rec.Code, check.Equals, 200)
+		c.Check(rec.Header().Get("Content-Type"), check.Equals, "application/json")
+
+		var rsp daemon.RespJSON
+		c.Assert(json.Unmarshal(rec.Body.Bytes(), &rsp), check.IsNil)
+		c.Check(rsp.Status, check.Equals, 200)
+		c.Check(rsp.Type, check.Equals, daemon.ResponseTypeSync)
+
+		m, _ := rsp.Result.(map[string]any)
+		c.Assert(m, check.NotNil)
+		c.Check(m["snapd-bin-from"], check.Equals, exp)
+	} else {
+		c.Check(rec.Code, check.Equals, 500)
+		c.Check(rec.Header().Get("Content-Type"), check.Equals, "application/json")
+		assertResponseBody(c, rec.Body, map[string]any{
+			"type":        "error",
+			"status-code": float64(500),
+			"status":      "Internal Server Error",
+			"result": map[string]any{
+				"message": `cannot obtain snapd reexec status: mock error`,
+			},
+		})
+	}
+}
+
+func (s *generalSuite) TestSysInfoBinOriginSnapd(c *check.C) {
+	defer daemon.MockSnapdtoolsIsReexecd(func() (bool, error) {
+		return true, nil
+	})()
+
+	s.testSysInfoBinOrigin(c, "snap", "")
+}
+
+func (s *generalSuite) TestSysInfoBinOriginError(c *check.C) {
+	defer daemon.MockSnapdtoolsIsReexecd(func() (bool, error) {
+		return false, errors.New("mock error")
+	})()
+
+	s.testSysInfoBinOrigin(c, "", "foo bar")
+}
+
 func (s *generalSuite) testSysInfoSystemMode(c *check.C, mode string) {
+	s.expectSystemInfoReadAccess()
 	req, err := http.NewRequest("GET", "/v2/system-info", nil)
 	c.Assert(err, check.IsNil)
 
@@ -317,43 +422,44 @@ func (s *generalSuite) testSysInfoSystemMode(c *check.C, mode string) {
 	defer restore()
 
 	rec := httptest.NewRecorder()
-	s.req(c, req, nil).ServeHTTP(rec, nil)
+	s.req(c, req, nil, actionIsExpected).ServeHTTP(rec, nil)
 	c.Check(rec.Code, check.Equals, 200)
 	c.Check(rec.Header().Get("Content-Type"), check.Equals, "application/json")
 
-	expected := map[string]interface{}{
+	expected := map[string]any{
 		"series":  "16",
 		"version": "42b1",
-		"os-release": map[string]interface{}{
+		"os-release": map[string]any{
 			"id":         "distro-id",
 			"version-id": "1.2",
 		},
 		"build-id":   buildID,
 		"on-classic": false,
 		"managed":    false,
-		"locations": map[string]interface{}{
+		"locations": map[string]any{
 			"snap-mount-dir": dirs.SnapMountDir,
 			"snap-bin-dir":   dirs.SnapBinariesDir,
 		},
-		"refresh": map[string]interface{}{
+		"refresh": map[string]any{
 			"timer": "00:00~24:00/4",
 		},
 		"confinement": "strict",
-		"sandbox-features": map[string]interface{}{
-			"apparmor":            []interface{}{"feature-1", "feature-2"},
-			"confinement-options": []interface{}{"devmode", "strict"}, // we know it's this because of the release.Mock... calls above
+		"sandbox-features": map[string]any{
+			"apparmor":            []any{"feature-1", "feature-2"},
+			"confinement-options": []any{"devmode", "strict"}, // we know it's this because of the release.Mock... calls above
 		},
-		"architecture": arch.DpkgArchitecture(),
-		"system-mode":  mode,
+		"architecture":   arch.DpkgArchitecture(),
+		"system-mode":    mode,
+		"snapd-bin-from": "native-package",
 	}
 	var rsp daemon.RespJSON
 	c.Assert(json.Unmarshal(rec.Body.Bytes(), &rsp), check.IsNil)
 	c.Check(rsp.Status, check.Equals, 200)
 	c.Check(rsp.Type, check.Equals, daemon.ResponseTypeSync)
 	const kernelVersionKey = "kernel-version"
-	delete(rsp.Result.(map[string]interface{}), kernelVersionKey)
+	delete(rsp.Result.(map[string]any), kernelVersionKey)
 	const featuresKey = "features"
-	delete(rsp.Result.(map[string]interface{}), featuresKey)
+	delete(rsp.Result.(map[string]any), featuresKey)
 	c.Check(rsp.Result, check.DeepEquals, expected)
 }
 
@@ -369,6 +475,7 @@ func (s *generalSuite) TestSysInfoSystemModeInstall(c *check.C) {
 	s.testSysInfoSystemMode(c, "install")
 }
 func (s *generalSuite) TestSysInfoIsManaged(c *check.C) {
+	s.expectSystemInfoReadAccess()
 	d := s.daemon(c)
 
 	st := d.Overlord().State()
@@ -385,11 +492,12 @@ func (s *generalSuite) TestSysInfoIsManaged(c *check.C) {
 	req, err := http.NewRequest("GET", "/v2/system-info", nil)
 	c.Assert(err, check.IsNil)
 
-	rsp := s.syncReq(c, req, nil)
-	c.Check(rsp.Result.(map[string]interface{})["managed"], check.Equals, true)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
+	c.Check(rsp.Result.(map[string]any)["managed"], check.Equals, true)
 }
 
 func (s *generalSuite) TestSysInfoWorksDegraded(c *check.C) {
+	s.expectSystemInfoReadAccess()
 	d := s.daemon(c)
 
 	d.SetDegradedMode(fmt.Errorf("some error"))
@@ -397,8 +505,286 @@ func (s *generalSuite) TestSysInfoWorksDegraded(c *check.C) {
 	req, err := http.NewRequest("GET", "/v2/system-info", nil)
 	c.Assert(err, check.IsNil)
 
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 	c.Check(rsp.Status, check.Equals, 200)
+}
+
+func (s *generalSuite) TestSysInfoClientAdviceProceedMatchingKey(c *check.C) {
+	s.expectSystemInfoWriteAccess()
+	s.daemon(c)
+
+	s.AddCleanup(interfaces.MockSystemKey(`
+{
+"build-id": "7a94e9736c091b3984bd63f5aebfc883c4d859e0",
+"apparmor-features": ["caps", "dbus"]
+}`))
+	c.Assert(interfaces.WriteSystemKey(interfaces.SystemKeyExtraData{}), check.IsNil)
+
+	k, err := interfaces.RecordedSystemKey()
+	c.Assert(err, check.IsNil)
+	ks := k.(fmt.Stringer).String()
+
+	b, err := json.Marshal(map[string]string{
+		"action":     "advise-system-key-mismatch",
+		"system-key": ks,
+	})
+	c.Assert(err, check.IsNil)
+	req, err := http.NewRequest("POST", "/v2/system-info", bytes.NewReader(b))
+	c.Assert(err, check.IsNil)
+
+	// no need to start overlord's loop as the key is a match
+	rec := httptest.NewRecorder()
+	s.req(c, req, nil, actionIsExpected).ServeHTTP(rec, nil)
+	c.Logf("rec: %v", rec)
+	c.Check(rec.Code, check.Equals, 200)
+}
+
+func (s *generalSuite) TestSysInfoClientAdviceAwaitChangeMismatch(c *check.C) {
+	s.expectSystemInfoWriteAccess()
+	d := s.daemon(c)
+	s.AddCleanup(interfaces.MockSystemKey(`
+{
+"build-id": "7a94e9736c091b3984bd63f5aebfc883c4d859e0",
+"apparmor-features": ["caps", "dbus"]
+}`))
+	c.Assert(interfaces.WriteSystemKey(interfaces.SystemKeyExtraData{}), check.IsNil)
+
+	k, err := interfaces.RecordedSystemKey()
+	c.Assert(err, check.IsNil)
+	ks := k.(fmt.Stringer).String()
+
+	// write a changed system key to cause a mismatch so that snapd and client
+	// observe different values
+	s.AddCleanup(interfaces.MockSystemKey(`
+{
+"build-id": "7a94e9736c091b3984bd63f5aebfc883c4d859e0",
+"apparmor-features": ["caps", "dbus", "new-feature"]
+}`))
+	c.Assert(interfaces.WriteSystemKey(interfaces.SystemKeyExtraData{}), check.IsNil)
+
+	b, err := json.Marshal(map[string]string{
+		"action":     "advise-system-key-mismatch",
+		"system-key": ks,
+	})
+	c.Assert(err, check.IsNil)
+	req, err := http.NewRequest("POST", "/v2/system-info", bytes.NewReader(b))
+	c.Assert(err, check.IsNil)
+
+	d.Overlord().Loop()
+	defer d.Overlord().Stop()
+
+	rec := httptest.NewRecorder()
+	s.req(c, req, nil, actionIsExpected).ServeHTTP(rec, nil)
+	c.Check(rec.Code, check.Equals, 202)
+
+	var body map[string]any
+	err = json.Unmarshal(rec.Body.Bytes(), &body)
+	c.Check(err, check.IsNil)
+	id := body["change"].(string)
+	st := d.Overlord().State()
+	st.Lock()
+	chg := st.Change(id)
+	c.Check(chg.Summary(), check.Equals, `Regenerate security profiles`)
+	st.Unlock()
+	c.Assert(chg, check.NotNil)
+}
+
+func (s *generalSuite) TestSysInfoClientAdviceInternalError(c *check.C) {
+	s.expectSystemInfoWriteAccess()
+	s.daemon(c)
+	s.AddCleanup(interfaces.MockSystemKey(`
+{
+"build-id": "7a94e9736c091b3984bd63f5aebfc883c4d859e0",
+"apparmor-features": ["caps", "dbus"]
+}`))
+	c.Assert(interfaces.WriteSystemKey(interfaces.SystemKeyExtraData{}), check.IsNil)
+	k, err := interfaces.RecordedSystemKey()
+	c.Assert(err, check.IsNil)
+	ks := k.(fmt.Stringer).String()
+
+	// no system key, will cause internal error from ifacestate
+	c.Assert(interfaces.RemoveSystemKey(), check.IsNil)
+
+	b, err := json.Marshal(map[string]string{
+		"action":     "advise-system-key-mismatch",
+		"system-key": ks,
+	})
+	c.Assert(err, check.IsNil)
+	req, err := http.NewRequest("POST", "/v2/system-info", bytes.NewReader(b))
+	c.Assert(err, check.IsNil)
+
+	// no need to start overlord's loop as no change is added
+	rec := httptest.NewRecorder()
+	s.req(c, req, nil, actionIsExpected).ServeHTTP(rec, nil)
+	c.Check(rec.Code, check.Equals, 500)
+	assertResponseBody(c, rec.Body, map[string]any{
+		"type":        "error",
+		"status-code": float64(500),
+		"status":      "Internal Server Error",
+		"result": map[string]any{
+			"message": `cannot process system key: system-key missing on disk`,
+		},
+	})
+}
+
+func (s *generalSuite) TestSysInfoClientAdviceUnsupportedSystemKey(c *check.C) {
+	s.expectSystemInfoWriteAccess()
+	s.daemon(c)
+	s.AddCleanup(interfaces.MockSystemKey(`
+{
+"version": 999,
+"build-id": "7a94e9736c091b3984bd63f5aebfc883c4d859e0",
+"apparmor-features": ["caps", "dbus"]
+}`))
+	c.Assert(interfaces.WriteSystemKey(interfaces.SystemKeyExtraData{}), check.IsNil)
+	k, err := interfaces.RecordedSystemKey()
+	c.Assert(err, check.IsNil)
+	ks := k.(fmt.Stringer).String()
+
+	// actual snapd system key is of lower version
+	s.AddCleanup(interfaces.MockSystemKey(`
+{
+"version": 11,
+"build-id": "7a94e9736c091b3984bd63f5aebfc883c4d859e0",
+"apparmor-features": ["caps", "dbus"]
+}`))
+	c.Assert(interfaces.WriteSystemKey(interfaces.SystemKeyExtraData{}), check.IsNil)
+
+	b, err := json.Marshal(map[string]string{
+		"action":     "advise-system-key-mismatch",
+		"system-key": ks,
+	})
+	c.Assert(err, check.IsNil)
+	req, err := http.NewRequest("POST", "/v2/system-info", bytes.NewReader(b))
+	c.Assert(err, check.IsNil)
+
+	// no need to start overlord's loop as no change is added
+	rec := httptest.NewRecorder()
+	s.req(c, req, nil, actionIsExpected).ServeHTTP(rec, nil)
+	c.Check(rec.Code, check.Equals, 400)
+	assertResponseBody(c, rec.Body, map[string]any{
+		"type":        "error",
+		"status-code": float64(400),
+		"status":      "Bad Request",
+		"result": map[string]any{
+			"kind":    "unsupported-system-key-version",
+			"message": "system-key version higher than supported",
+			"value":   "",
+		},
+	})
+}
+
+func (s *generalSuite) TestSysInfoClientAdviceBadRequest(c *check.C) {
+	s.expectSystemInfoWriteAccess()
+	s.daemon(c)
+	s.AddCleanup(interfaces.MockSystemKey(`
+{
+"build-id": "7a94e9736c091b3984bd63f5aebfc883c4d859e0",
+"apparmor-features": ["caps", "dbus"]
+}`))
+	c.Assert(interfaces.WriteSystemKey(interfaces.SystemKeyExtraData{}), check.IsNil)
+
+	b, err := json.Marshal(map[string]string{
+		"action":     "advise-system-key-mismatch",
+		"system-key": "not-a-system-key",
+	})
+	c.Assert(err, check.IsNil)
+	req, err := http.NewRequest("POST", "/v2/system-info", bytes.NewReader(b))
+	c.Assert(err, check.IsNil)
+
+	// no need to start overlord's loop as the key is a match
+	rec := httptest.NewRecorder()
+	s.req(c, req, nil, actionIsExpected).ServeHTTP(rec, nil)
+	c.Check(rec.Code, check.Equals, 400)
+	assertResponseBody(c, rec.Body, map[string]any{
+		"type":        "error",
+		"status-code": float64(400),
+		"status":      "Bad Request",
+		"result": map[string]any{
+			"message": `cannot decode system key: invalid character 'o' in literal null (expecting 'u')`,
+		},
+	})
+
+	req, err = http.NewRequest("POST", "/v2/system-info", bytes.NewReader([]byte(`{}{}`)))
+	c.Assert(err, check.IsNil)
+
+	// no need to start overlord's loop as the key is a match
+	rec = httptest.NewRecorder()
+	s.req(c, req, nil, actionIsExpected).ServeHTTP(rec, nil)
+	c.Check(rec.Code, check.Equals, 400)
+	assertResponseBody(c, rec.Body, map[string]any{
+		"type":        "error",
+		"status-code": float64(400),
+		"status":      "Bad Request",
+		"result": map[string]any{
+			"message": `unexpected additional content in request body`,
+		},
+	})
+
+	// no system key at all
+	b, err = json.Marshal(map[string]string{
+		"action": "advise-system-key-mismatch",
+	})
+	c.Assert(err, check.IsNil)
+	req, err = http.NewRequest("POST", "/v2/system-info", bytes.NewReader(b))
+	c.Assert(err, check.IsNil)
+
+	// no need to start overlord's loop as the key is a match
+	rec = httptest.NewRecorder()
+	s.req(c, req, nil, actionIsExpected).ServeHTTP(rec, nil)
+	c.Check(rec.Code, check.Equals, 400)
+	assertResponseBody(c, rec.Body, map[string]any{
+		"type":        "error",
+		"status-code": float64(400),
+		"status":      "Bad Request",
+		"result": map[string]any{
+			"message": `cannot decode system key: EOF`,
+		},
+	})
+}
+
+func (s *generalSuite) TestSysInfoPostAction(c *check.C) {
+	s.expectSystemInfoWriteAccess()
+	s.daemon(c)
+
+	// unknown action
+	b, err := json.Marshal(map[string]string{
+		"action": "unexpected",
+	})
+	c.Assert(err, check.IsNil)
+	req, err := http.NewRequest("POST", "/v2/system-info", bytes.NewReader(b))
+	c.Assert(err, check.IsNil)
+
+	// no need to start overlord's loop as the key is a match
+	rec := httptest.NewRecorder()
+	s.req(c, req, nil, actionIsUnexpected).ServeHTTP(rec, nil)
+	c.Check(rec.Code, check.Equals, 400)
+	assertResponseBody(c, rec.Body, map[string]any{
+		"type":        "error",
+		"status-code": float64(400),
+		"status":      "Bad Request",
+		"result": map[string]any{
+			"message": `unsupported action "unexpected"`,
+		},
+	})
+	// no action at all
+	b, err = json.Marshal(map[string]string{})
+	c.Assert(err, check.IsNil)
+	req, err = http.NewRequest("POST", "/v2/system-info", bytes.NewReader(b))
+	c.Assert(err, check.IsNil)
+
+	// no need to start overlord's loop as the key is a match
+	rec = httptest.NewRecorder()
+	s.req(c, req, nil, actionIsExpected).ServeHTTP(rec, nil)
+	c.Check(rec.Code, check.Equals, 400)
+	assertResponseBody(c, rec.Body, map[string]any{
+		"type":        "error",
+		"status-code": float64(400),
+		"status":      "Bad Request",
+		"result": map[string]any{
+			"message": `no action`,
+		},
+	})
 }
 
 func setupChanges(st *state.State) []string {
@@ -433,7 +819,7 @@ func (s *generalSuite) TestStateChangesDefaultToInProgress(c *check.C) {
 	// Execute
 	req, err := http.NewRequest("GET", "/v2/changes", nil)
 	c.Assert(err, check.IsNil)
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 
 	// Verify
 	c.Check(rsp.Status, check.Equals, 200)
@@ -462,7 +848,7 @@ func (s *generalSuite) TestStateChangesInProgress(c *check.C) {
 	// Execute
 	req, err := http.NewRequest("GET", "/v2/changes?select=in-progress", nil)
 	c.Assert(err, check.IsNil)
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 
 	// Verify
 	c.Check(rsp.Status, check.Equals, 200)
@@ -491,7 +877,7 @@ func (s *generalSuite) TestStateChangesAll(c *check.C) {
 	// Execute
 	req, err := http.NewRequest("GET", "/v2/changes?select=all", nil)
 	c.Assert(err, check.IsNil)
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 
 	// Verify
 	c.Check(rsp.Status, check.Equals, 200)
@@ -521,7 +907,7 @@ func (s *generalSuite) TestStateChangesReady(c *check.C) {
 	// Execute
 	req, err := http.NewRequest("GET", "/v2/changes?select=ready", nil)
 	c.Assert(err, check.IsNil)
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 
 	// Verify
 	c.Check(rsp.Status, check.Equals, 200)
@@ -550,13 +936,13 @@ func (s *generalSuite) TestStateChangesForSnapName(c *check.C) {
 	// Execute
 	req, err := http.NewRequest("GET", "/v2/changes?for=funky-snap-name&select=all", nil)
 	c.Assert(err, check.IsNil)
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 
 	// Verify
 	c.Check(rsp.Status, check.Equals, 200)
-	c.Assert(rsp.Result, check.FitsTypeOf, []*daemon.ChangeInfo(nil))
+	c.Assert(rsp.Result, check.FitsTypeOf, []*ctlcmd.ChangeInfo(nil))
 
-	res := rsp.Result.([]*daemon.ChangeInfo)
+	res := rsp.Result.([]*ctlcmd.ChangeInfo)
 	c.Assert(res, check.HasLen, 1)
 	c.Check(res[0].Kind, check.Equals, `install`)
 
@@ -586,13 +972,13 @@ func (s *generalSuite) TestStateChangesForSnapNameWithApp(c *check.C) {
 	// Execute
 	req, err := http.NewRequest("GET", "/v2/changes?for=lxd&select=all", nil)
 	c.Assert(err, check.IsNil)
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 
 	// Verify
 	c.Check(rsp.Status, check.Equals, 200)
-	c.Assert(rsp.Result, check.FitsTypeOf, []*daemon.ChangeInfo(nil))
+	c.Assert(rsp.Result, check.FitsTypeOf, []*ctlcmd.ChangeInfo(nil))
 
-	res := rsp.Result.([]*daemon.ChangeInfo)
+	res := rsp.Result.([]*ctlcmd.ChangeInfo)
 	c.Assert(res, check.HasLen, 1)
 	c.Check(res[0].Kind, check.Equals, `service-control`)
 
@@ -601,24 +987,39 @@ func (s *generalSuite) TestStateChangesForSnapNameWithApp(c *check.C) {
 	c.Assert(rec.Code, check.Equals, 200)
 }
 
+// This test relies on ctlcmd.StateChangeToChangeInfo(), which was moved from
+// the daemon package to the ctlcmd package.
 func (s *generalSuite) TestStateChange(c *check.C) {
 	restore := state.MockTime(time.Date(2016, 04, 21, 1, 2, 3, 0, time.UTC))
 	defer restore()
 
 	// Setup
-	s.expectChangesReadAccess()
+	s.expectChangeReadAccess()
 	d := s.daemon(c)
 	st := d.Overlord().State()
 	st.Lock()
-	ids := setupChanges(st)
-	chg := st.Change(ids[0])
-	chg.Set("api-data", map[string]int{"n": 42})
+
+	chg1 := st.NewChange("install", "install...")
+	chg1.Set("snap-names", []string{"funky-snap-name"})
+	t1 := st.NewTask("download", "1...")
+	t1.Set("snap-setup", &snapstate.SnapSetup{SideInfo: &snap.SideInfo{RealName: "some-snap"}})
+	chg1.AddTask(t1)
+	t1.Logf("l11")
+	t1.Logf("l12")
+
+	t2 := st.NewTask("activate", "2...")
+	chg1.AddTask(t2)
+	// Setting 'snap-setup' to something that cant be parsed allows us to test that missing data is ignored
+	// and doesn't cause the whole task to be missing from the output
+	t2.Set("snap-setup", "some-snap")
+
+	chg1.Set("api-data", map[string]int{"n": 42})
 	st.Unlock()
 
 	// Execute
-	req, err := http.NewRequest("GET", "/v2/changes/"+ids[0], nil)
+	req, err := http.NewRequest("GET", "/v2/changes/"+chg1.ID(), nil)
 	c.Assert(err, check.IsNil)
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 	rec := httptest.NewRecorder()
 	rsp.ServeHTTP(rec, req)
 
@@ -627,36 +1028,37 @@ func (s *generalSuite) TestStateChange(c *check.C) {
 	c.Check(rsp.Status, check.Equals, 200)
 	c.Check(rsp.Result, check.NotNil)
 
-	var body map[string]interface{}
+	var body map[string]any
 	err = json.Unmarshal(rec.Body.Bytes(), &body)
 	c.Check(err, check.IsNil)
-	c.Check(body["result"], check.DeepEquals, map[string]interface{}{
-		"id":         ids[0],
+	c.Check(body["result"], check.DeepEquals, map[string]any{
+		"id":         chg1.ID(),
 		"kind":       "install",
 		"summary":    "install...",
 		"status":     "Do",
 		"ready":      false,
 		"spawn-time": "2016-04-21T01:02:03Z",
-		"tasks": []interface{}{
-			map[string]interface{}{
-				"id":         ids[2],
+		"tasks": []any{
+			map[string]any{
+				"id":         t1.ID(),
 				"kind":       "download",
 				"summary":    "1...",
 				"status":     "Do",
-				"log":        []interface{}{"2016-04-21T01:02:03Z INFO l11", "2016-04-21T01:02:03Z INFO l12"},
-				"progress":   map[string]interface{}{"label": "", "done": 0., "total": 1.},
+				"log":        []any{"2016-04-21T01:02:03Z INFO l11", "2016-04-21T01:02:03Z INFO l12"},
+				"progress":   map[string]any{"label": "", "done": 0., "total": 1.},
 				"spawn-time": "2016-04-21T01:02:03Z",
+				"data":       map[string]any{"affected-snaps": []any{"some-snap"}},
 			},
-			map[string]interface{}{
-				"id":         ids[3],
+			map[string]any{
+				"id":         t2.ID(),
 				"kind":       "activate",
 				"summary":    "2...",
 				"status":     "Do",
-				"progress":   map[string]interface{}{"label": "", "done": 0., "total": 1.},
+				"progress":   map[string]any{"label": "", "done": 0., "total": 1.},
 				"spawn-time": "2016-04-21T01:02:03Z",
 			},
 		},
-		"data": map[string]interface{}{
+		"data": map[string]any{
 			"n": float64(42),
 		},
 	})
@@ -677,7 +1079,7 @@ func (s *generalSuite) TestStateChangeAbort(c *check.C) {
 	defer restore()
 
 	// Setup
-	s.expectChangesReadAccess()
+	s.expectChangeReadAccess()
 	d := s.daemon(c)
 	st := d.Overlord().State()
 	st.Lock()
@@ -691,7 +1093,7 @@ func (s *generalSuite) TestStateChangeAbort(c *check.C) {
 	// Execute
 	req, err := http.NewRequest("POST", "/v2/changes/"+ids[0], buf)
 	c.Assert(err, check.IsNil)
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 	rec := httptest.NewRecorder()
 	rsp.ServeHTTP(rec, req)
 
@@ -703,10 +1105,10 @@ func (s *generalSuite) TestStateChangeAbort(c *check.C) {
 	c.Check(rsp.Status, check.Equals, 200)
 	c.Check(rsp.Result, check.NotNil)
 
-	var body map[string]interface{}
+	var body map[string]any
 	err = json.Unmarshal(rec.Body.Bytes(), &body)
 	c.Check(err, check.IsNil)
-	c.Check(body["result"], check.DeepEquals, map[string]interface{}{
+	c.Check(body["result"], check.DeepEquals, map[string]any{
 		"id":         ids[0],
 		"kind":       "install",
 		"summary":    "install...",
@@ -714,23 +1116,23 @@ func (s *generalSuite) TestStateChangeAbort(c *check.C) {
 		"ready":      true,
 		"spawn-time": "2016-04-21T01:02:03Z",
 		"ready-time": "2016-04-21T01:02:03Z",
-		"tasks": []interface{}{
-			map[string]interface{}{
+		"tasks": []any{
+			map[string]any{
 				"id":         ids[2],
 				"kind":       "download",
 				"summary":    "1...",
 				"status":     "Hold",
-				"log":        []interface{}{"2016-04-21T01:02:03Z INFO l11", "2016-04-21T01:02:03Z INFO l12"},
-				"progress":   map[string]interface{}{"label": "", "done": 1., "total": 1.},
+				"log":        []any{"2016-04-21T01:02:03Z INFO l11", "2016-04-21T01:02:03Z INFO l12"},
+				"progress":   map[string]any{"label": "", "done": 1., "total": 1.},
 				"spawn-time": "2016-04-21T01:02:03Z",
 				"ready-time": "2016-04-21T01:02:03Z",
 			},
-			map[string]interface{}{
+			map[string]any{
 				"id":         ids[3],
 				"kind":       "activate",
 				"summary":    "2...",
 				"status":     "Hold",
-				"progress":   map[string]interface{}{"label": "", "done": 1., "total": 1.},
+				"progress":   map[string]any{"label": "", "done": 1., "total": 1.},
 				"spawn-time": "2016-04-21T01:02:03Z",
 				"ready-time": "2016-04-21T01:02:03Z",
 			},
@@ -743,7 +1145,7 @@ func (s *generalSuite) TestStateChangeAbortIsReady(c *check.C) {
 	defer restore()
 
 	// Setup
-	s.expectChangesReadAccess()
+	s.expectChangeReadAccess()
 	d := s.daemon(c)
 	st := d.Overlord().State()
 	st.Lock()
@@ -758,7 +1160,7 @@ func (s *generalSuite) TestStateChangeAbortIsReady(c *check.C) {
 	// Execute
 	req, err := http.NewRequest("POST", "/v2/changes/"+ids[0], buf)
 	c.Assert(err, check.IsNil)
-	rspe := s.errorReq(c, req, nil)
+	rspe := s.errorReq(c, req, nil, actionIsExpected)
 	rec := httptest.NewRecorder()
 	rspe.ServeHTTP(rec, req)
 
@@ -766,15 +1168,15 @@ func (s *generalSuite) TestStateChangeAbortIsReady(c *check.C) {
 	c.Check(rec.Code, check.Equals, 400)
 	c.Check(rspe.Status, check.Equals, 400)
 
-	var body map[string]interface{}
+	var body map[string]any
 	err = json.Unmarshal(rec.Body.Bytes(), &body)
 	c.Check(err, check.IsNil)
-	c.Check(body["result"], check.DeepEquals, map[string]interface{}{
+	c.Check(body["result"], check.DeepEquals, map[string]any{
 		"message": fmt.Sprintf("cannot abort change %s with nothing pending", ids[0]),
 	})
 }
 
-func (s *generalSuite) testWarnings(c *check.C, all bool, body io.Reader) (calls string, result interface{}) {
+func (s *generalSuite) testWarnings(c *check.C, all bool, body io.Reader) (calls string, result any) {
 	s.daemon(c)
 
 	s.expectManageAccess()
@@ -796,7 +1198,7 @@ func (s *generalSuite) testWarnings(c *check.C, all bool, body io.Reader) (calls
 	req, err := http.NewRequest(method, "/v2/warnings?"+q.Encode(), body)
 	c.Assert(err, check.IsNil)
 
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 
 	c.Check(rsp.Status, check.Equals, 200)
 	c.Assert(rsp.Result, check.NotNil)
@@ -819,4 +1221,180 @@ func (s *generalSuite) TestAckWarnings(c *check.C) {
 	calls, result := s.testWarnings(c, false, bytes.NewReader([]byte(`{"action": "okay", "timestamp": "2006-01-02T15:04:05Z"}`)))
 	c.Check(calls, check.Equals, "ok")
 	c.Check(result, check.DeepEquals, 0)
+}
+
+func (s *generalSuite) TestSysInfoStorageEncHappyWithoutModel(c *check.C) {
+	s.daemon(c)
+
+	expectedStatus := ""
+	expectedResponse := map[string]any{}
+
+	setExpectedStatus := func(status string) {
+		expectedStatus = status
+		expectedResponse["status"] = status
+		expectedResponse["auto-repair-result"] = "not-initialized"
+		expectedResponse["preinstall"] = map[string]any{
+			"requirements":    []any{},
+			"accepted-errors": map[string]any{},
+		}
+	}
+
+	defer daemon.MockFdestateSystemState(func(s *state.State, model *asserts.Model) (*fdestate.FDESystemState, error) {
+		switch expectedStatus {
+		case "active":
+			return &fdestate.FDESystemState{
+				Status:           fdestate.FDEStatusActive,
+				AutoRepairResult: fdestate.AutoRepairNotInitialized,
+				Preinstall: fdestate.FDEPreinstallInfo{
+					Requirements:   []install.EncryptionSupportRequirement{},
+					AcceptedErrors: map[string]any{},
+				},
+			}, nil
+
+		case "inactive":
+			return &fdestate.FDESystemState{
+				Status:           fdestate.FDEStatusInactive,
+				AutoRepairResult: fdestate.AutoRepairNotInitialized,
+				Preinstall: fdestate.FDEPreinstallInfo{
+					Requirements:   []install.EncryptionSupportRequirement{},
+					AcceptedErrors: map[string]any{},
+				},
+			}, nil
+		}
+
+		c.Check(model, check.IsNil)
+
+		return nil, errors.New("cannot set unsupported expected status")
+	})()
+
+	req, err := http.NewRequest("GET", "/v2/system-info/storage-encrypted", nil)
+	c.Assert(err, check.IsNil)
+
+	setExpectedStatus("active")
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
+	c.Check(rsp.Status, check.Equals, 200)
+	c.Check(rsp.Type, check.Equals, daemon.ResponseTypeSync)
+	resultBytes, err := json.Marshal(rsp.Result)
+	c.Assert(err, check.IsNil)
+	var resultAbstract any
+	err = json.Unmarshal(resultBytes, &resultAbstract)
+	c.Assert(err, check.IsNil)
+	c.Check(resultAbstract, check.DeepEquals, expectedResponse)
+
+	setExpectedStatus("inactive")
+	rsp = s.syncReq(c, req, nil, actionIsExpected)
+	c.Assert(err, check.IsNil)
+	resultBytes, err = json.Marshal(rsp.Result)
+	c.Assert(err, check.IsNil)
+	err = json.Unmarshal(resultBytes, &resultAbstract)
+	c.Assert(err, check.IsNil)
+	c.Check(resultAbstract, check.DeepEquals, expectedResponse)
+}
+
+func (s *generalSuite) TestSysInfoStorageEncHappyWithModel(c *check.C) {
+	d := s.daemonWithOverlordMockAndStore()
+	s.expectSystemInfoStorageEncReadAccess()
+
+	hookMgr, err := hookstate.Manager(d.Overlord().State(), d.Overlord().TaskRunner())
+	c.Assert(err, check.IsNil)
+	deviceMgr, err := devicestate.Manager(d.Overlord().State(), hookMgr, d.Overlord().TaskRunner(), nil)
+	c.Assert(err, check.IsNil)
+	d.Overlord().AddManager(deviceMgr)
+	func() {
+		st := d.Overlord().State()
+		st.Lock()
+		defer st.Unlock()
+		assertstatetest.AddMany(st, s.StoreSigning.StoreAccountKey(""))
+		assertstatetest.AddMany(st, s.Brands.AccountsAndKeys("my-brand")...)
+		s.mockModel(st, s.Brands.Model("my-brand", "my-model", map[string]any{
+			"architecture": "amd64",
+			"gadget":       "gadget",
+			"kernel":       "kernel",
+		}))
+	}()
+
+	expectedStatus := ""
+	expectedResponse := map[string]any{}
+
+	setExpectedStatus := func(status string) {
+		expectedStatus = status
+		expectedResponse["status"] = status
+		expectedResponse["auto-repair-result"] = "not-initialized"
+		expectedResponse["preinstall"] = map[string]any{
+			"requirements": []any{"volumes-auth"},
+			"accepted-errors": map[string]any{
+				"no-hardware-root-of-trust": nil,
+			},
+		}
+	}
+
+	defer daemon.MockFdestateSystemState(func(s *state.State, model *asserts.Model) (*fdestate.FDESystemState, error) {
+		switch expectedStatus {
+		case "active":
+			return &fdestate.FDESystemState{
+				Status:           fdestate.FDEStatusActive,
+				AutoRepairResult: fdestate.AutoRepairNotInitialized,
+				Preinstall: fdestate.FDEPreinstallInfo{
+					Requirements: []install.EncryptionSupportRequirement{"volumes-auth"},
+					AcceptedErrors: map[string]any{
+						"no-hardware-root-of-trust": nil,
+					},
+				},
+			}, nil
+
+		case "inactive":
+			return &fdestate.FDESystemState{
+				Status:           fdestate.FDEStatusInactive,
+				AutoRepairResult: fdestate.AutoRepairNotInitialized,
+				Preinstall: fdestate.FDEPreinstallInfo{
+					Requirements: []install.EncryptionSupportRequirement{"volumes-auth"},
+					AcceptedErrors: map[string]any{
+						"no-hardware-root-of-trust": nil,
+					},
+				},
+			}, nil
+		}
+
+		c.Check(model, check.NotNil)
+
+		return nil, errors.New("cannot set unsupported expected status")
+	})()
+
+	req, err := http.NewRequest("GET", "/v2/system-info/storage-encrypted", nil)
+	c.Assert(err, check.IsNil)
+
+	setExpectedStatus("active")
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
+	c.Check(rsp.Status, check.Equals, 200)
+	c.Check(rsp.Type, check.Equals, daemon.ResponseTypeSync)
+	resultBytes, err := json.Marshal(rsp.Result)
+	c.Assert(err, check.IsNil)
+	var resultAbstract any
+	err = json.Unmarshal(resultBytes, &resultAbstract)
+	c.Assert(err, check.IsNil)
+	c.Check(resultAbstract, check.DeepEquals, expectedResponse)
+
+	setExpectedStatus("inactive")
+	rsp = s.syncReq(c, req, nil, actionIsExpected)
+	c.Assert(err, check.IsNil)
+	resultBytes, err = json.Marshal(rsp.Result)
+	c.Assert(err, check.IsNil)
+	err = json.Unmarshal(resultBytes, &resultAbstract)
+	c.Assert(err, check.IsNil)
+	c.Check(resultAbstract, check.DeepEquals, expectedResponse)
+}
+
+func (s *generalSuite) TestSysInfoStorageEncErrorImpl(c *check.C) {
+	s.daemon(c)
+
+	defer daemon.MockFdestateSystemState(func(*state.State, *asserts.Model) (*fdestate.FDESystemState, error) {
+		return nil, errors.New("cannot calculate status")
+	})()
+
+	req, err := http.NewRequest("GET", "/v2/system-info/storage-encrypted", nil)
+	c.Assert(err, check.IsNil)
+
+	rsp := s.errorReq(c, req, nil, actionIsExpected)
+	c.Check(rsp.Status, check.Equals, 500)
+	c.Check(rsp.Message, check.Equals, "cannot determine system encrypted state: cannot calculate status")
 }

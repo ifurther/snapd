@@ -37,10 +37,10 @@ type policy20 struct {
 	model *asserts.Model
 	opts  *Options
 
-	warningf func(format string, a ...interface{})
+	warningf func(format string, a ...any)
 }
 
-var errNotAllowedExceptForDangerous = errors.New("cannot override channels, add devmode snaps, local snaps, or extra snaps with a model of grade higher than dangerous")
+var errNotAllowedExceptForDangerous = errors.New("cannot override channels, add devmode snaps, local snaps, or extra snaps/components with a model of grade higher than dangerous")
 
 func (pol *policy20) checkAllowedDangerous() error {
 	if pol.model.Grade() != asserts.ModelDangerous {
@@ -58,7 +58,10 @@ func (pol *policy20) checkDefaultChannel(channel.Channel) error {
 }
 
 func (pol *policy20) checkSnapChannel(ch channel.Channel, whichSnap string) error {
-	return pol.checkAllowedDangerous()
+	if pol.checkAllowedDangerous() != nil {
+		return fmt.Errorf("cannot override channels with a model of grade higher than dangerous but --snap=<snap-name> is allowed to select optional snaps to include")
+	}
+	return nil
 }
 
 func (pol *policy20) checkClassicSnap(sn *SeedSnap) error {
@@ -207,7 +210,7 @@ func (tr *tree20) ensureSystemSnapsDir() (string, error) {
 	return snapsDir, nil
 }
 
-func (tr *tree20) snapPath(sn *SeedSnap) (string, error) {
+func (tr *tree20) snapDir(sn *SeedSnap) (string, error) {
 	var snapsDir string
 	if sn.modelSnap != nil {
 		snapsDir = tr.snapsDirPath
@@ -219,7 +222,35 @@ func (tr *tree20) snapPath(sn *SeedSnap) (string, error) {
 			return "", err
 		}
 	}
+	return snapsDir, nil
+}
+
+func (tr *tree20) componentDir(sn *SeedSnap, sc *SeedComponent) (string, error) {
+	if ms := sn.modelSnap; ms != nil {
+		if _, ok := ms.Components[sc.ComponentName]; ok {
+			return tr.snapsDirPath, nil
+		}
+	}
+
+	return tr.ensureSystemSnapsDir()
+}
+
+func (tr *tree20) snapPath(sn *SeedSnap) (string, error) {
+	snapsDir, err := tr.snapDir(sn)
+	if err != nil {
+		return "", err
+	}
 	return filepath.Join(snapsDir, sn.Info.Filename()), nil
+}
+
+func (tr *tree20) componentPath(sn *SeedSnap, sc *SeedComponent) (string, error) {
+	componentsDir, err := tr.componentDir(sn, sc)
+	if err != nil {
+		return "", err
+	}
+
+	cpi := snap.MinimalComponentContainerPlaceInfo(sc.ComponentName, sc.Info.Revision, naming.InstanceName(sc.SnapName))
+	return filepath.Join(componentsDir, cpi.Filename()), nil
 }
 
 func (tr *tree20) localSnapPath(sn *SeedSnap) (string, error) {
@@ -230,7 +261,16 @@ func (tr *tree20) localSnapPath(sn *SeedSnap) (string, error) {
 	return filepath.Join(sysSnapsDir, fmt.Sprintf("%s_%s.snap", sn.SnapName(), sn.Info.Version)), nil
 }
 
-func (tr *tree20) writeAssertions(db asserts.RODatabase, modelRefs []*asserts.Ref, snapsFromModel []*SeedSnap, extraSnaps []*SeedSnap) error {
+func (tr *tree20) localComponentPath(sc *SeedComponent, snapVersion string) (string, error) {
+	sysSnapsDir, err := tr.ensureSystemSnapsDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(sysSnapsDir, fmt.Sprintf("%s_%s.comp",
+		sc.ComponentRef.String(), sc.Info.Version(snapVersion))), nil
+}
+
+func (tr *tree20) writeAssertions(db asserts.RODatabase, modelRefs []*asserts.Ref, extraRefs []*asserts.Ref, snapsFromModel []*SeedSnap, extraSnaps []*SeedSnap) error {
 	assertsDir := filepath.Join(tr.systemDir, "assertions")
 	if err := os.MkdirAll(assertsDir, 0755); err != nil {
 		return err
@@ -276,12 +316,16 @@ func (tr *tree20) writeAssertions(db asserts.RODatabase, modelRefs []*asserts.Re
 
 	modelOnly := func(aRef *asserts.Ref) bool { return aRef.Type == asserts.ModelType }
 	excludeModel := func(aRef *asserts.Ref) bool { return aRef.Type != asserts.ModelType }
+	isSystemUser := func(aRef *asserts.Ref) bool { return aRef.Type == asserts.SystemUserType }
+	excludeModelAndSystemUser := func(aRef *asserts.Ref) bool {
+		return aRef.Type != asserts.ModelType && aRef.Type != asserts.SystemUserType
+	}
 
-	modelRefsGen := func(include func(*asserts.Ref) bool) func(stop <-chan struct{}) <-chan *asserts.Ref {
+	refsGen := func(writeRefs []*asserts.Ref, include func(*asserts.Ref) bool) func(stop <-chan struct{}) <-chan *asserts.Ref {
 		return func(stop <-chan struct{}) <-chan *asserts.Ref {
 			refs := make(chan *asserts.Ref)
 			go func() {
-				for _, aRef := range modelRefs {
+				for _, aRef := range writeRefs {
 					if include(aRef) {
 						if !pushRef(refs, aRef, stop) {
 							return
@@ -294,12 +338,34 @@ func (tr *tree20) writeAssertions(db asserts.RODatabase, modelRefs []*asserts.Re
 		}
 	}
 
-	if err := writeByRefs("../model", modelRefsGen(modelOnly)); err != nil {
+	if err := writeByRefs("../model", refsGen(modelRefs, modelOnly)); err != nil {
 		return err
 	}
 
-	if err := writeByRefs("model-etc", modelRefsGen(excludeModel)); err != nil {
+	if err := writeByRefs("model-etc", refsGen(modelRefs, excludeModel)); err != nil {
 		return err
+	}
+
+	if len(extraRefs) != 0 {
+		// system-user assertions must be placed in a file called auto-import.assert to be auto loaded
+		var foundSystemUserAssert, foundExtraAssert bool
+		for _, aRef := range extraRefs {
+			if isSystemUser(aRef) {
+				foundSystemUserAssert = true
+			} else {
+				foundExtraAssert = true
+			}
+		}
+		if foundExtraAssert {
+			if err := writeByRefs("extra-assertions", refsGen(extraRefs, excludeModelAndSystemUser)); err != nil {
+				return err
+			}
+		}
+		if foundSystemUserAssert {
+			if err := writeByRefs("../auto-import.assert", refsGen(extraRefs, isSystemUser)); err != nil {
+				return err
+			}
+		}
 	}
 
 	snapsRefGen := func(snaps []*SeedSnap) func(stop <-chan struct{}) <-chan *asserts.Ref {
@@ -319,6 +385,9 @@ func (tr *tree20) writeAssertions(db asserts.RODatabase, modelRefs []*asserts.Re
 		}
 	}
 
+	// TODO: assertions for components that are not in the model (but their snap
+	// is in the model) still end up here, rather than extra-snaps. to be more
+	// consistent, they should go in extra-snaps
 	if err := writeByRefs("snaps", snapsRefGen(snapsFromModel)); err != nil {
 		return err
 	}
@@ -332,6 +401,30 @@ func (tr *tree20) writeAssertions(db asserts.RODatabase, modelRefs []*asserts.Re
 	return nil
 }
 
+func seedSnapComponentsForOptions(sn *SeedSnap) []internal.Component20 {
+	compOpts := make([]internal.Component20, 0, len(sn.Components))
+	for _, comp := range sn.Components {
+		if sn.modelSnap != nil {
+			// if the component is in the model and asserted, then we don't want to write it
+			// to the options.yaml file
+			if _, ok := sn.modelSnap.Components[comp.ComponentName]; ok && sn.Info.ID() != "" {
+				continue
+			}
+		}
+
+		unassertedComp := ""
+		if sn.Info.ID() == "" {
+			unassertedComp = filepath.Base(comp.Path)
+		}
+
+		compOpts = append(compOpts, internal.Component20{
+			Name:       comp.ComponentName,
+			Unasserted: unassertedComp,
+		})
+	}
+	return compOpts
+}
+
 func (tr *tree20) writeMeta(snapsFromModel []*SeedSnap, extraSnaps []*SeedSnap) error {
 	var optionsSnaps []*internal.Snap20
 
@@ -340,7 +433,16 @@ func (tr *tree20) writeMeta(snapsFromModel []*SeedSnap, extraSnaps []*SeedSnap) 
 		if sn.Channel != sn.modelSnap.DefaultChannel {
 			channelOverride = sn.Channel
 		}
-		if sn.Info.ID() != "" && channelOverride == "" {
+
+		extraComponents := false
+		for _, comp := range sn.Components {
+			if _, ok := sn.modelSnap.Components[comp.ComponentName]; !ok {
+				extraComponents = true
+				break
+			}
+		}
+
+		if sn.Info.ID() != "" && channelOverride == "" && !extraComponents {
 			continue
 		}
 		unasserted := ""
@@ -355,6 +457,7 @@ func (tr *tree20) writeMeta(snapsFromModel []*SeedSnap, extraSnaps []*SeedSnap) 
 			SnapID:     sn.modelSnap.ID(),
 			Unasserted: unasserted,
 			Channel:    channelOverride,
+			Components: seedSnapComponentsForOptions(sn),
 		})
 	}
 
@@ -371,6 +474,7 @@ func (tr *tree20) writeMeta(snapsFromModel []*SeedSnap, extraSnaps []*SeedSnap) 
 			SnapID:     sn.Info.ID(),
 			Unasserted: unasserted,
 			Channel:    channel,
+			Components: seedSnapComponentsForOptions(sn),
 		})
 	}
 

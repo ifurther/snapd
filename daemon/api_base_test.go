@@ -20,13 +20,19 @@
 package daemon_test
 
 import (
+	"bytes"
 	"context"
 	"crypto"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
-	"os/user"
 	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -39,7 +45,9 @@ import (
 	"github.com/snapcore/snapd/asserts/sysdb"
 	"github.com/snapcore/snapd/daemon"
 	"github.com/snapcore/snapd/dirs"
+	"github.com/snapcore/snapd/interfaces/ifacetest"
 	"github.com/snapcore/snapd/osutil"
+	"github.com/snapcore/snapd/osutil/user"
 	"github.com/snapcore/snapd/overlord"
 	"github.com/snapcore/snapd/overlord/assertstate"
 	"github.com/snapcore/snapd/overlord/assertstate/assertstatetest"
@@ -51,11 +59,13 @@ import (
 	"github.com/snapcore/snapd/overlord/snapstate/sequence"
 	"github.com/snapcore/snapd/overlord/snapstate/snapstatetest"
 	"github.com/snapcore/snapd/overlord/state"
+	"github.com/snapcore/snapd/overlord/swfeats"
 	"github.com/snapcore/snapd/sandbox"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/snap/snaptest"
 	"github.com/snapcore/snapd/store"
 	"github.com/snapcore/snapd/store/storetest"
+	"github.com/snapcore/snapd/strutil"
 	"github.com/snapcore/snapd/systemd"
 	"github.com/snapcore/snapd/testutil"
 )
@@ -97,6 +107,108 @@ type apiBaseSuite struct {
 
 	expectedReadAccess  daemon.AccessChecker
 	expectedWriteAccess daemon.AccessChecker
+
+	unwrapNewChange            func()
+	missingChangeRegistrations sync.Map
+}
+
+func addUcrednet(r *http.Request, securityTag string, uid uint32, socket string, ifaces ...string) {
+	daemon.AddUcrednetToRequest(r, daemon.NewUcrednet(securityTag, "", uid, socket), ifaces...)
+}
+
+func requestWithUcrednet(ucred *daemon.Ucrednet, ifaces ...string) *http.Request {
+	r := &http.Request{}
+	daemon.AddUcrednetToRequest(r, ucred, ifaces...)
+	return r
+}
+
+var (
+	actionsMap   *concurrentActionsMap
+	callCount    int64
+	disableMutex sync.RWMutex
+	disableMap   map[string][]string
+)
+
+func skipActionCoverage() bool {
+	if callCount <= 1 {
+		// If only one test suite ran, then it makes no sense to check action coverage
+		return true
+	}
+	for _, arg := range os.Args {
+		if strings.HasPrefix(arg, "-check.f") {
+			// If running a subset of tests, it doesn't make sense to check action coverage
+			return true
+		}
+	}
+	return false
+}
+
+func TestMain(m *testing.M) {
+	actionsMap = &concurrentActionsMap{data: map[*daemon.Command][]string{}}
+	disableMap = map[string][]string{}
+	code := m.Run()
+	if skipActionCoverage() {
+		os.Exit(code)
+	}
+	for _, cmd := range actionsMap.Keys() {
+		if cmd.Path == "/v2/debug" {
+			// API coverage for /v2/debug doesn't matter
+			continue
+		}
+		actions := actionsMap.Actions(cmd)
+		var path string
+		if cmd.Path != "" {
+			path = cmd.Path
+		} else {
+			path = cmd.PathPrefix
+		}
+		for _, action := range cmd.Actions {
+			if l, exists := disableMap[path]; exists && strutil.ListContains(l, action) {
+				continue
+			}
+			if !strutil.ListContains(actions, action) {
+				fmt.Printf("No test for action %s of command %s - if that action no longer exists, remove it from the Actions field slice in the relevant command. If it should not appear in unit tests, disable it calling apiBaseSuite.DisableActionsCheck(\"%s\", \"%s\")\n", action, path, path, action)
+				code = 1
+			}
+		}
+	}
+	os.Exit(code)
+}
+
+type concurrentActionsMap struct {
+	mu   sync.RWMutex
+	data map[*daemon.Command][]string
+}
+
+func (m *concurrentActionsMap) AddAction(cmd *daemon.Command, action string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, exists := m.data[cmd]; !exists {
+		m.data[cmd] = []string{}
+	}
+	m.data[cmd] = append(m.data[cmd], action)
+}
+
+func (m *concurrentActionsMap) Keys() []*daemon.Command {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	keys := make([]*daemon.Command, 0, len(m.data))
+	for cmd := range m.data {
+		keys = append(keys, cmd)
+	}
+	return keys
+}
+
+func (m *concurrentActionsMap) Actions(cmd *daemon.Command) []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	actionsMap, exists := m.data[cmd]
+	if !exists {
+		return nil
+	}
+	return actionsMap
 }
 
 func (s *apiBaseSuite) pokeStateLock() {
@@ -165,22 +277,54 @@ func (s *apiBaseSuite) ConnectivityCheck() (map[string]bool, error) {
 	return s.connectivityResult, s.err
 }
 
+func (s *apiBaseSuite) CleanDownloadsCache() error {
+	return nil
+}
+
 func (s *apiBaseSuite) muxVars(*http.Request) map[string]string {
 	return s.vars
 }
 
+// DisableActionsCheck disables the final check for command action coverage
+func (s *apiBaseSuite) DisableActionsCheck(path, action string) {
+	disableMutex.Lock()
+	defer disableMutex.Unlock()
+	if _, exists := disableMap[path]; !exists {
+		disableMap[path] = []string{}
+	}
+	disableMap[path] = append(disableMap[path], action)
+}
+
+func mapToSlice(m *sync.Map) []string {
+	var slice []string
+	m.Range(func(key, _ any) bool {
+		slice = append(slice, key.(string))
+		return true
+	})
+	return slice
+}
+
 func (s *apiBaseSuite) SetUpSuite(c *check.C) {
+	atomic.AddInt64(&callCount, 1)
 	s.restoreMuxVars = daemon.MockMuxVars(s.muxVars)
 	s.restoreRelease = sandbox.MockForceDevMode(false)
 	s.systemctlRestorer = systemd.MockSystemctl(s.systemctl)
 	s.restoreSanitize = snap.MockSanitizePlugsSlots(func(snapInfo *snap.Info) {})
+	s.unwrapNewChange = daemon.BeforeNewChange(func(_ *state.State, kind, _ string, _ []*state.TaskSet, _ []string) {
+		if !strutil.ListContains(swfeats.KnownChangeKinds(), kind) {
+			s.missingChangeRegistrations.Store(kind, nil)
+		}
+	})
 }
 
 func (s *apiBaseSuite) TearDownSuite(c *check.C) {
+	missingReg := mapToSlice(&s.missingChangeRegistrations)
+	c.Assert(missingReg, check.HasLen, 0, check.Commentf("Found missing change kind registrations %v Register new change kinds using swfeats.RegChangeKind", missingReg))
 	s.restoreMuxVars()
 	s.restoreRelease()
 	s.systemctlRestorer()
 	s.restoreSanitize()
+	s.unwrapNewChange()
 }
 
 func (s *apiBaseSuite) systemctl(args ...string) (buf []byte, err error) {
@@ -211,6 +355,7 @@ func (s *apiBaseSuite) SetUpTest(c *check.C) {
 	c.Assert(err, check.IsNil)
 	c.Assert(os.MkdirAll(dirs.SnapMountDir, 0755), check.IsNil)
 	c.Assert(os.MkdirAll(dirs.SnapBlobDir, 0755), check.IsNil)
+	c.Assert(os.MkdirAll(filepath.Dir(dirs.SnapSystemKeyFile), 0755), check.IsNil)
 
 	s.rsnaps = nil
 	s.suggestedCurrency = ""
@@ -256,12 +401,63 @@ func (s *apiBaseSuite) SetUpTest(c *check.C) {
 			HomeDir:  "",
 		}, nil
 	}))
+
+	s.AddCleanup(daemon.MockSnapstateStoreInstallGoal(newStoreInstallGoalRecorder))
+	s.AddCleanup(daemon.MockSnapstatePathUpdateGoal(newPathUpdateGoalRecorder))
+	s.AddCleanup(daemon.MockSnapstateStoreUpdateGoal(newStoreUpdateGoalRecorder))
+
+	daemon.ResetVirtualizationDetection()
+	daemon.ResetBuildIDDetection()
+}
+
+type storeInstallGoalRecorder struct {
+	snapstate.InstallGoal
+	snaps []snapstate.StoreSnap
+}
+
+func newStoreInstallGoalRecorder(snaps ...snapstate.StoreSnap) snapstate.InstallGoal {
+	return &storeInstallGoalRecorder{
+		snaps:       snaps,
+		InstallGoal: snapstate.StoreInstallGoal(snaps...),
+	}
+}
+
+type pathUpdateGoalRecorder struct {
+	snapstate.UpdateGoal
+	snaps []snapstate.PathSnap
+}
+
+func newPathUpdateGoalRecorder(snaps ...snapstate.PathSnap) snapstate.UpdateGoal {
+	return &pathUpdateGoalRecorder{
+		snaps:      snaps,
+		UpdateGoal: snapstate.PathUpdateGoal(snaps...),
+	}
+}
+
+type storeUpdateGoalRecorder struct {
+	snapstate.UpdateGoal
+	snaps []snapstate.StoreUpdate
+}
+
+func (s *storeUpdateGoalRecorder) names() []string {
+	names := make([]string, 0, len(s.snaps))
+	for _, snap := range s.snaps {
+		names = append(names, snap.InstanceName)
+	}
+	return names
+}
+
+func newStoreUpdateGoalRecorder(snaps ...snapstate.StoreUpdate) snapstate.UpdateGoal {
+	return &storeUpdateGoalRecorder{
+		snaps:      snaps,
+		UpdateGoal: snapstate.StoreUpdateGoal(snaps...),
+	}
 }
 
 func (s *apiBaseSuite) mockModel(st *state.State, model *asserts.Model) {
 	// realistic model setup
 	if model == nil {
-		model = s.Brands.Model("can0nical", "pc", map[string]interface{}{
+		model = s.Brands.Model("can0nical", "pc", map[string]any{
 			"architecture": "amd64",
 			"gadget":       "gadget",
 			"kernel":       "kernel",
@@ -287,8 +483,10 @@ func (s *apiBaseSuite) daemonWithStore(c *check.C, sto snapstate.StoreService) *
 	c.Assert(err, check.IsNil)
 
 	st := d.Overlord().State()
-	// mark as already seeded
 	st.Lock()
+	// set a fake fde state
+	st.Set("fde", &struct{}{})
+	// mark as already seeded
 	st.Set("seeded", true)
 	// and registered
 	s.mockModel(st, nil)
@@ -350,7 +548,7 @@ func (s *apiBaseSuite) daemonWithOverlordMockAndStore() *daemon.Daemon {
 
 // asUserAuth fakes authorization into the request as for root
 func (s *apiBaseSuite) asRootAuth(req *http.Request) {
-	req.RemoteAddr = fmt.Sprintf("pid=100;uid=0;socket=%s;", dirs.SnapdSocket)
+	daemon.AddUcrednetToRequest(req, daemon.NewUcrednet("snap.some-snap.app", "", 0, dirs.SnapdSocket))
 }
 
 // asUserAuth adds authorization to the request as for a logged in user
@@ -372,7 +570,7 @@ func (s *apiBaseSuite) asUserAuth(c *check.C, req *http.Request) {
 		s.authUser = u
 	}
 	req.Header.Set("Authorization", fmt.Sprintf(`Macaroon root="%s"`, s.authUser.Macaroon))
-	req.RemoteAddr = fmt.Sprintf("pid=100;uid=1000;socket=%s;", dirs.SnapdSocket)
+	daemon.AddUcrednetToRequest(req, daemon.NewUcrednet("snap.some-snap.app", "", 1000, dirs.SnapdSocket))
 }
 
 type fakeSnapManager struct{}
@@ -386,6 +584,9 @@ func newFakeSnapManager(st *state.State, runner *state.TaskRunner) *fakeSnapMana
 	}, nil)
 	runner.AddHandler("fake-install-snap-error", func(t *state.Task, _ *tomb.Tomb) error {
 		return fmt.Errorf("fake-install-snap-error errored")
+	}, nil)
+	runner.AddHandler("fake-refresh-snap", func(t *state.Task, _ *tomb.Tomb) error {
+		return nil
 	}, nil)
 
 	return &fakeSnapManager{}
@@ -428,7 +629,8 @@ func (s *apiBaseSuite) mockSnap(c *check.C, yamlText string) *snap.Info {
 		panic("call s.daemon(c) etc in your test first")
 	}
 
-	snapInfo := snaptest.MockSnap(c, yamlText, &snap.SideInfo{Revision: snap.R(1)})
+	appSet := ifacetest.MockSnapAndAppSet(c, yamlText, nil, &snap.SideInfo{Revision: snap.R(1)})
+	snapInfo := appSet.Info()
 
 	st := s.d.Overlord().State()
 
@@ -436,11 +638,11 @@ func (s *apiBaseSuite) mockSnap(c *check.C, yamlText string) *snap.Info {
 	defer st.Unlock()
 
 	// Put a side info into the state
-	snapstate.Set(st, snapInfo.InstanceName(), &snapstate.SnapState{
+	snapstate.Set(st, snapInfo.InstanceName().String(), &snapstate.SnapState{
 		Active: true,
 		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
 			{
-				RealName: snapInfo.SnapName(),
+				RealName: snapInfo.SnapName().String(),
 				Revision: snapInfo.Revision,
 				SnapID:   "ididid",
 			},
@@ -451,7 +653,7 @@ func (s *apiBaseSuite) mockSnap(c *check.C, yamlText string) *snap.Info {
 
 	// Put the snap into the interface repository
 	repo := s.d.Overlord().InterfaceManager().Repository()
-	err := repo.AddSnap(snapInfo)
+	err := repo.AddAppSet(appSet)
 	c.Assert(err, check.IsNil)
 	return snapInfo
 }
@@ -487,7 +689,7 @@ version: %s
 		dir, rev := filepath.Split(snapInfo.MountDir())
 		c.Assert(os.Symlink(rev, dir+"current"), check.IsNil)
 	}
-	c.Assert(snapInfo.InstanceName(), check.Equals, instanceName)
+	c.Assert(snapInfo.InstanceName().String(), check.Equals, instanceName)
 
 	c.Assert(os.MkdirAll(snapInfo.DataDir(), 0755), check.IsNil)
 	metadir := filepath.Join(snapInfo.MountDir(), "meta")
@@ -516,7 +718,7 @@ version: %s
 		return snapInfo
 	}
 
-	devAcct := assertstest.NewAccount(s.StoreSigning, developer, map[string]interface{}{
+	devAcct := assertstest.NewAccount(s.StoreSigning, developer, map[string]any{
 		"account-id": developer + "-id",
 	}, "")
 
@@ -527,7 +729,7 @@ version: %s
 		Validation:  devAcct.Validation(),
 	}
 
-	snapDecl, err := s.StoreSigning.Sign(asserts.SnapDeclarationType, map[string]interface{}{
+	snapDecl, err := s.StoreSigning.Sign(asserts.SnapDeclarationType, map[string]any{
 		"series":       "16",
 		"snap-id":      snapID,
 		"snap-name":    snapName,
@@ -541,7 +743,7 @@ version: %s
 	h := sha3.Sum384(content)
 	dgst, err := asserts.EncodeDigest(crypto.SHA3_384, h[:])
 	c.Assert(err, check.IsNil)
-	snapRev, err := s.StoreSigning.Sign(asserts.SnapRevisionType, map[string]interface{}{
+	snapRev, err := s.StoreSigning.Sign(asserts.SnapRevisionType, map[string]any{
 		"snap-sha3-384": string(dgst),
 		"snap-size":     "999",
 		"snap-id":       snapID,
@@ -601,7 +803,41 @@ func (s *apiBaseSuite) expectWriteAccess(a daemon.AccessChecker) {
 	s.expectedWriteAccess = a
 }
 
-func (s *apiBaseSuite) req(c *check.C, req *http.Request, u *auth.UserState) daemon.Response {
+type actionExpectedBool bool
+
+const (
+	actionIsUnexpected actionExpectedBool = false
+	actionIsExpected   actionExpectedBool = true
+)
+
+// recordAction records req's action for TestMain coverage, using the same
+// selection and decoding as Command.ServeHTTP. The body is restored so the
+// request can still be served. Trailing data still yields an action and is
+// recorded; the Actions-list check applies only to a clean decode.
+func recordAction(c *check.C, cmd *daemon.Command, req *http.Request) {
+	if req.Body == nil || !daemon.RequestDecodesAction(req) {
+		return
+	}
+
+	body, err := io.ReadAll(req.Body)
+	c.Assert(err, check.IsNil)
+	req.Body = io.NopCloser(bytes.NewReader(body))
+
+	action, err := daemon.DecodeAction(body)
+	if action == "" {
+		return
+	}
+
+	actionsMap.AddAction(cmd, action)
+	if err != nil {
+		return
+	}
+	if !strutil.ListContains(cmd.Actions, action) {
+		c.Errorf("The action, %s, is not registered in the list of Actions of the corresponding command %s", action, cmd.Path)
+	}
+}
+
+func (s *apiBaseSuite) req(c *check.C, req *http.Request, u *auth.UserState, actionExpected actionExpectedBool) daemon.Response {
 	if s.d == nil {
 		panic("call s.daemon(c) etc in your test first")
 	}
@@ -622,6 +858,9 @@ func (s *apiBaseSuite) req(c *check.C, req *http.Request, u *auth.UserState) dae
 		acc = cmd.WriteAccess
 		expAcc = s.expectedWriteAccess
 		whichAcc = "WriteAccess"
+		if actionExpected {
+			recordAction(c, cmd, req)
+		}
 	case "PUT":
 		f = cmd.PUT
 		acc = cmd.WriteAccess
@@ -637,26 +876,26 @@ func (s *apiBaseSuite) req(c *check.C, req *http.Request, u *auth.UserState) dae
 	return f(cmd, req, u)
 }
 
-func (s *apiBaseSuite) jsonReq(c *check.C, req *http.Request, u *auth.UserState) *daemon.RespJSON {
-	rsp, ok := s.req(c, req, u).(daemon.StructuredResponse)
+func (s *apiBaseSuite) jsonReq(c *check.C, req *http.Request, u *auth.UserState, actionExpected actionExpectedBool) *daemon.RespJSON {
+	rsp, ok := s.req(c, req, u, actionExpected).(daemon.StructuredResponse)
 	c.Assert(ok, check.Equals, true, check.Commentf("expected structured response"))
 	return rsp.JSON()
 }
 
-func (s *apiBaseSuite) syncReq(c *check.C, req *http.Request, u *auth.UserState) *daemon.RespJSON {
-	rsp := s.jsonReq(c, req, u)
+func (s *apiBaseSuite) syncReq(c *check.C, req *http.Request, u *auth.UserState, actionExpected actionExpectedBool) *daemon.RespJSON {
+	rsp := s.jsonReq(c, req, u, actionExpected)
 	c.Assert(rsp.Type, check.Equals, daemon.ResponseTypeSync, check.Commentf("expected sync resp: %#v, result: %+v", rsp, rsp.Result))
 	return rsp
 }
 
-func (s *apiBaseSuite) asyncReq(c *check.C, req *http.Request, u *auth.UserState) *daemon.RespJSON {
-	rsp := s.jsonReq(c, req, u)
+func (s *apiBaseSuite) asyncReq(c *check.C, req *http.Request, u *auth.UserState, actionExpected actionExpectedBool) *daemon.RespJSON {
+	rsp := s.jsonReq(c, req, u, actionExpected)
 	c.Assert(rsp.Type, check.Equals, daemon.ResponseTypeAsync, check.Commentf("expected async resp: %#v, result %v", rsp, rsp.Result))
 	return rsp
 }
 
-func (s *apiBaseSuite) errorReq(c *check.C, req *http.Request, u *auth.UserState) *daemon.APIError {
-	rsp := s.req(c, req, u)
+func (s *apiBaseSuite) errorReq(c *check.C, req *http.Request, u *auth.UserState, actionExpected actionExpectedBool) *daemon.APIError {
+	rsp := s.req(c, req, u, actionExpected)
 	rspe, ok := rsp.(*daemon.APIError)
 	c.Assert(ok, check.Equals, true, check.Commentf("expected apiError resp: %#v", rsp))
 	return rspe
@@ -669,6 +908,7 @@ func (s *apiBaseSuite) serveHTTP(c *check.C, w http.ResponseWriter, req *http.Re
 
 	cmd, vars := handlerCommand(c, s.d, req)
 	s.vars = vars
+	recordAction(c, cmd, req)
 
 	cmd.ServeHTTP(w, req)
 }
@@ -689,4 +929,13 @@ func (s *apiBaseSuite) simulateConflict(name string) {
 	t.Set("snap-setup", snapsup)
 	chg := st.NewChange("manip", "...")
 	chg.AddTask(t)
+}
+
+func assertResponseBody(c *check.C, b io.Reader, expected map[string]any) {
+	var body map[string]any
+	dec := json.NewDecoder(b)
+	err := dec.Decode(&body)
+	c.Check(err, check.IsNil)
+	c.Check(body, check.DeepEquals, expected)
+	c.Check(dec.More(), check.Equals, false)
 }

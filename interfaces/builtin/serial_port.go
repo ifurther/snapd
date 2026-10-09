@@ -77,7 +77,9 @@ func (iface *serialPortInterface) String() string {
 //   - ttyHSX (Qualcomm GENI based QTI serial cores)
 //   - ttyGSX (USB gadget serial devices)
 //   - ttyLPX (NXP Layerscape SoC UART serial ports)
-var serialDeviceNodePattern = regexp.MustCompile("^/dev/tty(mxc|USB|ACM|AMA|XRUSB|S|O|SC|MSM|HS|GS|LP)[0-9]+$")
+//   - ttyRPMSGX (RPMSG TTY driver serial ports)
+//   - ttyMAX (MAX3100 TTY driver serial ports)
+var serialDeviceNodePattern = regexp.MustCompile("^/dev/tty(mxc|USB|ACM|AMA|XRUSB|S|O|SC|MSM|HS|GS|LP|RPMSG|MAX)[0-9]+$")
 
 // Pattern that is considered valid for the udev symlink to the serial device,
 // path attributes will be compared to this for validity when usb vid and pid
@@ -221,7 +223,7 @@ func (iface *serialPortInterface) HotplugDeviceDetected(di *hotplug.HotplugDevic
 	}
 
 	slot := hotplug.ProposedSlot{
-		Attrs: map[string]interface{}{
+		Attrs: map[string]any{
 			"path": di.DeviceName(),
 		},
 	}
@@ -284,6 +286,10 @@ func (iface *serialPortInterface) hasUsbAttrs(attrs interfaces.Attrer) bool {
 		return true
 	}
 	return false
+}
+
+func (iface *serialPortInterface) ParallelInstancesSupportedForSlot(slot *snap.SlotInfo) error {
+	return parallelInstancesSystemOrGadgetSlotErr(slot)
 }
 
 func init() {

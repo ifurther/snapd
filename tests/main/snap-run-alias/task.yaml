@@ -33,5 +33,4 @@ execute: |
 
     $ALIAS "$SNAP/bin/cat"
     $ALIAS "$SNAP/bin/cat" > new.txt 2>&1
-
     diff -u orig.txt new.txt

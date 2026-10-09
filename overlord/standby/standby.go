@@ -92,14 +92,15 @@ func New(st *state.State) *StandbyOpinions {
 }
 
 func (m *StandbyOpinions) Start() {
-	logger.Debugf("will consider standby after: %v", m.standbyWait)
+	logger.Noticef("will consider standby after: %v", m.standbyWait)
 	go func() {
 		wait := m.standbyWait
 		timer := time.NewTimer(wait)
 		for {
 			if m.CanStandby() {
+				logger.Noticef("standby conditions met, initiating standby...")
 				m.state.Lock()
-				restart.Request(m.state, restart.RestartSocket, nil)
+				restart.Request(m.state, restart.RestartSocket, nil, restart.RestartSnapdIdle)
 				m.state.Unlock()
 			}
 			select {
@@ -117,6 +118,7 @@ func (m *StandbyOpinions) Start() {
 }
 
 func (m *StandbyOpinions) Stop() {
+	logger.Noticef("standby monitoring stop requested")
 	select {
 	case <-m.stoppedCh:
 		// nothing left to do

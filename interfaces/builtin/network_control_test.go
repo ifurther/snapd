@@ -84,12 +84,29 @@ func (s *NetworkControlInterfaceSuite) TestAppArmorSpec(c *C) {
 	r := apparmor_sandbox.MockFeatures(nil, nil, nil, nil)
 	defer r()
 
-	spec := apparmor.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	appSet, err := interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec := apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.slot), IsNil)
 	c.Check(spec.SuppressSysModuleCapability(), Equals, true)
 	c.Check(spec.UsesSysModuleCapability(), Equals, false)
 	c.Assert(spec.SecurityTags(), DeepEquals, []string{"snap.consumer.app"})
 	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "/run/netns/* rw,\n")
+	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, `path="/org/freedesktop/resolve1/link/*"`)
+	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, `interface="org.freedesktop.resolve1.Link"`)
+	// Some dbus members policy is wildcard, so splitting this member assert into two
+	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, `member="Set*"`)
+	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, `member="{ListLinks,GetLinkByName,GetLinkByIndex,SetLinkNTP,SetLinkDNS,SetLinkDNSEx,SetLinkDomains,SetLinkDefaultRoute,SetLinkLLMNR,SetLinkMulticastDNS,SetLinkDNSOverTLS,SetLinkDNSSEC,SetLinkDNSSECNegativeTrustAnchors,RevertLinkNTP,RevertLinkDNS,RenewLink,ForceRenewLink,ReconfigureLink,Reload,DescribeLink,Describe}"`)
+	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, `unix (bind) type=stream addr="@*/bus/networkctl*/system",`)
+	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "/run/systemd/netif/links/* r,")
+	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "/run/systemd/netif/lldp/[0-9]* r,")
+	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "/run/udev/data/n[0-9]* r,")
+	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "/{,usr/}{,s}bin/networkctl ixr,")
+	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, `path="/org/freedesktop/network1"`)
+	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, `interface="org.freedesktop.network1.Manager"`)
+	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, `path="/org/freedesktop/network1/link/_*"`)
+	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, `interface="org.freedesktop.network1.Link"`)
+	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, `peer=(label=unconfined),`)
 	// No "xdp" feature is available, so this rule should not be added
 	c.Assert(spec.SnippetForTag("snap.consumer.app"), Not(testutil.Contains), "network xdp,")
 	c.Assert(spec.UpdateNS(), DeepEquals, []string{`
@@ -110,7 +127,9 @@ func (s *NetworkControlInterfaceSuite) TestAppArmorSpecWithNoAppArmor(c *C) {
 	r := apparmor_sandbox.MockLevel(apparmor_sandbox.Unsupported)
 	defer r()
 
-	spec := apparmor.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	appSet, err := interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec := apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.slot), IsNil)
 	// Check a rule that should always be there...
 	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "/run/netns/* rw,\n")
@@ -124,7 +143,9 @@ func (s *NetworkControlInterfaceSuite) TestAppArmorSpecWithXdpFeature(c *C) {
 	r = apparmor_sandbox.MockFeatures(nil, nil, []string{"feat1", "xdp", "feat2"}, nil)
 	defer r()
 
-	spec := apparmor.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	appSet, err := interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec := apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.slot), IsNil)
 	// Check a rule that should always be there...
 	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "/run/netns/* rw,\n")
@@ -133,19 +154,23 @@ func (s *NetworkControlInterfaceSuite) TestAppArmorSpecWithXdpFeature(c *C) {
 }
 
 func (s *NetworkControlInterfaceSuite) TestSecCompSpec(c *C) {
-	spec := seccomp.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	appSet, err := interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec := seccomp.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.slot), IsNil)
 	c.Assert(spec.SecurityTags(), DeepEquals, []string{"snap.consumer.app"})
 	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "setns - CLONE_NEWNET\n")
 }
 
 func (s *NetworkControlInterfaceSuite) TestUDevSpec(c *C) {
-	spec := udev.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	appSet, err := interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec := udev.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.slot), IsNil)
 	c.Assert(spec.Snippets(), HasLen, 3)
 	c.Assert(spec.Snippets(), testutil.Contains, `# network-control
 KERNEL=="tun", TAG+="snap_consumer_app"`)
-	c.Assert(spec.Snippets(), testutil.Contains, fmt.Sprintf(`TAG=="snap_consumer_app", SUBSYSTEM!="module", SUBSYSTEM!="subsystem", RUN+="%v/snap-device-helper snap_consumer_app"`, dirs.DistroLibExecDir))
+	c.Assert(spec.Snippets(), testutil.Contains, fmt.Sprintf(`TAG=="snap_consumer_app", SUBSYSTEM!="module", SUBSYSTEM!="subsystem", RUN+="%v/snap-device-helper $env{ACTION} snap_consumer_app $devpath $major:$minor"`, dirs.DistroLibExecDir))
 }
 
 func (s *NetworkControlInterfaceSuite) TestMountSpec(c *C) {

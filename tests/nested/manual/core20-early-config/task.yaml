@@ -4,7 +4,11 @@ details: |
     Check that defaults are applied early when the Ubuntu Core image is
     booted and also after transition to recovery mode.
 
-systems: [ubuntu-2*]
+systems:
+  # FIXME: make it work on 26
+  - ubuntu-20*
+  - ubuntu-22*
+  - ubuntu-24*
 
 environment:
     NESTED_ENABLE_TPM: true
@@ -23,6 +27,14 @@ prepare: |
     snap download --basename=pc --channel="$VERSION/edge" pc
     unsquashfs -d pc-gadget pc.snap
 
+    # append system.motd config to the defaults.yaml selectively for 24+
+    if os.query is-ubuntu-ge 24.04; then
+        cat <<EOF >> defaults.yaml
+          motd: |
+            Welcome to Ubuntu Core!
+            Test MOTD.
+    EOF
+    fi
     cat defaults.yaml >> pc-gadget/meta/gadget.yaml
     mkdir -p pc-gadget/meta/hooks
     cp install pc-gadget/meta/hooks/
@@ -72,7 +84,7 @@ execute: |
         remote.exec "cat /var/snap/pc/common/debug.txt" | MATCH "backlight symlink: /dev/null"
 
         # timezone is set
-        remote.exec "cat /etc/timezone" | MATCH "Europe/Malta"
+        remote.exec "timedatectl show -p Timezone --value" | MATCH "Europe/Malta"
         remote.exec "readlink -f /etc/localtime" | MATCH "Europe/Malta"
         remote.exec "cat /var/snap/pc/common/debug.txt" | MATCH "localtime symlink: /usr/share/zoneinfo/Europe/Malta"
 
@@ -83,6 +95,16 @@ execute: |
         remote.exec "cat /var/snap/pc/common/debug.txt" | MATCH "hostname: foo"
         remote.exec "cat /etc/hostname" | MATCH "foo"
         remote.exec "hostname" | MATCH "foo"
+
+        # motd is set (on UC24+)
+        if os.query is-ubuntu-lt 24.04; then
+            echo "on pre-core24 the motd option is not supported"
+            not remote.exec "test -e /etc/motd.d/50-default"
+        else
+            echo "on core24+ setting the motd option via gadget defaults should work"
+            remote.exec "cat /etc/motd.d/50-default" | MATCH "Test MOTD"
+            remote.exec "sudo snap get system system.motd" | MATCH "Test MOTD"
+        fi
 
         # Should not have all-* snippets from the base
         not remote.exec "sudo snap get system system.network.netplan.network.ethernets.all-en"

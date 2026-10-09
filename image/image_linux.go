@@ -153,6 +153,23 @@ func Prepare(opts *Options) error {
 		return err
 	}
 
+	for _, assertionsFilename := range opts.ExtraAssertionsFiles {
+		// Function reads the assertions from the file, decodes them and rejects
+		// assertion types that are not allowed
+
+		assertionsFile, err := os.Open(assertionsFilename)
+		if err != nil {
+			return fmt.Errorf("cannot read extra assertion: %s", err)
+		}
+		defer assertionsFile.Close()
+		extraAssertions, err := decodeExtraAssertions(assertionsFile, model.Grade())
+		if err != nil {
+			return err
+		}
+
+		opts.ExtraAssertions = append(opts.ExtraAssertions, extraAssertions...)
+	}
+
 	if err := setupSeed(tsto, model, opts); err != nil {
 		return err
 	}
@@ -284,11 +301,12 @@ type imageSeeder struct {
 	model *asserts.Model
 	tsto  *tooling.ToolingStore
 
-	classic        bool
-	prepareDir     string
-	wideCohortKey  string
-	customizations *Customizations
-	architecture   string
+	classic                  bool
+	prepareDir               string
+	wideCohortKey            string
+	customizations           *Customizations
+	architecture             string
+	allowSnapdKernelMismatch bool
 
 	hasModes    bool
 	rootDir     string
@@ -313,12 +331,17 @@ func newImageSeeder(tsto *tooling.ToolingStore, model *asserts.Model, opts *Opti
 		wideCohortKey: opts.WideCohortKey,
 		// keep a pointer to the customization object in opts as the Validation
 		// member might be defaulted if not set.
-		customizations: &opts.Customizations,
-		architecture:   determineImageArchitecture(model, opts),
+		customizations:           &opts.Customizations,
+		architecture:             determineImageArchitecture(model, opts),
+		allowSnapdKernelMismatch: opts.AllowSnapdKernelMismatch,
 
 		hasModes: model.Grade() != asserts.ModelGradeUnset,
 		model:    model,
 		tsto:     tsto,
+	}
+
+	if os.Getenv("SNAPD_ALLOW_SNAPD_KERNEL_MISMATCH") == "true" {
+		s.allowSnapdKernelMismatch = true
 	}
 
 	if !s.hasModes {
@@ -343,13 +366,16 @@ func newImageSeeder(tsto *tooling.ToolingStore, model *asserts.Model, opts *Opti
 	}
 
 	wOpts := &seedwriter.Options{
-		SeedDir:        s.seedDir,
-		Label:          s.label,
-		DefaultChannel: opts.Channel,
-		Manifest:       opts.SeedManifest,
-		ManifestPath:   opts.SeedManifestPath,
+		SeedDir:           s.seedDir,
+		Label:             s.label,
+		DefaultChannel:    opts.Channel,
+		Manifest:          opts.SeedManifest,
+		ManifestPath:      opts.SeedManifestPath,
+		EnforceValidation: opts.Customizations.Validation != "ignore",
 
 		TestSkipCopyUnverifiedModel: osutil.GetenvBool("UBUNTU_IMAGE_SKIP_COPY_UNVERIFIED_MODEL"),
+
+		ExtraAssertions: opts.ExtraAssertions,
 	}
 	w, err := seedwriter.New(model, wOpts)
 	if err != nil {
@@ -451,17 +477,30 @@ func (s *imageSeeder) validateSnapArchs(snaps []*seedwriter.SeedSnap) error {
 
 type localSnapRefs map[*seedwriter.SeedSnap][]*asserts.Ref
 
-func (s *imageSeeder) deriveInfoForLocalSnaps(f seedwriter.SeedAssertionFetcher, db *asserts.Database) (localSnapRefs, error) {
+func (s *imageSeeder) deriveInfoForLocalSnaps(localCompsPaths []string, f seedwriter.SeedAssertionFetcher, db *asserts.Database) (localSnapRefs, error) {
 	localSnaps, err := s.w.LocalSnaps()
 	if err != nil {
 		return nil, err
 	}
 
-	snaps := make(map[*seedwriter.SeedSnap][]*asserts.Ref)
-	for _, sn := range localSnaps {
-		si, aRefs, err := seedwriter.DeriveSideInfo(sn.Path, s.model, f, db)
-		if err != nil && !errors.Is(err, &asserts.NotFoundError{}) {
+	cinfos := make(map[string]*snap.ComponentInfo, len(localCompsPaths))
+	for _, path := range localCompsPaths {
+		ci, err := readComponentInfoFromCont(path)
+		if err != nil {
 			return nil, err
+		}
+		cinfos[path] = ci
+	}
+
+	snaps := make(localSnapRefs)
+	for _, sn := range localSnaps {
+		assertedSnap := true
+		si, aRefs, err := seedwriter.DeriveSideInfo(sn.Path, s.model, f, db)
+		if err != nil {
+			if !errors.Is(err, &asserts.NotFoundError{}) {
+				return nil, err
+			}
+			assertedSnap = false
 		}
 
 		snapFile, err := snapfile.Open(sn.Path)
@@ -473,10 +512,51 @@ func (s *imageSeeder) deriveInfoForLocalSnaps(f seedwriter.SeedAssertionFetcher,
 			return nil, err
 		}
 
-		if err := s.w.SetInfo(sn, info); err != nil {
+		// Assign components now that we know the snap name
+		seedComps := map[string]*seedwriter.SeedComponent{}
+		for path, ci := range cinfos {
+			if ci.Component.SnapName != info.SnapName() {
+				continue
+			}
+
+			if assertedSnap {
+				// Components for an asserted snap should have
+				// assertions too, error out otherwise
+				csi, crefs, err := seedwriter.DeriveComponentSideInfo(
+					path, ci, info, s.model, f, db)
+				if err != nil {
+					return nil, err
+				}
+				ci.ComponentSideInfo = *csi
+				aRefs = append(aRefs, crefs...)
+			}
+			seedComps[ci.Component.ComponentName] = &seedwriter.SeedComponent{
+				ComponentRef: naming.NewComponentRef(info.SnapName(),
+					ci.Component.ComponentName),
+				Path: path,
+				Info: ci,
+			}
+			delete(cinfos, path)
+		}
+
+		// For local snaps, the component information is set inside
+		// w.SetInfo by looking at the local components information set
+		// in the call to w.SetOptionsSnaps.
+		if err := s.w.SetInfo(sn, info, seedComps); err != nil {
 			return nil, err
 		}
+
 		snaps[sn] = aRefs
+	}
+
+	// Check if there are local components that did not belong to one
+	// of the local snaps
+	var errMsg strings.Builder
+	for path := range cinfos {
+		errMsg.WriteString(fmt.Sprintf("\n%q local component does not have a matching local snap", path))
+	}
+	if errMsg.Len() > 0 {
+		return nil, fmt.Errorf("missing local snaps:%s", errMsg.String())
 	}
 
 	// derive info first before verifying the arch
@@ -505,16 +585,18 @@ func (s *imageSeeder) validationSetKeysAndRevisionForSnap(snapName string) ([]sn
 		return nil, snap.Revision{}, err
 	}
 
-	// TODO: It's pointed out that here and some of the others uses of this
-	// may miss logic for optional snaps which have required revisions. This
-	// is not covered by the below check, and we may or may not have multiple places
-	// with a similar issue.
-	snapVsKeys, snapRev, err := allVss.CheckPresenceRequired(naming.Snap(snapName))
+	pres, err := allVss.Presence(naming.Snap(snapName))
 	if err != nil {
 		return nil, snap.Revision{}, err
 	}
-	if len(snapVsKeys) > 0 {
-		return snapVsKeys, snapRev, nil
+
+	// TODO: figure out if this is needed
+	if pres.Presence == asserts.PresenceInvalid {
+		return nil, snap.Revision{}, fmt.Errorf("snap %q is invalid in validation sets: %v", snapName, pres.Sets.CommaSeparated())
+	}
+
+	if pres.Constrained() {
+		return pres.Sets, pres.Revision, nil
 	}
 	return nil, s.w.Manifest().AllowedSnapRevision(snapName), nil
 }
@@ -522,38 +604,76 @@ func (s *imageSeeder) validationSetKeysAndRevisionForSnap(snapName string) ([]sn
 func (s *imageSeeder) downloadSnaps(snapsToDownload []*seedwriter.SeedSnap, curSnaps []*tooling.CurrentSnap) (downloadedSnaps map[string]*tooling.DownloadedSnap, err error) {
 	byName := make(map[string]*seedwriter.SeedSnap, len(snapsToDownload))
 	revisions := make(map[string]snap.Revision)
-	beforeDownload := func(info *snap.Info) (string, error) {
-		sn := byName[info.SnapName()]
+	beforeDownload := func(info *snap.Info, cinfos map[string]*snap.ComponentInfo) (string, map[string]string, error) {
+		sn := byName[info.SnapName().String()]
 		if sn == nil {
-			return "", fmt.Errorf("internal error: downloading unexpected snap %q", info.SnapName())
+			return "", nil, fmt.Errorf("internal error: downloading unexpected snap %q", info.SnapName())
 		}
-		rev := revisions[info.SnapName()]
+		rev := revisions[info.SnapName().String()]
 		if rev.Unset() {
 			rev = info.Revision
 		}
+		seedComps := make(map[string]*seedwriter.SeedComponent, len(cinfos))
+		for _, ci := range cinfos {
+			// No path as these are downloaded components
+			seedComps[ci.Component.ComponentName] = &seedwriter.SeedComponent{
+				ComponentRef: ci.Component,
+				Path:         "",
+				Info:         ci,
+			}
+		}
 		fmt.Fprintf(Stdout, "Fetching %s (%s)\n", sn.SnapName(), rev)
-		if err := s.w.SetInfo(sn, info); err != nil {
-			return "", err
+		if err := s.w.SetInfo(sn, info, seedComps); err != nil {
+			return "", nil, err
 		}
 		if err := s.validateSnapArchs([]*seedwriter.SeedSnap{sn}); err != nil {
-			return "", err
+			return "", nil, err
 		}
-		return sn.Path, nil
+
+		compPaths := make(map[string]string, len(cinfos))
+		for _, comp := range sn.Components {
+			compPaths[comp.ComponentName] = comp.Path
+		}
+
+		return sn.Path, compPaths, nil
 	}
 	snapToDownloadOptions := make([]tooling.SnapToDownload, len(snapsToDownload))
 	for i, sn := range snapsToDownload {
-		vss, rev, err := s.validationSetKeysAndRevisionForSnap(sn.SnapName())
+		vss, rev, err := s.validationSetKeysAndRevisionForSnap(sn.SnapName().String())
 		if err != nil {
 			return nil, err
 		}
 
-		byName[sn.SnapName()] = sn
-		revisions[sn.SnapName()] = rev
+		var channel string
+		switch {
+		case !rev.Unset():
+			// if we're setting a revision from a validation set, we don't want
+			// to send a channel, since we don't know if that revision is in
+			// that channel
+			channel = ""
+		case sn.Channel == "":
+			// otherwise, we want to make sure to set a default channel if
+			// possible. this case shouldn't ever really happen, since SeedSnaps
+			// should have a channel set
+			channel = "stable"
+		default:
+			channel = sn.Channel
+		}
+
+		byName[sn.SnapName().String()] = sn
+		revisions[sn.SnapName().String()] = rev
 		snapToDownloadOptions[i].Snap = sn
-		snapToDownloadOptions[i].Channel = sn.Channel
+		snapToDownloadOptions[i].Channel = channel
 		snapToDownloadOptions[i].Revision = rev
 		snapToDownloadOptions[i].CohortKey = s.wideCohortKey
 		snapToDownloadOptions[i].ValidationSets = vss
+
+		// Components
+		compsToDownload := make([]string, len(sn.Components))
+		for i, comp := range sn.Components {
+			compsToDownload[i] = comp.ComponentRef.ComponentName
+		}
+		snapToDownloadOptions[i].CompsToDownload = compsToDownload
 	}
 
 	// sort the curSnaps slice for test consistency
@@ -567,6 +687,7 @@ func (s *imageSeeder) downloadSnaps(snapsToDownload []*seedwriter.SeedSnap, curS
 	if err != nil {
 		return nil, err
 	}
+
 	return downloadedSnaps, nil
 }
 
@@ -577,7 +698,7 @@ func localSnapsWithID(snaps localSnapRefs) []*tooling.CurrentSnap {
 			continue
 		}
 		localSnaps = append(localSnaps, &tooling.CurrentSnap{
-			SnapName: sn.Info.SnapName(),
+			SnapName: sn.Info.SnapName().String(),
 			SnapID:   sn.Info.ID(),
 			Revision: sn.Info.Revision,
 			Epoch:    sn.Info.Epoch,
@@ -600,13 +721,13 @@ func (s *imageSeeder) downloadAllSnaps(localSnaps localSnapRefs, fetchAsserts se
 		}
 
 		for _, sn := range toDownload {
-			dlsn := downloadedSnaps[sn.SnapName()]
+			dlsn := downloadedSnaps[sn.SnapName().String()]
 			if err := s.w.SetRedirectChannel(sn, dlsn.RedirectChannel); err != nil {
 				return err
 			}
 
 			curSnaps = append(curSnaps, &tooling.CurrentSnap{
-				SnapName: sn.Info.SnapName(),
+				SnapName: sn.Info.SnapName().String(),
 				SnapID:   sn.Info.ID(),
 				Revision: sn.Info.Revision,
 				Epoch:    sn.Info.Epoch,
@@ -739,7 +860,7 @@ func (s *imageSeeder) warnOnUnassertedSnaps() error {
 	if len(unassertedSnaps) > 0 {
 		locals := make([]string, len(unassertedSnaps))
 		for i, sn := range unassertedSnaps {
-			locals[i] = sn.SnapName()
+			locals[i] = sn.SnapName().String()
 		}
 		fmt.Fprintf(Stderr, "WARNING: %s installed from local snaps disconnected from a store cannot be refreshed subsequently!\n", strutil.Quoted(locals))
 	}
@@ -747,6 +868,17 @@ func (s *imageSeeder) warnOnUnassertedSnaps() error {
 }
 
 func (s *imageSeeder) finish() error {
+	// Ensure that the snapd snap is compatible with the snap-bootstrap
+	// contained within the kernel snap.
+	if err := s.w.VerifySnapBootstrapCompatibility(); err != nil {
+		if !s.allowSnapdKernelMismatch {
+			// If not, error out as there is no reason to allow
+			// this as the resulting image will be invalid.
+			return err
+		}
+		fmt.Fprintf(Stderr, "WARNING: %v\n", err)
+	}
+
 	// print any warnings that occurred during the download phase
 	for _, warn := range s.w.Warnings() {
 		fmt.Fprintf(Stderr, "WARNING: %s\n", warn)
@@ -759,10 +891,8 @@ func (s *imageSeeder) finish() error {
 
 	// run validation-set checks, this is also done by store but
 	// we double-check for the seed.
-	if s.customizations.Validation != "ignore" {
-		if err := s.w.CheckValidationSets(); err != nil {
-			return err
-		}
+	if err := s.w.CheckValidationSets(); err != nil {
+		return err
 	}
 
 	copySnap := func(name, src, dst string) error {
@@ -786,8 +916,20 @@ func (s *imageSeeder) finish() error {
 	return s.finishSeedCore()
 }
 
-func optionSnaps(opts *Options) []*seedwriter.OptionsSnap {
+func readComponentInfoFromCont(path string) (*snap.ComponentInfo, error) {
+	compf, err := snapfile.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open container: %w", err)
+	}
+
+	return snap.ReadComponentInfoFromContainer(compf, nil, nil)
+}
+
+func optionSnaps(opts *Options) ([]*seedwriter.OptionsSnap, []string, error) {
 	optSnaps := make([]*seedwriter.OptionsSnap, 0, len(opts.Snaps))
+	pathToLocalComp := map[string]*snap.ComponentInfo{}
+	localCompsPaths := []string{}
+
 	for _, snapName := range opts.Snaps {
 		var optSnap seedwriter.OptionsSnap
 		if strings.HasSuffix(snapName, ".snap") {
@@ -799,7 +941,43 @@ func optionSnaps(opts *Options) []*seedwriter.OptionsSnap {
 		optSnap.Channel = opts.SnapChannels[snapName]
 		optSnaps = append(optSnaps, &optSnap)
 	}
-	return optSnaps
+	for _, compOpt := range opts.Components {
+		if strings.HasSuffix(compOpt, ".comp") {
+			// We need to look inside to know the owner snap, wait until
+			// that can be done for all local snaps/comps
+			cinfo, err := readComponentInfoFromCont(compOpt)
+			if err != nil {
+				return nil, nil, err
+			}
+			// Being a map, we ensure we do not get duplicates
+			pathToLocalComp[compOpt] = cinfo
+			localCompsPaths = append(localCompsPaths, compOpt)
+		} else {
+			snapName, compName, err := naming.SplitFullComponentName(compOpt)
+			if err != nil {
+				return nil, nil, err
+			}
+			optComp := seedwriter.OptionsComponent{Name: compName}
+			// Add the component to the matching snap, or create
+			// new otherwise (that is, assume that
+			// --comp <snap>+<comp> implicitly pulls also the snap)
+			snapFound := false
+			for _, optSn := range optSnaps {
+				if optSn.Name == snapName.String() {
+					optSn.Components = append(optSn.Components, optComp)
+					snapFound = true
+					break
+				}
+			}
+			if !snapFound {
+				optSnaps = append(optSnaps, &seedwriter.OptionsSnap{
+					Name:       snapName.String(),
+					Components: []seedwriter.OptionsComponent{optComp},
+				})
+			}
+		}
+	}
+	return optSnaps, localCompsPaths, nil
 }
 
 func selectAssertionMaxFormats(tsto *tooling.ToolingStore, model *asserts.Model, sysSn, kernSn *seedwriter.SeedSnap) error {
@@ -846,7 +1024,11 @@ var setupSeed = func(tsto *tooling.ToolingStore, model *asserts.Model, opts *Opt
 		return err
 	}
 
-	if err := s.start(optionSnaps(opts)); err != nil {
+	snapOpts, localCompsPaths, err := optionSnaps(opts)
+	if err != nil {
+		return err
+	}
+	if err := s.start(snapOpts); err != nil {
 		return err
 	}
 
@@ -860,17 +1042,16 @@ var setupSeed = func(tsto *tooling.ToolingStore, model *asserts.Model, opts *Opt
 		return tsto.AssertionFetcher(tmpDb, save)
 	})
 
-	localSnaps, err := s.deriveInfoForLocalSnaps(tmpFetcher, tmpDb)
+	localSnaps, err := s.deriveInfoForLocalSnaps(localCompsPaths, tmpFetcher, tmpDb)
 	if err != nil {
 		return err
 	}
 
+	// Default validation behavior to "enforce" if not set
 	if opts.Customizations.Validation == "" {
-		if !opts.Classic {
-			fmt.Fprintf(Stderr, "WARNING: proceeding to download snaps ignoring validations, this default will change in the future. For now use --validation=enforce for validations to be taken into account, pass instead --validation=ignore to preserve current behavior going forward\n")
-		}
-		opts.Customizations.Validation = "ignore"
+		opts.Customizations.Validation = "enforce"
 	}
+	fmt.Fprintf(Stdout, "INFO: validation mode: %s\n", opts.Customizations.Validation)
 
 	assertMaxFormatsSelected := false
 	var assertMaxFormats map[string]int
@@ -914,8 +1095,15 @@ var setupSeed = func(tsto *tooling.ToolingStore, model *asserts.Model, opts *Opt
 				return nil, err
 			}
 		} else {
-			// fetch snap assertions
-			if _, err = FetchAndCheckSnapAssertions(sn.Path, sn.Info, model, s.f, s.db); err != nil {
+			// fetch snap and components assertions
+			compPaths := make([]CompInfoPath, len(sn.Components))
+			for i, comp := range sn.Components {
+				compPaths[i] = CompInfoPath{
+					Info: comp.Info,
+					Path: comp.Path,
+				}
+			}
+			if _, err = FetchAndCheckSnapAssertions(sn.Path, sn.Info, compPaths, model, s.f, s.db); err != nil {
 				return nil, err
 			}
 		}
@@ -926,4 +1114,36 @@ var setupSeed = func(tsto *tooling.ToolingStore, model *asserts.Model, opts *Opt
 		return err
 	}
 	return s.finish()
+}
+
+func decodeExtraAssertions(r io.Reader, grade asserts.ModelGrade) ([]asserts.Assertion, error) {
+	var extraAssertions []asserts.Assertion
+
+	dec := asserts.NewDecoder(r)
+	for {
+		a, err := dec.Decode()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode extra assertion: %v", err)
+		}
+
+		switch a.Type() {
+		case asserts.SnapDeclarationType, asserts.SnapRevisionType, asserts.ModelType, asserts.SerialType, asserts.ValidationSetType:
+			return nil, fmt.Errorf("assertion type %v is not allowed for extra assertions", a.Type().Name)
+		case asserts.SystemUserType:
+			if grade != asserts.ModelDangerous {
+				return nil, fmt.Errorf("seeding system-user assertions is allowed for dangerous grade model only")
+			}
+			if a.HeaderString("password") != "" {
+				return nil, fmt.Errorf("seeded system-user assertions must not contain a password for security reasons, please use public key authentication instead")
+			}
+			fmt.Fprintf(Stderr, "INFO: the provided system-user assertion for user %s will be imported on first boot\n", a.HeaderString("username"))
+		}
+
+		extraAssertions = append(extraAssertions, a)
+	}
+
+	return extraAssertions, nil
 }

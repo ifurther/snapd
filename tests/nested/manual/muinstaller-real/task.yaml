@@ -2,11 +2,16 @@ summary: End-to-end test for install via muinstaller
 
 details: End-to-end test for install via muinstaller
 
-systems: [ubuntu-22.04-64, ubuntu-24.04-64]
+systems:
+  - ubuntu-22*
+  - ubuntu-24*
+  - ubuntu-26*
 
 environment:
   # No partial gadget by default
   PARTIAL_GADGET: false
+
+  NESTED_ENABLE_TPM: true
 
   # Test both encrypted and unencrypted install using the muinstaller
   NESTED_ENABLE_TPM/encrypted,partial: true
@@ -16,32 +21,35 @@ environment:
   NESTED_ENABLE_TPM/plain: false
   NESTED_ENABLE_SECURE_BOOT/plain: false
 
+  SEED_PARTITION: false
+  SEED_PARTITION/seeded: true
+
+  PRESEED_ROOTFS: false
+  PRESEED_ROOTFS/preseed: true
+
   # Using partial case (TPM used, see above)
   PARTIAL_GADGET/partial: true
 
   # ensure we use our latest code
   NESTED_BUILD_SNAPD_FROM_CURRENT: true
   NESTED_REPACK_KERNEL_SNAP: true
-  NESTED_ENABLE_OVMF: true
   # store related setup
   STORE_ADDR: localhost:11028
   STORE_DIR: $(pwd)/fake-store-blobdir
   # image
   IMAGE_MOUNTPOINT: /mnt/cloudimg
 
+skip:
+    - reason: This test needs test keys to be trusted
+      if: |
+        [ "$TRUST_TEST_KEYS" = "false" ]
+
 prepare: |
-  if [ "$TRUST_TEST_KEYS" = "false" ]; then
-      echo "This test needs test keys to be trusted"
-      exit
-  fi
-  apt install dosfstools kpartx
-  snap install jq
-  snap install yq
   "$TESTSTOOLS"/store-state setup-fake-store "$STORE_DIR"
 
 restore: |
   "$TESTSTOOLS"/store-state teardown-fake-store "$STORE_DIR"
-  rm -rf ./classic-root
+  rm -rf pc-kernel.* pc.* initrd* linux* kernel* tmp* pc-gadget pc-kernel-from-store.* pc-kernel-repacked.snap classic.model disk.img pc-kernel core*
 
 execute: |
   # shellcheck source=tests/lib/prepare.sh
@@ -70,7 +78,7 @@ execute: |
   if [ "$PARTIAL_GADGET" = true ]; then
       # Change to a gadget.yaml where "partial" is being used
       cp gadget-partial.yaml pc-gadget/meta/gadget.yaml
-  else
+  elif [ "$SEED_PARTITION" != 'true' ]; then
       # use the system-seed-null classic role
       sed -i 's/role: system-seed/role: system-seed-null/' pc-gadget/meta/gadget.yaml
   fi
@@ -81,20 +89,29 @@ execute: |
   tests.nested secboot-sign gadget pc-gadget "$SNAKEOIL_KEY" "$SNAKEOIL_CERT"
   snap pack --filename=pc.snap pc-gadget/
 
-  # Retrieve kernel
-  snap download --basename=pc-kernel --channel="$version/edge" pc-kernel
+  # Retrieve kernel assertion and snap through repack-kernel tool
+  "$TESTSTOOLS"/repack-kernel --mode download --kernel-branch "$version" --kernel-channel edge --output-snap "$PWD/pc-kernel-from-store.snap"
   # the fakestore needs this assertion
   snap ack pc-kernel.assert
-  # keep original blob just so we can find the assertion later
-  cp pc-kernel.snap pc-kernel.snap.orig
-  # Build kernel with initramfs with the compiled snap-bootstrap
-  uc20_build_initramfs_kernel_snap "$PWD/pc-kernel.snap" "$NESTED_ASSETS_DIR"
-  mv "${NESTED_ASSETS_DIR}"/pc-kernel_*.snap pc-kernel.snap
 
-  gendeveloper1 sign-model < "$TESTSLIB"/assertions/developer1-22-classic-dangerous.json > classic.model
+  # Build kernel with initramfs with the compiled snap-bootstrap
+  kmods_arg=""
+  component_args=()
+  if os.query is-ubuntu-ge 24.04; then
+      # split kernel into snap and kernel-modules component
+      component_args=(
+          --component-module efi_pstore
+          --component-name efi-pstore
+          --output-component "$PWD/pc-kernel+efi-pstore.comp"
+      )
+      kmods_arg="--kmods-comp pc-kernel+efi-pstore.comp"
+  fi
+  "$TESTSTOOLS"/repack-kernel --mode initramfs --core-version "$version" --orig-snap "$PWD/pc-kernel-from-store.snap" --output-snap "$PWD/pc-kernel-repacked.snap" "${component_args[@]}"
+
+  gendeveloper1 sign-model < "$TESTSLIB"/assertions/developer1-"$version"-classic-dangerous.json > classic.model
 
   # create new disk for the installer to work on and attach to VM
-  truncate --size=4G disk.img
+  truncate --size=6G disk.img
   if [ "$PARTIAL_GADGET" = true ]; then
       # create gpt volume and add a partition that should be ignored by snapd
       cat << 'EOF' | sfdisk disk.img
@@ -103,56 +120,111 @@ execute: |
   EOF
   fi
 
+  if [ "${PRESEED_ROOTFS}" = true ]; then
+      preseed_rootfs_args=--preseed-rootfs
+  fi
+
   # setup_nested_hybrid_system.sh runs the muinstaller to install a hybrid
   # system
+  # shellcheck disable=SC2086
   "${TESTSTOOLS}"/setup_nested_hybrid_system.sh \
      --model classic.model \
      --store-dir "${STORE_DIR}" \
      --gadget pc.snap \
      --gadget-assertion pc.assert \
-     --kernel pc-kernel.snap \
-     --kernel-assertion pc-kernel.assert \
+     --kernel pc-kernel-repacked.snap \
+    --kernel-assertion pc-kernel.assert \
+     ${preseed_rootfs_args-} \
+     $kmods_arg \
      --disk disk.img
+  rm -f disk.img
 
-  # things look fine
+  # basic things look fine
   remote.exec "cat /etc/os-release" | MATCH 'NAME="Ubuntu"'
   remote.exec "snap changes" | MATCH "Done.* Initialize system state"
   remote.exec "snap list" | MATCH pc-kernel
+  if os.query is-ubuntu-ge 24.04; then
+      remote.exec snap components pc-kernel | MATCH 'pc-kernel\+efi-pstore'
+      # kernel drivers tree has been created
+      remote.exec test -d /var/lib/snapd/kernel/pc-kernel/x1
+      # efi_pstore has been loaded and comes from the "updates" subfolder
+      # efi_pstore is loaded by systemd-pstore.service (pulled by sysinit.target) and must be available
+      # early, otherwise it will not have been loaded
+      remote.exec lsmod | MATCH efi_pstore
+      remote.exec modinfo -F filename efi_pstore | MATCH updates/efi-pstore/kmod/efi-pstore.ko
+      # Make sure it was loaded early
+      remote.exec systemctl show -p ExecMainStatus modprobe@efi_pstore.service | MATCH ExecMainStatus=0
+      # Additionally, check that modules loaded by systemd right after switch root could be loaded
+      remote.exec lsmod | MATCH ahci
+      # Check that the kernel-modules component can be removed
+      remote.exec sudo snap remove pc-kernel+efi-pstore
+  fi
 
-  # check encryption
-  if [ "$NESTED_ENABLE_TPM" = true ]; then
+  api_get_v2_system_info_storage_encrypted() {
+      remote.exec "sudo snap debug api /v2/system-info/storage-encrypted 2>/dev/null"
+  }
+
+  api_get_v2_systems_classic() {
+    remote.exec "sudo snap debug api /v2/systems/classic 2>/dev/null"
+  }
+
+  # check encryption 
+  remote.exec "sudo snap install test-snapd-tools"
+  remote.exec "snap list" | MATCH "test-snapd-tools"
+  if [ "$NESTED_ENABLE_TPM" = false ]; then
+      remote.exec "test-snapd-tools.cmd snapctl system-mode" | NOMATCH "storage-encrypted"
+      api_get_v2_system_info_storage_encrypted | gojq '.result.status' | MATCH "inactive"
+  else
+      remote.exec "test-snapd-tools.cmd snapctl system-mode" | MATCH "storage-encrypted: managed"
+      api_get_v2_system_info_storage_encrypted | gojq '.result.status' | MATCH "active"
+
       remote.exec "sudo test -d /var/lib/snapd/device/fde"
       remote.exec "sudo test -e /var/lib/snapd/device/fde/marker"
       remote.exec "sudo test -e /var/lib/snapd/device/fde/marker"
       remote.exec "sudo blkid /dev/disk/by-label/ubuntu-data-enc" | MATCH crypto_LUKS
 
-      echo "Ensure recovery keys are available on classic FDE too"
-      # We check for the key twice (see LP#2036631)
-      #shellcheck disable=SC2034
-      for i in 1 2; do
-          remote.exec "sudo snap recovery --show-keys" > show-keys.out
-          MATCH 'recovery:\s+[0-9]{5}-[0-9]{5}-[0-9]{5}-[0-9]{5}-[0-9]{5}-[0-9]{5}-[0-9]{5}-[0-9]{5}' < show-keys.out
-      done
+      # 26.04+ systems are not permitted to use /v2/system-recovery-keys, it can only
+      # show the recovery key at the point where it gets created.
+      if os.query is_ubuntu_lt 26.04; then
+          echo "Ensure recovery keys are available on classic FDE too"
+          # We check for the key twice (see LP#2036631)
+          #shellcheck disable=SC2034
+          for i in 1 2; do
+              remote.exec "sudo snap recovery --show-keys" > show-keys.out
+              MATCH 'recovery:\s+[0-9]{5}-[0-9]{5}-[0-9]{5}-[0-9]{5}-[0-9]{5}-[0-9]{5}-[0-9]{5}-[0-9]{5}' < show-keys.out
+          done
+      fi
 
       # check disk mappings
-      remote.exec "sudo snap install jq"
       # TODO: no ubuntu-save right now because:
       #       "ERROR cannot store device key pair: internal error: cannot access device keypair manager if ubuntu-save is unavailable"
       #DISK_MAPPINGS=(/run/mnt/ubuntu-save/device/disk-mapping.json
       #               /run/mnt/data/var/lib/snapd/device/disk-mapping.json)
       DISK_MAPPINGS=(/run/mnt/data/var/lib/snapd/device/disk-mapping.json)
       for DM in "${DISK_MAPPINGS[@]}"; do
-          remote.exec "sudo cat $DM | jq '.pc.\"structure-encryption\".\"ubuntu-save\".method'" | MATCH '"LUKS"'
-          remote.exec "sudo cat $DM | jq '.pc.\"structure-encryption\".\"ubuntu-data\".method'" | MATCH '"LUKS"'
+          remote.exec "sudo cat $DM" | gojq '.pc."structure-encryption"."ubuntu-save".method' | MATCH '"LUKS"'
+          remote.exec "sudo cat $DM" | gojq '.pc."structure-encryption"."ubuntu-data".method' | MATCH '"LUKS"'
       done
 
-      # check that on an already provisioned system the API will give a
-      # sensible reason why the system cannot be installed without further
-      # action.
-      remote.exec "sudo apt install -y curl"
-      remote.exec "sudo curl -s --unix-socket /run/snapd.socket http://localhost/v2/systems/classic" > system
-      jq '.result."storage-encryption".support' < system | MATCH "unavailable"
-      jq '.result."storage-encryption"."unavailable-reason"' < system | MATCH "not encrypting device storage as checking TPM gave: the TPM is in DA lockout mode"
+      # check that on an already provisioned system the API will use post install checks
+      api_get_v2_systems_classic | gojq '.result."storage-encryption".support' | MATCH "available"
+      api_get_v2_systems_classic | gojq '.result."storage-encryption"."encryption-type"' | MATCH "cryptsetup"
+  fi
+
+  if os.query is-ubuntu-ge 24.04; then
+      # test refresh of kernel with component
+      remote.push pc-kernel-repacked.snap
+      remote.push pc-kernel+efi-pstore.comp
+      REMOTE_CHG_ID=$(remote.exec sudo snap install --no-wait --dangerous pc-kernel-repacked.snap pc-kernel+efi-pstore.comp)
+      retry --wait 1 -n 120 sh -c "remote.exec \"snap change $REMOTE_CHG_ID | grep -E 'Task set to wait until a system restart allows to continue'\""
+      boot_id=$(tests.nested boot-id)
+      remote.exec sudo reboot || true
+      tests.nested wait-for reboot "$boot_id"
+      remote.exec sudo snap watch "$REMOTE_CHG_ID"
+      remote.exec "snap change $REMOTE_CHG_ID" | NOMATCH Error
+      # efi_pstore has been loaded and comes from the "updates" subfolder
+      remote.exec lsmod | MATCH efi_pstore
+      remote.exec modinfo -F filename efi_pstore | MATCH updates/efi-pstore/kmod/efi-pstore.ko
   fi
 
   # test kernel/gadget refreshes via the fake-store
@@ -207,26 +279,48 @@ execute: |
 
   # nested vm needs to restart for fake-store
   tests.nested vm stop
-  tests.nested create-vm core --tpm-no-restart
+  tests.nested create-vm core --keep-firmware-state
 
   # test gadget/kernel refresh
 
   # Make sure there is a change in assets to update
   sed -i 's/This program cannot be run in DOS mode/This program cannot be run in XXX mode/' pc-gadget/grubx64.efi
+
+  if [ "$SEED_PARTITION" = 'true' ]; then
+      role='system-seed'
+  else
+      role='system-seed-null'
+  fi
+
   # Bump edition of ubuntu-{seed,boot} content to get grub updated in both partitions
-  yq -i '(.volumes.pc.structure[] | select(.role == "system-seed-null") | .update.edition) |= . + 1' pc-gadget/meta/gadget.yaml
-  yq -i '(.volumes.pc.structure[] | select(.role == "system-boot") | .update.edition) |= . + 1' pc-gadget/meta/gadget.yaml
+  gojq --yaml-input --yaml-output \
+      "(.volumes.pc.structure[] | select(.role == \"${role}\") | .update.edition) |= . + 1" \
+      pc-gadget/meta/gadget.yaml > gadget.yaml.tmp
+  gojq --yaml-input --yaml-output \
+      '(.volumes.pc.structure[] | select(.role == "system-boot") | .update.edition) |= . + 1' \
+      gadget.yaml.tmp > gadget.yaml.tmp.2
+  mv gadget.yaml.tmp.2 pc-gadget/meta/gadget.yaml
   nested_secboot_sign_file pc-gadget/grubx64.efi "$SNAKEOIL_KEY" "$SNAKEOIL_CERT"
   refresh_rebooting_snap pc pc.snap.orig ./pc-gadget
+  rm -rf pc-gadget
 
   # Make sure we installed the new grub
-  remote.exec 'grep "This program cannot be run in XXX mode" /run/mnt/ubuntu-seed/EFI/boot/grubx64.efi'
+  if os.query is-ubuntu-ge 24.04 && [ "$PARTIAL_GADGET" = false ]; then
+      remote.exec 'grep "This program cannot be run in XXX mode" /run/mnt/ubuntu-seed/EFI/ubuntu/grubx64.efi'
+  else
+      remote.exec 'grep "This program cannot be run in XXX mode" /run/mnt/ubuntu-seed/EFI/boot/grubx64.efi'
+  fi
   remote.exec 'grep "This program cannot be run in XXX mode" /run/mnt/ubuntu-boot/EFI/boot/grubx64.efi'
 
-  unsquashfs -d pc-kernel pc-kernel.snap
-  refresh_rebooting_snap pc-kernel pc-kernel.snap.orig ./pc-kernel
-
-  version="$(nested_get_version)"
+  unsquashfs -d pc-kernel pc-kernel-repacked.snap
+  # The kernel snap version has grown too much and when we use the fakestore
+  # we append a fake1 string to the version, which can make the string grown
+  # beyond the 32 characters limit. Cut '+' character and what goes after to
+  # workaround this issue.
+  original_pc_kernel_version="$(gojq '.version' -r --yaml-input pc-kernel/meta/snap.yaml)"
+  sed -i 's#\(version: .*\)+.*#\1#' pc-kernel/meta/snap.yaml
+  refresh_rebooting_snap pc-kernel pc-kernel-from-store.snap ./pc-kernel
+  rm -rf pc-kernel
 
   # test that core22+ refreshes fine and does not revert after a reboot
   # (see https://github.com/snapcore/snapd/pull/12532)
@@ -238,6 +332,7 @@ execute: |
   echo "modified" >> ./"core${version}"/etc/motd
   snap pack --filename="core${version}".snap ./"core${version}"
   fakestore make-refreshable --dir "$STORE_DIR" --snap-orig-blob "core${version}.snap.orig" --snap-blob "./core${version}" "core${version}"
+  rm -rf "core${version}"
 
   remote.exec sudo snap refresh --amend --channel="edge" "core${version}"
   remote.exec snap list "core${version}" > "core${version}".before-boot
@@ -255,3 +350,83 @@ execute: |
       remote.exec 'test -e "/dev/disk/by-partlabel/BIOS\x20Boot"'
       remote.exec 'sudo fdisk -l /dev/vda' | MATCH '/dev/vda1\s+2048\s+4095\s+2048\s+1M\s+BIOS boot'
   fi
+
+  if [ "${PRESEED_ROOTFS}" = true ]; then
+      remote.exec "snap debug seeding" | MATCH "^preseeded: +true"
+  fi
+
+  if [ "$SEED_PARTITION" = 'false' ]; then
+      remote.exec not test -e /run/mnt/ubuntu-seed/systems/classic
+      exit 0
+  fi
+
+  # check that the hybrid recovery menu only contains an entry for the recovery
+  # mode selected by snapd, not entries for selecting arbitrary recovery modes
+  remote.exec "sudo cat /run/mnt/ubuntu-seed/EFI/ubuntu/grub.cfg" > grub.cfg
+  MATCH "Continue to run mode" < grub.cfg
+  MATCH "menuentry \"Continue to \\\$snapd_recovery_mode mode\"" < grub.cfg
+  MATCH "UEFI Firmware Settings" < grub.cfg
+  NOMATCH "Recover using" < grub.cfg
+  NOMATCH "Install using" < grub.cfg
+  NOMATCH "Factory reset using" < grub.cfg
+
+  if [ "$version" == 22 ]; then
+      # We are not mounting the users file for 22.04, the full recover
+      # feature is not supported until 24.04+.
+      exit 0
+  fi
+
+  # check that seed is properly installed
+  remote.exec test -d /run/mnt/ubuntu-seed/systems/classic
+  remote.exec "sudo snap recovery" | MATCH "classic\s+developer1\s+developer1-${version}-classic-dangerous\s+current"
+
+  echo "unasserted snaps"
+  remote.exec "ls /run/mnt/ubuntu-seed/systems/classic/snaps"
+
+  echo "asserted snaps"
+  remote.exec "ls /run/mnt/ubuntu-seed/snaps"
+
+  # on hybrid systems, we bind mount the seed from the mount that is set up by
+  # snap-bootstrap (/run/mnt/ubuntu-seed) to /var/lib/snapd/seed. we inject the
+  # systemd mount unit for the bind mount at install time, during the
+  # "install-finish" task.
+  test "$(remote.exec "findmnt /run/mnt/ubuntu-seed/ -o source -n")" = "$(remote.exec "findmnt /var/lib/snapd/seed -o source -n")"
+  remote.exec "systemctl is-active var-lib-snapd-seed.mount"
+
+  # check for unasserted snaps
+  for sn in pc snapd; do
+      sn_version=$(remote.exec "snap list ${sn}" | awk 'NR != 1 { print $2 }' | sed 's/+fake1//')
+      remote.exec "test -f /run/mnt/ubuntu-seed/systems/classic/snaps/${sn}_${sn_version}.snap"
+  done
+  remote.exec "test -f /run/mnt/ubuntu-seed/systems/classic/snaps/pc-kernel_${original_pc_kernel_version}.snap"
+
+  # check for asserted snaps
+  core_rev=$(remote.exec "snap list core${version}" | awk 'NR != 1 { print $3 }')
+  remote.exec "test -f /run/mnt/ubuntu-seed/snaps/core${version}_${core_rev}.snap"
+
+  # model in the seed should match the one that was installed on the system
+  remote.exec "diff <(snap model --assertion) /run/mnt/ubuntu-seed/systems/classic/model"
+
+  boot_id=$(remote.exec "cat /proc/sys/kernel/random/boot_id")
+  remote.exec "sudo snap reboot --recover classic" || true
+  remote.wait-for reboot "${boot_id}"
+
+  # we explicitly provide a password since the sudo group is not configured to
+  # allow passwordless sudo
+  timeout -v 300 remote.exec "echo ubuntu | sudo -S snap wait system seed.loaded"
+
+  # booted into recover mode
+  remote.exec "cat /proc/cmdline" | MATCH "snapd_recovery_mode=recover snapd_recovery_system=classic"
+  # but next boot will be run mode
+  remote.exec "echo ubuntu | sudo -S snap debug boot-vars --root-dir /run/mnt/ubuntu-seed" | MATCH '^snapd_recovery_mode=run$'
+
+  remote.exec "groups" | tr ' ' '\n' | sort | xargs | MATCH 'sudo user1'
+
+  remote.exec "snap list" > snap-list
+  for name in "pc" "pc-kernel" "snapd" "core${version}"; do
+      MATCH "${name}" < snap-list
+  done
+
+  for name in passwd shadow group gshadow; do
+      remote.exec "findmnt -n /etc/${name}" | awk '{ print $2 }' | MATCH "tmpfs\[/snapd/hybrid-users/${name}\]"
+  done

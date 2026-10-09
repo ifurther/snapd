@@ -87,10 +87,14 @@ func (s *OpenglInterfaceSuite) TestAppArmorSpec(c *C) {
 	tmpdir := c.MkDir()
 	dirs.SetRootDir(tmpdir)
 	c.Assert(os.MkdirAll(filepath.Join(tmpdir, "/usr/share/nvidia"), 0777), IsNil)
+	c.Assert(os.MkdirAll(filepath.Join(tmpdir, "/usr/lib/wsl"), 0777), IsNil)
 
-	spec := apparmor.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	appSet, err := interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec := apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.slot), IsNil)
 	c.Assert(spec.SecurityTags(), DeepEquals, []string{"snap.consumer.app"})
+	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, `/dev/kfd rw,`)
 	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, `/dev/nvidia* rw,`)
 	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, `/dev/dri/renderD[0-9]* rw,`)
 	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, `/dev/mali[0-9]* rw,`)
@@ -109,12 +113,21 @@ func (s *OpenglInterfaceSuite) TestAppArmorSpec(c *C) {
 	remount options=(bind, ro) /usr/share/nvidia/,
 	umount /usr/share/nvidia/,
 `, tmpdir))
+
+	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, `/usr/lib/wsl/{,**} rm,`)
+
+	c.Check(updateNS, testutil.Contains, fmt.Sprintf(`	# Access to WSL libs in /usr/lib/wsl
+	mount options=(rbind) /var/lib/snapd/hostfs%s/usr/lib/wsl/ -> /usr/lib/wsl/,
+	umount /usr/lib/wsl/,
+`, tmpdir))
 }
 
 func (s *OpenglInterfaceSuite) TestUDevSpec(c *C) {
-	spec := udev.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	appSet, err := interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec := udev.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.slot), IsNil)
-	c.Assert(spec.Snippets(), HasLen, 15)
+	c.Assert(spec.Snippets(), HasLen, 20)
 	c.Assert(spec.Snippets(), testutil.Contains, `# opengl
 SUBSYSTEM=="drm", KERNEL=="card[0-9]*", TAG+="snap_consumer_app"`)
 	c.Assert(spec.Snippets(), testutil.Contains, `# opengl
@@ -139,7 +152,9 @@ KERNEL=="mali[0-9]*", TAG+="snap_consumer_app"`)
 KERNEL=="dma_buf_te", TAG+="snap_consumer_app"`)
 	c.Assert(spec.Snippets(), testutil.Contains, `# opengl
 KERNEL=="galcore", TAG+="snap_consumer_app"`)
-	c.Assert(spec.Snippets(), testutil.Contains, fmt.Sprintf(`TAG=="snap_consumer_app", SUBSYSTEM!="module", SUBSYSTEM!="subsystem", RUN+="%v/snap-device-helper snap_consumer_app"`, dirs.DistroLibExecDir))
+	c.Assert(spec.Snippets(), testutil.Contains, `# opengl
+SUBSYSTEM=="kfd", KERNEL=="kfd", TAG+="snap_consumer_app"`)
+	c.Assert(spec.Snippets(), testutil.Contains, fmt.Sprintf(`TAG=="snap_consumer_app", SUBSYSTEM!="module", SUBSYSTEM!="subsystem", RUN+="%v/snap-device-helper $env{ACTION} snap_consumer_app $devpath $major:$minor"`, dirs.DistroLibExecDir))
 }
 
 func (s *OpenglInterfaceSuite) TestStaticInfo(c *C) {
@@ -162,15 +177,21 @@ func (s *OpenglInterfaceSuite) TestMountSpec(c *C) {
 	tmpdir := c.MkDir()
 	dirs.SetRootDir(tmpdir)
 	c.Assert(os.MkdirAll(filepath.Join(tmpdir, "/usr/share/nvidia"), 0777), IsNil)
+	c.Assert(os.MkdirAll(filepath.Join(tmpdir, "/usr/lib/wsl"), 0777), IsNil)
 
 	spec := mount.Specification{}
 	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.slot), IsNil)
 
 	entries := spec.MountEntries()
-	c.Assert(entries, HasLen, 1)
+	c.Assert(entries, HasLen, 2)
 
 	const hostfs = "/var/lib/snapd/hostfs"
+
 	c.Check(entries[0].Name, Equals, filepath.Join(hostfs, tmpdir, "/usr/share/nvidia"))
 	c.Check(entries[0].Dir, Equals, "/usr/share/nvidia")
 	c.Check(entries[0].Options, DeepEquals, []string{"bind", "ro"})
+
+	c.Check(entries[1].Name, Equals, filepath.Join(hostfs, tmpdir, "/usr/lib/wsl"))
+	c.Check(entries[1].Dir, Equals, "/usr/lib/wsl")
+	c.Check(entries[1].Options, DeepEquals, []string{"rbind"})
 }

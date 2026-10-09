@@ -23,17 +23,21 @@ package schema
 import "github.com/snapcore/snapd/snap"
 
 // ConnState holds properties of an interface connection.
+//
+// Note: ifacestate.cloneConnState makes a deep copy of this type. If we add any
+// more reference-like types (slices, maps) to this struct, that function needs
+// an update.
 type ConnState struct {
 	Auto      bool   `json:"auto,omitempty" yaml:"auto"`
 	ByGadget  bool   `json:"by-gadget,omitempty" yaml:"by-gadget"`
 	Interface string `json:"interface,omitempty" yaml:"interface"`
 	// Undesired tracks connections that were manually disconnected after being auto-connected,
 	// so that they are not automatically reconnected again in the future.
-	Undesired        bool                   `json:"undesired,omitempty" yaml:"undesired"`
-	StaticPlugAttrs  map[string]interface{} `json:"plug-static,omitempty" yaml:"plug-static,omitempty"`
-	DynamicPlugAttrs map[string]interface{} `json:"plug-dynamic,omitempty" yaml:"plug-dynamic,omitempty"`
-	StaticSlotAttrs  map[string]interface{} `json:"slot-static,omitempty" yaml:"slot-static,omitempty"`
-	DynamicSlotAttrs map[string]interface{} `json:"slot-dynamic,omitempty" yaml:"slot-dynamic,omitempty"`
+	Undesired        bool           `json:"undesired,omitempty" yaml:"undesired"`
+	StaticPlugAttrs  map[string]any `json:"plug-static,omitempty" yaml:"plug-static,omitempty"`
+	DynamicPlugAttrs map[string]any `json:"plug-dynamic,omitempty" yaml:"plug-dynamic,omitempty"`
+	StaticSlotAttrs  map[string]any `json:"slot-static,omitempty" yaml:"slot-static,omitempty"`
+	DynamicSlotAttrs map[string]any `json:"slot-dynamic,omitempty" yaml:"slot-dynamic,omitempty"`
 	// Hotplug-related attributes: HotplugGone indicates a connection that
 	// disappeared because the device was removed, but may potentially be
 	// restored in the future if we see the device again. HotplugKey is the

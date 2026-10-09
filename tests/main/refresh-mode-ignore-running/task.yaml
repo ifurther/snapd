@@ -1,16 +1,18 @@
 summary: apps can request not to be tracked
 
+details: |
+  Check that installs and refreshes fail if the snap is running but not when
+  the snap has set its refresh-mode configuration to `ignore-running`.
+
 systems: [-ubuntu-14.04-*]
 
 prepare: |
-  snap set system experimental.refresh-app-awareness=true
   snap pack test-snapd-refresh
   snap install --dangerous ./test-snapd-refresh_1_all.snap
 
 restore: |
   snap remove --purge test-snapd-refresh
   rm -f test-snapd-refresh_1.all.snap
-  snap unset system experimental.refresh-app-awareness
 
 execute: |
   tests.cleanup defer rm -f stamp

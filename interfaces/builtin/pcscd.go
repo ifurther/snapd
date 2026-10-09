@@ -19,8 +19,7 @@
 
 package builtin
 
-const pcscdSummary = `allows interacting with PCSD daemon
-(e.g. for the PS/SC API library).`
+const pcscdSummary = `allows interacting with PCSD daemon (e.g. for the PS/SC API library).`
 
 const pcscdBaseDeclarationSlots = `
   pcscd:
@@ -33,14 +32,17 @@ const pcscdBaseDeclarationSlots = `
 const pcscdConnectedPlugAppArmor = `
 # Socket for communication between PCSCD and PS/SC API library
 /{var/,}run/pcscd/pcscd.comm rw,
+# Configuration file for OPENSC
+/etc/{opensc/,}opensc.conf r,
 `
 
 func init() {
 	registerIface(&commonInterface{
-		name:                  "pcscd",
-		summary:               pcscdSummary,
-		implicitOnClassic:     true,
-		baseDeclarationSlots:  pcscdBaseDeclarationSlots,
-		connectedPlugAppArmor: pcscdConnectedPlugAppArmor,
+		name:                     "pcscd",
+		summary:                  pcscdSummary,
+		implicitOnClassic:        true,
+		baseDeclarationSlots:     pcscdBaseDeclarationSlots,
+		connectedPlugAppArmor:    pcscdConnectedPlugAppArmor,
+		parallelInstancesSlotErr: errParallelInstancesSystemSlot,
 	})
 }

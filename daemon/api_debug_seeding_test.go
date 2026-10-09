@@ -40,11 +40,11 @@ func (s *seedingDebugSuite) SetUpTest(c *C) {
 	s.daemonWithOverlordMock()
 }
 
-func (s *seedingDebugSuite) getSeedingDebug(c *C) interface{} {
+func (s *seedingDebugSuite) getSeedingDebug(c *C) any {
 	req, err := http.NewRequest("GET", "/v2/debug?aspect=seeding", nil)
 	c.Assert(err, IsNil)
 
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 	c.Assert(rsp.Type, Equals, daemon.ResponseTypeSync)
 	return rsp.Result
 }

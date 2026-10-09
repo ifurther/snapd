@@ -28,8 +28,11 @@ import (
 	"github.com/snapcore/snapd/overlord/auth"
 	"github.com/snapcore/snapd/overlord/configstate"
 	"github.com/snapcore/snapd/overlord/configstate/config"
+	"github.com/snapcore/snapd/overlord/configstate/configcore"
 	"github.com/snapcore/snapd/overlord/state"
+	"github.com/snapcore/snapd/overlord/swfeats"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/strutil"
 )
 
@@ -43,6 +46,8 @@ var (
 	}
 )
 
+var configureSnapChangeKind = swfeats.RegisterChangeKind("configure-snap")
+
 func getSnapConf(c *Command, r *http.Request, user *auth.UserState) Response {
 	vars := muxVars(r)
 	snapName := configstate.RemapSnapFromRequest(vars["name"])
@@ -54,18 +59,18 @@ func getSnapConf(c *Command, r *http.Request, user *auth.UserState) Response {
 	tr := config.NewTransaction(s)
 	s.Unlock()
 
-	currentConfValues := make(map[string]interface{})
+	currentConfValues := make(map[string]any)
 	// Special case - return root document
 	if len(keys) == 0 {
 		keys = []string{""}
 	}
 	for _, key := range keys {
-		var value interface{}
+		var value any
 		if err := tr.Get(snapName, key, &value); err != nil {
 			if config.IsNoOption(err) {
 				if key == "" {
 					// no configuration - return empty document
-					currentConfValues = make(map[string]interface{})
+					currentConfValues = make(map[string]any)
 					break
 				}
 				return &apiError{
@@ -77,6 +82,14 @@ func getSnapConf(c *Command, r *http.Request, user *auth.UserState) Response {
 			} else {
 				return InternalError("%v", err)
 			}
+		}
+
+		// Hide experimental features that are no longer required because it was
+		// either accepted or rejected
+		if snapName == "core" {
+			// TODO: reconsider this filtering now that graduated experimental
+			// flags are pruned from state during configstate.Init.
+			value = pruneExperimentalFlags(key, value)
 		}
 		if key == "" {
 			if len(keys) > 1 {
@@ -91,11 +104,55 @@ func getSnapConf(c *Command, r *http.Request, user *auth.UserState) Response {
 	return SyncResponse(currentConfValues)
 }
 
+// pruneExperimentalFlags returns a copy of val with unsupported experimental
+// features removed from the experimental configuration. This applies to
+// generic queries, where the key is either an empty string ("") or "experimental".
+// Exact queries (e.g. "core.experimental.old-flag") are not pruned to avoid breaking
+// snaps that gate some behaviour behind a flag check.
+//
+// This helper should only be called for core configurations. Any errors when parsing
+// core config are ignored and val is returned without modification.
+func pruneExperimentalFlags(key string, val any) any {
+	if val == nil {
+		return val
+	}
+
+	if key != "" && key != "experimental" {
+		// We only care about config that might contain old experimental features
+		// and exact queries (e.g. core.experimental.old-flag) are not pruned to
+		// avoid breaking snaps that gate some behaviour behind a flag check.
+		return val
+	}
+
+	experimentalFlags, ok := val.(map[string]any)
+	if !ok {
+		// XXX: This should never happen, skip cleaning
+		return val
+	}
+	if key == "" {
+		experimentalFlags, ok = experimentalFlags["experimental"].(map[string]any)
+		if !ok {
+			// No experimental key, do nothing
+			return val
+		}
+	}
+
+	for flag := range experimentalFlags {
+		if !configcore.IsSupportedExperimentalFlag(flag) {
+			// Hide the no longer supported experimental flag
+			delete(experimentalFlags, flag)
+		}
+	}
+
+	// Changes in experimentalFlags should reflect in values
+	return val
+}
+
 func setSnapConf(c *Command, r *http.Request, user *auth.UserState) Response {
 	vars := muxVars(r)
 	snapName := configstate.RemapSnapFromRequest(vars["name"])
 
-	var patchValues map[string]interface{}
+	var patchValues map[string]any
 	if err := jsonutil.DecodeWithNumber(r.Body, &patchValues); err != nil {
 		return BadRequest("cannot decode request body into patch values: %v", err)
 	}
@@ -104,7 +161,7 @@ func setSnapConf(c *Command, r *http.Request, user *auth.UserState) Response {
 	st.Lock()
 	defer st.Unlock()
 
-	taskset, err := configstate.ConfigureInstalled(st, snapName, patchValues, 0)
+	taskset, err := configstate.ConfigureInstalled(st, naming.InstanceName(snapName), patchValues, 0)
 	if err != nil {
 		// TODO: just return snap-not-installed instead ?
 		if _, ok := err.(*snap.NotInstalledError); ok {
@@ -114,7 +171,7 @@ func setSnapConf(c *Command, r *http.Request, user *auth.UserState) Response {
 	}
 
 	summary := fmt.Sprintf("Change configuration of %q snap", snapName)
-	change := newChange(st, "configure-snap", summary, []*state.TaskSet{taskset}, []string{snapName})
+	change := newChange(st, configureSnapChangeKind, summary, []*state.TaskSet{taskset}, []string{snapName})
 
 	st.EnsureBefore(0)
 

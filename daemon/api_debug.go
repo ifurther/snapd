@@ -34,13 +34,19 @@ import (
 	"github.com/snapcore/snapd/overlord/devicestate"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
+	"github.com/snapcore/snapd/overlord/swfeats"
 	"github.com/snapcore/snapd/timings"
 )
 
 var debugCmd = &Command{
-	Path:        "/v2/debug",
-	GET:         getDebug,
-	POST:        postDebug,
+	Path: "/v2/debug",
+	GET:  getDebug,
+	POST: postDebug,
+	Actions: []string{
+		"add-warning", "unshow-warnings", "ensure-state-soon",
+		"can-manage-refreshes", "prune", "stacktraces",
+		"create-recovery-system", "migrate-home",
+	},
 	ReadAccess:  openAccess{},
 	WriteAccess: rootAccess{},
 }
@@ -66,7 +72,7 @@ func getBaseDeclaration(st *state.State) Response {
 	if err != nil {
 		return InternalError("cannot get base declaration: %s", err)
 	}
-	return SyncResponse(map[string]interface{}{
+	return SyncResponse(map[string]any{
 		"base-declaration": string(asserts.Encode(bd)),
 	})
 
@@ -97,7 +103,7 @@ type changeTimings struct {
 	Kind           string                `json:"kind,omitempty"`
 	Summary        string                `json:"summary,omitempty"`
 	Lane           int                   `json:"lane,omitempty"`
-	ReadyTime      time.Time             `json:"ready-time,omitempty"`
+	ReadyTime      time.Time             `json:"ready-time,omitzero"`
 	DoingTime      time.Duration         `json:"doing-time,omitempty"`
 	UndoingTime    time.Duration         `json:"undoing-time,omitempty"`
 	DoingTimings   []*timings.TimingJSON `json:"doing-timings,omitempty"`
@@ -338,6 +344,44 @@ func createRecovery(st *state.State, label string) Response {
 	return AsyncResponse(nil, chg.ID())
 }
 
+type featureResponse struct {
+	Tasks      []taskResponse        `json:"tasks"`
+	Interfaces []string              `json:"interfaces"`
+	Endpoints  []featureEndpoint     `json:"endpoints"`
+	Changes    []string              `json:"changes"`
+	Ensures    []swfeats.EnsureEntry `json:"ensures"`
+}
+
+type taskResponse struct {
+	Kind    string `json:"kind"`
+	HasUndo bool   `json:"has-undo,omitempty"`
+}
+
+func getFeatures(c *Command) Response {
+	runner := c.d.overlord.TaskRunner()
+	taskKinds := runner.KnownTaskKinds()
+	taskResponses := make([]taskResponse, 0, len(taskKinds))
+	for _, taskKind := range taskKinds {
+		t := taskResponse{
+			Kind:    taskKind,
+			HasUndo: runner.TaskKindHasUndo(taskKind),
+		}
+		taskResponses = append(taskResponses, t)
+	}
+
+	ifaces := c.d.overlord.InterfaceManager().Repository().AllInterfaces()
+	inames := make([]string, 0, len(ifaces))
+	for _, iface := range ifaces {
+		inames = append(inames, iface.Name())
+	}
+	changes := swfeats.KnownChangeKinds()
+
+	ensures := swfeats.KnownEnsures()
+
+	resp := featureResponse{Tasks: taskResponses, Interfaces: inames, Endpoints: featureList, Changes: changes, Ensures: ensures}
+	return SyncResponse(resp)
+}
+
 func getDebug(c *Command, r *http.Request, user *auth.UserState) Response {
 	query := r.URL.Query()
 	aspect := query.Get("aspect")
@@ -354,7 +398,7 @@ func getDebug(c *Command, r *http.Request, user *auth.UserState) Response {
 		if err != nil {
 			return InternalError("cannot get model: %v", err)
 		}
-		return SyncResponse(map[string]interface{}{
+		return SyncResponse(map[string]any{
 			"model": string(asserts.Encode(model)),
 		})
 
@@ -370,6 +414,10 @@ func getDebug(c *Command, r *http.Request, user *auth.UserState) Response {
 		return getGadgetDiskMapping(st)
 	case "disks":
 		return getDisks(st)
+	case "raa":
+		return getRAAInfo(st)
+	case "features":
+		return getFeatures(c)
 	default:
 		return BadRequest("unknown debug aspect %q", aspect)
 	}

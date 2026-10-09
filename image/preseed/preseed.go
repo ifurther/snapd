@@ -143,14 +143,32 @@ func writePreseedAssertion(artifactDigest []byte, opts *preseedCoreOptions) erro
 		return err
 	}
 
-	snaps := []interface{}{}
+	snaps := []any{}
 	addSnap := func(sn *seed.Snap) {
-		preseedSnap := map[string]interface{}{}
-		preseedSnap["name"] = sn.SnapName()
-		if sn.ID() != "" {
+		preseedSnap := map[string]any{}
+		preseedSnap["name"] = sn.SnapName().String()
+
+		asserted := sn.ID() != ""
+		if asserted {
 			preseedSnap["id"] = sn.ID()
 			preseedSnap["revision"] = sn.PlaceInfo().SnapRevision().String()
 		}
+
+		components := make([]any, 0, len(sn.Components))
+		for _, c := range sn.Components {
+			comp := map[string]any{
+				"name": c.CompSideInfo.Component.ComponentName,
+			}
+			if asserted {
+				comp["revision"] = c.CompSideInfo.Revision.String()
+			}
+			components = append(components, comp)
+		}
+
+		if len(components) > 0 {
+			preseedSnap["components"] = components
+		}
+
 		snaps = append(snaps, preseedSnap)
 	}
 
@@ -169,7 +187,7 @@ func writePreseedAssertion(artifactDigest []byte, opts *preseedCoreOptions) erro
 	if err != nil {
 		return err
 	}
-	headers := map[string]interface{}{
+	headers := map[string]any{
 		"type":              "preseed",
 		"authority-id":      model.AuthorityID(),
 		"series":            "16",

@@ -21,6 +21,7 @@ package main_test
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 
@@ -29,8 +30,8 @@ import (
 	update "github.com/snapcore/snapd/cmd/snap-update-ns"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/osutil"
+	"github.com/snapcore/snapd/osutil/sys"
 	"github.com/snapcore/snapd/sandbox/cgroup"
-	"github.com/snapcore/snapd/testutil"
 )
 
 type systemSuite struct{}
@@ -46,7 +47,7 @@ func (s *systemSuite) TestLockCgroup(c *C) {
 
 	var frozen []string
 	var thawed []string
-	happyFreeze := func(snapName string) error {
+	happyFreeze := func(ctx context.Context, snapName string) error {
 		frozen = append(frozen, snapName)
 		return nil
 	}
@@ -81,6 +82,7 @@ func (s *systemSuite) TestAssumptions(c *C) {
 	c.Check(as.ModeForPath("/var/lib/snapd/hostfs/tmp/snap-private-tmp/snap.x11-server/tmp"), Equals, os.FileMode(0777)|os.ModeSticky)
 	c.Check(as.ModeForPath("/var/lib/snapd/hostfs/tmp/snap-private-tmp/snap.x11-server/foo"), Equals, os.FileMode(0755))
 	c.Check(as.ModeForPath("/var/lib/snapd/hostfs/tmp/snap-private-tmp/snap.x11-server/tmp/.X11-unix"), Equals, os.FileMode(0777)|os.ModeSticky)
+	c.Check(as.ModeForPath("/tmp/.X11-unix"), Equals, os.FileMode(0777)|os.ModeSticky)
 	c.Check(as.ModeForPath("/dev/shm/snap.some-snap"), Equals, os.FileMode(0777)|os.ModeSticky)
 
 	// Instances can, in addition, access /snap/$SNAP_INSTANCE_NAME
@@ -148,8 +150,17 @@ func (s *systemSuite) TestSaveCurrentProfile(c *C) {
 	c.Assert(err, IsNil)
 
 	// Ask the system profile update to write the current profile.
+	var profilePath string
+	var savedProfile string
+	restore := update.MockSaveMountProfile(func(p *osutil.MountProfile, fname string, uid sys.UserID, gid sys.GroupID) (err error) {
+		profilePath = fname
+		savedProfile, err = osutil.SaveMountProfileText(p)
+		return err
+	})
+	defer restore()
 	c.Assert(upCtx.SaveCurrentProfile(profile), IsNil)
-	c.Check(update.CurrentSystemProfilePath(upCtx.InstanceName()), testutil.FileEquals, text)
+	c.Check(profilePath, Equals, update.CurrentSystemProfilePath(upCtx.InstanceName()))
+	c.Check(savedProfile, Equals, text)
 }
 
 func (s *systemSuite) TestDesiredSystemProfilePath(c *C) {

@@ -54,7 +54,8 @@ func (s *deviceMgrBootconfigSuite) mockGadget(c *C, yaml string) {
 	s.state.Lock()
 	defer s.state.Unlock()
 
-	devicestate.SetBootOkRan(s.mgr, true)
+	restore := devicestate.SetBootOkRanForCurrentBootID(s.mgr, true)
+	defer restore()
 	si := &snap.SideInfo{
 		RealName: "pc",
 		Revision: snap.R(33),
@@ -114,7 +115,7 @@ func (s *deviceMgrBootconfigSuite) setupUC20ModelWithGrade(c *C, grade string) *
 		Model:  "pc-model-20",
 		Serial: "didididi",
 	})
-	headers := make(map[string]interface{})
+	headers := make(map[string]any)
 	for k, v := range mockCore20ModelHeaders {
 		headers[k] = v
 	}
@@ -129,18 +130,18 @@ func (s *deviceMgrBootconfigSuite) setupClassicWithModesModel(c *C) *asserts.Mod
 		Serial: "didididi",
 	})
 	return s.makeModelAssertionInState(c, "canonical", "classic-with-modes",
-		map[string]interface{}{
+		map[string]any{
 			"architecture": "amd64",
 			"classic":      "true",
 			"distribution": "ubuntu",
 			"base":         "core22",
-			"snaps": []interface{}{
-				map[string]interface{}{
+			"snaps": []any{
+				map[string]any{
 					"name": "pc-linux",
 					"id":   "pclinuxdidididididididididididid",
 					"type": "kernel",
 				},
-				map[string]interface{}{
+				map[string]any{
 					"name": "pc",
 					"id":   "pcididididididididididididididid",
 					"type": "gadget",
@@ -150,14 +151,18 @@ func (s *deviceMgrBootconfigSuite) setupClassicWithModesModel(c *C) *asserts.Mod
 }
 
 type testBootConfigUpdateOpts struct {
-	updateAttempted     bool
-	updateApplied       bool
-	cmdlineAppend       string
-	cmdlineAppendDanger string
+	updateAttempted                  bool
+	updateApplied                    bool
+	cmdlineAppend                    string
+	cmdlineAppendDanger              string
+	extraSnapdKernelCmdlineFragments map[string]string
 }
 
 func (s *deviceMgrBootconfigSuite) testBootConfigUpdateRun(c *C, opts testBootConfigUpdateOpts, errMatch string) {
 	restore := release.MockOnClassic(false)
+	defer restore()
+
+	restore = devicestate.SetBootOkRanForCurrentBootID(s.mgr, true)
 	defer restore()
 
 	// Override the gadget from SetupTest to add allowed arguments
@@ -181,6 +186,25 @@ kernel-cmdline:
 	c.Assert(err, IsNil)
 	tr.Commit()
 
+	if len(opts.extraSnapdKernelCmdlineFragments) != 0 {
+		// Mock exclusive change so that ensureExtraSnapdKernelCommandLineFragmentsApplied
+		// does not run and we can test "update-managed-boot-config" actually applies
+		// pending snapd kcmdline fragments.
+		chg := s.state.NewChange("remodel", "...")
+		chg.SetStatus(state.DoingStatus)
+	}
+
+	// Set extra snapd kernel command line args as well
+	for fragmentID, fragment := range opts.extraSnapdKernelCmdlineFragments {
+		err := devicestate.SetExtraSnapdKernelCommandLineFragment(s.state, devicestate.ExtraSnapdKernelCmdlineFragmentID(fragmentID), fragment)
+		c.Assert(err, IsNil)
+	}
+	if len(opts.extraSnapdKernelCmdlineFragments) == 0 {
+		checkPendingExtraSnapdFragments(c, s.state, false)
+	} else {
+		checkPendingExtraSnapdFragments(c, s.state, true)
+	}
+
 	tsk := s.state.NewTask("update-managed-boot-config", "update boot config")
 	tsk.Set("snap-setup", &snapstate.SnapSetup{
 		SideInfo: &s.gadgetSnapInfo.SideInfo,
@@ -198,7 +222,7 @@ kernel-cmdline:
 	s.state.Lock()
 	defer s.state.Unlock()
 
-	restarting, rt := restart.Pending(s.state)
+	rt := restart.Pending(s.state)
 	if errMatch == "" {
 		if opts.updateAttempted && opts.updateApplied {
 			// Expect the change to be in wait status at this point, as a restart
@@ -226,7 +250,6 @@ kernel-cmdline:
 			c.Check(log[1], Matches, ".* INFO Task set to wait until a system restart allows to continue")
 			// update was applied, thus a restart was requested
 			c.Check(s.restartRequests, DeepEquals, []restart.RestartType{restart.RestartSystemNow})
-			c.Check(restarting, Equals, true)
 			c.Check(rt, Equals, restart.RestartSystemNow)
 		} else {
 			// update was not applied or failed
@@ -239,6 +262,9 @@ kernel-cmdline:
 
 func (s *deviceMgrBootconfigSuite) testBootConfigUpdateRunClassic(c *C, opts testBootConfigUpdateOpts, errMatch string) {
 	restore := release.MockOnClassic(true)
+	defer restore()
+
+	restore = devicestate.SetBootOkRanForCurrentBootID(s.mgr, true)
 	defer restore()
 
 	// Override the gadget from SetupTest to add allowed arguments
@@ -261,6 +287,25 @@ kernel-cmdline:
 	tr.Set("core", "system.kernel.dangerous-cmdline-append", opts.cmdlineAppendDanger)
 	c.Assert(err, IsNil)
 	tr.Commit()
+
+	if len(opts.extraSnapdKernelCmdlineFragments) != 0 {
+		// Mock exclusive change so that ensureExtraSnapdKernelCommandLineFragmentsApplied
+		// does not run and we can test "update-managed-boot-config" actually applies
+		// pending snapd kcmdline fragments.
+		chg := s.state.NewChange("remodel", "...")
+		chg.SetStatus(state.DoingStatus)
+	}
+
+	// Set extra snapd kernel command line args as well
+	for fragmentID, fragment := range opts.extraSnapdKernelCmdlineFragments {
+		err := devicestate.SetExtraSnapdKernelCommandLineFragment(s.state, devicestate.ExtraSnapdKernelCmdlineFragmentID(fragmentID), fragment)
+		c.Assert(err, IsNil)
+	}
+	if len(opts.extraSnapdKernelCmdlineFragments) == 0 {
+		checkPendingExtraSnapdFragments(c, s.state, false)
+	} else {
+		checkPendingExtraSnapdFragments(c, s.state, true)
+	}
 
 	tsk := s.state.NewTask("update-managed-boot-config", "update boot config")
 	tsk.Set("snap-setup", &snapstate.SnapSetup{
@@ -373,6 +418,61 @@ func (s *deviceMgrBootconfigSuite) TestBootConfigUpdateRunSuccessClassicWithMode
 		"snapd_recovery_mode=run console=ttyS0 console=tty1 panic=-1",
 		"snapd_recovery_mode=run console=ttyS0 console=tty1 panic=-1 candidate par1=val par2",
 	})
+}
+
+func (s *deviceMgrBootconfigSuite) TestBootConfigUpdateRunSuccessClassicWithModesWithExtraSnapdArgs(c *C) {
+	s.state.Lock()
+	s.setupClassicWithModesModel(c)
+	s.state.Unlock()
+
+	s.managedbl.Updated = true
+
+	opts := testBootConfigUpdateOpts{
+		updateAttempted: true,
+		updateApplied:   true,
+		extraSnapdKernelCmdlineFragments: map[string]string{
+			"xkb": `arg1="val-1" arg1="val-2" arg2`,
+		},
+	}
+	s.testBootConfigUpdateRunClassic(c, opts, "")
+
+	m, err := boot.ReadModeenv("")
+	c.Assert(err, IsNil)
+	c.Check([]string(m.CurrentKernelCommandLines), DeepEquals, []string{
+		"snapd_recovery_mode=run console=ttyS0 console=tty1 panic=-1",
+		`snapd_recovery_mode=run console=ttyS0 console=tty1 panic=-1 candidate arg1="val-1" arg1="val-2" arg2`,
+	})
+	s.state.Lock()
+	checkPendingExtraSnapdFragments(c, s.state, false)
+	s.state.Unlock()
+}
+
+func (s *deviceMgrBootconfigSuite) TestBootConfigUpdateRunSuccessClassicWithModesWithExtraSnapdArgsAndAppend(c *C) {
+	s.state.Lock()
+	s.setupClassicWithModesModel(c)
+	s.state.Unlock()
+
+	s.managedbl.Updated = true
+
+	opts := testBootConfigUpdateOpts{
+		updateAttempted: true,
+		updateApplied:   true,
+		cmdlineAppend:   "par1=val par2",
+		extraSnapdKernelCmdlineFragments: map[string]string{
+			"xkb": `snapd.xkb="some-value"`,
+		},
+	}
+	s.testBootConfigUpdateRunClassic(c, opts, "")
+
+	m, err := boot.ReadModeenv("")
+	c.Assert(err, IsNil)
+	c.Check([]string(m.CurrentKernelCommandLines), DeepEquals, []string{
+		"snapd_recovery_mode=run console=ttyS0 console=tty1 panic=-1",
+		`snapd_recovery_mode=run console=ttyS0 console=tty1 panic=-1 candidate snapd.xkb="some-value" par1=val par2`,
+	})
+	s.state.Lock()
+	checkPendingExtraSnapdFragments(c, s.state, false)
+	s.state.Unlock()
 }
 
 func (s *deviceMgrBootconfigSuite) TestBootConfigUpdateWithGadgetExtra(c *C) {
@@ -510,6 +610,62 @@ func (s *deviceMgrBootconfigSuite) TestBootConfigUpdateRunWithAppendBothOptsSign
 	s.testBootConfigUpdateRunWithAppendBothOpts(c, "signed")
 }
 
+func (s *deviceMgrBootconfigSuite) TestBootConfigUpdateRunWithExtraSnapdArgs(c *C) {
+	s.state.Lock()
+	s.setupUC20Model(c)
+	s.state.Unlock()
+
+	s.managedbl.Updated = true
+
+	opts := testBootConfigUpdateOpts{
+		updateAttempted: true,
+		updateApplied:   true,
+		extraSnapdKernelCmdlineFragments: map[string]string{
+			"xkb": "some-value",
+		},
+	}
+	s.testBootConfigUpdateRun(c, opts, "")
+
+	m, err := boot.ReadModeenv("")
+	c.Assert(err, IsNil)
+	c.Check([]string(m.CurrentKernelCommandLines), DeepEquals, []string{
+		"snapd_recovery_mode=run console=ttyS0 console=tty1 panic=-1",
+		"snapd_recovery_mode=run console=ttyS0 console=tty1 panic=-1 candidate some-value",
+	})
+	s.state.Lock()
+	checkPendingExtraSnapdFragments(c, s.state, false)
+	s.state.Unlock()
+}
+
+func (s *deviceMgrBootconfigSuite) TestBootConfigUpdateRunWithExtraSnapdArgsAndAppend(c *C) {
+	s.state.Lock()
+	s.setupUC20Model(c)
+	s.state.Unlock()
+
+	s.managedbl.Updated = true
+
+	opts := testBootConfigUpdateOpts{
+		updateAttempted:     true,
+		updateApplied:       true,
+		cmdlineAppend:       "par1=val par2",
+		cmdlineAppendDanger: "par3=val par4",
+		extraSnapdKernelCmdlineFragments: map[string]string{
+			"xkb": "xkb-val",
+		},
+	}
+	s.testBootConfigUpdateRun(c, opts, "")
+
+	m, err := boot.ReadModeenv("")
+	c.Assert(err, IsNil)
+	c.Check([]string(m.CurrentKernelCommandLines), DeepEquals, []string{
+		"snapd_recovery_mode=run console=ttyS0 console=tty1 panic=-1",
+		`snapd_recovery_mode=run console=ttyS0 console=tty1 panic=-1 candidate xkb-val par1=val par2 par3=val par4`,
+	})
+	s.state.Lock()
+	checkPendingExtraSnapdFragments(c, s.state, false)
+	s.state.Unlock()
+}
+
 func (s *deviceMgrBootconfigSuite) TestBootConfigUpdateRunButNotUpdated(c *C) {
 	s.state.Lock()
 	s.setupUC20Model(c)
@@ -548,7 +704,7 @@ func (s *deviceMgrBootconfigSuite) TestBootConfigNoUC20(c *C) {
 		Model:  "pc-model",
 		Serial: "didididi",
 	})
-	s.makeModelAssertionInState(c, "canonical", "pc-model", map[string]interface{}{
+	s.makeModelAssertionInState(c, "canonical", "pc-model", map[string]any{
 		"architecture": "amd64",
 		"kernel":       "pc-kernel",
 		"gadget":       "pc",
@@ -567,6 +723,9 @@ func (s *deviceMgrBootconfigSuite) TestBootConfigRemodelDoNothing(c *C) {
 	restore := release.MockOnClassic(false)
 	defer restore()
 
+	restore = devicestate.SetBootOkRanForCurrentBootID(s.mgr, true)
+	defer restore()
+
 	s.state.Lock()
 
 	devicestatetest.SetDevice(s.state, &auth.DeviceState{
@@ -577,7 +736,7 @@ func (s *deviceMgrBootconfigSuite) TestBootConfigRemodelDoNothing(c *C) {
 
 	uc20Model := s.setupUC20Model(c)
 	// save the hassle and try a trivial remodel
-	newModel := s.brands.Model("canonical", "pc-model-20", map[string]interface{}{
+	newModel := s.brands.Model("canonical", "pc-model-20", map[string]any{
 		"brand":        "canonical",
 		"model":        "pc-model-20",
 		"architecture": "amd64",

@@ -1,5 +1,11 @@
 summary: Check that snap-mgmt.sh works
 
+details: |
+    Check that "snap-mgmt.sh --purge" removes all data installed by snapd.
+    This includes /var/snap, some writable parts of /var/lib/snapd.
+    /run/snapd/ns should be unmounted. Systemd and dbus configuration
+    managed in /etc should also be removed.
+
 # slow in autopkgtest (>1m)
 backends: [-autopkgtest]
 
@@ -51,9 +57,14 @@ prepare: |
         echo "${SNAP_MOUNT_DIR} empty - test setup broken"
         exit 1
     fi
+    echo "$SNAP_MOUNT_DIR" > start-mount-dir
 
     echo "test service is known to systemd and enabled"
     systemctl list-unit-files --type service --no-legend | MATCH 'snap.test-snapd-service\..*\.service\s+enabled'
+
+    # install a snap with some components to make sure that we properly clean
+    # those up too
+    snap install test-snap-with-components+one+two
 
     # expecting to find various files that snap installation produced
     test "$(find /etc/udev/rules.d -name '*-snap.*.rules' | wc -l)" -gt 0
@@ -74,9 +85,32 @@ prepare: |
     fi
 
 restore: |
+    # during purge, there is no way to stop snap services running in user
+    # sessions, so take a best effort approach to kill all the processes which
+    # are in cgroups that resemble snap services in  user sessions
+    find /sys/fs/cgroup/ -type d -path "*/user.slice/*/snap.*service" -prune | while read -r svc; do
+        while (("$(wc -l < "$svc/cgroup.procs" || echo 0)" > 0)); do
+            # for compatibility with v1/hybrid and old kernels not having cgroup.kill
+            if [ -f "$svc/cgroup.kill" ]; then
+                echo 1 > "$svc/cgroup.kill"
+            else
+                # shellcheck disable=SC2002
+                cat "$svc/cgroup.procs" | while read -r killpid; do
+                    kill -9 "$killpid" || true
+                done
+            fi
+            sleep 1
+        done
+        rmdir "$svc" || true
+    done
     #shellcheck source=tests/lib/pkgdb.sh
     . "$TESTSLIB/pkgdb.sh"
     if [ -e pkg-removed ]; then
+        # since we are not reinstalling the package, restore the snap mount
+        # directory which sometimes is created during install
+        mkdir -p "$(cat start-mount-dir)"
+        # TODO: the package isn't technically removed, this needs to
+        # consistently force reinstallation
         distro_install_build_snapd
         rm pkg-removed
     fi
@@ -85,6 +119,7 @@ debug: |
     systemctl --no-legend --full | grep -E 'snap\..*\.(service|timer|socket|slice)' || true
 
 execute: |
+    SNAP_MOUNT_DIR="$(os.paths snap-mount-dir)"
     echo "Stop snapd before purging"
     systemctl stop snapd.service snapd.socket
 
@@ -93,7 +128,6 @@ execute: |
     touch pkg-removed
 
     echo "Data directories are empty"
-    SNAP_MOUNT_DIR="$(os.paths snap-mount-dir)"
     emptydirs="${SNAP_MOUNT_DIR} \
                /var/snap \
                /var/lib/snapd/dbus-1/services/ \

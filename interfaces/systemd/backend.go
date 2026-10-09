@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2016-2021 Canonical Ltd
+ * Copyright (C) 2016-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -31,6 +31,7 @@ import (
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 	sysd "github.com/snapcore/snapd/systemd"
 	"github.com/snapcore/snapd/timings"
 )
@@ -39,7 +40,7 @@ func serviceName(snapName, distinctServiceSuffix string) string {
 	return snap.ScopedSecurityTag(snapName, "interface", distinctServiceSuffix) + ".service"
 }
 
-// Backend is responsible for maintaining apparmor profiles for ubuntu-core-launcher.
+// Backend is responsible for maintaining special systemd units.
 type Backend struct {
 	preseed bool
 }
@@ -57,17 +58,22 @@ func (b *Backend) Name() interfaces.SecuritySystem {
 	return interfaces.SecuritySystemd
 }
 
+func (b *Backend) Prepare(_ *interfaces.SnapAppSet) error {
+	// No preparation required.
+	return nil
+}
+
 // Setup creates and starts systemd services specific to a given snap.
 //
 // This method should be called after changing plug, slots, connections between
 // them or application present in the snap.
-func (b *Backend) Setup(appSet *interfaces.SnapAppSet, confinement interfaces.ConfinementOptions, repo *interfaces.Repository, tm timings.Measurer) error {
+func (b *Backend) Setup(appSet *interfaces.SnapAppSet, opts interfaces.ConfinementOptions, sctx interfaces.SetupContext, repo *interfaces.Repository, tm timings.Measurer) error {
 	// Record all the extra systemd services for this snap.
-	snapName := appSet.InstanceName()
+	instanceName := appSet.InstanceName()
 	// Get the services that apply to this snap
-	spec, err := repo.SnapSpecification(b.Name(), appSet)
+	spec, err := repo.SnapSpecification(b.Name(), appSet, opts)
 	if err != nil {
-		return fmt.Errorf("cannot obtain systemd services for snap %q: %s", snapName, err)
+		return fmt.Errorf("cannot obtain systemd services for snap %q: %s", instanceName, err)
 	}
 	content := deriveContent(spec.(*Specification), appSet)
 	// synchronize the content with the filesystem
@@ -75,7 +81,7 @@ func (b *Backend) Setup(appSet *interfaces.SnapAppSet, confinement interfaces.Co
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("cannot create directory for systemd services %q: %s", dir, err)
 	}
-	glob := serviceName(snapName, "*")
+	glob := serviceName(instanceName.String(), "*")
 
 	var systemd sysd.Systemd
 	if b.preseed {
@@ -120,7 +126,7 @@ func (b *Backend) Setup(appSet *interfaces.SnapAppSet, confinement interfaces.Co
 }
 
 // Remove disables, stops and removes systemd services of a given snap.
-func (b *Backend) Remove(snapName string) error {
+func (b *Backend) Remove(instanceName naming.InstanceName) error {
 	var systemd sysd.Systemd
 	if b.preseed {
 		// removing while preseeding is not a viable scenario, but implemented
@@ -130,7 +136,7 @@ func (b *Backend) Remove(snapName string) error {
 		systemd = sysd.New(sysd.SystemMode, &noopReporter{})
 	}
 	// Remove all the files matching snap glob
-	glob := serviceName(snapName, "*")
+	glob := serviceName(instanceName.String(), "*")
 	_, removed, errEnsure := osutil.EnsureDirState(dirs.SnapServicesDir, glob, nil)
 
 	if len(removed) > 0 {
@@ -155,7 +161,7 @@ func (b *Backend) Remove(snapName string) error {
 }
 
 // NewSpecification returns a new systemd specification.
-func (b *Backend) NewSpecification(*interfaces.SnapAppSet) interfaces.Specification {
+func (b *Backend) NewSpecification(*interfaces.SnapAppSet, interfaces.ConfinementOptions) interfaces.Specification {
 	return &Specification{}
 }
 
@@ -172,7 +178,7 @@ func deriveContent(spec *Specification, appSet *interfaces.SnapAppSet) map[strin
 	}
 	content := make(map[string]osutil.FileState)
 	for suffix, service := range services {
-		filename := serviceName(appSet.InstanceName(), suffix)
+		filename := serviceName(appSet.InstanceName().String(), suffix)
 		content[filename] = &osutil.MemoryFileState{
 			Content: []byte(service.String()),
 			Mode:    0644,

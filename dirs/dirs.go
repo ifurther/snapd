@@ -20,10 +20,11 @@
 package dirs
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 
@@ -48,6 +49,7 @@ var (
 	snapDataHomeGlob     []string
 	SnapDownloadCacheDir string
 	SnapAppArmorDir      string
+	SnapLdconfigDir      string
 	SnapSeccompBase      string
 	SnapSeccompDir       string
 	SnapMountPolicyDir   string
@@ -63,13 +65,20 @@ var (
 	SnapRunLockDir       string
 	SnapBootstrapRunDir  string
 	SnapVoidDir          string
+	SnapPrivateTmpDir    string
+
+	SnapInterfacesRequestsRunDir   string
+	SnapInterfacesRequestsStateDir string
 
 	SnapdMaintenanceFile string
 
 	SnapdStoreSSLCertsDir string
+	SnapdPKIV1Dir         string
+	SystemCertsDir        string
 
 	SnapSeedDir   string
 	SnapDeviceDir string
+	SnapBPFFSDir  string
 
 	SnapAssertsDBDir      string
 	SnapCookieDir         string
@@ -95,6 +104,8 @@ var (
 	SnapSectionsFile    string
 	SnapCommandsDB      string
 	SnapAuxStoreInfoDir string
+	SnapIconsPoolDir    string
+	SnapIconsDir        string
 
 	SnapBinariesDir        string
 	SnapServicesDir        string
@@ -104,6 +115,7 @@ var (
 	SnapDesktopFilesDir    string
 	SnapDesktopIconsDir    string
 	SnapPolkitPolicyDir    string
+	SnapPolkitRuleDir      string
 	SnapSystemdDir         string
 	SnapSystemdRunDir      string
 
@@ -118,6 +130,8 @@ var (
 	SnapSaveDir       string
 	SnapDeviceSaveDir string
 	SnapDataSaveDir   string
+
+	SnapGpioChardevDir string
 
 	CloudMetaDataFile     string
 	CloudInstanceDataFile string
@@ -140,7 +154,18 @@ var (
 
 	SysfsDir string
 
+	DevDir string
+
 	FeaturesDir string
+
+	// WritableMountPath is a path where writable root data is
+	// mounted. For Classic it is /, but Ubuntu Core it is
+	// /writable.
+	WritableMountPath string
+
+	// WritableUbuntuCoreSystemDataDir points to /writable/system-data on
+	// UC, and is not valid on classic.
+	WritableUbuntuCoreSystemDataDir string
 )
 
 // User defined home directory variables
@@ -151,7 +176,14 @@ var (
 )
 
 const (
-	defaultSnapMountDir = "/snap"
+	DefaultSnapMountDir = "/snap"
+	AltSnapMountDir     = "/var/lib/snapd/snap"
+
+	// DefaultDistroLibexecDir is a default libexecdir used on most
+	// distributions
+	DefaultDistroLibexecDir = "/usr/lib/snapd"
+	// AltDistroLibexecDir is an anterlative libexec dir used on some distributions
+	AltDistroLibexecDir = "/usr/libexec/snapd"
 
 	// These are directories which are static inside the core snap and
 	// can never be prefixed as they will be always absolute once we
@@ -287,6 +319,16 @@ func DataHomeGlobs(opts *SnapDirOptions) []string {
 	return snapDataHomeGlob
 }
 
+func AllDataHomeGlobs() []string {
+	snapHomeDirsMu.Lock()
+	defer snapHomeDirsMu.Unlock()
+
+	globs := make([]string, len(hiddenSnapDataHomeGlob)+len(snapDataHomeGlob))
+	copy(globs, hiddenSnapDataHomeGlob)
+	copy(globs[len(hiddenSnapDataHomeGlob):], snapDataHomeGlob)
+	return globs
+}
+
 // SupportsClassicConfinement returns true if the current directory layout supports classic confinement.
 func SupportsClassicConfinement() bool {
 	// Core systems don't support classic confinement as a policy decision.
@@ -298,7 +340,7 @@ func SupportsClassicConfinement() bool {
 	// location for snaps, that is /snap or if using the alternate mount
 	// location, /var/lib/snapd/snap along with the /snap ->
 	// /var/lib/snapd/snap symlink in place.
-	smd := filepath.Join(GlobalRootDir, defaultSnapMountDir)
+	smd := filepath.Join(GlobalRootDir, DefaultSnapMountDir)
 	if SnapMountDir == smd {
 		return true
 	}
@@ -375,10 +417,20 @@ func SnapSystemdConfDirUnder(rootdir string) string {
 	return filepath.Join(rootdir, "/etc/systemd/system.conf.d")
 }
 
-// SnapSystemdConfDirUnder returns the path to the systemd conf dir under
-// rootdir.
+// SnapServicesDirUnder returns the path to the systemd services
+// conf dir under rootdir.
 func SnapServicesDirUnder(rootdir string) string {
 	return filepath.Join(rootdir, "/etc/systemd/system")
+}
+
+func SnapRuntimeServicesDirUnder(rootdir string) string {
+	return filepath.Join(rootdir, "/run/systemd/system")
+}
+
+// SnapSystemdDirUnder returns the path to the systemd conf dir under
+// rootdir.
+func SnapSystemdDirUnder(rootdir string) string {
+	return filepath.Join(rootdir, "/etc/systemd")
 }
 
 // SnapBootAssetsDirUnder returns the path to boot assets directory under a
@@ -414,11 +466,99 @@ func SnapRepairConfigFileUnder(rootdir string) string {
 	return filepath.Join(rootdir, snappyDir, "repair.json")
 }
 
+// SnapKernelTreesDirUnder returns the path to the snap kernel drivers trees
+// dir under rootdir.
+func SnapKernelDriversTreesDirUnder(rootdir string) string {
+	return filepath.Join(rootdir, snappyDir, "kernel")
+}
+
+// SnapExportDirUnder returns the path to files with information about things
+// exported from snaps to the rootfs, under rootdir.
+func SnapExportDirUnder(rootdir string) string {
+	return filepath.Join(rootdir, snappyDir, "export")
+}
+
+// SnapExportLibDirUnder returns the path to the directory under which
+// libraries from snaps are going to be exported.
+func SnapExportLibDirUnder(rootdir string) string {
+	return filepath.Join(SnapdStateDir(rootdir), "lib")
+}
+
 // AddRootDirCallback registers a callback for whenever the global root
 // directory (set by SetRootDir) is changed to enable updates to variables in
 // other packages that depend on its location.
 func AddRootDirCallback(c func(string)) {
 	callbacks = append(callbacks, c)
+}
+
+var (
+	// distributions known to use /snap/ but are packaged in a special way
+	specialDefaultDirDistros = []string{
+		"ubuntucoreinitramfs",
+	}
+
+	// snapMountDirDetectionError is set when it was not possible to resolve the
+	// snap mount directory location.
+	snapMountDirDetectionError error = nil
+	// a well known default value, with which it will be impossible to carry out
+	// operations on the filesystem
+	snapMountDirUnresolvedPlaceholder = "mount-dir-is-unset"
+)
+
+// SnapMountDirDetectionOutcome returns an error, if any, which occurred when
+// probing the mount directory location. A non-nil error indicates that snap
+// mount dir could no thave been properly determined.
+func SnapMountDirDetectionOutcome() error {
+	return snapMountDirDetectionError
+}
+
+func snapMountDirProbe(rootdir string) (string, error) {
+	defaultDir := filepath.Join(rootdir, DefaultSnapMountDir)
+	altDir := filepath.Join(rootdir, AltSnapMountDir)
+
+	// notable exception for Ubuntu Core initramfs
+	if release.DistroLike(specialDefaultDirDistros...) {
+		return defaultDir, nil
+	}
+
+	// observe the system state to find out how snapd was packaged,
+	// essentially use the same logic as
+	// sc_probe_snap_mount_dir_from_pid_1_mount_ns() used in snap-confine,
+	// except for hard errors
+	fi, err := os.Lstat(defaultDir)
+	switch {
+	case err != nil:
+		if errors.Is(err, fs.ErrNotExist) {
+			// path does not exist, given that well-known distros are
+			// handled explicitly we are dealing with a distribution we have
+			// no knowledge of and the packaging does not include a default
+			// mount path
+			return altDir, nil
+		} else {
+			return "", fmt.Errorf("cannot stat %s: %w", defaultDir, err)
+		}
+	case fi.Mode().Type()&fs.ModeSymlink != 0:
+		// exists and is a symlink, find out what the target is, but keep the
+		// checks simple and read the symlink rather than trying
+		// filepath.EvalSymlinks() which needs intermediate directories to
+		// exist; the symlink can be relative so cehck both with and without the
+		// leading /
+		p, err := os.Readlink(defaultDir)
+		switch {
+		case err != nil:
+			return "", err
+		case p != AltSnapMountDir && p != AltSnapMountDir[1:] && p != altDir:
+			return "", fmt.Errorf("%v must be a symbolic link to %v", defaultDir, AltSnapMountDir)
+		default:
+			// we read the symlink and it points to the alternative location
+			return altDir, nil
+		}
+	case fi.Mode().Type().IsDir():
+		// exists and is a directory
+		return defaultDir, nil
+	}
+
+	return "", errors.New("internal error: unresolved snap mount dir")
 }
 
 // SetRootDir allows settings a new global root directory, this is useful
@@ -429,26 +569,23 @@ func SetRootDir(rootdir string) {
 	}
 	GlobalRootDir = rootdir
 
-	altDirDistros := []string{
-		"altlinux",
-		"antergos",
-		"arch",
-		"archlinux",
-		"fedora",
-		"gentoo",
-		"manjaro",
-		"manjaro-arm",
-	}
-
 	isInsideBase, _ := isInsideBaseSnap()
-	if !isInsideBase && release.DistroLike(altDirDistros...) {
-		SnapMountDir = filepath.Join(rootdir, "/var/lib/snapd/snap")
+	if isInsideBase {
+		// when inside the base, the mount directory is always /snap
+		SnapMountDir = filepath.Join(rootdir, DefaultSnapMountDir)
 	} else {
-		SnapMountDir = filepath.Join(rootdir, defaultSnapMountDir)
+		if dir, err := snapMountDirProbe(rootdir); err == nil {
+			SnapMountDir = dir
+			snapMountDirDetectionError = nil
+		} else {
+			SnapMountDir = snapMountDirUnresolvedPlaceholder
+			snapMountDirDetectionError = fmt.Errorf("cannot resolve snap mount directory: %w", err)
+		}
 	}
 
 	SnapDataDir = filepath.Join(rootdir, "/var/snap")
 	SnapAppArmorDir = filepath.Join(rootdir, snappyDir, "apparmor", "profiles")
+	SnapLdconfigDir = filepath.Join(rootdir, "/etc/ld.so.conf.d")
 	SnapDownloadCacheDir = filepath.Join(rootdir, snappyDir, "cache")
 	SnapSeccompBase = filepath.Join(rootdir, snappyDir, "seccomp")
 	SnapSeccompDir = filepath.Join(SnapSeccompBase, "bpf")
@@ -457,6 +594,7 @@ func SetRootDir(rootdir string) {
 	SnapdMaintenanceFile = filepath.Join(rootdir, snappyDir, "maintenance.json")
 	SnapBlobDir = SnapBlobDirUnder(rootdir)
 	SnapVoidDir = filepath.Join(rootdir, snappyDir, "void")
+	SnapPrivateTmpDir = filepath.Join(rootdir, "tmp", "snap-private-tmp")
 	// ${snappyDir}/desktop is added to $XDG_DATA_DIRS.
 	// Subdirectories are interpreted according to the relevant
 	// freedesktop.org specifications
@@ -469,7 +607,12 @@ func SetRootDir(rootdir string) {
 
 	SnapBootstrapRunDir = filepath.Join(SnapRunDir, "snap-bootstrap")
 
+	SnapInterfacesRequestsRunDir = filepath.Join(SnapRunDir, "interfaces-requests")
+	SnapInterfacesRequestsStateDir = filepath.Join(rootdir, snappyDir, "interfaces-requests")
+
 	SnapdStoreSSLCertsDir = filepath.Join(rootdir, snappyDir, "ssl/store-certs")
+	SnapdPKIV1Dir = filepath.Join(rootdir, snappyDir, "pki", "v1")
+	SystemCertsDir = filepath.Join(rootdir, "etc", "ssl", "certs")
 
 	// keep in sync with the debian/snapd.socket file:
 	SnapdSocket = filepath.Join(rootdir, "/run/snapd.socket")
@@ -489,9 +632,12 @@ func SetRootDir(rootdir string) {
 	SnapSectionsFile = filepath.Join(SnapCacheDir, "sections")
 	SnapCommandsDB = filepath.Join(SnapCacheDir, "commands.db")
 	SnapAuxStoreInfoDir = filepath.Join(SnapCacheDir, "aux")
+	SnapIconsPoolDir = filepath.Join(SnapCacheDir, "icons-pool")
+	SnapIconsDir = filepath.Join(SnapCacheDir, "icons")
 
 	SnapSeedDir = SnapSeedDirUnder(rootdir)
 	SnapDeviceDir = SnapDeviceDirUnder(rootdir)
+	SnapBPFFSDir = filepath.Join(rootdir, "/sys/fs/bpf/snap")
 
 	SnapModeenvFile = SnapModeenvFileUnder(rootdir)
 	SnapBootAssetsDir = SnapBootAssetsDirUnder(rootdir)
@@ -510,8 +656,8 @@ func SetRootDir(rootdir string) {
 	SnapRollbackDir = filepath.Join(rootdir, snappyDir, "rollback")
 
 	SnapBinariesDir = filepath.Join(SnapMountDir, "bin")
-	SnapServicesDir = filepath.Join(rootdir, "/etc/systemd/system")
-	SnapRuntimeServicesDir = filepath.Join(rootdir, "/run/systemd/system")
+	SnapServicesDir = SnapServicesDirUnder(rootdir)
+	SnapRuntimeServicesDir = SnapRuntimeServicesDirUnder(rootdir)
 	SnapUserServicesDir = filepath.Join(rootdir, "/etc/systemd/user")
 	SnapSystemdConfDir = SnapSystemdConfDirUnder(rootdir)
 	SnapSystemdDir = filepath.Join(rootdir, "/etc/systemd")
@@ -525,6 +671,7 @@ func SetRootDir(rootdir string) {
 	SnapDBusSystemServicesDir = filepath.Join(rootdir, snappyDir, "dbus-1", "system-services")
 
 	SnapPolkitPolicyDir = filepath.Join(rootdir, "/usr/share/polkit-1/actions")
+	SnapPolkitRuleDir = filepath.Join(rootdir, "/etc/polkit-1/rules.d")
 
 	CloudInstanceDataFile = filepath.Join(rootdir, "/run/cloud-init/instance-data.json")
 
@@ -533,34 +680,20 @@ func SetRootDir(rootdir string) {
 	SnapKModModulesDir = filepath.Join(rootdir, "/etc/modules-load.d/")
 	SnapKModModprobeDir = filepath.Join(rootdir, "/etc/modprobe.d/")
 
+	DevDir = filepath.Join(rootdir, "/dev")
+	SnapGpioChardevDir = filepath.Join(DevDir, "/snap/gpio-chardev")
+
 	LocaleDir = filepath.Join(rootdir, "/usr/share/locale")
 	ClassicDir = filepath.Join(rootdir, "/writable/classic")
 
-	opensuseTWWithLibexec := func() bool {
-		// XXX: this is pretty naive if openSUSE ever starts going back
-		// and forth about the change
-		if !release.DistroLike("opensuse-tumbleweed") {
-			return false
+	DistroLibExecDir = filepath.Join(rootdir, DefaultDistroLibexecDir)
+	if _, err := os.Stat(DistroLibExecDir); errors.Is(err, fs.ErrNotExist) {
+		// the default /usr/lib/snapd does not exist, but maybe we have the
+		// alternative dir /usr/libexec/snapd
+		alt := filepath.Join(rootdir, AltDistroLibexecDir)
+		if _, err := os.Stat(alt); err == nil {
+			DistroLibExecDir = alt
 		}
-		v, err := strconv.Atoi(release.ReleaseInfo.VersionID)
-		if err != nil {
-			// nothing we can do here
-			return false
-		}
-		// first seen on snapshot "20200826"
-		if v < 20200826 {
-			return false
-		}
-		return true
-	}
-
-	if release.DistroLike("fedora") || opensuseTWWithLibexec() {
-		// RHEL, CentOS, Fedora and derivatives, some more recent
-		// snapshots of openSUSE Tumbleweed;
-		// both RHEL and CentOS list "fedora" in ID_LIKE
-		DistroLibExecDir = filepath.Join(rootdir, "/usr/libexec/snapd")
-	} else {
-		DistroLibExecDir = filepath.Join(rootdir, "/usr/lib/snapd")
 	}
 
 	XdgRuntimeDirBase = filepath.Join(rootdir, "/run/user")
@@ -606,6 +739,15 @@ func SetRootDir(rootdir string) {
 		c(rootdir)
 	}
 
+	if release.OnClassic {
+		// On Classic, the data disk is mounted as /
+		WritableMountPath = rootdir
+	} else {
+		// If on Core /writable is a bind mount from data dir
+		WritableMountPath = filepath.Join(rootdir, "writable")
+	}
+	// This will point to a non-existing dir on classic
+	WritableUbuntuCoreSystemDataDir = filepath.Join(WritableMountPath, "system-data")
 }
 
 // what inside a (non-classic) snap is /usr/lib/snapd, outside can come from different places

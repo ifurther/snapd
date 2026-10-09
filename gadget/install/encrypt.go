@@ -21,17 +21,17 @@
 package install
 
 import (
-	"bytes"
+	"context"
 	"fmt"
-	"os/exec"
 
-	"github.com/snapcore/snapd/osutil"
+	"github.com/snapcore/snapd/gadget/device"
 	"github.com/snapcore/snapd/secboot"
-	"github.com/snapcore/snapd/secboot/keys"
 )
 
 var (
-	secbootFormatEncryptedDevice = secboot.FormatEncryptedDevice
+	secbootFormatEncryptedDevice         = secboot.FormatEncryptedDevice
+	secbootNewSimpleActivateContext      = secboot.NewSimpleActivateContext
+	secbootUnlockEncryptedVolumeUsingKey = secboot.UnlockEncryptedVolumeUsingKey
 )
 
 // encryptedDeviceCryptsetup represents a encrypted block device.
@@ -42,9 +42,11 @@ type encryptedDevice interface {
 
 // encryptedDeviceLUKS represents a LUKS-backed encrypted block device.
 type encryptedDeviceLUKS struct {
-	parent string
-	name   string
-	node   string
+	context   secboot.ActivateContext
+	container secboot.StorageContainer
+	parent    string
+	name      string
+	node      string
 }
 
 // expected interface is implemented
@@ -52,19 +54,32 @@ var _ = encryptedDevice(&encryptedDeviceLUKS{})
 
 // newEncryptedDeviceLUKS creates an encrypted device in the existing
 // partition using the specified key with the LUKS backend.
-func newEncryptedDeviceLUKS(devNode string, encType secboot.EncryptionType, key keys.EncryptionKey, label, name string) (encryptedDevice, error) {
+func newEncryptedDeviceLUKS(devNode string, encType device.EncryptionType, key secboot.DiskUnlockKey, label, name string) (encryptedDevice, error) {
+	// on top of us expecting encrypted partitions to have -enc suffix, the
+	// label, specifically the one for "ubuntu-data", is important for fwupd
+	// auto detection of FDE, see
+	// https://github.com/fwupd/fwupd/blob/f958d13ab6a8d638a8f5693a34f69d1e2580798c/libfwupdplugin/fu-context.c#L1084
 	encLabel := label + "-enc"
 	if err := secbootFormatEncryptedDevice(key, encType, encLabel, devNode); err != nil {
 		return nil, fmt.Errorf("cannot format encrypted device: %v", err)
 	}
 
-	if err := cryptsetupOpen(key, devNode, name); err != nil {
+	ctxt, err := secbootNewSimpleActivateContext(context.Background())
+	if err != nil {
+		return nil, err
+	}
+
+	container, err := secbootUnlockEncryptedVolumeUsingKey(ctxt, devNode, name, key)
+
+	if err != nil {
 		return nil, fmt.Errorf("cannot open encrypted device on %s: %s", devNode, err)
 	}
 
 	dev := &encryptedDeviceLUKS{
-		parent: devNode,
-		name:   name,
+		context:   ctxt,
+		container: container,
+		parent:    devNode,
+		name:      name,
 		// A new block device is used to access the encrypted data. Note that
 		// you can't open an encrypted device under different names and a name
 		// can't be used in more than one device at the same time.
@@ -78,21 +93,5 @@ func (dev *encryptedDeviceLUKS) Node() string {
 }
 
 func (dev *encryptedDeviceLUKS) Close() error {
-	return cryptsetupClose(dev.name)
-}
-
-func cryptsetupOpen(key keys.EncryptionKey, node, name string) error {
-	cmd := exec.Command("cryptsetup", "open", "--key-file", "-", node, name)
-	cmd.Stdin = bytes.NewReader(key[:])
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return osutil.OutputErr(output, err)
-	}
-	return nil
-}
-
-func cryptsetupClose(name string) error {
-	if output, err := exec.Command("cryptsetup", "close", name).CombinedOutput(); err != nil {
-		return osutil.OutputErr(output, err)
-	}
-	return nil
+	return dev.context.DeactivateContainer(context.Background(), dev.container, "normal closing")
 }

@@ -81,9 +81,9 @@ func (s *aliasesSuite) TestAliasSuccess(c *check.C) {
 	req, err := http.NewRequest("POST", "/v2/aliases", buf)
 	c.Assert(err, check.IsNil)
 	rec := httptest.NewRecorder()
-	s.req(c, req, nil).ServeHTTP(rec, req)
+	s.req(c, req, nil, actionIsExpected).ServeHTTP(rec, req)
 	c.Assert(rec.Code, check.Equals, 202)
-	var body map[string]interface{}
+	var body map[string]any
 	err = json.Unmarshal(rec.Body.Bytes(), &body)
 	c.Check(err, check.IsNil)
 	id := body["change"].(string)
@@ -132,19 +132,19 @@ func (s *aliasesSuite) TestAliasChangeConflict(c *check.C) {
 	req, err := http.NewRequest("POST", "/v2/aliases", buf)
 	c.Assert(err, check.IsNil)
 	rec := httptest.NewRecorder()
-	s.req(c, req, nil).ServeHTTP(rec, req)
+	s.req(c, req, nil, actionIsExpected).ServeHTTP(rec, req)
 	c.Check(rec.Code, check.Equals, 409)
 
-	var body map[string]interface{}
+	var body map[string]any
 	err = json.Unmarshal(rec.Body.Bytes(), &body)
 	c.Check(err, check.IsNil)
-	c.Check(body, check.DeepEquals, map[string]interface{}{
+	c.Check(body, check.DeepEquals, map[string]any{
 		"status-code": 409.,
 		"status":      "Conflict",
-		"result": map[string]interface{}{
+		"result": map[string]any{
 			"message": `snap "alias-snap" has "manip" change in progress`,
 			"kind":    "snap-change-conflict",
-			"value": map[string]interface{}{
+			"value": map[string]any{
 				"change-kind": "manip",
 				"snap-name":   "alias-snap",
 			},
@@ -181,7 +181,7 @@ func (s *aliasesSuite) TestAliasErrors(c *check.C) {
 		req, err := http.NewRequest("POST", "/v2/aliases", buf)
 		c.Assert(err, check.IsNil)
 
-		rspe := s.errorReq(c, req, nil)
+		rspe := s.errorReq(c, req, nil, actionIsUnexpected)
 		c.Check(rspe.Status, check.Equals, 400)
 		c.Check(rspe.Message, check.Matches, scen.err)
 	}
@@ -213,9 +213,9 @@ func (s *aliasesSuite) TestUnaliasSnapSuccess(c *check.C) {
 	req, err := http.NewRequest("POST", "/v2/aliases", buf)
 	c.Assert(err, check.IsNil)
 	rec := httptest.NewRecorder()
-	s.req(c, req, nil).ServeHTTP(rec, req)
+	s.req(c, req, nil, actionIsExpected).ServeHTTP(rec, req)
 	c.Assert(rec.Code, check.Equals, 202)
-	var body map[string]interface{}
+	var body map[string]any
 	err = json.Unmarshal(rec.Body.Bytes(), &body)
 	c.Check(err, check.IsNil)
 	id := body["change"].(string)
@@ -268,9 +268,9 @@ func (s *aliasesSuite) TestUnaliasDWIMSnapSuccess(c *check.C) {
 	req, err := http.NewRequest("POST", "/v2/aliases", buf)
 	c.Assert(err, check.IsNil)
 	rec := httptest.NewRecorder()
-	s.req(c, req, nil).ServeHTTP(rec, req)
+	s.req(c, req, nil, actionIsExpected).ServeHTTP(rec, req)
 	c.Assert(rec.Code, check.Equals, 202)
-	var body map[string]interface{}
+	var body map[string]any
 	err = json.Unmarshal(rec.Body.Bytes(), &body)
 	c.Check(err, check.IsNil)
 	id := body["change"].(string)
@@ -324,9 +324,9 @@ func (s *aliasesSuite) TestUnaliasAliasSuccess(c *check.C) {
 	req, err := http.NewRequest("POST", "/v2/aliases", buf)
 	c.Assert(err, check.IsNil)
 	rec := httptest.NewRecorder()
-	s.req(c, req, nil).ServeHTTP(rec, req)
+	s.req(c, req, nil, actionIsExpected).ServeHTTP(rec, req)
 	c.Assert(rec.Code, check.Equals, 202)
-	var body map[string]interface{}
+	var body map[string]any
 	err = json.Unmarshal(rec.Body.Bytes(), &body)
 	c.Check(err, check.IsNil)
 	id := body["change"].(string)
@@ -355,7 +355,7 @@ func (s *aliasesSuite) TestUnaliasAliasSuccess(c *check.C) {
 	req, err = http.NewRequest("POST", "/v2/aliases", buf)
 	c.Assert(err, check.IsNil)
 	rec = httptest.NewRecorder()
-	s.req(c, req, nil).ServeHTTP(rec, req)
+	s.req(c, req, nil, actionIsExpected).ServeHTTP(rec, req)
 	c.Assert(rec.Code, check.Equals, 202)
 	err = json.Unmarshal(rec.Body.Bytes(), &body)
 	c.Check(err, check.IsNil)
@@ -406,9 +406,9 @@ func (s *aliasesSuite) TestUnaliasDWIMAliasSuccess(c *check.C) {
 	req, err := http.NewRequest("POST", "/v2/aliases", buf)
 	c.Assert(err, check.IsNil)
 	rec := httptest.NewRecorder()
-	s.req(c, req, nil).ServeHTTP(rec, req)
+	s.req(c, req, nil, actionIsExpected).ServeHTTP(rec, req)
 	c.Assert(rec.Code, check.Equals, 202)
-	var body map[string]interface{}
+	var body map[string]any
 	err = json.Unmarshal(rec.Body.Bytes(), &body)
 	c.Check(err, check.IsNil)
 	id := body["change"].(string)
@@ -438,7 +438,7 @@ func (s *aliasesSuite) TestUnaliasDWIMAliasSuccess(c *check.C) {
 	req, err = http.NewRequest("POST", "/v2/aliases", buf)
 	c.Assert(err, check.IsNil)
 	rec = httptest.NewRecorder()
-	s.req(c, req, nil).ServeHTTP(rec, req)
+	s.req(c, req, nil, actionIsExpected).ServeHTTP(rec, req)
 	c.Assert(rec.Code, check.Equals, 202)
 	err = json.Unmarshal(rec.Body.Bytes(), &body)
 	c.Check(err, check.IsNil)
@@ -487,9 +487,9 @@ func (s *aliasesSuite) TestPreferSuccess(c *check.C) {
 	req, err := http.NewRequest("POST", "/v2/aliases", buf)
 	c.Assert(err, check.IsNil)
 	rec := httptest.NewRecorder()
-	s.req(c, req, nil).ServeHTTP(rec, req)
+	s.req(c, req, nil, actionIsExpected).ServeHTTP(rec, req)
 	c.Assert(rec.Code, check.Equals, 202)
-	var body map[string]interface{}
+	var body map[string]any
 	err = json.Unmarshal(rec.Body.Bytes(), &body)
 	c.Check(err, check.IsNil)
 	id := body["change"].(string)
@@ -549,7 +549,7 @@ func (s *aliasesSuite) TestAliases(c *check.C) {
 	req, err := http.NewRequest("GET", "/v2/aliases", nil)
 	c.Assert(err, check.IsNil)
 
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 	c.Check(rsp.Status, check.Equals, 200)
 	c.Check(rsp.Result, check.DeepEquals, map[string]map[string]daemon.AliasStatus{
 		"alias-snap1": {
@@ -590,11 +590,11 @@ func (s *aliasesSuite) TestAliases(c *check.C) {
 func (s *aliasesSuite) TestInstallUnaliased(c *check.C) {
 	var calledFlags snapstate.Flags
 
-	defer daemon.MockSnapstateInstall(func(ctx context.Context, s *state.State, name string, opts *snapstate.RevisionOptions, userID int, flags snapstate.Flags) (*state.TaskSet, error) {
-		calledFlags = flags
+	defer daemon.MockSnapstateInstallWithGoal(func(ctx context.Context, st *state.State, g snapstate.InstallGoal, opts snapstate.Options) ([]*snap.Info, []*state.TaskSet, error) {
+		calledFlags = opts.Flags
 
-		t := s.NewTask("fake-install-snap", "Doing a fake install")
-		return state.NewTaskSet(t), nil
+		t := st.NewTask("fake-install-snap", "Doing a fake install")
+		return []*snap.Info{{}}, []*state.TaskSet{state.NewTaskSet(t)}, nil
 	})()
 
 	d := s.daemon(c)
@@ -608,7 +608,7 @@ func (s *aliasesSuite) TestInstallUnaliased(c *check.C) {
 	st := d.Overlord().State()
 	st.Lock()
 	defer st.Unlock()
-	_, _, err := inst.Dispatch()(inst, st)
+	_, err := inst.Dispatch()(context.Background(), inst, st)
 	c.Check(err, check.IsNil)
 
 	c.Check(calledFlags.Unaliased, check.Equals, true)
@@ -617,11 +617,11 @@ func (s *aliasesSuite) TestInstallUnaliased(c *check.C) {
 func (s *aliasesSuite) TestInstallIgnoreRunning(c *check.C) {
 	var calledFlags snapstate.Flags
 
-	defer daemon.MockSnapstateInstall(func(ctx context.Context, s *state.State, name string, opts *snapstate.RevisionOptions, userID int, flags snapstate.Flags) (*state.TaskSet, error) {
-		calledFlags = flags
+	defer daemon.MockSnapstateInstallWithGoal(func(ctx context.Context, st *state.State, g snapstate.InstallGoal, opts snapstate.Options) ([]*snap.Info, []*state.TaskSet, error) {
+		calledFlags = opts.Flags
 
-		t := s.NewTask("fake-install-snap", "Doing a fake install")
-		return state.NewTaskSet(t), nil
+		t := st.NewTask("fake-install-snap", "Doing a fake install")
+		return []*snap.Info{{}}, []*state.TaskSet{state.NewTaskSet(t)}, nil
 	})()
 
 	d := s.daemon(c)
@@ -635,7 +635,7 @@ func (s *aliasesSuite) TestInstallIgnoreRunning(c *check.C) {
 	st := d.Overlord().State()
 	st.Lock()
 	defer st.Unlock()
-	_, _, err := inst.Dispatch()(inst, st)
+	_, err := inst.Dispatch()(context.Background(), inst, st)
 	c.Check(err, check.IsNil)
 
 	c.Check(calledFlags.IgnoreRunning, check.Equals, true)
@@ -644,11 +644,11 @@ func (s *aliasesSuite) TestInstallIgnoreRunning(c *check.C) {
 func (s *aliasesSuite) TestInstallPrefer(c *check.C) {
 	var calledFlags snapstate.Flags
 
-	defer daemon.MockSnapstateInstall(func(ctx context.Context, s *state.State, name string, opts *snapstate.RevisionOptions, userID int, flags snapstate.Flags) (*state.TaskSet, error) {
-		calledFlags = flags
+	defer daemon.MockSnapstateInstallWithGoal(func(ctx context.Context, st *state.State, g snapstate.InstallGoal, opts snapstate.Options) ([]*snap.Info, []*state.TaskSet, error) {
+		calledFlags = opts.Flags
 
-		t := s.NewTask("fake-install-snap", "Doing a fake install")
-		return state.NewTaskSet(t), nil
+		t := st.NewTask("fake-install-snap", "Doing a fake install")
+		return []*snap.Info{{}}, []*state.TaskSet{state.NewTaskSet(t)}, nil
 	})()
 
 	d := s.daemon(c)
@@ -661,7 +661,7 @@ func (s *aliasesSuite) TestInstallPrefer(c *check.C) {
 	st := d.Overlord().State()
 	st.Lock()
 	defer st.Unlock()
-	_, _, err := inst.Dispatch()(inst, st)
+	_, err := inst.Dispatch()(context.Background(), inst, st)
 	c.Check(err, check.IsNil)
 
 	c.Check(calledFlags.Prefer, check.Equals, true)

@@ -23,7 +23,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -65,15 +64,15 @@ type configTestSuite struct{}
 var _ = Suite(&configTestSuite{})
 
 var (
-	// this is what snap.E("0") looks like when decoded into an interface{} (the /^i/ is for "interface")
-	iZeroEpoch = map[string]interface{}{
-		"read":  []interface{}{0.},
-		"write": []interface{}{0.},
+	// this is what snap.E("0") looks like when decoded into an any
+	anyZeroEpoch = map[string]any{
+		"read":  []any{0.},
+		"write": []any{0.},
 	}
 	// ...and this is snap.E("5*")
-	iFiveStarEpoch = map[string]interface{}{
-		"read":  []interface{}{4., 5.},
-		"write": []interface{}{5.},
+	anyFiveStarEpoch = map[string]any{
+		"read":  []any{4., 5.},
+		"write": []any{5.},
 	}
 )
 
@@ -319,6 +318,10 @@ func (dac *testDauthContext) ProxyStoreParams(defaultURL *url.URL) (string, *url
 
 func (dac *testDauthContext) StoreOffline() (bool, error) {
 	return dac.storeOffline, nil
+}
+
+func (sc *testDauthContext) WithSnapStoreDelta() bool {
+	return true
 }
 
 func (dac *testDauthContext) CloudInfo() (*auth.CloudInfo, error) {
@@ -1343,7 +1346,7 @@ func (s *storeTestSuite) TestInfo(c *C) {
 	}
 	result, err := sto.SnapInfo(s.ctx, spec, nil)
 	c.Assert(err, IsNil)
-	c.Check(result.InstanceName(), Equals, "hello-world")
+	c.Check(result.InstanceName().String(), Equals, "hello-world")
 	c.Check(result.Architectures, DeepEquals, []string{"all"})
 	c.Check(result.Revision, Equals, snap.R(29))
 	c.Check(result.SnapID, Equals, helloWorldSnapID)
@@ -1453,7 +1456,7 @@ func (s *storeTestSuite) TestInfoBadResponses(c *C) {
 
 	info, err := sto.SnapInfo(s.ctx, store.SnapSpec{Name: "hello"}, nil)
 	c.Assert(err, IsNil)
-	c.Check(info.InstanceName(), Equals, "hello")
+	c.Check(info.InstanceName().String(), Equals, "hello")
 
 	info, err = sto.SnapInfo(s.ctx, store.SnapSpec{Name: "hello"}, nil)
 	c.Check(err, Equals, store.ErrSnapNotFound)
@@ -1497,7 +1500,7 @@ func (s *storeTestSuite) TestInfoDefaultChannelIsStable(c *C) {
 	}
 	result, err := sto.SnapInfo(s.ctx, spec, nil)
 	c.Assert(err, IsNil)
-	c.Check(result.InstanceName(), Equals, "hello-world")
+	c.Check(result.InstanceName().String(), Equals, "hello-world")
 	c.Check(result.SnapID, Equals, helloWorldSnapID)
 	c.Check(result.Channel, Equals, "stable")
 }
@@ -1561,7 +1564,7 @@ func (s *storeTestSuite) TestInfo500Once(c *C) {
 	}
 	result, err := sto.SnapInfo(s.ctx, spec, nil)
 	c.Assert(err, IsNil)
-	c.Check(result.InstanceName(), Equals, "hello-world")
+	c.Check(result.InstanceName().String(), Equals, "hello-world")
 	c.Assert(n, Equals, 2)
 }
 
@@ -1600,7 +1603,7 @@ func (s *storeTestSuite) TestInfoAndChannels(c *C) {
 	result, err := sto.SnapInfo(s.ctx, spec, nil)
 	c.Assert(err, IsNil)
 	c.Assert(n, Equals, 1)
-	c.Check(result.InstanceName(), Equals, "hello-world")
+	c.Check(result.InstanceName().String(), Equals, "hello-world")
 	expected := map[string]*snap.ChannelSnapInfo{
 		"latest/stable": {
 			Revision:    snap.R(29),
@@ -1732,7 +1735,7 @@ func (s *storeTestSuite) TestInfoNonDefaults(c *C) {
 	}
 	result, err := sto.SnapInfo(s.ctx, spec, nil)
 	c.Assert(err, IsNil)
-	c.Check(result.InstanceName(), Equals, "hello-world")
+	c.Check(result.InstanceName().String(), Equals, "hello-world")
 }
 
 func (s *storeTestSuite) TestStoreIDFromAuthContext(c *C) {
@@ -1762,7 +1765,7 @@ func (s *storeTestSuite) TestStoreIDFromAuthContext(c *C) {
 	}
 	result, err := sto.SnapInfo(s.ctx, spec, nil)
 	c.Assert(err, IsNil)
-	c.Check(result.InstanceName(), Equals, "hello-world")
+	c.Check(result.InstanceName().String(), Equals, "hello-world")
 }
 
 func (s *storeTestSuite) TestLocation(c *C) {
@@ -1789,7 +1792,7 @@ func (s *storeTestSuite) TestLocation(c *C) {
 	}
 	result, err := sto.SnapInfo(s.ctx, spec, nil)
 	c.Assert(err, IsNil)
-	c.Check(result.InstanceName(), Equals, "hello-world")
+	c.Check(result.InstanceName().String(), Equals, "hello-world")
 }
 
 func (s *storeTestSuite) TestProxyStoreFromAuthContext(c *C) {
@@ -1821,7 +1824,7 @@ func (s *storeTestSuite) TestProxyStoreFromAuthContext(c *C) {
 	}
 	result, err := sto.SnapInfo(s.ctx, spec, nil)
 	c.Assert(err, IsNil)
-	c.Check(result.InstanceName(), Equals, "hello-world")
+	c.Check(result.InstanceName().String(), Equals, "hello-world")
 }
 
 func (s *storeTestSuite) TestProxyStoreFromAuthContextURLFallback(c *C) {
@@ -1852,7 +1855,7 @@ func (s *storeTestSuite) TestProxyStoreFromAuthContextURLFallback(c *C) {
 	}
 	result, err := sto.SnapInfo(s.ctx, spec, nil)
 	c.Assert(err, IsNil)
-	c.Check(result.InstanceName(), Equals, "hello-world")
+	c.Check(result.InstanceName().String(), Equals, "hello-world")
 }
 
 func (s *storeTestSuite) TestInfoOopses(c *C) {
@@ -1968,7 +1971,7 @@ func (s *storeTestSuite) TestExists(c *C) {
 	}
 	ref, ch, err := sto.SnapExists(s.ctx, spec, nil)
 	c.Assert(err, IsNil)
-	c.Check(ref.SnapName(), Equals, "hello")
+	c.Check(ref.SnapName().String(), Equals, "hello")
 	c.Check(ref.ID(), Equals, "mVyGrEwiqSi5PugCwyH7WgpoQLemtTd6")
 	c.Check(ch, DeepEquals, &channel.Channel{
 		Architecture: "amd64",
@@ -2412,6 +2415,33 @@ func (s *storeTestSuite) TestSectionsQueryErrors(c *C) {
 	c.Assert(err, ErrorMatches, `cannot retrieve sections: got unexpected HTTP status code 500 via GET to.*`)
 }
 
+func (s *storeTestSuite) TestSectionsQueryCanceledContext(c *C) {
+	n := 0
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n++
+		w.Header().Set("Content-Type", "application/hal+json")
+		w.WriteHeader(200)
+		io.WriteString(w, MockSectionsJSON)
+	}))
+	c.Assert(mockServer, NotNil)
+	defer mockServer.Close()
+
+	serverURL, _ := url.Parse(mockServer.URL)
+	cfg := store.Config{
+		StoreBaseURL: serverURL,
+	}
+	dauthCtx := &testDauthContext{c: c, device: s.device}
+	sto := store.New(&cfg, dauthCtx)
+
+	ctx, cancel := context.WithCancel(s.ctx)
+	cancel()
+
+	sections, err := sto.Sections(ctx, s.user)
+	c.Check(err, testutil.ErrorIs, context.Canceled)
+	c.Check(sections, IsNil)
+	c.Check(n, Equals, 0)
+}
+
 /*
 	acquired via:
 
@@ -2538,9 +2568,6 @@ func (s *storeTestSuite) testSnapCommands(c *C, onClassic bool) {
 	sto := store.New(&store.Config{StoreBaseURL: serverURL}, dauthCtx)
 
 	db, err := advisor.Create()
-	if errors.Is(err, advisor.ErrNotSupported) {
-		c.Skip("bolt support is disabled")
-	}
 	c.Assert(err, IsNil)
 	defer db.Rollback()
 
@@ -2586,9 +2613,6 @@ func (s *storeTestSuite) TestSnapCommandsTooMany(c *C) {
 	sto := store.New(&store.Config{StoreBaseURL: serverURL}, dauthCtx)
 
 	db, err := advisor.Create()
-	if errors.Is(err, advisor.ErrNotSupported) {
-		c.Skip("bolt support is disabled")
-	}
 	c.Assert(err, IsNil)
 	defer db.Rollback()
 
@@ -2691,7 +2715,7 @@ func (s *storeTestSuite) testFind(c *C, apiV1 bool) {
 	c.Assert(err, IsNil)
 	c.Assert(snaps, HasLen, 1)
 	snp := snaps[0]
-	c.Check(snp.InstanceName(), Equals, "hello-world")
+	c.Check(snp.InstanceName().String(), Equals, "hello-world")
 	c.Check(snp.Revision, Equals, snap.R(27))
 	c.Check(snp.SnapID, Equals, helloWorldSnapID)
 	c.Check(snp.Publisher, Equals, snap.StoreAccount{
@@ -4305,10 +4329,10 @@ func (s *storeTestSuite) TestConnectivityCheckHappy(c *C) {
 	var mockServerURL *url.URL
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/v2/snaps/info/core":
+		case "/v2/snaps/info/snapd":
 			c.Check(r.Method, Equals, "GET")
 			c.Check(r.URL.Query(), DeepEquals, url.Values{"fields": {"download"}, "architecture": {arch.DpkgArchitecture()}})
-			u, err := url.Parse("/download/core")
+			u, err := url.Parse("/download/snapd")
 			c.Assert(err, IsNil)
 			io.WriteString(w,
 				fmt.Sprintf(`{"channel-map": [{"download": {"url": %q}}, {"download": {"url": %q}}, {"download": {"url": %q}}]}`,
@@ -4316,7 +4340,7 @@ func (s *storeTestSuite) TestConnectivityCheckHappy(c *C) {
 					mockServerURL.String()+"/bogus1/",
 					mockServerURL.String()+"/bogus2/",
 				))
-		case "/download/core":
+		case "/download/snapd":
 			c.Check(r.Method, Equals, "HEAD")
 			w.WriteHeader(200)
 		default:
@@ -4339,8 +4363,8 @@ func (s *storeTestSuite) TestConnectivityCheckHappy(c *C) {
 		mockServerURL.Host: true,
 	})
 	c.Check(seenPaths, DeepEquals, map[string]int{
-		"/v2/snaps/info/core": 1,
-		"/download/core":      1,
+		"/v2/snaps/info/snapd": 1,
+		"/download/snapd":      1,
 	})
 }
 
@@ -4354,7 +4378,7 @@ func (s *storeTestSuite) TestConnectivityCheckUnhappy(c *C) {
 	var mockServerURL *url.URL
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/v2/snaps/info/core":
+		case "/v2/snaps/info/snapd":
 			w.WriteHeader(500)
 		default:
 			c.Fatalf("unexpected request: %s", r.URL.String())
@@ -4377,7 +4401,7 @@ func (s *storeTestSuite) TestConnectivityCheckUnhappy(c *C) {
 	})
 	// three because retries
 	c.Check(seenPaths, DeepEquals, map[string]int{
-		"/v2/snaps/info/core": 3,
+		"/v2/snaps/info/snapd": 3,
 	})
 }
 

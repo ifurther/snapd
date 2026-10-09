@@ -20,6 +20,7 @@
 package seedwriter
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -38,7 +39,7 @@ type policy16 struct {
 	model *asserts.Model
 	opts  *Options
 
-	warningf func(format string, a ...interface{})
+	warningf func(format string, a ...any)
 
 	needsCore   []string
 	needsCore16 []string
@@ -98,7 +99,7 @@ func (pol *policy16) checkBase(info *snap.Info, modes []string, availableByMode 
 	if info.Base == "" {
 		if info.Type() == snap.TypeGadget || info.Type() == snap.TypeApp {
 			// remember to make sure we have core installed
-			pol.needsCore = append(pol.needsCore, info.SnapName())
+			pol.needsCore = append(pol.needsCore, info.SnapName().String())
 		}
 		return nil
 	}
@@ -109,7 +110,7 @@ func (pol *policy16) checkBase(info *snap.Info, modes []string, availableByMode 
 
 	if info.Base == "core16" {
 		// check at the end
-		pol.needsCore16 = append(pol.needsCore16, info.SnapName())
+		pol.needsCore16 = append(pol.needsCore16, info.SnapName().String())
 		return nil
 	}
 
@@ -210,7 +211,15 @@ func (tr *tree16) localSnapPath(sn *SeedSnap) (string, error) {
 	return filepath.Join(tr.snapsDirPath, sn.Info.Filename()), nil
 }
 
-func (tr *tree16) writeAssertions(db asserts.RODatabase, modelRefs []*asserts.Ref, snapsFromModel []*SeedSnap, extraSnaps []*SeedSnap) error {
+func (tr *tree16) componentPath(sn *SeedSnap, sc *SeedComponent) (string, error) {
+	return "", errors.New("components not supported on UC16")
+}
+
+func (tr *tree16) localComponentPath(*SeedComponent, string) (string, error) {
+	return "", errors.New("components not supported on UC16")
+}
+
+func (tr *tree16) writeAssertions(db asserts.RODatabase, modelRefs []*asserts.Ref, extraRefs []*asserts.Ref, snapsFromModel []*SeedSnap, extraSnaps []*SeedSnap) error {
 	seedAssertsDir := filepath.Join(tr.opts.SeedDir, "assertions")
 	if err := os.MkdirAll(seedAssertsDir, 0755); err != nil {
 		return err
@@ -237,6 +246,10 @@ func (tr *tree16) writeAssertions(db asserts.RODatabase, modelRefs []*asserts.Re
 	}
 
 	if err := writeByRefs(modelRefs); err != nil {
+		return err
+	}
+
+	if err := writeByRefs(extraRefs); err != nil {
 		return err
 	}
 

@@ -77,23 +77,43 @@ func (us *ServiceScopeOptions) Users() client.UserSelector {
 	}
 }
 
+type FmtServiceStatusOptions struct {
+	IsUserGlobal        bool
+	DropSnapInstanceKey bool
+	// FromSnapCtl disables translation for the formatted
+	// services output so it is machine readable.
+	FromSnapCtl bool
+}
+
 // FmtServiceStatus formats a given service application into the following string
 // <snap.app>             <enabled> <active> <notes>
 // To keep output persistent between snapctl and snap cmd.
-func FmtServiceStatus(svc *client.AppInfo, isGlobal bool) string {
-	startup := i18n.G("disabled")
+func FmtServiceStatus(svc *client.AppInfo, opts FmtServiceStatusOptions) string {
+	maybeI18nG := i18n.G
+	if opts.FromSnapCtl {
+		// Disable translation for snapctl calls so it
+		// machine readable.
+		maybeI18nG = func(s string) string { return s }
+	}
+
+	startup := maybeI18nG("disabled")
 	if svc.Enabled {
-		startup = i18n.G("enabled")
+		startup = maybeI18nG("enabled")
 	}
 
 	// When requesting global service status, we don't have any active
 	// information available for user daemons.
-	current := i18n.G("inactive")
-	if svc.DaemonScope == snap.UserDaemon && isGlobal {
+	current := maybeI18nG("inactive")
+	if svc.DaemonScope == snap.UserDaemon && opts.IsUserGlobal {
 		current = "-"
 	} else if svc.Active {
-		current = i18n.G("active")
+		current = maybeI18nG("active")
 	}
 
-	return fmt.Sprintf("%s.%s\t%s\t%s\t%s", svc.Snap, svc.Name, startup, current, ClientAppInfoNotes(svc))
+	snapInstanceName := svc.Snap
+	if opts.DropSnapInstanceKey {
+		sn, _ := snap.SplitInstanceName(svc.Snap)
+		snapInstanceName = sn
+	}
+	return fmt.Sprintf("%s.%s\t%s\t%s\t%s", snapInstanceName, svc.Name, startup, current, ClientAppInfoNotes(svc))
 }

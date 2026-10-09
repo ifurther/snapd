@@ -118,7 +118,7 @@ func (iface *posixMQInterface) checkPosixMQAppArmorSupport() error {
 		return err
 	}
 
-	if !strutil.ListContains(features, "mqueue") {
+	if !strutil.ListContains(features, "mqueue-posix") {
 		return fmt.Errorf("AppArmor does not support POSIX message queues - cannot setup or connect interfaces")
 	}
 
@@ -133,26 +133,6 @@ func (iface *posixMQInterface) validatePermissionList(perms []string, name strin
 	}
 
 	return nil
-}
-
-func (iface *posixMQInterface) validatePermissionsAttr(permsAttr interface{}) ([]string, error) {
-	var perms []string
-	permsList, ok := permsAttr.([]interface{})
-
-	if !ok {
-		return nil, fmt.Errorf(`posix-mq slot "permissions" attribute must be a list of strings, not %v`, permsAttr)
-	}
-
-	// Ensure that each permission in the list is a string
-	for _, i := range permsList {
-		perm, ok := i.(string)
-		if !ok {
-			return nil, fmt.Errorf(`each posix-mq slot permission must be a string, not %v`, permsAttr)
-		}
-		perms = append(perms, perm)
-	}
-
-	return perms, nil
 }
 
 func (iface *posixMQInterface) getPermissions(attrs interfaces.Attrer, name string) ([]string, error) {
@@ -235,7 +215,7 @@ func (iface *posixMQInterface) validatePath(name, path string) error {
 	return nil
 }
 
-func (iface *posixMQInterface) checkPosixMQAttr(name string, attrs *map[string]interface{}) error {
+func (iface *posixMQInterface) checkPosixMQAttr(name string, attrs *map[string]any) error {
 	posixMQAttr, isSet := (*attrs)["posix-mq"]
 	posixMQ, ok := posixMQAttr.(string)
 	if isSet && !ok {
@@ -243,7 +223,7 @@ func (iface *posixMQInterface) checkPosixMQAttr(name string, attrs *map[string]i
 	}
 	if posixMQ == "" {
 		if *attrs == nil {
-			*attrs = make(map[string]interface{})
+			*attrs = make(map[string]any)
 		}
 		// posix-mq attribute defaults to name if unspecified
 		(*attrs)["posix-mq"] = name
@@ -295,10 +275,32 @@ func (iface *posixMQInterface) generateSnippet(name, plugOrSlot string, permissi
 
 	snippet.WriteString(fmt.Sprintf("  # POSIX Message Queue %s: %s\n", plugOrSlot, name))
 	for _, path := range paths {
-		snippet.WriteString(fmt.Sprintf("  mqueue (%s) \"%s\",\n", aaPerms, path))
+		snippet.WriteString(fmt.Sprintf("  mqueue (%s) type=posix \"%s\",\n", aaPerms, path))
 	}
 
 	return snippet.String()
+}
+
+func (iface *posixMQInterface) extendPermissions(perms []string) []string {
+	extended := make([]string, len(perms), len(perms)+3)
+	copy(extended, perms)
+
+	// Always allow "open"
+	if !strutil.ListContains(perms, "open") {
+		extended = append(extended, "open")
+	}
+
+	// Make "read" imply "getattr".
+	if !strutil.ListContains(perms, "getattr") && strutil.ListContains(perms, "read") {
+		extended = append(extended, "getattr")
+	}
+
+	// Make "write" imply "setattr".
+	if !strutil.ListContains(perms, "setattr") && strutil.ListContains(perms, "write") {
+		extended = append(extended, "setattr")
+	}
+
+	return extended
 }
 
 func (iface *posixMQInterface) AppArmorPermanentSlot(spec *apparmor.Specification, slot *snap.SlotInfo) error {
@@ -312,7 +314,8 @@ func (iface *posixMQInterface) AppArmorPermanentSlot(spec *apparmor.Specificatio
 	}
 
 	// Slots always have all permissions enabled for the given message queue path
-	snippet := iface.generateSnippet(slot.Name, "slot", posixMQPlugPermissions, paths)
+	perms := iface.extendPermissions(posixMQPlugPermissions)
+	snippet := iface.generateSnippet(slot.Name, "slot", perms, paths)
 	spec.AddSnippet(snippet)
 
 	return nil
@@ -329,13 +332,14 @@ func (iface *posixMQInterface) AppArmorConnectedPlug(spec *apparmor.Specificatio
 		return err
 	}
 
-	// Always allow "open"
-	if !strutil.ListContains(perms, "open") {
-		perms = append(perms, "open")
-	}
+	perms = iface.extendPermissions(perms)
 
 	snippet := iface.generateSnippet(plug.Name(), "plug", perms, paths)
 	spec.AddSnippet(snippet)
+
+	// cater to a legitimate use case when a posix-mq consumer may want
+	// to probe whether /dev/mqueue is indeed the mqueue pseudo filesystem
+	spec.AddSnippet(`mqueue (getattr) type=posix "/",`)
 
 	return nil
 }
@@ -377,5 +381,8 @@ func (iface *posixMQInterface) SecCompConnectedPlug(spec *seccomp.Specification,
 }
 
 func init() {
-	registerIface(&posixMQInterface{})
+	registerIface(&posixMQInterface{commonInterface{
+		parallelInstancesPlugErr: errors.New("conflicting operations on shared POSIX message queues"),
+		parallelInstancesSlotErr: errors.New("conflicting operations on shared POSIX message queues"),
+	}})
 }

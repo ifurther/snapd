@@ -29,6 +29,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/snapcore/snapd/desktop/desktopentry"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
@@ -103,10 +104,9 @@ var isValidDesktopFileLine = regexp.MustCompile(strings.Join([]string{
 	"^TargetEnvironment=",
 }, "|")).Match
 
-// rewriteExecLine rewrites a "Exec=" line to use the wrapper path for snap application.
-func rewriteExecLine(s *snap.Info, desktopFile, line string) (string, error) {
-	env := fmt.Sprintf("env BAMF_DESKTOP_FILE_HINT=%s ", desktopFile)
-
+// detectAppAndRewriteExecLine parses snap app name from passed "Exec=" line and rewrites it
+// to use the wrapper path for snap application.
+func detectAppAndRewriteExecLine(s *snap.Info, desktopFile, line string) (appInfo *snap.AppInfo, execLine string, err error) {
 	cmd := strings.SplitN(line, "=", 2)[1]
 	for _, app := range s.Apps {
 		wrapper := app.WrapperPath()
@@ -115,15 +115,23 @@ func rewriteExecLine(s *snap.Info, desktopFile, line string) (string, error) {
 			// wrapper uses s.InstanceName(), with the instance key
 			// set the command will be 'snap_foo.app' instead of
 			// 'snap.app', need to account for that
-			validCmd = snap.JoinSnapApp(s.SnapName(), app.Name)
+			validCmd = snap.JoinSnapApp(s.SnapName().String(), app.Name)
 		}
 		// check the prefix to allow %flag style args
 		// this is ok because desktop files are not run through sh
 		// so we don't have to worry about the arguments too much
 		if cmd == validCmd {
-			return "Exec=" + env + wrapper, nil
+			if app.IsService() {
+				return app, "Exec=/usr/bin/false", nil
+			} else {
+				return app, "Exec=" + wrapper, nil
+			}
 		} else if strings.HasPrefix(cmd, validCmd+" ") {
-			return fmt.Sprintf("Exec=%s%s%s", env, wrapper, line[len("Exec=")+len(validCmd):]), nil
+			if app.IsService() {
+				return app, "Exec=/usr/bin/false", nil
+			} else {
+				return app, fmt.Sprintf("Exec=%s%s", wrapper, line[len("Exec=")+len(validCmd):]), nil
+			}
 		}
 	}
 
@@ -135,12 +143,15 @@ func rewriteExecLine(s *snap.Info, desktopFile, line string) (string, error) {
 	desktopFileApp := strings.TrimSuffix(df, filepath.Ext(df))
 	app, ok := s.Apps[desktopFileApp]
 	if ok {
-		newExec := fmt.Sprintf("Exec=%s%s", env, app.WrapperPath())
+		newExec := fmt.Sprintf("Exec=%s", app.WrapperPath())
+		if app.IsService() {
+			newExec = "Exec=/usr/bin/false"
+		}
 		logger.Noticef("rewriting desktop file %q to %q", desktopFile, newExec)
-		return newExec, nil
+		return app, newExec, nil
 	}
 
-	return "", fmt.Errorf("invalid exec command: %q", cmd)
+	return nil, "", fmt.Errorf("invalid exec command: %q", cmd)
 }
 
 func rewriteIconLine(s *snap.Info, line string) (string, error) {
@@ -175,7 +186,6 @@ func rewriteIconLine(s *snap.Info, line string) (string, error) {
 
 func sanitizeDesktopFile(s *snap.Info, desktopFile string, rawcontent []byte) []byte {
 	var newContent bytes.Buffer
-	mountDir := []byte(s.MountDir())
 	scanner := bufio.NewScanner(bytes.NewReader(rawcontent))
 	for i := 0; scanner.Scan(); i++ {
 		bline := scanner.Bytes()
@@ -188,11 +198,19 @@ func sanitizeDesktopFile(s *snap.Info, desktopFile string, rawcontent []byte) []
 		// rewrite exec lines to an absolute path for the binary
 		if bytes.HasPrefix(bline, []byte("Exec=")) {
 			var err error
-			line, err := rewriteExecLine(s, desktopFile, string(bline))
+			appInfo, line, err := detectAppAndRewriteExecLine(s, desktopFile, string(bline))
 			if err != nil {
 				// something went wrong, ignore the line
 				continue
 			}
+			// Add metadata entry to associate the exec line with a snap app
+			newContent.Write([]byte("X-SnapAppName=" + appInfo.Name + "\n"))
+
+			if appInfo.CommonID != "" {
+				// Add metadata entry to associate the application with a common ID.
+				newContent.Write([]byte("X-SnapCommonID=" + appInfo.CommonID + "\n"))
+			}
+
 			bline = []byte(line)
 		}
 
@@ -206,8 +224,12 @@ func sanitizeDesktopFile(s *snap.Info, desktopFile string, rawcontent []byte) []
 			bline = []byte(line)
 		}
 
+		// use "current" instead of the revision number to avoid icon
+		// breakage when users copy the desktop files (LP: #1851490)
+		dollarSnapValue := []byte(filepath.Join(s.MountDir(), "..", "current"))
+
 		// do variable substitution
-		bline = bytes.Replace(bline, []byte("${SNAP}"), mountDir, -1)
+		bline = bytes.Replace(bline, []byte("${SNAP}"), dollarSnapValue, -1)
 
 		newContent.Grow(len(bline) + 1)
 		newContent.Write(bline)
@@ -248,24 +270,26 @@ func findDesktopFiles(rootDir string) ([]string, error) {
 }
 
 func deriveDesktopFilesContent(s *snap.Info) (map[string]osutil.FileState, error) {
-	rootDir := filepath.Join(s.MountDir(), "meta", "gui")
-	desktopFiles, err := findDesktopFiles(rootDir)
+	desktopFiles, err := s.DesktopFilesFromInstalledSnap(snap.DesktopFilesFromInstalledSnapOptions{})
 	if err != nil {
 		return nil, err
 	}
 
-	content := make(map[string]osutil.FileState)
+	content := make(map[string]osutil.FileState, len(desktopFiles))
 	for _, df := range desktopFiles {
 		base := filepath.Base(df)
+		base, err := s.MangleDesktopFileName(base)
+		if err != nil {
+			return nil, err
+		}
+		if _, exists := content[base]; exists {
+			logger.Noticef("error: identified %q as a duplicate file name %q after mangling in snap %q", filepath.Base(df), base, s.InstanceName())
+			continue
+		}
 		fileContent, err := os.ReadFile(df)
 		if err != nil {
 			return nil, err
 		}
-		// FIXME: don't blindly use the snap desktop filename, mangle it
-		// but we can't just use the app name because a desktop file
-		// may call the same app with multiple parameters, e.g.
-		// --create-new, --open-existing etc
-		base = fmt.Sprintf("%s_%s", s.DesktopPrefix(), base)
 		installedDesktopFileName := filepath.Join(dirs.SnapDesktopFilesDir, base)
 		fileContent = sanitizeDesktopFile(s, installedDesktopFileName, fileContent)
 		content[base] = &osutil.MemoryFileState{
@@ -274,6 +298,50 @@ func deriveDesktopFilesContent(s *snap.Info) (map[string]osutil.FileState, error
 		}
 	}
 	return content, nil
+}
+
+// forAllDesktopFiles loops over all installed desktop files under
+// dirs.SnapDesktopFilesDir.
+//
+// Only the desktop file base and parsed instance name are passed to the
+// callback function.
+func forAllDesktopFiles(cb func(base, instanceName string) error) error {
+	installedDesktopFiles, err := findDesktopFiles(dirs.SnapDesktopFilesDir)
+	if err != nil {
+		return err
+	}
+
+	for _, desktopFile := range installedDesktopFiles {
+		base := filepath.Base(desktopFile)
+		if isSnapdDesktopFile(base) {
+			// skip snapd desktop files installed on core, they don't
+			// have the usual X-SnapInstanceName entry.
+			continue
+		}
+
+		de, err := desktopentry.Read(desktopFile)
+		if err != nil {
+			// cannot read instance name from desktop file, ignore
+			logger.Noticef("cannot read instance name from %q: %v", desktopFile, err)
+			continue
+		}
+		if de.SnapInstanceName == "" {
+			logger.Noticef("cannot find X-SnapInstanceName entry in %q", desktopFile)
+			continue
+		}
+
+		if err := cb(base, de.SnapInstanceName); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func hasDesktopPrefix(s *snap.Info, desktopFile string) bool {
+	base := filepath.Base(desktopFile)
+	prefix := s.DesktopPrefix() + "_"
+	return strings.HasPrefix(base, prefix) && strings.HasSuffix(base, ".desktop")
 }
 
 // EnsureSnapDesktopFiles puts in place the desktop files for the applications from the snap.
@@ -286,17 +354,42 @@ func EnsureSnapDesktopFiles(snaps []*snap.Info) error {
 	}
 
 	var updated []string
-	for _, s := range snaps {
-		if s == nil {
+	for _, info := range snaps {
+		if info == nil {
 			return fmt.Errorf("internal error: snap info cannot be nil")
 		}
-		content, err := deriveDesktopFilesContent(s)
+
+		desktopFileIDs, err := info.DesktopPlugFileIDs()
+		if err != nil {
+			return err
+		}
+		desktopFilesGlobs := []string{fmt.Sprintf("%s_*.desktop", info.DesktopPrefix())}
+		for _, desktopFileID := range desktopFileIDs {
+			desktopFilesGlobs = append(desktopFilesGlobs, desktopFileID)
+		}
+		content, err := deriveDesktopFilesContent(info)
 		if err != nil {
 			return err
 		}
 
-		desktopFilesGlob := fmt.Sprintf("%s_*.desktop", s.DesktopPrefix())
-		changed, removed, err := osutil.EnsureDirState(dirs.SnapDesktopFilesDir, desktopFilesGlob, content)
+		addGlobPatternAndConflictCheck := func(base, instanceName string) error {
+			// Check if a target desktop file belongs to another snap
+			_, hasTarget := content[base]
+			if hasTarget && instanceName != info.InstanceName().String() {
+				return fmt.Errorf("cannot install %q: %q already exists for another snap", base, filepath.Join(dirs.SnapDesktopFilesDir, base))
+			}
+			if instanceName == info.InstanceName().String() && !hasTarget && !hasDesktopPrefix(info, base) {
+				// An unmangled desktop file exists for the snap, add to glob
+				// patterns for removal
+				desktopFilesGlobs = append(desktopFilesGlobs, base)
+			}
+			return nil
+		}
+		if err := forAllDesktopFiles(addGlobPatternAndConflictCheck); err != nil {
+			return err
+		}
+
+		changed, removed, err := osutil.EnsureDirStateGlobs(dirs.SnapDesktopFilesDir, desktopFilesGlobs, content)
 		if err != nil {
 			return err
 		}
@@ -318,8 +411,22 @@ func RemoveSnapDesktopFiles(s *snap.Info) error {
 		return nil
 	}
 
-	desktopFilesGlob := fmt.Sprintf("%s_*.desktop", s.DesktopPrefix())
-	_, removed, err := osutil.EnsureDirState(dirs.SnapDesktopFilesDir, desktopFilesGlob, nil)
+	desktopFilesGlobs := []string{fmt.Sprintf("%s_*.desktop", s.DesktopPrefix())}
+
+	addGlobPattern := func(base, instanceName string) error {
+		if instanceName == s.InstanceName().String() && !hasDesktopPrefix(s, base) {
+			// An unmangled desktop file exists for the snap, add to glob
+			// patterns for removal
+			desktopFilesGlobs = append(desktopFilesGlobs, base)
+		}
+
+		return nil
+	}
+	if err := forAllDesktopFiles(addGlobPattern); err != nil {
+		return err
+	}
+
+	_, removed, err := osutil.EnsureDirStateGlobs(dirs.SnapDesktopFilesDir, desktopFilesGlobs, nil)
 	if err != nil {
 		return err
 	}

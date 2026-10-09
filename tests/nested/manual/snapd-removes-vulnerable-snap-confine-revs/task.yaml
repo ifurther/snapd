@@ -6,7 +6,11 @@ details: |
 
 # just focal is fine for this test - we only need to check that things happen on
 # classic
-systems: [ubuntu-2*]
+systems:
+  - ubuntu-20*
+  - ubuntu-22*
+  - ubuntu-24*
+  - ubuntu-26*
 
 environment:
   # which snap snapd comes from in this test
@@ -24,7 +28,7 @@ environment:
   # meh snap-state doesn't have a consistent naming for these snaps, so we can't
   # just do "$SNAPD_SOURCE_SNAP-from-deb.snap"
   REPACKED_SNAP_NAME/core: core-from-snapd-deb.snap
-  REPACKED_SNAP_NAME/snapd: snapd-from-deb.snap
+  REPACKED_SNAP_NAME/snapd: snapd-new.snap
 
   # a specific vulnerable snapd version we can base our image on
   VULN_SNAP_REV_URL/snapd: https://storage.googleapis.com/snapd-spread-tests/snaps/snapd_14549.snap
@@ -43,7 +47,17 @@ prepare: |
   mount_ubuntu_image "$(tests.nested get images-path)/$IMAGE_NAME" "$IMAGE_MOUNTPOINT"
 
   # repack the deb into the snap we want
-  "$TESTSTOOLS"/snaps-state repack_snapd_deb_into_snap "$SNAPD_SOURCE_SNAP"
+  case "$SNAPD_SOURCE_SNAP" in
+    core)
+      "$TESTSTOOLS"/snaps-state repack_snapd_deb_into_snap "$SNAPD_SOURCE_SNAP"
+    ;;
+    snapd)
+      # shellcheck source=tests/lib/prepare.sh
+      . "$TESTSLIB"/prepare.sh
+      build_snapd_snap .
+      mv snapd_*.snap "${REPACKED_SNAP_NAME}"
+    ;;
+  esac
 
   # add the known vulnerable version of snapd into the seed, dangerously
   curl -s -o "$SNAPD_SOURCE_SNAP-vuln.snap" "$VULN_SNAP_REV_URL"
@@ -60,9 +74,15 @@ prepare: |
   # so we want to undo that to ensure our snaps are on them
   SNAPD_DEBUG=1 /usr/lib/snapd/snap-preseed --reset "$IMAGE_MOUNTPOINT"
 
+  # for some systems in the core variant, the version of snapd inside chroot will
+  # trigger a reexec with --reset-chroot, which will remove the /snap dir due to
+  # an old version of snap-preseed
+  mkdir -p "$IMAGE_MOUNTPOINT"/snap
+
   # unmount the image and start the VM
   umount_ubuntu_image "$IMAGE_MOUNTPOINT"
   tests.nested create-vm classic
+  remote.exec "sudo snap wait system seed.loaded"
 
 execute: |
   # check the current snapd snap is vulnerable
@@ -72,7 +92,7 @@ execute: |
   # now install our snapd deb from the branch - this is so we know the patched
   # snapd is always executing, regardless of which snapd/core snap re-exec 
   # nonsense is going on
-  SNAPD_DEB_ARR=( "$SPREAD_PATH"/../snapd_*.deb )
+  SNAPD_DEB_ARR=( "$GOHOME"/snapd_*.deb )
   SNAPD_DEB=${SNAPD_DEB_ARR[0]}
   remote.push "$SNAPD_DEB"
   remote.exec "sudo dpkg -i $(basename "$SNAPD_DEB")"

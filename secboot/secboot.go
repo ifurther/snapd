@@ -25,16 +25,27 @@ package secboot
 // Debian does run "go list" without any support for passing -tags.
 
 import (
-	"crypto/ecdsa"
+	"errors"
+	"time"
 
 	"github.com/snapcore/snapd/asserts"
 	"github.com/snapcore/snapd/bootloader"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/gadget/device"
-	"github.com/snapcore/snapd/secboot/keys"
 )
 
 const (
+	// The range 0x01880005-0x0188000F
+	//
+	// TODO:FDEM: we should apply for a subrange from UAPI group once
+	// they got a range assigned by TCG.  See
+	// https://github.com/uapi-group/specifications/pull/118
+	// For now we use a sub range on the unassigned owner handles
+	PCRPolicyCounterHandleStart = uint32(0x01880005)
+	PCRPolicyCounterHandleRange = uint32(0x01880010 - 0x01880005)
+
+	// These handles are legacy, do not use them in new code.
+	//
 	// Handles are in the block reserved for TPM owner objects (0x01800000 - 0x01bfffff).
 	//
 	// Handles are rotated during factory reset, depending on the PCR handle
@@ -48,6 +59,8 @@ const (
 
 // WithSecbootSupport is true if this package was built with githbu.com/snapcore/secboot.
 var WithSecbootSupport = false
+
+var ErrKernelKeyNotFound = errors.New("kernel key not found")
 
 type LoadChain struct {
 	*bootloader.BootFile
@@ -66,13 +79,17 @@ func NewLoadChain(bf bootloader.BootFile, next ...*LoadChain) *LoadChain {
 }
 
 type SealKeyRequest struct {
-	// The key to seal
-	Key keys.EncryptionKey
+	// The installation key to enroll a new key slot
+	BootstrappedContainer BootstrappedContainer
 	// The key name; identical keys should have identical names
 	KeyName string
-	// The path to store the sealed key file. The same Key/KeyName
-	// can be stored under multiple KeyFile names for safety.
+	// The name of the slot where they key will be saved.
+	SlotName string
+	// The file to store the key data. If empty, the key data will
+	// be saved to the token.
 	KeyFile string
+	// The boot modes allowed (i.e. snapd_recovery_mode kernel parameter)
+	BootModes []string
 }
 
 // ModelForSealing provides information about the model for use in the context
@@ -86,6 +103,30 @@ type ModelForSealing interface {
 	SignKeyID() string
 }
 
+type KeyDatabase int
+
+const (
+	KeyDatabasePK KeyDatabase = iota
+	KeyDatabaseKEK
+	KeyDatabaseDB
+	KeyDatabaseDBX
+)
+
+type DbUpdate struct {
+	Database KeyDatabase
+	Payload  []byte
+}
+
+// DALockoutInfo describes the TPM Dictionary Attack lockout state.
+type DALockoutInfo struct {
+	LockoutCounter  uint32
+	MaxTries        uint32
+	RecoveryTime    time.Duration
+	LockoutRecovery time.Duration
+	InLockout       bool
+}
+
+// TODO:FDEM: rename and drop Model from the name?
 type SealKeyModelParams struct {
 	// The snap model
 	Model ModelForSealing
@@ -94,6 +135,9 @@ type SealKeyModelParams struct {
 	EFILoadChains []*LoadChain
 	// The kernel command line
 	KernelCmdlines []string
+	// TODO:FDEM: move this somewhere else?
+	// The content of an update to EFI DBX
+	EFISignatureDbxUpdates []DbUpdate
 }
 
 type TPMProvisionMode int
@@ -113,36 +157,91 @@ const (
 	TPMProvisionFullWithoutLockout
 )
 
+// PCRProtectionProfileOptions carries the options that influence how a PCR
+// protection profile is built.
+type PCRProtectionProfileOptions struct {
+	// AllowInsufficientDmaProtection allows systems lacking sufficient DMA
+	// protection.
+	AllowInsufficientDmaProtection bool
+	// AllowThunderboltSecurityLevel0 allows systems reporting the "Security
+	// Level is Downgraded to 0" Thunderbolt event.
+	AllowThunderboltSecurityLevel0 bool
+}
+
 type SealKeysParams struct {
 	// The parameters we're sealing the key to
 	ModelParams []*SealKeyModelParams
-	// The authorization policy update key file (only relevant for TPM)
-	TPMPolicyAuthKey *ecdsa.PrivateKey
+	// The primary key to use, nil if needs to be generated
+	PrimaryKey []byte
+	// The handle at which to create a NV index for dynamic authorization policy revocation support
+	PCRPolicyCounterHandle uint32
 	// The path to the authorization policy update key file (only relevant for TPM,
 	// if empty the key will not be saved)
 	TPMPolicyAuthKeyFile string
-	// The handle at which to create a NV index for dynamic authorization policy revocation support
-	PCRPolicyCounterHandle uint32
+	// Optional volume authentication options
+	VolumesAuth *device.VolumesAuthOptions
+	// Optional preinstall check result for optimum PCR configuration
+	CheckResult *PreinstallCheckResult
+	// The key role (run, run+recover, recover)
+	KeyRole string
+	// Whether to allow disabled DMA protection
+	AllowInsufficientDmaProtection bool
+	// Whether to allow the "Security Level is Downgraded to 0" Thunderbolt event
+	AllowThunderboltSecurityLevel0 bool
 }
 
 type SealKeysWithFDESetupHookParams struct {
 	// Initial model to bind sealed keys to.
 	Model ModelForSealing
-	// AuxKey is the auxiliary key used to bind models.
-	AuxKey keys.AuxKey
 	// The path to the aux key file (if empty the key will not be
 	// saved)
 	AuxKeyFile string
+	// The primary key to use, nil if needs to be generated
+	PrimaryKey []byte
 }
 
-type ResealKeysParams struct {
-	// The snap model parameters
-	ModelParams []*SealKeyModelParams
-	// The path to the sealed key files
-	KeyFiles []string
-	// The path to the authorization policy update key file (only relevant for TPM)
-	TPMPolicyAuthKeyFile string
+// KeyDataLocation represents the possible places where key data
+// might be saved.
+//
+// This is used for resealing keys in key data. The resealing will be
+// responsible of finding which one is in use. The basic strategy is
+// if a key data is found in the token, then this will be used and the
+// key file will be ignored.
+type KeyDataLocation struct {
+	// KeyFile is the path to the file that contains either the key data or sealed key object.
+	KeyFile string
+	// DevicePath is the LUKS2 device which contains a token with they key data
+	DevicePath string
+	// SlotName is the name of the token that contains the key data
+	SlotName string
 }
+
+const (
+	PlatformTpm2       = "tpm2"
+	PlatformTpm2Legacy = "tpm2-legacy"
+	PlatformPlainkey   = "plainkey"
+	PlatformFdeHookV2  = "fde-hook-v2"
+	PlatformFdeHooksV3 = "fde-hooks-v3"
+)
+
+// KeyData represents a disk unlock key protected by a platform's secure device.
+type KeyData interface {
+	PlatformName() string
+	Roles() []string
+	AuthMode() device.AuthMode
+	// ChangePassphrase changes passphrase given old passphrase.
+	// AuthMode must be device.AuthModePassphrase.
+	ChangePassphrase(oldPassphrase, newPassphrase string) error
+	// ChangePIN changes pin given old pin.
+	// AuthMode must be device.AuthModePIN.
+	ChangePIN(oldPIN, newPIN string) error
+	// WriteTokenAtomic saves this key data to the specified LUKS2 token.
+	WriteTokenAtomic(devicePath, slotName string) error
+}
+
+// SerializedPCRProfile wraps a serialized PCR profile which is treated as an
+// opaque binary blob outside of secboot package.
+type SerializedPCRProfile []byte
 
 // UnlockVolumeUsingSealedKeyOptions contains options for unlocking encrypted
 // volumes using keys sealed to the TPM.
@@ -153,6 +252,8 @@ type UnlockVolumeUsingSealedKeyOptions struct {
 	// WhichModel if invoked should return the device model
 	// assertion for which the disk is being unlocked.
 	WhichModel func() (*asserts.Model, error)
+	// BootMode is the current boot mode (i.e. snapd_recovery_mode kernel parameter)
+	BootMode string
 }
 
 // UnlockMethod is the method that was used to unlock a volume.
@@ -193,6 +294,22 @@ type UnlockResult struct {
 	// - UnlockedWithSealedKey
 	// - UnlockedWithKey
 	UnlockMethod UnlockMethod
+	// Keyslot is the name of the keyslot used or the name of the
+	// associated keyfile used.
+	Keyslot string
+}
+
+type ProtectKeyParams struct {
+	// The serialized PCR profile
+	PCRProfile SerializedPCRProfile
+	// The handle at which to create a NV index for dynamic authorization policy revocation support
+	PCRPolicyCounterHandle uint32
+	// The key role (run, run+recover, recover)
+	KeyRole string
+	// Optional volume authentication options
+	VolumesAuth *device.VolumesAuthOptions
+	// Primary key
+	PrimaryKey []byte
 }
 
 // EncryptedPartitionName returns the name/label used by an encrypted partition
@@ -225,4 +342,73 @@ func MarkSuccessful() error {
 	}
 
 	return nil
+}
+
+const (
+	defaultKeyringPrefix = "ubuntu-fde"
+)
+
+type ResealKeyParams struct {
+	// PrimaryKeyDevices is the list of all devices that might
+	// have been unlocked and provides a primary key.
+	PrimaryKeyDevices []string
+	// FallbackPrimaryKeyFiles is the list of files that might contain
+	// the primary key.
+	FallbackPrimaryKeyFiles []string
+	// VerifyPrimaryKey is called if the primary key was read
+	VerifyPrimaryKey func([]byte)
+	// The allowed boot modes (run, recover, factory-reset)
+	BootModes []string
+	// The allowed models
+	Models []ModelForSealing
+	// Function that returns TPM policy profile. It is only called when resealing TPM keys.
+	GetTpmPCRProfile func() ([]byte, error)
+	// Whether a incremented value of the counter is allowed
+	// (before a revocation)
+	NewPCRPolicyVersion bool
+	// DryRun validates that resealing can succeed without persisting updated
+	// key material.
+	DryRun bool
+	// Whether old ambiguous key formats interpreted as FDE hook keys.
+	HintExpectFDEHook bool
+}
+
+// LegacyKeyFile represents a legacy key file
+type LegacyKeyFile struct {
+	// Name is the value that will be reported as used keyslot
+	Name string
+	// Path is the absolute path to the key file
+	Path string
+}
+
+// Partition implementations return partition information required by secboot.
+type Partition interface {
+	PartitionNode() string
+	PartitionUUID() string
+	PartitionLabel() string
+	FilesystemUUID() string
+}
+
+// Disk implementations provide disk information required by secboot.
+type Disk interface {
+	PartitionWithFsLabel(string) (Partition, error)
+	DiskModel() string
+}
+
+// RemedialActions is a set of actions recommended to repair detected
+// issues with FDE state.
+type RemedialActions struct {
+	// AttemptRepair tells whether an auto-repair should be attempted.
+	// If the attempt fails, then it means a reprovision is required.
+	AttemptRepair bool
+	// RequireReprovision tells whether issues require a reprovision
+	// and it was detected that auto-repair would not be enough.
+	RequireReprovision bool
+	// PermitManual signals that there are some issues that could
+	// be fixed by administrator.
+	PermitManual bool
+	// RequirePlatformReset tells that the platform is owned by another
+	// system, we lost ownership of the platform. In that case
+	// the security device (e.g. TPM) needs to be cleared.
+	RequirePlatformReset bool
 }

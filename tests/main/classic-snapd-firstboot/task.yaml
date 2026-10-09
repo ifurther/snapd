@@ -1,16 +1,23 @@
 summary: Check that firstboot assertions are imported and snaps installed also on classic
 
+details: |
+    Verify that the snapd.seeded.service unit is able to import assertions from
+    the seed directory and install the seed snaps on classic systems. This test
+    specifically makes sure that the classic system can install snapd as a snap
+    from the seed.
+
 systems: [-ubuntu-core-*]
 
 environment:
     SEED_DIR: /var/lib/snapd/seed
 
-prepare: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
+skip:
+    - reason: This test needs test keys to be trusted
+      if: |
+       # In this scenario, the keys from the snapd pkg are used
+       [ "$TRUST_TEST_KEYS" = "false" ] || tests.info is-snapd-from-archive
 
+prepare: |
     snap pack "$TESTSLIB/snaps/basic18"
     snap download "--$SNAPD_CHANNEL" snapd
     snap download core18
@@ -45,20 +52,10 @@ prepare: |
     cp ./basic18_1.0_all.snap "$SEED_DIR/snaps/basic18.snap"
 
 restore: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
-
     rm -rf "$SEED_DIR"
     systemctl start snapd.socket snapd.service
 
 execute: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
-
     echo "Start the daemon with an empty state, this will make it import "
     echo "assertions from the $SEED_DIR/assertions subdirectory and "
     echo "install the seed snaps."

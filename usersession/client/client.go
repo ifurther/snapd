@@ -29,11 +29,11 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/snapcore/snapd/client/clientutil"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/systemd"
 )
@@ -75,9 +75,9 @@ func NewForUids(uids ...int) *Client {
 }
 
 type Error struct {
-	Kind    string      `json:"kind"`
-	Value   interface{} `json:"value"`
-	Message string      `json:"message"`
+	Kind    string `json:"kind"`
+	Value   any    `json:"value"`
+	Message string `json:"message"`
 }
 
 func (e *Error) Error() string {
@@ -107,9 +107,9 @@ func (resp *response) checkError() {
 	}
 }
 
-func (client *Client) sendRequest(ctx context.Context, uid int, method, urlpath string, query url.Values, headers map[string]string, body []byte) *response {
-	response := &response{uid: uid}
-
+// sendOneRaw performs a request for a single UID, returns the response and/or
+// an error.
+func (client *Client) sendOneRaw(ctx context.Context, uid int, method, urlpath string, query url.Values, headers map[string]string, body []byte) (*http.Response, error) {
 	u := url.URL{
 		Scheme:   "http",
 		Host:     fmt.Sprintf("%d", uid),
@@ -118,23 +118,36 @@ func (client *Client) sendRequest(ctx context.Context, uid int, method, urlpath 
 	}
 	req, err := http.NewRequest(method, u.String(), bytes.NewBuffer(body))
 	if err != nil {
-		response.err = fmt.Errorf("internal error: %v", err)
-		return response
+		return nil, fmt.Errorf("internal error: %v", err)
 	}
 	req = req.WithContext(ctx)
 	for key, value := range headers {
 		req.Header.Set(key, value)
 	}
-	httpResp, err := client.doer.Do(req)
+
+	return client.doer.Do(req)
+}
+
+func (client *Client) sendRequest(ctx context.Context, uid int, method, urlpath string, query url.Values, headers map[string]string, body []byte) *response {
+	response := &response{uid: uid}
+
+	httpResp, err := client.sendOneRaw(ctx, uid, method, urlpath, query, headers, body)
 	if err != nil {
 		response.err = err
 		return response
 	}
+
 	defer httpResp.Body.Close()
 	response.statusCode = httpResp.StatusCode
 	response.err = decodeInto(httpResp.Body, &response)
 	response.checkError()
 	return response
+}
+
+// DebugOneRaw allows to make raw queries to the API with the intention of using
+// it from the debug code.
+func (client *Client) DebugOneRaw(ctx context.Context, uid int, method, urlpath string, query url.Values, headers map[string]string, body []byte) (*http.Response, error) {
+	return client.sendOneRaw(ctx, uid, method, urlpath, query, headers, body)
 }
 
 func (client *Client) uidIsValidAsTarget(uid int) bool {
@@ -147,26 +160,18 @@ func (client *Client) uidIsValidAsTarget(uid int) bool {
 }
 
 func (client *Client) sessionTargets() ([]int, error) {
-	sockets, err := filepath.Glob(filepath.Join(dirs.XdgRuntimeDirGlob, "snapd-session-agent.socket"))
+	uids, err := clientutil.AvailableUserSessions()
 	if err != nil {
 		return nil, err
 	}
 
-	uids := make([]int, 0, len(client.uids))
-	for _, sock := range sockets {
-		uidStr := filepath.Base(filepath.Dir(sock))
-		uid, err := strconv.Atoi(uidStr)
-		if err != nil {
-			// Ignore directories that do not
-			// appear to be valid XDG runtime dirs
-			// (i.e. /run/user/NNNN).
-			continue
-		}
+	filtered := make([]int, 0, len(client.uids))
+	for _, uid := range uids {
 		if client.uidIsValidAsTarget(uid) {
-			uids = append(uids, uid)
+			filtered = append(filtered, uid)
 		}
 	}
-	return uids, nil
+	return filtered, nil
 }
 
 // doMany sends the given request to all active user sessions or a subset of them
@@ -201,7 +206,7 @@ func (client *Client) doMany(ctx context.Context, method, urlpath string, query 
 	return responses, nil
 }
 
-func decodeInto(reader io.Reader, v interface{}) error {
+func decodeInto(reader io.Reader, v any) error {
 	dec := json.NewDecoder(reader)
 	if err := dec.Decode(v); err != nil {
 		r := dec.Buffered()
@@ -250,11 +255,11 @@ type ServiceFailure struct {
 	Error   string
 }
 
-func decodeServiceErrors(uid int, errorValue map[string]interface{}, kind string) ([]ServiceFailure, error) {
+func decodeServiceErrors(uid int, errorValue map[string]any, kind string) ([]ServiceFailure, error) {
 	if errorValue[kind] == nil {
 		return nil, nil
 	}
-	errors, ok := errorValue[kind].(map[string]interface{})
+	errors, ok := errorValue[kind].(map[string]any)
 	if !ok {
 		return nil, fmt.Errorf("cannot decode %s failures: expected a map, got %T", kind, errorValue[kind])
 	}
@@ -295,7 +300,7 @@ type ServiceInstruction struct {
 func (client *Client) decodeControlResponses(responses []*response) (startFailures, stopFailures []ServiceFailure, err error) {
 	for _, resp := range responses {
 		if agentErr, ok := resp.err.(*Error); ok && agentErr.Kind == "service-control" {
-			if errorValue, ok := agentErr.Value.(map[string]interface{}); ok {
+			if errorValue, ok := agentErr.Value.(map[string]any); ok {
 				if failures, err := decodeServiceErrors(resp.uid, errorValue, "restart-errors"); err == nil && len(failures) > 0 {
 					startFailures = append(startFailures, failures...)
 				} else {
@@ -465,7 +470,6 @@ func (us *ServiceUnitStatus) SystemdUnitStatus() *systemd.UnitStatus {
 func (client *Client) ServiceStatus(ctx context.Context, services []string) (map[int][]ServiceUnitStatus, map[int][]ServiceFailure, error) {
 	q := make(url.Values)
 	q.Add("services", strings.Join(services, ","))
-
 	responses, err := client.doMany(ctx, "GET", "/v1/service-status", q, nil, nil)
 	if err != nil {
 		return nil, nil, err
@@ -477,7 +481,7 @@ func (client *Client) ServiceStatus(ctx context.Context, services []string) (map
 	for _, resp := range responses {
 		// Parse status errors which were a result of failure to retrieve status of services
 		if agentErr, ok := resp.err.(*Error); ok && agentErr.Kind == "service-status" {
-			if errorValue, ok := agentErr.Value.(map[string]interface{}); ok {
+			if errorValue, ok := agentErr.Value.(map[string]any); ok {
 				if fs, err := decodeServiceErrors(resp.uid, errorValue, "status-errors"); err == nil && len(fs) > 0 {
 					failures[resp.uid] = append(failures[resp.uid], fs...)
 				}

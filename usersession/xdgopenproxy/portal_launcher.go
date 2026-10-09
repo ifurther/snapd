@@ -20,8 +20,9 @@
 package xdgopenproxy
 
 import (
-	"github.com/godbus/dbus"
-	"golang.org/x/xerrors"
+	"errors"
+
+	"github.com/godbus/dbus/v5"
 
 	"github.com/snapcore/snapd/desktop/portal"
 )
@@ -31,7 +32,7 @@ type portalLauncher struct {
 }
 
 func convertError(err error) error {
-	if err != nil && xerrors.Is(err, &portal.ResponseError{}) {
+	if err != nil && errors.Is(err, &portal.ResponseError{}) {
 		err = &responseError{msg: err.Error()}
 	}
 	return err

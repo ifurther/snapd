@@ -25,10 +25,13 @@ remap_one() {
             echo "python-gobject"
             ;;
         test-snapd-pkg-1)
-            echo "freeglut"
+            echo "cmus"
             ;;
         test-snapd-pkg-2)
             echo "robotfindskitten"
+            ;;
+        gdbserver)
+            echo "gdb"
             ;;
         *)
             echo "$1"
@@ -66,6 +69,10 @@ cmd_list_installed() {
 }
 
 cmd_remove() {
+    pacman -Rnsc --noconfirm "$@"
+}
+
+cmd_download() {
     # shellcheck disable=SC2068
-    pacman -Rnsc --noconfirm $@
+    pacman -Sw --noconfirm --cachedir "${PWD:-.}" -q "$@" >/dev/null
 }

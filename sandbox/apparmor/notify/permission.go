@@ -5,9 +5,24 @@ import (
 	"strings"
 )
 
+// AppArmorPermission defines the requirements common to the permission types
+// for all mediation classes, so that functions and helpers can be safely used
+// for all AppArmor permission types.
+type AppArmorPermission interface {
+	// AsAppArmorOpMask returns the receiver as an AppArmor operation mask, as
+	// found in MsgNotificationOp and MsgNotificationResponse.
+	AsAppArmorOpMask() uint32
+	// String returns the string representation of the receiver.
+	String() string
+}
+
 // FilePermission is a bit-mask of apparmor permissions in relation to files.
 // It is applicable to messages with the class of AA_CLASS_FILE.
 type FilePermission uint32
+
+func (fp FilePermission) AsAppArmorOpMask() uint32 {
+	return uint32(fp)
+}
 
 const (
 	// AA_MAY_EXEC implies that a process has a permission to execute another
@@ -32,9 +47,9 @@ const (
 	AA_MAY_OPEN
 	// AA_MAY_RENAME implies that a process may rename a file.
 	AA_MAY_RENAME
-	// AA_MAY_SETATTR is not checked by the kernel.
+	// AA_MAY_SETATTR implies that a process may modify file attributes.
 	AA_MAY_SETATTR
-	// AA_MAY_GETATTR is not checked by the kernel.
+	// AA_MAY_GETATTR implies that a process may read file attributes.
 	AA_MAY_GETATTR
 	// AA_MAY_SETCRED is not used in the kernel.
 	AA_MAY_SETCRED

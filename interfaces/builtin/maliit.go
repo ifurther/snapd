@@ -139,7 +139,7 @@ func (iface *maliitInterface) StaticInfo() interfaces.StaticInfo {
 
 func (iface *maliitInterface) AppArmorConnectedPlug(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	old := "###SLOT_SECURITY_TAGS###"
-	new := spec.SnapAppSet().SlotLabelExpression(slot)
+	new := slot.LabelExpression()
 	snippet := strings.Replace(maliitConnectedPlugAppArmor, old, new, -1)
 	spec.AddSnippet(snippet)
 	return nil
@@ -157,7 +157,7 @@ func (iface *maliitInterface) AppArmorPermanentSlot(spec *apparmor.Specification
 
 func (iface *maliitInterface) AppArmorConnectedSlot(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	old := "###PLUG_SECURITY_TAGS###"
-	new := spec.SnapAppSet().PlugLabelExpression(plug)
+	new := plug.LabelExpression()
 	snippet := strings.Replace(maliitConnectedSlotAppArmor, old, new, -1)
 	spec.AddSnippet(snippet)
 	return nil
@@ -166,6 +166,12 @@ func (iface *maliitInterface) AppArmorConnectedSlot(spec *apparmor.Specification
 func (iface *maliitInterface) AutoConnect(*snap.PlugInfo, *snap.SlotInfo) bool {
 	// allow what declarations allowed
 	return true
+}
+
+func (iface *maliitInterface) ParallelInstancesSupportedForSlot(_ *snap.SlotInfo) error {
+	// maliit server owns the well-known bus name org.maliit.server on the
+	// session bus; only one snap instance can hold it at a time.
+	return errParallelInstancesUniqueResourceOwner
 }
 
 func init() {

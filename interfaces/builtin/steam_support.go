@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2022 Canonical Ltd
+ * Copyright (C) 2022-2026 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -21,11 +21,14 @@ package builtin
 
 import (
 	"github.com/snapcore/snapd/interfaces"
+	"github.com/snapcore/snapd/interfaces/apparmor"
 	"github.com/snapcore/snapd/interfaces/udev"
 	"github.com/snapcore/snapd/release"
+	apparmor_sandbox "github.com/snapcore/snapd/sandbox/apparmor"
+	"github.com/snapcore/snapd/strutil"
 )
 
-const steamSupportSummary = `allow Steam to configure pressure-vessel containers`
+const steamSupportSummary = `allows Steam to configure pressure-vessel containers`
 
 const steamSupportBaseDeclarationPlugs = `
   steam-support:
@@ -42,199 +45,55 @@ const steamSupportBaseDeclarationSlots = `
 `
 
 const steamSupportConnectedPlugAppArmor = `
-# Allow pressure-vessel to set up its Bubblewrap sandbox.
-/sys/kernel/ r,
-@{PROC}/sys/kernel/overflowuid r,
-@{PROC}/sys/kernel/overflowgid r,
-@{PROC}/sys/kernel/sched_autogroup_enabled r,
-@{PROC}/pressure/io r,
-owner @{PROC}/@{pid}/uid_map rw,
-owner @{PROC}/@{pid}/gid_map rw,
-owner @{PROC}/@{pid}/setgroups rw,
-owner @{PROC}/@{pid}/mounts r,
-owner @{PROC}/@{pid}/mountinfo r,
+# Mimic allow all with a base set of AppArmor rules, of supported
+# mediation classes before "allow all," was fully supported
+allow capability,
+# file includes ix for x transitions
+allow file,
+allow network,
+allow unix,
+allow ptrace,
+allow signal,
+allow mount,
+allow umount,
+allow pivot_root,
+allow dbus,
+# rlimit is implicitly allowed in the abi version unless an rlimit
+# rule is specified
+# change_profile not allowed
+`
 
-# Create and pivot to the intermediate root
-mount options=(rw, rslave) -> /,
-mount options=(rw, silent, rslave) -> /,
-mount fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> /tmp/,
-mount options=(rw, rbind) /tmp/newroot/ -> /tmp/newroot/,
-pivot_root oldroot=/tmp/oldroot/ /tmp/,
+const steamSupportConnectedPlugAppArmorAlsoMqueue = `
+allow mqueue,
+`
 
-# Set up sandbox in /newroot
-mount options=(rw, rbind) /oldroot/ -> /newroot/,
-mount options=(rw, rbind) /oldroot/dev/ -> /newroot/dev/,
-mount options=(rw, rbind) /oldroot/etc/ -> /newroot/etc/,
-mount options=(rw, rbind) /oldroot/proc/ -> /newroot/proc/,
-mount options=(rw, rbind) /oldroot/sys/ -> /newroot/sys/,
-mount options=(rw, rbind) /oldroot/tmp/ -> /newroot/tmp/,
-mount options=(rw, rbind) /oldroot/var/ -> /newroot/var/,
-mount options=(rw, rbind) /oldroot/var/tmp/ -> /newroot/var/tmp/,
-mount options=(rw, rbind) /oldroot/usr/ -> /newroot/run/host/usr/,
-mount options=(rw, rbind) /oldroot/etc/ -> /newroot/run/host/etc/,
-mount options=(rw, rbind) /oldroot/usr/lib/os-release -> /newroot/run/host/os-release,
+const steamSupportConnectedPlugAppArmorAlsoUserNS = `
+allow userns,
+`
 
-# Bubblewrap performs remounts on directories it binds under /newroot
-# to fix up the options (since options other than MS_REC are ignored
-# when performing a bind mount). Ideally we could do something like:
-#   remount options=(bind, silent, nosuid, *) /newroot/{,**},
-#
-# But that is not supported by AppArmor. So we enumerate the possible
-# combinations of options Bubblewrap might use.
-remount options=(bind, silent, nosuid, rw) /newroot/{,**},
-remount options=(bind, silent, nosuid, rw, nodev) /newroot/{,**},
-remount options=(bind, silent, nosuid, rw, noexec) /newroot/{,**},
-remount options=(bind, silent, nosuid, rw, nodev, noexec) /newroot/{,**},
-remount options=(bind, silent, nosuid, rw, noatime) /newroot/{,**},
-remount options=(bind, silent, nosuid, rw, nodev, noatime) /newroot/{,**},
-remount options=(bind, silent, nosuid, rw, noexec, noatime) /newroot/{,**},
-remount options=(bind, silent, nosuid, rw, nodev, noexec, noatime) /newroot/{,**},
-remount options=(bind, silent, nosuid, rw, relatime) /newroot/{,**},
-remount options=(bind, silent, nosuid, rw, nodev, relatime) /newroot/{,**},
-remount options=(bind, silent, nosuid, rw, noexec, relatime) /newroot/{,**},
-remount options=(bind, silent, nosuid, rw, nodev, noexec, relatime) /newroot/{,**},
-remount options=(bind, silent, nosuid, rw, nodiratime) /newroot/{,**},
-remount options=(bind, silent, nosuid, rw, nodev, nodiratime) /newroot/{,**},
-remount options=(bind, silent, nosuid, rw, noexec, nodiratime) /newroot/{,**},
-remount options=(bind, silent, nosuid, rw, nodev, noexec, nodiratime) /newroot/{,**},
-remount options=(bind, silent, nosuid, rw, noatime, nodiratime) /newroot/{,**},
-remount options=(bind, silent, nosuid, rw, nodev, noatime, nodiratime) /newroot/{,**},
-remount options=(bind, silent, nosuid, rw, noexec, noatime, nodiratime) /newroot/{,**},
-remount options=(bind, silent, nosuid, rw, nodev, noexec, noatime, nodiratime) /newroot/{,**},
-remount options=(bind, silent, nosuid, rw, relatime, nodiratime) /newroot/{,**},
-remount options=(bind, silent, nosuid, rw, nodev, relatime, nodiratime) /newroot/{,**},
-remount options=(bind, silent, nosuid, rw, noexec, relatime, nodiratime) /newroot/{,**},
-remount options=(bind, silent, nosuid, rw, nodev, noexec, relatime, nodiratime) /newroot/{,**},
-remount options=(bind, silent, nosuid, ro) /newroot/{,**},
-remount options=(bind, silent, nosuid, ro, nodev) /newroot/{,**},
-remount options=(bind, silent, nosuid, ro, noexec) /newroot/{,**},
-remount options=(bind, silent, nosuid, ro, nodev, noexec) /newroot/{,**},
-remount options=(bind, silent, nosuid, ro, noatime) /newroot/{,**},
-remount options=(bind, silent, nosuid, ro, nodev, noatime) /newroot/{,**},
-remount options=(bind, silent, nosuid, ro, noexec, noatime) /newroot/{,**},
-remount options=(bind, silent, nosuid, ro, nodev, noexec, noatime) /newroot/{,**},
-remount options=(bind, silent, nosuid, ro, relatime) /newroot/{,**},
-remount options=(bind, silent, nosuid, ro, nodev, relatime) /newroot/{,**},
-remount options=(bind, silent, nosuid, ro, noexec, relatime) /newroot/{,**},
-remount options=(bind, silent, nosuid, ro, nodev, noexec, relatime) /newroot/{,**},
-remount options=(bind, silent, nosuid, ro, nodiratime) /newroot/{,**},
-remount options=(bind, silent, nosuid, ro, nodev, nodiratime) /newroot/{,**},
-remount options=(bind, silent, nosuid, ro, noexec, nodiratime) /newroot/{,**},
-remount options=(bind, silent, nosuid, ro, nodev, noexec, nodiratime) /newroot/{,**},
-remount options=(bind, silent, nosuid, ro, noatime, nodiratime) /newroot/{,**},
-remount options=(bind, silent, nosuid, ro, nodev, noatime, nodiratime) /newroot/{,**},
-remount options=(bind, silent, nosuid, ro, noexec, noatime, nodiratime) /newroot/{,**},
-remount options=(bind, silent, nosuid, ro, nodev, noexec, noatime, nodiratime) /newroot/{,**},
-remount options=(bind, silent, nosuid, ro, relatime, nodiratime) /newroot/{,**},
-remount options=(bind, silent, nosuid, ro, nodev, relatime, nodiratime) /newroot/{,**},
-remount options=(bind, silent, nosuid, ro, noexec, relatime, nodiratime) /newroot/{,**},
-remount options=(bind, silent, nosuid, ro, nodev, noexec, relatime, nodiratime) /newroot/{,**},
+const steamSupportConnectedPlugAppArmorAlsoIoUring = `
+allow io_uring,
+`
 
-/newroot/** rwkl,
-/bindfile* rw,
-mount options=(rw, rbind) /oldroot/opt/ -> /newroot/opt/,
-mount options=(rw, rbind) /oldroot/srv/ -> /newroot/srv/,
-mount options=(rw, rbind) /oldroot/run/udev/ -> /newroot/run/udev/,
-mount options=(rw, rbind) /oldroot/home/{,**} -> /newroot/home/{,**},
-mount options=(rw, rbind) /oldroot/snap/{,**} -> /newroot/snap/{,**},
-mount options=(rw, rbind) /oldroot/home/**/usr/ -> /newroot/usr/,
-mount options=(rw, rbind) /oldroot/home/**/usr/etc/** -> /newroot/etc/**,
-mount options=(rw, rbind) /oldroot/home/**/usr/etc/ld.so.cache -> /newroot/**,
-mount options=(rw, rbind) /oldroot/home/**/usr/etc/ld.so.conf -> /newroot/**,
-
-mount options=(rw, rbind) /oldroot/{home,media,mnt,run/media,opt,srv}/**/steamapps/common/** -> /newroot/**,
-
-mount options=(rw, rbind) /oldroot/mnt/{,**} -> /newroot/mnt/{,**},
-mount options=(rw, rbind) /oldroot/media/{,**} -> /newroot/media/{,**},
-mount options=(rw, rbind) /oldroot/run/media/ -> /newroot/run/media/,
-mount options=(rw, rbind) /oldroot/etc/nvidia/ -> /newroot/etc/nvidia/,
-
-mount options=(rw, rbind) /oldroot/etc/machine-id -> /newroot/etc/machine-id,
-mount options=(rw, rbind) /oldroot/etc/group -> /newroot/etc/group,
-mount options=(rw, rbind) /oldroot/etc/passwd -> /newroot/etc/passwd,
-mount options=(rw, rbind) /oldroot/etc/host.conf -> /newroot/etc/host.conf,
-mount options=(rw, rbind) /oldroot/etc/hosts -> /newroot/etc/hosts,
-mount options=(rw, rbind) /oldroot/usr/share/zoneinfo/** -> /newroot/etc/localtime,
-mount options=(rw, rbind) /oldroot/**/*resolv.conf -> /newroot/etc/resolv.conf,
-mount options=(rw, rbind) /bindfile* -> /newroot/etc/timezone,
-
-mount options=(rw, rbind) /oldroot/run/systemd/journal/socket -> /newroot/run/systemd/journal/socket,
-mount options=(rw, rbind) /oldroot/run/systemd/journal/stdout -> /newroot/run/systemd/journal/stdout,
-
-mount options=(rw, rbind) /oldroot/usr/share/fonts/ -> /newroot/run/host/fonts/,
-mount options=(rw, rbind) /oldroot/usr/local/share/fonts/ -> /newroot/run/host/local-fonts/,
-mount options=(rw, rbind) /oldroot/{var/cache/fontconfig,usr/lib/fontconfig/cache}/ -> /newroot/run/host/fonts-cache/,
-mount options=(rw, rbind) /oldroot/home/**/.cache/fontconfig/ -> /newroot/run/host/user-fonts-cache/,
-mount options=(rw, rbind) /bindfile* -> /newroot/run/host/font-dirs.xml,
-
-mount options=(rw, rbind) /oldroot/usr/share/icons/ -> /newroot/run/host/share/icons/,
-mount options=(rw, rbind) /oldroot/home/**/.local/share/icons/ -> /newroot/run/host/user-share/icons/,
-
-mount options=(rw, rbind) /oldroot/run/user/[0-9]*/wayland-* -> /newroot/**,
-mount options=(rw, rbind) /oldroot/tmp/.X11-unix/X* -> /newroot/tmp/.X11-unix/X*,
-mount options=(rw, rbind) /bindfile* -> /newroot/**,
-
-mount options=(rw, rbind) /bindfile* -> /newroot/**,
-mount options=(rw, rbind) /oldroot/run/user/[0-9]*/pulse/native -> /newroot/**,
-mount options=(rw, rbind) /oldroot/dev/snd/ -> /newroot/dev/snd/,
-mount options=(rw, rbind) /bindfile* -> /newroot/etc/asound.conf,
-mount options=(rw, rbind) /oldroot/run/user/[0-9]*/bus -> /newroot/**,
-
-mount options=(rw, rbind) /oldroot/run/dbus/system_bus_socket -> /newroot/run/dbus/system_bus_socket,
-mount options=(rw, rbind) /oldroot/run/systemd/resolve/io.systemd.Resolve -> /newroot/run/systemd/resolve/io.systemd.Resolve,
-mount options=(rw, rbind) /bindfile* -> /newroot/run/host/container-manager,
-
-# Allow mounting Nvidia drivers into the sandbox
-mount options=(rw, rbind) /oldroot/var/lib/snapd/hostfs/usr/lib/@{multiarch}/** -> /newroot/var/lib/snapd/hostfs/usr/lib/@{multiarch}/**,
-
-# Allow PV to access driver information and features necessary for some games to run
-mount options=(rw, rbind) /oldroot/var/lib/snapd/hostfs/usr/share/** -> /newroot/**,
-mount options=(rw, rbind) /oldroot/var/lib/snapd/hostfs/ -> /newroot/var/lib/snapd/hostfs/,
-
-# Allow masking of certain directories in the sandbox
-mount fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> /newroot/**,
-
-# Pivot from the intermediate root to sandbox root
-mount options in (rw, silent, rprivate) -> /oldroot/,
-umount /oldroot/,
-pivot_root oldroot=/newroot/ /newroot/,
-umount /,
-
-# Permissions needed within sandbox root
-/usr/** ixr,
-deny /usr/bin/{chfn,chsh,gpasswd,mount,newgrp,passwd,su,sudo,umount} x,
-/run/host/** mr,
-/*/pressure-vessel/** mrw,
-/run/host/usr/sbin/ldconfig* ixr,
-/run/host/usr/bin/localedef ixr,
-/var/cache/ldconfig/** rw,
-/sys/module/nvidia/version r,
-/var/lib/snapd/hostfs/usr/share/nvidia/** mr,
-/etc/debian_chroot r,
-
-capability sys_admin,
-capability sys_ptrace,
-capability setpcap,
+const steamSupportConnectedPlugAppArmorAll = `
+# For now to avoid steam constantly breaking with every update, requiring
+# new permissions just allow everything.
+allow all,
 `
 
 const steamSupportConnectedPlugSecComp = `
-# Description: additional permissions needed by Steam
+# Description: allow steam to run without a seccomp profile so that
+# steam's internal sandbox can use any features available on the system
+# without having to perpetually update the snapd interface side.
 
-# Allow Steam to set up "pressure-vessel" containers to run games in.
-mount
-umount2
-pivot_root
-
-# Native games using QtWebEngineProcess -
-# https://forum.snapcraft.io/t/autoconnect-request-steam-network-control/34267
-unshare CLONE_NEWNS
+@unrestricted
 `
 
 const steamSupportSteamInputUDevRules = `
 ### Begin devices from 60-steam-input.rules
 
 # Valve USB devices
-SUBSYSTEM=="usb", ATTRS{idVendor}=="28de", MODE="0660", TAG+="uaccess"
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="28de", MODE="0660", TAG+="uaccess"
 
 # Steam Controller udev write access
 KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
@@ -244,6 +103,15 @@ KERNEL=="hidraw*", ATTRS{idVendor}=="28de", MODE="0660", TAG+="uaccess"
 
 # Valve HID devices over bluetooth hidraw
 KERNEL=="hidraw*", KERNELS=="*28DE:*", MODE="0660", TAG+="uaccess"
+
+# Allow wakeup from Valve devices (Steam Controller 2015 receiver, Steam Controller 2026 receiver, Steam Machine Bluetooth) 
+ACTION=="add", SUBSYSTEM=="usb", ATTRS{idVendor}=="28de", ATTR{power/wakeup}="enabled"
+
+# DualShock 3 over USB hidraw
+KERNEL=="hidraw*", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="0268", MODE="0660", TAG+="uaccess"
+
+# DualShock 3 over bluetooth hidraw
+KERNEL=="hidraw*", KERNELS=="*054C:0268*", MODE="0660", TAG+="uaccess"
 
 # DualShock 4 over USB hidraw
 KERNEL=="hidraw*", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="05c4", MODE="0660", TAG+="uaccess"
@@ -266,25 +134,41 @@ KERNEL=="hidraw*", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="0ce6", MODE="0660
 # PS5 DualSense controller over bluetooth hidraw
 KERNEL=="hidraw*", KERNELS=="*054C:0CE6*", MODE="0660", TAG+="uaccess"
 
+# Sony DualSense Edge Wireless-Controller over bluetooth hidraw
+KERNEL=="hidraw*", KERNELS=="*054C:0DF2*", MODE="0660", TAG+="uaccess"
+
+# Sony DualSense Edge Wireless-Controller over USB hidraw
+KERNEL=="hidraw*", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="0df2", MODE="0660", TAG+="uaccess"
+
 # Nintendo Switch Pro Controller over USB hidraw
 KERNEL=="hidraw*", ATTRS{idVendor}=="057e", ATTRS{idProduct}=="2009", MODE="0660", TAG+="uaccess"
 
 # Nintendo Switch Pro Controller over bluetooth hidraw
 KERNEL=="hidraw*", KERNELS=="*057E:2009*", MODE="0660", TAG+="uaccess"
 
-# Faceoff Wired Pro Controller for Nintendo Switch
+# Nintendo Switch Joy-Con (L/R)
+KERNEL=="hidraw*", KERNELS=="*057E:200[67]*", MODE="0660", TAG+="uaccess"
+
+# PDP Faceoff Wired Pro Controller for Nintendo Switch
 KERNEL=="hidraw*", ATTRS{idVendor}=="0e6f", ATTRS{idProduct}=="0180", MODE="0660", TAG+="uaccess"
+
+# PDP Faceoff Deluxe+ Audio Wired Pro Controller for Nintendo Switch
+KERNEL=="hidraw*", ATTRS{idVendor}=="0e6f", ATTRS{idProduct}=="0184", MODE="0660", TAG+="uaccess"
 
 # PDP Wired Fight Pad Pro for Nintendo Switch
 KERNEL=="hidraw*", ATTRS{idVendor}=="0e6f", ATTRS{idProduct}=="0185", MODE="0660", TAG+="uaccess"
 
+# Logic3 Rock Candy Wired Controller for Nintendo Switch
+KERNEL=="hidraw*", ATTRS{idVendor}=="0e6f", ATTRS{idProduct}=="0187", MODE="0660", TAG+="uaccess"
+
 # PowerA Wired Controller for Nintendo Switch
 KERNEL=="hidraw*", ATTRS{idVendor}=="20d6", ATTRS{idProduct}=="a711", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="20d6", ATTRS{idProduct}=="a712", MODE="0660", TAG+="uaccess"
 KERNEL=="hidraw*", ATTRS{idVendor}=="20d6", ATTRS{idProduct}=="a713", MODE="0660", TAG+="uaccess"
 
 # PowerA Wireless Controller for Nintendo Switch we have to use
 # ATTRS{name} since VID/PID are reported as zeros. We use /bin/sh
-# instead of udevadm directly becuase we need to use '*' glob at the
+# instead of udevadm directly because we need to use '*' glob at the
 # end of "hidraw" name since we don't know the index it'd have.
 #
 KERNEL=="input*", ATTRS{name}=="Lic Pro Controller", RUN{program}+="/bin/sh -c 'udevadm test-builtin uaccess /sys/%p/../../hidraw/hidraw*'"
@@ -307,8 +191,17 @@ KERNEL=="hidraw*", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="1008", MODE="0660
 # Razer Raiju PS4 Controller Tournament Edition over bluetooth hidraw
 KERNEL=="hidraw*", KERNELS=="*1532:100A*", MODE="0660", TAG+="uaccess"
 
+# Razer Raiju Ultimate over USB
+KERNEL=="hidraw*", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="1004", MODE="0660", TAG+="uaccess"
+
+# Razer Raiju Ultimate over PC Bluetooth
+KERNEL=="hidraw*", KERNELS=="*1532:1009*", MODE="0660", TAG+="uaccess"
+
 # Razer Panthera Arcade Stick
 KERNEL=="hidraw*", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="0401", MODE="0660", TAG+="uaccess"
+
+# Razer Wolverine V2 Pro in wired PS5 mode
+KERNEL=="hidraw*", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="100b", MODE="0660", TAG+="uaccess"
 
 # Mad Catz - Street Fighter V Arcade FightPad PRO
 KERNEL=="hidraw*", ATTRS{idVendor}=="0738", ATTRS{idProduct}=="8250", MODE="0660", TAG+="uaccess"
@@ -328,6 +221,15 @@ KERNEL=="hidraw*", ATTRS{idVendor}=="0c12", ATTRS{idProduct}=="0ef6", MODE="0660
 # HORI RAP4
 KERNEL=="hidraw*", ATTRS{idVendor}=="0f0d", ATTRS{idProduct}=="008a", MODE="0660", TAG+="uaccess"
 
+# HORI Alpha for PS5 (PS5 Mode)
+KERNEL=="hidraw*", ATTRS{idVendor}=="0f0d", ATTRS{idProduct}=="0184", MODE="0660", TAG+="uaccess"
+
+# HORI Alpha for PS5 (PS4 Mode)
+KERNEL=="hidraw*", ATTRS{idVendor}=="0f0d", ATTRS{idProduct}=="011c", MODE="0660", TAG+="uaccess"
+
+# HORI Alpha for PS5 (PC Mode)
+KERNEL=="hidraw*", ATTRS{idVendor}=="0f0d", ATTRS{idProduct}=="011e", MODE="0660", TAG+="uaccess"
+
 # HORIPAD 4 FPS
 KERNEL=="hidraw*", ATTRS{idVendor}=="0f0d", ATTRS{idProduct}=="0055", MODE="0660", TAG+="uaccess"
 
@@ -339,6 +241,9 @@ KERNEL=="hidraw*", ATTRS{idVendor}=="0f0d", ATTRS{idProduct}=="00c1", MODE="0660
 
 # HORIPAD mini 4
 KERNEL=="hidraw*", ATTRS{idVendor}=="0f0d", ATTRS{idProduct}=="00ee", MODE="0660", TAG+="uaccess"
+
+# HORIPAD STEAM
+KERNEL=="hidraw*", ATTRS{idVendor}=="0f0d", ATTRS{idProduct}=="01ab", MODE="0660", TAG+="uaccess"
 
 # Armor Armor 3 Pad PS4
 KERNEL=="hidraw*", ATTRS{idVendor}=="0c12", ATTRS{idProduct}=="0e10", MODE="0660", TAG+="uaccess"
@@ -360,6 +265,69 @@ KERNEL=="hidraw*", ATTRS{idVendor}=="9886", ATTRS{idProduct}=="0025", MODE="0660
 
 # Thrustmaster eSwap Pro
 KERNEL=="hidraw*", ATTRS{idVendor}=="044f", ATTRS{idProduct}=="d00e", MODE="0660", TAG+="uaccess"
+
+# EdgeTX and OpenTX radio controllers in gamepad mode over USB hidraw
+KERNEL=="hidraw*", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="4f54", MODE="0660", TAG+="uaccess"
+
+# Thrustmaster TFRP Rudder
+KERNEL=="hidraw*", ATTRS{idVendor}=="044f", ATTRS{idProduct}=="b679", MODE="0660", TAG+="uaccess"
+
+# Thrustmaster TWCS Throttle
+KERNEL=="hidraw*", ATTRS{idVendor}=="044f", ATTRS{idProduct}=="b687", MODE="0660", TAG+="uaccess"
+
+# Thrustmaster T.16000M Joystick
+KERNEL=="hidraw*", ATTRS{idVendor}=="044f", ATTRS{idProduct}=="b10a", MODE="0660", TAG+="uaccess"
+
+# Performance Designed Products Victrix Pro FS-12 for PS4 & PS5
+KERNEL=="hidraw*", ATTRS{idVendor}=="0e6f", ATTRS{idProduct}=="020c", MODE="0660", TAG+="uaccess"
+
+# Hori Co., Ltd HORI Wireless Pad ONYX PLUS Wired
+KERNEL=="hidraw*", ATTRS{idVendor}=="0f0d", ATTRS{idProduct}=="012d", MODE="0660", TAG+="uaccess"
+
+# Hori Co., Ltd HORI Wireless Pad ONYX PLUS Wireless
+KERNEL=="hidraw*", ATTRS{idVendor}=="0f0d", ATTRS{idProduct}=="012b", MODE="0660", TAG+="uaccess"
+
+# Xbox One Elite 2 Controller
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", KERNELS=="*045E:0B22*", MODE="0660", TAG+="uaccess"
+
+# Generic SInput Device over USB hidraw
+KERNEL=="hidraw*", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="10c6", MODE="0660", TAG+="uaccess"
+
+# Generic SInput Device over bluetooth hidraw
+KERNEL=="hidraw*", KERNELS=="*2E8A:10C6*", MODE="0660", TAG+="uaccess"
+
+# ProGCC in SInput Mode over USB hidraw
+KERNEL=="hidraw*", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="10df", MODE="0660", TAG+="uaccess"
+
+# ProGCC in SInput Mode over bluetooth hidraw
+KERNEL=="hidraw*", KERNELS=="*2E8A:10DF*", MODE="0660", TAG+="uaccess"
+
+# GC Ultimate in SInput Mode over USB hidraw
+KERNEL=="hidraw*", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="10dd", MODE="0660", TAG+="uaccess"
+
+# GC Ultimate in SInput Mode over bluetooth hidraw
+KERNEL=="hidraw*", KERNELS=="*2E8A:10DD*", MODE="0660", TAG+="uaccess"
+
+# Firebird in SInput Mode over USB hidraw
+KERNEL=="hidraw*", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="10e0", MODE="0660", TAG+="uaccess"
+
+# 8bitdo 2.4 GHz / Wired
+KERNEL=="hidraw*", ATTRS{idVendor}=="2dc8", MODE="0660", TAG+="uaccess"
+
+# 8bitdo Bluetooth
+KERNEL=="hidraw*", KERNELS=="*2DC8:*", MODE="0660", TAG+="uaccess"
+
+# Flydigi 2.4 GHz / Wired
+KERNEL=="hidraw*", ATTRS{idVendor}=="04b4", MODE="0660", TAG+="uaccess"
+
+# Flydigi HIDAPI Enhanced Mode
+KERNEL=="hidraw*", ATTRS{idVendor}=="37d7", MODE="0660", TAG+="uaccess"
+
+# Nintendo Wii U/Switch Wired GameCube Controller Adapter
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="057e", ATTRS{idProduct}=="0337", MODE="0660", TAG+="uaccess"
+
+# Nintendo Switch 2 GameCube Controller over USB
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="057e", ATTRS{idProduct}=="2073", MODE="0660", TAG+="uaccess"
 `
 
 const steamSupportSteamVRUDevRules = `
@@ -389,10 +357,54 @@ KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="28de", ATTRS{idProduct
 KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="2150", MODE="0660", TAG+="uaccess"
 KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="2300", MODE="0660", TAG+="uaccess"
 KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="2301", MODE="0660", TAG+="uaccess"
+
+SUBSYSTEM=="tty", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="2102", MODE="0660", TAG+="uaccess"
+
+# Bigscreen Beyond
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="35bd", ATTRS{idProduct}=="0101", MODE="0660", TAG+="uaccess"
+# Bigscreen Bigeye
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="35bd", ATTRS{idProduct}=="0202", MODE="0660", TAG+="uaccess"
+# Bigscreen Beyond Audio Strap
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="35bd", ATTRS{idProduct}=="0105", MODE="0660", TAG+="uaccess"
+# Bigscreen Beyond Firmware Mode?
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="35bd", ATTRS{idProduct}=="4004", MODE="0660", TAG+="uaccess"
+
 `
 
 type steamSupportInterface struct {
 	commonInterface
+}
+
+func (iface *steamSupportInterface) AppArmorConnectedPlug(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
+	// if apparmor supports "allow all" then use it. This allows not updating
+	// the supported features list as new features are added.
+	if apparmor_sandbox.ProbedLevel() != apparmor_sandbox.Unsupported {
+		features, err := apparmor_sandbox.ParserFeatures()
+		if err != nil {
+			return err
+		}
+		if strutil.ListContains(features, "allow-all") {
+			spec.AddSnippet(steamSupportConnectedPlugAppArmorAll)
+		} else {
+			spec.AddSnippet(steamSupportConnectedPlugAppArmor)
+			if strutil.ListContains(features, "mqueue") {
+				spec.AddSnippet(steamSupportConnectedPlugAppArmorAlsoMqueue)
+			}
+			if strutil.ListContains(features, "userns") {
+				spec.AddSnippet(steamSupportConnectedPlugAppArmorAlsoUserNS)
+			}
+			if strutil.ListContains(features, "io_uring") {
+				spec.AddSnippet(steamSupportConnectedPlugAppArmorAlsoIoUring)
+			}
+		}
+	}
+
+	// we need to override the base denial of /proc/self/mountinfo otherwise that
+	// denial would take priority over the "allow all," / "allow file,"
+	spec.AddPrioritizedSnippet(mountInfoSnippet, apparmor.MountInfoKey, mountInfoPriority)
+
+	spec.SetUsesPtraceTrace()
+	return nil
 }
 
 func (iface *steamSupportInterface) UDevConnectedPlug(spec *udev.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
@@ -403,13 +415,14 @@ func (iface *steamSupportInterface) UDevConnectedPlug(spec *udev.Specification, 
 
 func init() {
 	registerIface(&steamSupportInterface{commonInterface{
-		name:                  "steam-support",
-		summary:               steamSupportSummary,
-		implicitOnCore:        release.OnCoreDesktop,
-		implicitOnClassic:     true,
-		baseDeclarationSlots:  steamSupportBaseDeclarationSlots,
-		baseDeclarationPlugs:  steamSupportBaseDeclarationPlugs,
-		connectedPlugAppArmor: steamSupportConnectedPlugAppArmor,
-		connectedPlugSecComp:  steamSupportConnectedPlugSecComp,
+		name:                     "steam-support",
+		summary:                  steamSupportSummary,
+		implicitOnCore:           release.OnCoreDesktop,
+		implicitOnClassic:        true,
+		baseDeclarationSlots:     steamSupportBaseDeclarationSlots,
+		baseDeclarationPlugs:     steamSupportBaseDeclarationPlugs,
+		connectedPlugSecComp:     steamSupportConnectedPlugSecComp,
+		parallelInstancesPlugErr: errParallelInstancesSharedResources,
+		parallelInstancesSlotErr: errParallelInstancesSystemSlot,
 	}})
 }

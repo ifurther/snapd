@@ -295,8 +295,6 @@ func (s *appArmorSuite) TestLoadedApparmorProfilesParsesAndFiltersData(c *C) {
 		// The pi2-piglow.{background,foreground}.snap entries are the only
 		// ones that should be reported by the function.
 		`/sbin/dhclient (enforce)
-/usr/bin/ubuntu-core-launcher (enforce)
-/usr/bin/ubuntu-core-launcher (enforce)
 /usr/lib/NetworkManager/nm-dhcp-client.action (enforce)
 /usr/lib/NetworkManager/nm-dhcp-helper (enforce)
 /usr/lib/connman/scripts/dhclient-script (enforce)
@@ -446,9 +444,9 @@ func (s *appArmorSuite) TestSetupSnapConfineSnippetsHomedirs(c *C) {
 	c.Assert(files[0].IsDir(), Equals, false)
 
 	c.Assert(filepath.Join(apparmor.SnapConfineAppArmorDir, files[0].Name()),
-		testutil.FileContains, `"/mnt/foo/" -> "/tmp/snap.rootfs_*/mnt/foo/",`)
+		testutil.FileContains, `"/mnt/foo/" -> "/tmp/snap-private-tmp/snap.rootfs_*/mnt/foo/",`)
 	c.Assert(filepath.Join(apparmor.SnapConfineAppArmorDir, files[0].Name()),
-		testutil.FileContains, `"/mnt/bar/" -> "/tmp/snap.rootfs_*/mnt/bar/",`)
+		testutil.FileContains, `"/mnt/bar/" -> "/tmp/snap-private-tmp/snap.rootfs_*/mnt/bar/",`)
 }
 
 func (s *appArmorSuite) TestSetupSnapConfineGeneratedPolicyWithHomedirsLoadError(c *C) {
@@ -665,6 +663,10 @@ func (s *appArmorSuite) TestSetupSnapConfineGeneratedPolicyError2(c *C) {
 
 // Test behavior when EnsureDirState fails
 func (s *appArmorSuite) TestSetupSnapConfineGeneratedPolicyError3(c *C) {
+	if os.Geteuid() == 0 {
+		c.Skip("this test cannot run as root (root can remove files from read-only directories)")
+	}
+
 	dirs.SetRootDir(c.MkDir())
 	defer dirs.SetRootDir("")
 

@@ -30,6 +30,7 @@ import (
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/snapstate/snapstatetest"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/snap/snaptest"
 )
 
@@ -67,6 +68,40 @@ func (s *mountSnapSuite) TestDoMountSnapDoesNotRemovesSnaps(c *C) {
 	s.se.Wait()
 
 	c.Assert(osutil.FileExists(testSnap), Equals, true)
+}
+
+func (s *mountSnapSuite) TestDoMountSnapRemoveSnapPathClearsSnapSetup(c *C) {
+	v1 := "name: foo\nversion: 1.0\n"
+	testSnap := snaptest.MakeTestSnapWithFiles(c, v1, nil)
+
+	s.state.Lock()
+
+	t := s.state.NewTask("mount-snap", "test")
+	t.Set("snap-setup", &snapstate.SnapSetup{
+		SideInfo: &snap.SideInfo{
+			RealName: "foo",
+			Revision: snap.R(33),
+		},
+		SnapPath: testSnap,
+		Flags:    snapstate.Flags{RemoveSnapPath: true},
+	})
+	chg := s.state.NewChange("sample", "...")
+	chg.AddTask(t)
+
+	s.state.Unlock()
+
+	s.se.Ensure()
+	s.se.Wait()
+
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	c.Assert(chg.Err(), IsNil)
+	c.Assert(osutil.FileExists(testSnap), Equals, false)
+
+	snapsup, err := snapstate.TaskSnapSetup(t)
+	c.Assert(err, IsNil)
+	c.Check(snapsup.SnapPath, Equals, "")
 }
 
 func (s *mountSnapSuite) TestDoUndoMountSnap(c *C) {
@@ -431,7 +466,7 @@ func (s *mountSnapSuite) TestDoMountNotMountedRetryRetry(c *C) {
 	r := snapstate.MockMountPollInterval(10 * time.Millisecond)
 	defer r()
 	n := 0
-	slowMountedReadInfo := func(name string, si *snap.SideInfo) (*snap.Info, error) {
+	slowMountedReadInfo := func(name naming.InstanceName, si *snap.SideInfo) (*snap.Info, error) {
 		n++
 		if n < 3 {
 			return nil, &snap.NotFoundError{Snap: "not-there", Revision: si.Revision}

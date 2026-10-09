@@ -42,9 +42,24 @@ var ops = []struct {
 	op     func(*client.Client, string, *client.SnapOptions) (string, error)
 	action string
 }{
-	{(*client.Client).Install, "install"},
-	{(*client.Client).Refresh, "refresh"},
-	{(*client.Client).Remove, "remove"},
+	{
+		op: func(c *client.Client, name string, options *client.SnapOptions) (string, error) {
+			return c.Install(name, nil, options)
+		},
+		action: "install",
+	},
+	{
+		op: func(c *client.Client, name string, options *client.SnapOptions) (string, error) {
+			return c.Refresh(name, nil, options)
+		},
+		action: "refresh",
+	},
+	{
+		op: func(c *client.Client, name string, options *client.SnapOptions) (string, error) {
+			return c.Remove(name, nil, options)
+		},
+		action: "remove",
+	},
 	{(*client.Client).Revert, "revert"},
 	{(*client.Client).Enable, "enable"},
 	{(*client.Client).Disable, "disable"},
@@ -57,9 +72,24 @@ var multiOps = []struct {
 	op     func(*client.Client, []string, *client.SnapOptions) (string, error)
 	action string
 }{
-	{(*client.Client).RefreshMany, "refresh"},
-	{(*client.Client).InstallMany, "install"},
-	{(*client.Client).RemoveMany, "remove"},
+	{
+		op: func(c *client.Client, names []string, options *client.SnapOptions) (string, error) {
+			return c.RefreshMany(names, nil, options)
+		},
+		action: "refresh",
+	},
+	{
+		op: func(c *client.Client, names []string, options *client.SnapOptions) (string, error) {
+			return c.InstallMany(names, nil, options)
+		},
+		action: "install",
+	},
+	{
+		op: func(c *client.Client, names []string, options *client.SnapOptions) (string, error) {
+			return c.RemoveMany(names, nil, options)
+		},
+		action: "remove",
+	},
 	{(*client.Client).HoldRefreshesMany, "hold"},
 	{(*client.Client).UnholdRefreshesMany, "unhold"},
 }
@@ -179,11 +209,11 @@ func (cs *clientSuite) TestClientMultiOpSnap(c *check.C) {
 
 		body, err := io.ReadAll(cs.req.Body)
 		c.Assert(err, check.IsNil, check.Commentf(s.action))
-		jsonBody := make(map[string]interface{})
+		jsonBody := make(map[string]any)
 		err = json.Unmarshal(body, &jsonBody)
 		c.Assert(err, check.IsNil, check.Commentf(s.action))
 		c.Check(jsonBody["action"], check.Equals, s.action, check.Commentf(s.action))
-		c.Check(jsonBody["snaps"], check.DeepEquals, []interface{}{pkgName}, check.Commentf(s.action))
+		c.Check(jsonBody["snaps"], check.DeepEquals, []any{pkgName}, check.Commentf(s.action))
 		c.Check(jsonBody, check.HasLen, 2, check.Commentf(s.action))
 
 		c.Check(cs.req.URL.Path, check.Equals, "/v2/snaps", check.Commentf(s.action))
@@ -208,11 +238,11 @@ func (cs *clientSuite) TestClientMultiOpSnapTransactional(c *check.C) {
 
 		body, err := io.ReadAll(cs.req.Body)
 		c.Assert(err, check.IsNil, check.Commentf(s.action))
-		jsonBody := make(map[string]interface{})
+		jsonBody := make(map[string]any)
 		err = json.Unmarshal(body, &jsonBody)
 		c.Assert(err, check.IsNil, check.Commentf(s.action))
 		c.Check(jsonBody["action"], check.Equals, s.action, check.Commentf(s.action))
-		c.Check(jsonBody["snaps"], check.DeepEquals, []interface{}{pkgName}, check.Commentf(s.action))
+		c.Check(jsonBody["snaps"], check.DeepEquals, []any{pkgName}, check.Commentf(s.action))
 		c.Check(jsonBody["transaction"], check.Equals, string(client.TransactionAllSnaps),
 			check.Commentf(s.action))
 		c.Check(jsonBody, check.HasLen, 3, check.Commentf(s.action))
@@ -239,11 +269,11 @@ func (cs *clientSuite) TestClientMultiOpSnapIgnoreRunning(c *check.C) {
 
 		body, err := io.ReadAll(cs.req.Body)
 		c.Assert(err, check.IsNil, check.Commentf(s.action))
-		jsonBody := make(map[string]interface{})
+		jsonBody := make(map[string]any)
 		err = json.Unmarshal(body, &jsonBody)
 		c.Assert(err, check.IsNil, check.Commentf(s.action))
 		c.Check(jsonBody["action"], check.Equals, s.action, check.Commentf(s.action))
-		c.Check(jsonBody["snaps"], check.DeepEquals, []interface{}{pkgName}, check.Commentf(s.action))
+		c.Check(jsonBody["snaps"], check.DeepEquals, []any{pkgName}, check.Commentf(s.action))
 		c.Check(jsonBody["ignore-running"], check.Equals, true,
 			check.Commentf(s.action))
 		c.Check(jsonBody, check.HasLen, 3, check.Commentf(s.action))
@@ -268,11 +298,11 @@ func (cs *clientSuite) TestClientMultiSnapshot(c *check.C) {
 
 	body, err := io.ReadAll(cs.req.Body)
 	c.Assert(err, check.IsNil)
-	jsonBody := make(map[string]interface{})
+	jsonBody := make(map[string]any)
 	err = json.Unmarshal(body, &jsonBody)
 	c.Assert(err, check.IsNil)
 	c.Check(jsonBody["action"], check.Equals, "snapshot")
-	c.Check(jsonBody["snaps"], check.DeepEquals, []interface{}{pkgName})
+	c.Check(jsonBody["snaps"], check.DeepEquals, []any{pkgName})
 	c.Check(jsonBody, check.HasLen, 2)
 	c.Check(cs.req.URL.Path, check.Equals, "/v2/snaps")
 	c.Check(setID, check.Equals, uint64(42))
@@ -533,11 +563,11 @@ func (cs *clientSuite) TestClientOpInstallDangerous(c *check.C) {
 	c.Assert(string(body), check.Matches, "(?s).*Content-Disposition: form-data; name=\"dangerous\"\r\n\r\ntrue\r\n.*")
 
 	// Install does not (and gives us a clear error message)
-	_, err = cs.cli.Install("foo", &opts)
+	_, err = cs.cli.Install("foo", nil, &opts)
 	c.Assert(err, check.Equals, client.ErrDangerousNotApplicable)
 
 	// InstallMany just ignores it without error for the moment
-	_, err = cs.cli.InstallMany([]string{"foo"}, &opts)
+	_, err = cs.cli.InstallMany([]string{"foo"}, nil, &opts)
 	c.Assert(err, check.IsNil)
 }
 
@@ -558,12 +588,12 @@ func (cs *clientSuite) TestClientOpInstallUnaliased(c *check.C) {
 		Unaliased: true,
 	}
 
-	_, err = cs.cli.Install("foo", &opts)
+	_, err = cs.cli.Install("foo", nil, &opts)
 	c.Assert(err, check.IsNil)
 
 	body, err := io.ReadAll(cs.req.Body)
 	c.Assert(err, check.IsNil)
-	jsonBody := make(map[string]interface{})
+	jsonBody := make(map[string]any)
 	err = json.Unmarshal(body, &jsonBody)
 	c.Assert(err, check.IsNil, check.Commentf("body: %v", string(body)))
 	c.Check(jsonBody["unaliased"], check.Equals, true, check.Commentf("body: %v", string(body)))
@@ -594,12 +624,12 @@ func (cs *clientSuite) TestClientOpInstallTransactional(c *check.C) {
 		Transaction: client.TransactionAllSnaps,
 	}
 
-	_, err = cs.cli.InstallMany([]string{"foo", "bar"}, &opts)
+	_, err = cs.cli.InstallMany([]string{"foo", "bar"}, nil, &opts)
 	c.Assert(err, check.IsNil)
 
 	body, err := io.ReadAll(cs.req.Body)
 	c.Assert(err, check.IsNil)
-	jsonBody := make(map[string]interface{})
+	jsonBody := make(map[string]any)
 	err = json.Unmarshal(body, &jsonBody)
 	c.Assert(err, check.IsNil, check.Commentf("body: %v", string(body)))
 	c.Check(jsonBody["transaction"], check.Equals, string(client.TransactionAllSnaps),
@@ -632,12 +662,12 @@ func (cs *clientSuite) TestClientOpInstallPrefer(c *check.C) {
 		Prefer: true,
 	}
 
-	_, err = cs.cli.Install("foo", &opts)
+	_, err = cs.cli.Install("foo", nil, &opts)
 	c.Assert(err, check.IsNil)
 
 	body, err := io.ReadAll(cs.req.Body)
 	c.Assert(err, check.IsNil)
-	var jsonBody map[string]interface{}
+	var jsonBody map[string]any
 	err = json.Unmarshal(body, &jsonBody)
 	c.Assert(err, check.IsNil, check.Commentf("body: %v", string(body)))
 	c.Check(jsonBody["prefer"], check.Equals, true, check.Commentf("body: %v", string(body)))
@@ -854,7 +884,7 @@ func (cs *clientSuite) TestClientRefreshWithValidationSets(c *check.C) {
 	}`
 
 	sets := []string{"foo/bar=2", "foo/baz"}
-	chgID, err := cs.cli.RefreshMany(nil, &client.SnapOptions{
+	chgID, err := cs.cli.RefreshMany(nil, nil, &client.SnapOptions{
 		ValidationSets: sets,
 	})
 	c.Assert(err, check.IsNil)
@@ -913,4 +943,72 @@ func (cs *clientSuite) TestClientHoldMany(c *check.C) {
 		HoldLevel: "general",
 	})
 	c.Check(cs.req.Header["Content-Type"], check.DeepEquals, []string{"application/json"})
+}
+
+func (cs *clientSuite) testClientOpWithComponents(c *check.C, action func(name string, components []string, options *client.SnapOptions) (changeID string, err error)) {
+	cs.status = 202
+	cs.rsp = `{
+		"change": "66b3",
+		"status-code": 202,
+		"type": "async"
+	}`
+
+	_, err := action("foo", []string{"one", "two"}, nil)
+	c.Assert(err, check.IsNil)
+
+	var body map[string]any
+	err = json.NewDecoder(cs.req.Body).Decode(&body)
+	c.Assert(err, check.IsNil)
+
+	c.Check(body["components"], check.DeepEquals, []any{"one", "two"})
+}
+
+func (cs *clientSuite) TestClientOpInstallWithComponents(c *check.C) {
+	cs.testClientOpWithComponents(c, cs.cli.Install)
+}
+
+func (cs *clientSuite) TestClientOpRefreshWithComponents(c *check.C) {
+	cs.testClientOpWithComponents(c, cs.cli.Refresh)
+}
+
+func (cs *clientSuite) TestClientOpRemoveWithComponents(c *check.C) {
+	cs.testClientOpWithComponents(c, cs.cli.Remove)
+}
+
+func (cs *clientSuite) testClientOpManyWithComponents(c *check.C, action func(names []string, components map[string][]string, options *client.SnapOptions) (changeID string, err error)) {
+	cs.status = 202
+	cs.rsp = `{
+		"change": "66b3",
+		"status-code": 202,
+		"type": "async"
+	}`
+
+	comps := map[string][]string{
+		"foo": {"one", "two"},
+		"bar": {"three", "four"},
+	}
+
+	_, err := action([]string{"foo", "bar"}, comps, nil)
+	c.Assert(err, check.IsNil)
+
+	var body map[string]any
+	err = json.NewDecoder(cs.req.Body).Decode(&body)
+	c.Assert(err, check.IsNil)
+
+	c.Check(body["components"], check.DeepEquals, map[string]any{
+		"foo": []any{"one", "two"},
+		"bar": []any{"three", "four"},
+	})
+}
+
+func (cs *clientSuite) TestClientOpInstallManyWithComponents(c *check.C) {
+	cs.testClientOpManyWithComponents(c, cs.cli.InstallMany)
+}
+
+func (cs *clientSuite) TestClientOpRefreshManyWithComponents(c *check.C) {
+	cs.testClientOpManyWithComponents(c, cs.cli.RefreshMany)
+}
+
+func (cs *clientSuite) TestClientOpRemoveManyWithComponents(c *check.C) {
+	cs.testClientOpManyWithComponents(c, cs.cli.RemoveMany)
 }

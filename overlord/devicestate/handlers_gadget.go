@@ -31,12 +31,12 @@ import (
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/gadget"
 	"github.com/snapcore/snapd/logger"
+	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/overlord/configstate/config"
 	"github.com/snapcore/snapd/overlord/restart"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/snap"
-	"github.com/snapcore/snapd/strutil"
 )
 
 func makeRollbackDir(name string) (string, error) {
@@ -118,7 +118,7 @@ func (m *DeviceManager) doUpdateGadgetAssets(t *state.Task, _ *tomb.Tomb) error 
 	switch snapsup.Type {
 	case snap.TypeGadget:
 		expectedGadgetSnap := model.Gadget()
-		if snapsup.InstanceName() != expectedGadgetSnap {
+		if snapsup.InstanceName().String() != expectedGadgetSnap {
 			return fmt.Errorf("cannot apply gadget assets update from non-model gadget snap %q, expected %q snap",
 				snapsup.InstanceName(), expectedGadgetSnap)
 		}
@@ -129,7 +129,7 @@ func (m *DeviceManager) doUpdateGadgetAssets(t *state.Task, _ *tomb.Tomb) error 
 		}
 	case snap.TypeKernel:
 		expectedKernelSnap := model.Kernel()
-		if snapsup.InstanceName() != expectedKernelSnap {
+		if snapsup.InstanceName().String() != expectedKernelSnap {
 			return fmt.Errorf("cannot apply kernel assets update from non-model kernel snap %q, expected %q snap",
 				snapsup.InstanceName(), expectedKernelSnap)
 		}
@@ -152,6 +152,9 @@ func (m *DeviceManager) doUpdateGadgetAssets(t *state.Task, _ *tomb.Tomb) error 
 		// no updates during first boot & seeding
 		return nil
 	}
+
+	// Inject fault during the refresh of the gadget assets
+	osutil.MaybeInjectFault("refresh-gadget-assets")
 
 	// add kernel directories
 	currentKernelInfo, err := snapstate.CurrentInfo(st, groundDeviceCtx.Model().Kernel())
@@ -197,11 +200,27 @@ func (m *DeviceManager) doUpdateGadgetAssets(t *state.Task, _ *tomb.Tomb) error 
 			updateObserver = observeTrustedBootAssets
 			defer observeTrustedBootAssets.Done()
 		}
+
 		// do not release the state lock, the update observer may
 		// attempt to modify modeenv inside, which implicitly is
 		// guarded by the state lock; on top of that we do not expect
 		// the update to be moving large amounts of data
-		return gadgetUpdate(model, *currentData, *updateData, snapRollbackDir, updatePolicy, updateObserver)
+		if err := gadgetUpdate(model, *currentData, *updateData, snapRollbackDir, updatePolicy, updateObserver); err != nil {
+			return err
+		}
+
+		// After a gadget update, some recovery bootloaders may need to
+		// regenerate their config from the persisted boot variables.
+		if updated, err := boot.ReconfigureRecoveryBootConfig(groundDeviceCtx); err != nil {
+			return fmt.Errorf("cannot reconfigure recovery boot config: %v", err)
+		} else if updated {
+			t.Logf("reconfigured recovery boot config")
+		}
+
+		if updateObserver == nil {
+			return nil
+		}
+		return observeTrustedBootAssets.UpdateBootEntry()
 	}()
 	if err != nil {
 		if err == gadget.ErrNoUpdate {
@@ -234,70 +253,23 @@ func fromSystemOption(t *state.Task) bool {
 	return false
 }
 
-// kernelCommandLineAppendArgs returns extra arguments that we want to
-// append to the kernel command line, searching first by looking at
-// the task, and if not found, looking at the current configuration
-// options. One thing or the other could happen depending on whether
-// this is a task created when setting a kernel option or by gadget
-// installation.
-func kernelCommandLineAppendArgs(tsk *state.Task, tr *config.Transaction,
-	taskParam string) (string, error) {
-
-	var value string
-	err := tsk.Get(taskParam, &value)
-	if err == nil {
-		return value, nil
-	}
-	if !errors.Is(err, state.ErrNoState) {
-		return "", err
-	}
-
-	var option string
-	switch taskParam {
-	case "cmdline-append":
-		option = "system.kernel.cmdline-append"
-	case "dangerous-cmdline-append":
-		option = "system.kernel.dangerous-cmdline-append"
-	default:
-		return "", fmt.Errorf("internal error, unexpected task parameter %q", taskParam)
-	}
-	if err := tr.Get("core", option, &value); err != nil && !config.IsNoOption(err) {
-		return "", err
-	}
-
-	return value, nil
-}
-
-func buildAppendedKernelCommandLine(t *state.Task, gd *gadget.GadgetData, deviceCtx snapstate.DeviceContext) (string, error) {
-	tr := config.NewTransaction(t.State())
-	rawCmdlineAppend, err := kernelCommandLineAppendArgs(t, tr, "cmdline-append")
-	if err != nil {
-		return "", err
-	}
-	// Validation against allow list has already happened in
-	// configcore, but the gadget might have changed, so we check
-	// again and filter any unallowed argument.
-	cmdlineAppend, forbidden := gadget.FilterKernelCmdline(rawCmdlineAppend, gd.Info.KernelCmdline.Allow)
-	if forbidden != "" {
-		warnMsg := fmt.Sprintf("%q is not allowed by the gadget and has been filtered out from the kernel command line", forbidden)
-		logger.Noticef(warnMsg)
-		t.Logf(warnMsg)
-	}
-
-	// Dangerous extra cmdline only considered for dangerous models
-	if deviceCtx.Model().Grade() == asserts.ModelDangerous {
-		cmdlineAppendDanger, err := kernelCommandLineAppendArgs(t, tr,
-			"dangerous-cmdline-append")
-		if err != nil {
-			return "", err
+func earlyCommitCommandLineAppendTransaction(t *state.Task, st *state.State) error {
+	tr := config.NewTransaction(st)
+	for _, param := range []string{"cmdline-append", "dangerous-cmdline-append"} {
+		if !t.Has(param) {
+			continue
 		}
-		cmdlineAppend = strutil.JoinNonEmpty(
-			[]string{cmdlineAppend, cmdlineAppendDanger}, " ")
+		var value string
+		if err := t.Get(param, &value); err != nil {
+			return err
+		}
+		option := fmt.Sprintf("system.kernel.%s", param)
+		if err := tr.Set("core", option, value); err != nil {
+			return err
+		}
 	}
-
-	logger.Debugf("appended kernel command line part is %q", cmdlineAppend)
-
-	return cmdlineAppend, nil
+	tr.Commit()
+	return nil
 }
 
 func (m *DeviceManager) updateGadgetCommandLine(t *state.Task, st *state.State, useCurrentGadget bool) (updated bool, err error) {
@@ -347,7 +319,7 @@ func (m *DeviceManager) updateGadgetCommandLine(t *state.Task, st *state.State, 
 	return updated, nil
 }
 
-func (m *DeviceManager) doUpdateGadgetCommandLine(t *state.Task, _ *tomb.Tomb) error {
+func (m *DeviceManager) doUpdateGadgetCommandLine(t *state.Task, _ *tomb.Tomb) (retErr error) {
 	st := t.State()
 	st.Lock()
 	defer st.Unlock()
@@ -370,17 +342,59 @@ func (m *DeviceManager) doUpdateGadgetCommandLine(t *state.Task, _ *tomb.Tomb) e
 		return nil
 	}
 
+	// Find out if the update has been triggered by setting an extra
+	// snapd kernel command line fragment.
+	var fromExtraSnapdFragments bool
+	err = t.Get("from-extra-snapd-fragments", &fromExtraSnapdFragments)
+	if err != nil && !errors.Is(err, state.ErrNoState) {
+		return err
+	}
+
 	// Find out if the update has been triggered by setting a system
 	// option that modifies the kernel command line.
-	isSysOption := fromSystemOption(t)
+	fromSysOption := fromSystemOption(t)
+	defer func() {
+		if retErr != nil || !fromSysOption {
+			return
+		}
+		// This task is triggered by setting a system option, This is a
+		// special case where the kernel cmdline configuration is fetched
+		// from the task state instead of the system configuration options
+		// because the parent run-hook[configure] task (see configcore/kernel.go)
+		// does not commit the configuration transaction until after this task
+		// has finished successfully which leaves a window where other tasks
+		// might have an inconsistent view of the configuration state and might
+		// mistakenly overwrite the kernel cmdline with out-of-date values even
+		// when doing conflict detection or blocking on the task level because it
+		// will not take into consideration that the parent run-hook[configure]
+		// task has not committed the configuration transaction yet.
+		//
+		// Early committing here on success (given the task is triggered by
+		// setting a system option) solves this issue and keeps any conflict
+		// detection or blocking logic working as expected.
+		//
+		// TODO: Consider better alternative to double-commit approach below.
+		if err := earlyCommitCommandLineAppendTransaction(t, st); err != nil {
+			logger.Debugf("internal error: cannot early commit kernel command line configuration transaction: %v", err)
+		}
+	}()
 
 	// We use the current gadget kernel command line if the change comes
 	// from setting a system option.
-	useCurrentGadget := isSysOption
+	useCurrentGadget := fromSysOption || fromExtraSnapdFragments
 	updated, err := m.updateGadgetCommandLine(t, st, useCurrentGadget)
 	if err != nil {
 		return err
 	}
+
+	// Any pending extra snapd kernel command line fragments should have
+	// been applied by now.
+	//
+	// Note that the state lock must be held for the duration of the
+	// task so that we do not accidentally unset the pending state
+	// that might have been set externally if the state was unlocked.
+	st.Set(kcmdlinePendingExtraSnapdFragmentsKey, false)
+
 	if !updated {
 		logger.Debugf("no kernel command line update from gadget")
 		return nil
@@ -391,8 +405,8 @@ func (m *DeviceManager) doUpdateGadgetCommandLine(t *state.Task, _ *tomb.Tomb) e
 	// snap carries an update to the gadget assets and a change in the
 	// kernel command line
 
-	if isSysOption {
-		logger.Debugf("change comes from system option, we do not reboot")
+	if fromSysOption || fromExtraSnapdFragments {
+		logger.Debugf("change did not come from gadget, we do not reboot")
 		t.SetStatus(state.DoneStatus)
 		return nil
 	}

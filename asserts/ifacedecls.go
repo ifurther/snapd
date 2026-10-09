@@ -31,8 +31,12 @@ import (
 
 // AttrMatchContext has contextual helpers for evaluating attribute constraints.
 type AttrMatchContext interface {
-	PlugAttr(arg string) (interface{}, error)
-	SlotAttr(arg string) (interface{}, error)
+	PlugAttr(arg string) (any, error)
+	SlotAttr(arg string) (any, error)
+	PlugPublisherID() string
+	SlotPublisherID() string
+	// This should be removed when the ContentCompatLabel feature is enabled by default.
+	CompatLabelsEnabled() bool
 }
 
 const (
@@ -40,6 +44,8 @@ const (
 	deviceScopeConstraintsFeature = "device-scope-constraints"
 	// feature label for plug-names/slot-names constraints
 	nameConstraintsFeature = "name-constraints"
+	// feature label for on-classic distro/variant constraints
+	onClassicVariantConstraintsFeature = "on-classic-variant-constraints"
 )
 
 // AttributeConstraints implements a set of constraints on the attributes of a slot or plug.
@@ -53,10 +59,11 @@ func (ac *AttributeConstraints) feature(flabel string) bool {
 
 // compileAttributeConstraints checks and compiles a mapping or list
 // from the assertion format into AttributeConstraints.
-func compileAttributeConstraints(constraints interface{}) (*AttributeConstraints, error) {
+func compileAttributeConstraints(constraints any) (*AttributeConstraints, error) {
 	cc := compileContext{
 		opts: &compileAttrMatcherOptions{
-			allowedOperations: []string{"SLOT", "PLUG"},
+			allowedOperations: []string{"SLOT", "PLUG", "SLOT_COMPAT", "PLUG_COMPAT"},
+			allowedRefs:       []string{"PLUG_PUBLISHER_ID", "SLOT_PUBLISHER_ID"},
 		},
 	}
 	matcher, err := compileAttrMatcher(cc, constraints)
@@ -74,7 +81,7 @@ func (matcher fixedAttrMatcher) feature(flabel string) bool {
 	return false
 }
 
-func (matcher fixedAttrMatcher) match(apath string, v interface{}, ctx *attrMatchingContext) error {
+func (matcher fixedAttrMatcher) match(apath string, v any, ctx *attrMatchingContext) error {
 	return matcher.result
 }
 
@@ -85,7 +92,7 @@ var (
 
 // Attrer reflects part of the Attrer interface (see interfaces.Attrer).
 type Attrer interface {
-	Lookup(path string) (interface{}, bool)
+	Lookup(path string) (any, bool)
 }
 
 // Check checks whether attrs don't match the constraints.
@@ -117,7 +124,7 @@ func (ac SideArityConstraint) Any() bool {
 	return ac.N == -1
 }
 
-func compileSideArityConstraint(context *subruleContext, which string, v interface{}) (SideArityConstraint, error) {
+func compileSideArityConstraint(context *subruleContext, which string, v any) (SideArityConstraint, error) {
 	var a SideArityConstraint
 	if context.installation() || !context.allow() {
 		return a, fmt.Errorf("%s cannot specify a %s constraint, they apply only to allow-*connection", context, which)
@@ -179,7 +186,102 @@ var (
 // OnClassicConstraint specifies a constraint based whether the system is classic and optional specific distros' sets.
 type OnClassicConstraint struct {
 	Classic   bool
-	SystemIDs []string
+	SystemIDs []OnClassicSystemConstraint
+}
+
+// OnClassicSystemConstraint specifies an operating system distro/variant matcher.
+//
+// VariantAny is true for constraints that accept any VARIANT_ID, including the
+// legacy distro-only form (for example "ubuntu") and the explicit wildcard form
+// (for example "ubuntu/*"). VariantID preserves the explicit wildcard so format
+// detection can distinguish old and new syntax.
+type OnClassicSystemConstraint struct {
+	DistroID   string
+	VariantID  string
+	VariantAny bool
+}
+
+func (c *OnClassicConstraint) feature(flabel string) bool {
+	if flabel != onClassicVariantConstraintsFeature {
+		return false
+	}
+	for _, systemID := range c.SystemIDs {
+		// Explicit variant syntax requires format 7, even when it still matches any
+		// variant (for example "ubuntu/*"). The legacy distro-only form keeps the
+		// zero VariantID while still setting VariantAny.
+		if !systemID.VariantAny || systemID.VariantID == "*" {
+			return true
+		}
+	}
+	return false
+}
+
+func compileOnClassicConstraint(context *subruleContext, onClassic any) (*OnClassicConstraint, error) {
+	what := fmt.Sprintf("on-classic in %s", context)
+	syntaxError := fmt.Errorf("%s must be 'true', 'false' or a list of operating system IDs with optional /variant IDs", what)
+
+	switch x := onClassic.(type) {
+	case string:
+		switch x {
+		case "true":
+			return &OnClassicConstraint{Classic: true}, nil
+		case "false":
+			return &OnClassicConstraint{Classic: false}, nil
+		default:
+			return nil, syntaxError
+		}
+	case []any:
+		systems := make([]OnClassicSystemConstraint, len(x))
+		for i, v := range x {
+			s, ok := v.(string)
+			if !ok {
+				return nil, fmt.Errorf("%s must be a list of strings", what)
+			}
+			systemID, err := compileOnClassicSystemConstraint(s)
+			if err != nil {
+				return nil, fmt.Errorf("%s contains an invalid element: %q: %v", what, s, err)
+			}
+			systems[i] = systemID
+		}
+		return &OnClassicConstraint{Classic: true, SystemIDs: systems}, nil
+	default:
+		return nil, syntaxError
+	}
+}
+
+func compileOnClassicSystemConstraint(s string) (OnClassicSystemConstraint, error) {
+	if strings.Count(s, "/") > 1 {
+		return OnClassicSystemConstraint{}, fmt.Errorf("invalid operating system constraint: too many '/' separators")
+	}
+	if distroID, variantID, hasVariant := strings.Cut(s, "/"); hasVariant {
+		if !validDistro.MatchString(distroID) {
+			return OnClassicSystemConstraint{}, fmt.Errorf("invalid operating system constraint: invalid distro ID")
+		}
+		constraint := OnClassicSystemConstraint{
+			DistroID: distroID,
+		}
+		switch {
+		case variantID == "*":
+			constraint.VariantAny = true
+			constraint.VariantID = "*"
+		case variantID == "":
+			// Match only when VARIANT_ID is unset.
+		case validDistro.MatchString(variantID):
+			constraint.VariantID = variantID
+		default:
+			return OnClassicSystemConstraint{}, fmt.Errorf("invalid operating system constraint: invalid variant ID")
+		}
+		return constraint, nil
+	}
+	if !validDistro.MatchString(s) {
+		return OnClassicSystemConstraint{}, fmt.Errorf("invalid operating system constraint: invalid distro ID")
+	}
+	return OnClassicSystemConstraint{DistroID: s, VariantAny: true}, nil
+}
+
+// OnCoreDesktopConstraint specifies a constraint based whether the system is core desktop.
+type OnCoreDesktopConstraint struct {
+	CoreDesktop bool
 }
 
 type nameMatcher interface {
@@ -191,7 +293,7 @@ var (
 	validSpecialNameConstraint = regexp.MustCompile(`^\$[A-Z][A-Z0-9_]*$`)
 )
 
-func compileNameMatcher(whichName string, v interface{}) (nameMatcher, error) {
+func compileNameMatcher(whichName string, v any) (nameMatcher, error) {
 	s, ok := v.(string)
 	if !ok {
 		return nil, fmt.Errorf("%s constraint entry must be a regexp or special $ value", whichName)
@@ -241,8 +343,8 @@ type NameConstraints struct {
 	matchers []nameMatcher
 }
 
-func compileNameConstraints(whichName string, constraints interface{}) (*NameConstraints, error) {
-	l, ok := constraints.([]interface{})
+func compileNameConstraints(whichName string, constraints any) (*NameConstraints, error) {
+	l, ok := constraints.([]any)
 	if !ok {
 		return nil, fmt.Errorf("%s constraints must be a list of regexps and special $ values", whichName)
 	}
@@ -284,9 +386,9 @@ var (
 	}
 )
 
-func checkMapOrShortcut(v interface{}) (m map[string]interface{}, invert bool, err error) {
+func checkMapOrShortcut(v any) (m map[string]any, invert bool, err error) {
 	switch x := v.(type) {
-	case map[string]interface{}:
+	case map[string]any:
 		return x, false, nil
 	case string:
 		switch x {
@@ -304,6 +406,7 @@ type constraintsHolder interface {
 	setAttributeConstraints(field string, cstrs *AttributeConstraints)
 	setIDConstraints(field string, cstrs []string)
 	setOnClassicConstraint(onClassic *OnClassicConstraint)
+	setOnCoreDesktopConstraint(onCoreDesktop *OnCoreDesktopConstraint)
 	setDeviceScopeConstraint(deviceScope *DeviceScopeConstraint)
 }
 
@@ -376,26 +479,30 @@ func baseCompileConstraints(context *subruleContext, cDef constraintsDef, target
 	if onClassic == nil {
 		defaultUsed++
 	} else {
-		var c *OnClassicConstraint
-		switch x := onClassic.(type) {
+		c, err := compileOnClassicConstraint(context, onClassic)
+		if err != nil {
+			return err
+		}
+		target.setOnClassicConstraint(c)
+	}
+	onCoreDesktop := cMap["on-core-desktop"]
+	if onCoreDesktop == nil {
+		defaultUsed++
+	} else {
+		var c *OnCoreDesktopConstraint
+		switch x := onCoreDesktop.(type) {
 		case string:
 			switch x {
 			case "true":
-				c = &OnClassicConstraint{Classic: true}
+				c = &OnCoreDesktopConstraint{CoreDesktop: true}
 			case "false":
-				c = &OnClassicConstraint{Classic: false}
+				c = &OnCoreDesktopConstraint{CoreDesktop: false}
 			}
-		case []interface{}:
-			lst, err := checkStringListInMap(cMap, "on-classic", fmt.Sprintf("on-classic in %s", context), validDistro)
-			if err != nil {
-				return err
-			}
-			c = &OnClassicConstraint{Classic: true, SystemIDs: lst}
 		}
 		if c == nil {
-			return fmt.Errorf("on-classic in %s must be 'true', 'false' or a list of operating system IDs", context)
+			return fmt.Errorf("on-core-desktop in %s must be 'true' or 'false'", context)
 		}
-		target.setOnClassicConstraint(c)
+		target.setOnCoreDesktopConstraint(c)
 	}
 	dsc, err := compileDeviceScopeConstraint(cMap, context.String())
 	if err != nil {
@@ -408,10 +515,10 @@ func baseCompileConstraints(context *subruleContext, cDef constraintsDef, target
 	}
 	// checks whether defaults have been used for everything, which is not
 	// well-formed
-	// +1+1 accounts for defaults for missing on-classic plus missing
+	// +1+1+1 accounts for defaults for missing on-classic, on-core-desktop plus missing
 	// on-store/on-brand/on-model
-	if defaultUsed == len(nameConstraints)+len(attributeConstraints)+len(idConstraints)+len(sideArityConstraints)+1+1 {
-		return fmt.Errorf("%s must specify at least one of %s, %s, %s, %s, on-classic, on-store, on-brand, on-model", context, strings.Join(nameConstraints, ", "), strings.Join(attrConstraints, ", "), strings.Join(idConstraints, ", "), strings.Join(sideArityConstraints, ", "))
+	if defaultUsed == len(nameConstraints)+len(attributeConstraints)+len(idConstraints)+len(sideArityConstraints)+1+1+1 {
+		return fmt.Errorf("%s must specify at least one of %s, %s, %s, %s, on-classic, on-core-desktop, on-store, on-brand, on-model", context, strings.Join(nameConstraints, ", "), strings.Join(attrConstraints, ", "), strings.Join(idConstraints, ", "), strings.Join(sideArityConstraints, ", "))
 	}
 	return nil
 }
@@ -421,7 +528,7 @@ type rule interface {
 }
 
 type constraintsDef struct {
-	cMap   map[string]interface{}
+	cMap   map[string]any
 	invert bool
 }
 
@@ -467,7 +574,7 @@ func (c *subruleContext) autoConnection() bool {
 
 type subruleCompiler func(context *subruleContext, def constraintsDef) (constraintsHolder, error)
 
-func baseCompileRule(context string, rule interface{}, target rule, subrules []string, compilers map[string]subruleCompiler, defaultOutcome, invertedOutcome map[string]interface{}) error {
+func baseCompileRule(context string, rule any, target rule, subrules []string, compilers map[string]subruleCompiler, defaultOutcome, invertedOutcome map[string]any) error {
 	rMap, invert, err := checkMapOrShortcut(rule)
 	if err != nil {
 		return fmt.Errorf("%s must be a map or one of the shortcuts 'true' or 'false'", context)
@@ -482,18 +589,18 @@ func baseCompileRule(context string, rule interface{}, target rule, subrules []s
 	// compile and set subrules
 	for _, subrule := range subrules {
 		v := rMap[subrule]
-		var lst []interface{}
+		var lst []any
 		alternatives := false
 		switch x := v.(type) {
 		case nil:
 			v = defaultOutcome[subrule]
 			defaultUsed++
-		case []interface{}:
+		case []any:
 			alternatives = true
 			lst = x
 		}
 		if lst == nil { // v is map or a string, checked below
-			lst = []interface{}{v}
+			lst = []any{v}
 		}
 		compiler := compilers[subrule]
 		if compiler == nil {
@@ -627,7 +734,8 @@ type PlugInstallationConstraints struct {
 
 	PlugAttributes *AttributeConstraints
 
-	OnClassic *OnClassicConstraint
+	OnClassic     *OnClassicConstraint
+	OnCoreDesktop *OnCoreDesktopConstraint
 
 	DeviceScope *DeviceScopeConstraint
 }
@@ -635,6 +743,9 @@ type PlugInstallationConstraints struct {
 func (c *PlugInstallationConstraints) feature(flabel string) bool {
 	if flabel == deviceScopeConstraintsFeature {
 		return c.DeviceScope != nil
+	}
+	if flabel == onClassicVariantConstraintsFeature {
+		return c.OnClassic != nil && c.OnClassic.feature(flabel)
 	}
 	if flabel == nameConstraintsFeature {
 		return c.PlugNames != nil
@@ -675,6 +786,10 @@ func (c *PlugInstallationConstraints) setOnClassicConstraint(onClassic *OnClassi
 	c.OnClassic = onClassic
 }
 
+func (c *PlugInstallationConstraints) setOnCoreDesktopConstraint(onCoreDesktop *OnCoreDesktopConstraint) {
+	c.OnCoreDesktop = onCoreDesktop
+}
+
 func (c *PlugInstallationConstraints) setDeviceScopeConstraint(deviceScope *DeviceScopeConstraint) {
 	c.DeviceScope = deviceScope
 }
@@ -709,7 +824,8 @@ type PlugConnectionConstraints struct {
 	// PlugsPerSlot is always * (any) (for now)
 	PlugsPerSlot SideArityConstraint
 
-	OnClassic *OnClassicConstraint
+	OnClassic     *OnClassicConstraint
+	OnCoreDesktop *OnCoreDesktopConstraint
 
 	DeviceScope *DeviceScopeConstraint
 }
@@ -717,6 +833,9 @@ type PlugConnectionConstraints struct {
 func (c *PlugConnectionConstraints) feature(flabel string) bool {
 	if flabel == deviceScopeConstraintsFeature {
 		return c.DeviceScope != nil
+	}
+	if flabel == onClassicVariantConstraintsFeature {
+		return c.OnClassic != nil && c.OnClassic.feature(flabel)
 	}
 	if flabel == nameConstraintsFeature {
 		return c.PlugNames != nil || c.SlotNames != nil
@@ -779,6 +898,10 @@ func (c *PlugConnectionConstraints) setOnClassicConstraint(onClassic *OnClassicC
 	c.OnClassic = onClassic
 }
 
+func (c *PlugConnectionConstraints) setOnCoreDesktopConstraint(onCoreDesktop *OnCoreDesktopConstraint) {
+	c.OnCoreDesktop = onCoreDesktop
+}
+
 func (c *PlugConnectionConstraints) setDeviceScopeConstraint(deviceScope *DeviceScopeConstraint) {
 	c.DeviceScope = deviceScope
 }
@@ -800,7 +923,7 @@ func compilePlugConnectionConstraints(context *subruleContext, cDef constraintsD
 }
 
 var (
-	defaultOutcome = map[string]interface{}{
+	defaultOutcome = map[string]any{
 		"allow-installation":    "true",
 		"allow-connection":      "true",
 		"allow-auto-connection": "true",
@@ -809,7 +932,7 @@ var (
 		"deny-auto-connection":  "false",
 	}
 
-	invertedOutcome = map[string]interface{}{
+	invertedOutcome = map[string]any{
 		"allow-installation":    "false",
 		"allow-connection":      "false",
 		"allow-auto-connection": "false",
@@ -830,7 +953,7 @@ var plugRuleCompilers = map[string]subruleCompiler{
 	"deny-auto-connection":  compilePlugConnectionConstraints,
 }
 
-func compilePlugRule(interfaceName string, rule interface{}) (*PlugRule, error) {
+func compilePlugRule(interfaceName string, rule any) (*PlugRule, error) {
 	context := fmt.Sprintf("plug rule for interface %q", interfaceName)
 	plugRule := &PlugRule{
 		Interface: interfaceName,
@@ -936,7 +1059,8 @@ type SlotInstallationConstraints struct {
 
 	SlotAttributes *AttributeConstraints
 
-	OnClassic *OnClassicConstraint
+	OnClassic     *OnClassicConstraint
+	OnCoreDesktop *OnCoreDesktopConstraint
 
 	DeviceScope *DeviceScopeConstraint
 }
@@ -944,6 +1068,9 @@ type SlotInstallationConstraints struct {
 func (c *SlotInstallationConstraints) feature(flabel string) bool {
 	if flabel == deviceScopeConstraintsFeature {
 		return c.DeviceScope != nil
+	}
+	if flabel == onClassicVariantConstraintsFeature {
+		return c.OnClassic != nil && c.OnClassic.feature(flabel)
 	}
 	if flabel == nameConstraintsFeature {
 		return c.SlotNames != nil
@@ -982,6 +1109,10 @@ func (c *SlotInstallationConstraints) setIDConstraints(field string, cstrs []str
 
 func (c *SlotInstallationConstraints) setOnClassicConstraint(onClassic *OnClassicConstraint) {
 	c.OnClassic = onClassic
+}
+
+func (c *SlotInstallationConstraints) setOnCoreDesktopConstraint(onCoreDesktop *OnCoreDesktopConstraint) {
+	c.OnCoreDesktop = onCoreDesktop
 }
 
 func (c *SlotInstallationConstraints) setDeviceScopeConstraint(deviceScope *DeviceScopeConstraint) {
@@ -1032,7 +1163,8 @@ type SlotConnectionConstraints struct {
 	// PlugsPerSlot is always * (any) (for now)
 	PlugsPerSlot SideArityConstraint
 
-	OnClassic *OnClassicConstraint
+	OnClassic     *OnClassicConstraint
+	OnCoreDesktop *OnCoreDesktopConstraint
 
 	DeviceScope *DeviceScopeConstraint
 }
@@ -1040,6 +1172,9 @@ type SlotConnectionConstraints struct {
 func (c *SlotConnectionConstraints) feature(flabel string) bool {
 	if flabel == deviceScopeConstraintsFeature {
 		return c.DeviceScope != nil
+	}
+	if flabel == onClassicVariantConstraintsFeature {
+		return c.OnClassic != nil && c.OnClassic.feature(flabel)
 	}
 	if flabel == nameConstraintsFeature {
 		return c.PlugNames != nil || c.SlotNames != nil
@@ -1108,6 +1243,10 @@ func (c *SlotConnectionConstraints) setOnClassicConstraint(onClassic *OnClassicC
 	c.OnClassic = onClassic
 }
 
+func (c *SlotConnectionConstraints) setOnCoreDesktopConstraint(onCoreDesktop *OnCoreDesktopConstraint) {
+	c.OnCoreDesktop = onCoreDesktop
+}
+
 func (c *SlotConnectionConstraints) setDeviceScopeConstraint(deviceScope *DeviceScopeConstraint) {
 	c.DeviceScope = deviceScope
 }
@@ -1131,7 +1270,7 @@ var slotRuleCompilers = map[string]subruleCompiler{
 	"deny-auto-connection":  compileSlotConnectionConstraints,
 }
 
-func compileSlotRule(interfaceName string, rule interface{}) (*SlotRule, error) {
+func compileSlotRule(interfaceName string, rule any) (*SlotRule, error) {
 	context := fmt.Sprintf("slot rule for interface %q", interfaceName)
 	slotRule := &SlotRule{
 		Interface: interfaceName,

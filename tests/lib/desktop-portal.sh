@@ -37,6 +37,17 @@ UseIn=spread
 EOF
 
     tests.session -u test exec systemctl --user set-environment XDG_CURRENT_DESKTOP=spread
+
+    # Some recent distributions ship xdg-desktop-portal.service with a hard
+    # dependency on graphical-session.target (via Requisite=). The spread test
+    # environment has no graphical session, so this causes portal startup to
+    # fail and xdg-open requests to error out. Remove the dependency when
+    # present so the portal can run in the test session.
+    xdg_portal_user_unit=/usr/lib/systemd/user/xdg-desktop-portal.service
+    if [ -f "$xdg_portal_user_unit" ] && grep -q '^Requisite=graphical-session.target' "$xdg_portal_user_unit"; then
+        sed -i '/^Requisite=graphical-session.target/d' "$xdg_portal_user_unit"
+        systemctl daemon-reload
+    fi
 }
 
 teardown_portals() {

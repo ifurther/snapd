@@ -23,6 +23,7 @@ import (
 	"encoding/base64"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -40,7 +41,6 @@ var (
 	_ = Suite(&snapBuildSuite{})
 	_ = Suite(&snapRevSuite{})
 	_ = Suite(&validationSuite{})
-	_ = Suite(&baseDeclSuite{})
 	_ = Suite(&snapDevSuite{})
 )
 
@@ -51,7 +51,7 @@ type snapDeclSuite struct {
 
 type emptyAttrerObject struct{}
 
-func (o emptyAttrerObject) Lookup(path string) (interface{}, bool) {
+func (o emptyAttrerObject) Lookup(path string) (any, bool) {
 	return nil, false
 }
 
@@ -96,7 +96,7 @@ func (sds *snapDeclSuite) TestDecodeOK(c *C) {
 	c.Check(snapDecl.Timestamp(), Equals, sds.ts)
 	c.Check(snapDecl.Series(), Equals, "16")
 	c.Check(snapDecl.SnapID(), Equals, "snap-id-1")
-	c.Check(snapDecl.SnapName(), Equals, "first")
+	c.Check(snapDecl.SnapName().String(), Equals, "first")
 	c.Check(snapDecl.PublisherID(), Equals, "dev-id1")
 	c.Check(snapDecl.RefreshControl(), DeepEquals, []string{"foo", "bar"})
 	c.Check(snapDecl.AutoAliases(), DeepEquals, []string{"cmd1", "cmd_2", "Cmd-3", "CMD.4"})
@@ -141,7 +141,7 @@ func (sds *snapDeclSuite) TestDecodeOKWithRevisionAuthority(c *C) {
 	c.Check(snapDecl.Timestamp(), Equals, sds.ts)
 	c.Check(snapDecl.Series(), Equals, "16")
 	c.Check(snapDecl.SnapID(), Equals, "snap-id-1")
-	c.Check(snapDecl.SnapName(), Equals, "first")
+	c.Check(snapDecl.SnapName().String(), Equals, "first")
 	c.Check(snapDecl.PublisherID(), Equals, "dev-id1")
 	c.Check(snapDecl.RefreshControl(), DeepEquals, []string{"foo", "bar"})
 	ras := snapDecl.RevisionAuthority("prov1")
@@ -227,7 +227,7 @@ func (sds *snapDeclSuite) TestEmptySnapName(c *C) {
 	a, err := asserts.Decode([]byte(encoded))
 	c.Assert(err, IsNil)
 	snapDecl := a.(*asserts.SnapDeclaration)
-	c.Check(snapDecl.SnapName(), Equals, "")
+	c.Check(snapDecl.SnapName().String(), Equals, "")
 }
 
 func (sds *snapDeclSuite) TestMissingRefreshControlAutoAliases(c *C) {
@@ -508,8 +508,8 @@ func (sds *snapDeclSuite) TestSuggestedFormat(c *C) {
 	c.Assert(err, IsNil)
 	c.Check(fmtnum, Equals, 0)
 
-	headers := map[string]interface{}{
-		"plugs": map[string]interface{}{
+	headers := map[string]any{
+		"plugs": map[string]any{
 			"interface1": "true",
 		},
 	}
@@ -517,8 +517,8 @@ func (sds *snapDeclSuite) TestSuggestedFormat(c *C) {
 	c.Assert(err, IsNil)
 	c.Check(fmtnum, Equals, 1)
 
-	headers = map[string]interface{}{
-		"slots": map[string]interface{}{
+	headers = map[string]any{
+		"slots": map[string]any{
 			"interface2": "true",
 		},
 	}
@@ -526,11 +526,11 @@ func (sds *snapDeclSuite) TestSuggestedFormat(c *C) {
 	c.Assert(err, IsNil)
 	c.Check(fmtnum, Equals, 1)
 
-	headers = map[string]interface{}{
-		"plugs": map[string]interface{}{
-			"interface3": map[string]interface{}{
-				"allow-auto-connection": map[string]interface{}{
-					"plug-attributes": map[string]interface{}{
+	headers = map[string]any{
+		"plugs": map[string]any{
+			"interface3": map[string]any{
+				"allow-auto-connection": map[string]any{
+					"plug-attributes": map[string]any{
 						"x": "$SLOT(x)",
 					},
 				},
@@ -541,11 +541,11 @@ func (sds *snapDeclSuite) TestSuggestedFormat(c *C) {
 	c.Assert(err, IsNil)
 	c.Check(fmtnum, Equals, 2)
 
-	headers = map[string]interface{}{
-		"slots": map[string]interface{}{
-			"interface3": map[string]interface{}{
-				"allow-auto-connection": map[string]interface{}{
-					"plug-attributes": map[string]interface{}{
+	headers = map[string]any{
+		"slots": map[string]any{
+			"interface3": map[string]any{
+				"allow-auto-connection": map[string]any{
+					"plug-attributes": map[string]any{
 						"x": "$SLOT(x)",
 					},
 				},
@@ -560,10 +560,10 @@ func (sds *snapDeclSuite) TestSuggestedFormat(c *C) {
 	for _, side := range []string{"plugs", "slots"} {
 		for k, vals := range deviceScopeConstrs {
 
-			headers := map[string]interface{}{
-				side: map[string]interface{}{
-					"interface3": map[string]interface{}{
-						"allow-installation": map[string]interface{}{
+			headers := map[string]any{
+				side: map[string]any{
+					"interface3": map[string]any{
+						"allow-installation": map[string]any{
 							k: vals,
 						},
 					},
@@ -575,10 +575,10 @@ func (sds *snapDeclSuite) TestSuggestedFormat(c *C) {
 
 			for _, conn := range []string{"connection", "auto-connection"} {
 
-				headers = map[string]interface{}{
-					side: map[string]interface{}{
-						"interface3": map[string]interface{}{
-							"allow-" + conn: map[string]interface{}{
+				headers = map[string]any{
+					side: map[string]any{
+						"interface3": map[string]any{
+							"allow-" + conn: map[string]any{
 								k: vals,
 							},
 						},
@@ -593,18 +593,18 @@ func (sds *snapDeclSuite) TestSuggestedFormat(c *C) {
 
 	// higher format features win
 
-	headers = map[string]interface{}{
-		"plugs": map[string]interface{}{
-			"interface3": map[string]interface{}{
-				"allow-auto-connection": map[string]interface{}{
-					"on-store": []interface{}{"store"},
+	headers = map[string]any{
+		"plugs": map[string]any{
+			"interface3": map[string]any{
+				"allow-auto-connection": map[string]any{
+					"on-store": []any{"store"},
 				},
 			},
 		},
-		"slots": map[string]interface{}{
-			"interface4": map[string]interface{}{
-				"allow-auto-connection": map[string]interface{}{
-					"plug-attributes": map[string]interface{}{
+		"slots": map[string]any{
+			"interface4": map[string]any{
+				"allow-auto-connection": map[string]any{
+					"plug-attributes": map[string]any{
 						"x": "$SLOT(x)",
 					},
 				},
@@ -615,20 +615,20 @@ func (sds *snapDeclSuite) TestSuggestedFormat(c *C) {
 	c.Assert(err, IsNil)
 	c.Check(fmtnum, Equals, 3)
 
-	headers = map[string]interface{}{
-		"plugs": map[string]interface{}{
-			"interface4": map[string]interface{}{
-				"allow-auto-connection": map[string]interface{}{
-					"slot-attributes": map[string]interface{}{
+	headers = map[string]any{
+		"plugs": map[string]any{
+			"interface4": map[string]any{
+				"allow-auto-connection": map[string]any{
+					"slot-attributes": map[string]any{
 						"x": "$SLOT(x)",
 					},
 				},
 			},
 		},
-		"slots": map[string]interface{}{
-			"interface3": map[string]interface{}{
-				"allow-auto-connection": map[string]interface{}{
-					"on-store": []interface{}{"store"},
+		"slots": map[string]any{
+			"interface3": map[string]any{
+				"allow-auto-connection": map[string]any{
+					"on-store": []any{"store"},
 				},
 			},
 		},
@@ -638,13 +638,13 @@ func (sds *snapDeclSuite) TestSuggestedFormat(c *C) {
 	c.Check(fmtnum, Equals, 3)
 
 	// errors
-	headers = map[string]interface{}{
+	headers = map[string]any{
 		"plugs": "what",
 	}
 	_, err = asserts.SuggestFormat(asserts.SnapDeclarationType, headers, nil)
 	c.Assert(err, ErrorMatches, `assertion snap-declaration: "plugs" header must be a map`)
 
-	headers = map[string]interface{}{
+	headers = map[string]any{
 		"slots": "what",
 	}
 	_, err = asserts.SuggestFormat(asserts.SnapDeclarationType, headers, nil)
@@ -653,11 +653,11 @@ func (sds *snapDeclSuite) TestSuggestedFormat(c *C) {
 	// plug-names/slot-names => format 4
 	for _, sidePrefix := range []string{"plug", "slot"} {
 		side := sidePrefix + "s"
-		headers := map[string]interface{}{
-			side: map[string]interface{}{
-				"interface3": map[string]interface{}{
-					"allow-installation": map[string]interface{}{
-						sidePrefix + "-names": []interface{}{"foo"},
+		headers := map[string]any{
+			side: map[string]any{
+				"interface3": map[string]any{
+					"allow-installation": map[string]any{
+						sidePrefix + "-names": []any{"foo"},
 					},
 				},
 			},
@@ -668,11 +668,11 @@ func (sds *snapDeclSuite) TestSuggestedFormat(c *C) {
 
 		for _, conn := range []string{"connection", "auto-connection"} {
 
-			headers = map[string]interface{}{
-				side: map[string]interface{}{
-					"interface3": map[string]interface{}{
-						"allow-" + conn: map[string]interface{}{
-							sidePrefix + "-names": []interface{}{"foo"},
+			headers = map[string]any{
+				side: map[string]any{
+					"interface3": map[string]any{
+						"allow-" + conn: map[string]any{
+							sidePrefix + "-names": []any{"foo"},
 						},
 					},
 				},
@@ -681,12 +681,12 @@ func (sds *snapDeclSuite) TestSuggestedFormat(c *C) {
 			c.Assert(err, IsNil)
 			c.Check(fmtnum, Equals, 4)
 
-			headers = map[string]interface{}{
-				side: map[string]interface{}{
-					"interface3": map[string]interface{}{
-						"allow-" + conn: map[string]interface{}{
-							"plug-names": []interface{}{"Pfoo"},
-							"slot-names": []interface{}{"Sfoo"},
+			headers = map[string]any{
+				side: map[string]any{
+					"interface3": map[string]any{
+						"allow-" + conn: map[string]any{
+							"plug-names": []any{"Pfoo"},
+							"slot-names": []any{"Sfoo"},
 						},
 					},
 				},
@@ -699,12 +699,12 @@ func (sds *snapDeclSuite) TestSuggestedFormat(c *C) {
 
 	// alt matcher (so far unused) => format 5
 	for _, sidePrefix := range []string{"plug", "slot"} {
-		headers = map[string]interface{}{
-			sidePrefix + "s": map[string]interface{}{
-				"interface5": map[string]interface{}{
-					"allow-auto-connection": map[string]interface{}{
-						sidePrefix + "-attributes": map[string]interface{}{
-							"x": []interface{}{"alt1", "alt2"}, // alt matcher
+		headers = map[string]any{
+			sidePrefix + "s": map[string]any{
+				"interface5": map[string]any{
+					"allow-auto-connection": map[string]any{
+						sidePrefix + "-attributes": map[string]any{
+							"x": []any{"alt1", "alt2"}, // alt matcher
 						},
 					},
 				},
@@ -714,10 +714,84 @@ func (sds *snapDeclSuite) TestSuggestedFormat(c *C) {
 		c.Assert(err, IsNil)
 		c.Check(fmtnum, Equals, 5)
 	}
+
+	for _, cstr := range []string{"$PLUG_PUBLISHER_ID", "$SLOT_PUBLISHER_ID"} {
+		for _, sidePrefix := range []string{"plug", "slot"} {
+			headers = map[string]any{
+				sidePrefix + "s": map[string]any{
+					"interface6": map[string]any{
+						"allow-auto-connection": map[string]any{
+							sidePrefix + "-attributes": map[string]any{
+								"x": cstr,
+							},
+						},
+					},
+				},
+			}
+
+			fmtnum, err = asserts.SuggestFormat(asserts.SnapDeclarationType, headers, nil)
+			c.Assert(err, IsNil)
+			c.Check(fmtnum, Equals, 6)
+		}
+	}
+
+	headers = map[string]any{
+		"plugs": map[string]any{
+			"interface7": map[string]any{
+				"allow-installation": map[string]any{
+					"on-classic": []any{"ubuntu"},
+				},
+			},
+		},
+	}
+	fmtnum, err = asserts.SuggestFormat(asserts.SnapDeclarationType, headers, nil)
+	c.Assert(err, IsNil)
+	c.Check(fmtnum, Equals, 1)
+
+	for _, sidePrefix := range []string{"plug", "slot"} {
+		headers = map[string]any{
+			sidePrefix + "s": map[string]any{
+				"interface7": map[string]any{
+					"allow-installation": map[string]any{
+						"on-classic": []any{"ubuntu/touch"},
+					},
+				},
+			},
+		}
+		fmtnum, err = asserts.SuggestFormat(asserts.SnapDeclarationType, headers, nil)
+		c.Assert(err, IsNil)
+		c.Check(fmtnum, Equals, 7)
+
+		headers = map[string]any{
+			sidePrefix + "s": map[string]any{
+				"interface7": map[string]any{
+					"allow-installation": map[string]any{
+						"on-classic": []any{"ubuntu/*"},
+					},
+				},
+			},
+		}
+		fmtnum, err = asserts.SuggestFormat(asserts.SnapDeclarationType, headers, nil)
+		c.Assert(err, IsNil)
+		c.Check(fmtnum, Equals, 7)
+
+		headers = map[string]any{
+			sidePrefix + "s": map[string]any{
+				"interface7": map[string]any{
+					"allow-auto-connection": map[string]any{
+						"on-classic": []any{"ubuntu/"},
+					},
+				},
+			},
+		}
+		fmtnum, err = asserts.SuggestFormat(asserts.SnapDeclarationType, headers, nil)
+		c.Assert(err, IsNil)
+		c.Check(fmtnum, Equals, 7)
+	}
 }
 
 func prereqDevAccount(c *C, storeDB assertstest.SignerDB, db *asserts.Database) {
-	dev1Acct := assertstest.NewAccount(storeDB, "developer1", map[string]interface{}{
+	dev1Acct := assertstest.NewAccount(storeDB, "developer1", map[string]any{
 		"account-id": "dev-id1",
 	}, "")
 	err := db.Add(dev1Acct)
@@ -729,7 +803,7 @@ func (sds *snapDeclSuite) TestSnapDeclarationCheck(c *C) {
 
 	prereqDevAccount(c, storeDB, db)
 
-	headers := map[string]interface{}{
+	headers := map[string]any{
 		"series":       "16",
 		"snap-id":      "snap-id-1",
 		"snap-name":    "foo",
@@ -748,7 +822,7 @@ func (sds *snapDeclSuite) TestSnapDeclarationCheckUntrustedAuthority(c *C) {
 
 	otherDB := setup3rdPartySigning(c, "other", storeDB, db)
 
-	headers := map[string]interface{}{
+	headers := map[string]any{
 		"series":       "16",
 		"snap-id":      "snap-id-1",
 		"snap-name":    "foo",
@@ -765,7 +839,7 @@ func (sds *snapDeclSuite) TestSnapDeclarationCheckUntrustedAuthority(c *C) {
 func (sds *snapDeclSuite) TestSnapDeclarationCheckMissingPublisherAccount(c *C) {
 	storeDB, db := makeStoreAndCheckDB(c)
 
-	headers := map[string]interface{}{
+	headers := map[string]any{
 		"series":       "16",
 		"snap-id":      "snap-id-1",
 		"snap-name":    "foo",
@@ -833,6 +907,7 @@ func (sbs *snapBuildSuite) SetUpSuite(c *C) {
 
 const (
 	blobSHA3_384 = "QlqR0uAWEAWF5Nwnzj5kqmmwFslYPu1IL16MKtLKhwhv0kpBv5wKZ_axf_nf_2cL"
+	hexSHA256    = "e2926364a8b1242d92fb1b56081e1ddb86eba35411961252a103a1c083c2be6d"
 )
 
 func (sbs *snapBuildSuite) TestDecodeOK(c *C) {
@@ -926,7 +1001,7 @@ func makeStoreAndCheckDB(c *C) (store *assertstest.StoreStack, checkDB *asserts.
 func setup3rdPartySigning(c *C, username string, storeDB assertstest.SignerDB, checkDB *asserts.Database) (signingDB *assertstest.SigningDB) {
 	privKey := testPrivKey2
 
-	acct := assertstest.NewAccount(storeDB, username, map[string]interface{}{
+	acct := assertstest.NewAccount(storeDB, username, map[string]any{
 		"account-id": username,
 	}, "")
 	accKey := assertstest.NewAccountKey(storeDB, acct, nil, privKey.PublicKey(), "")
@@ -943,7 +1018,7 @@ func (sbs *snapBuildSuite) TestSnapBuildCheck(c *C) {
 	storeDB, db := makeStoreAndCheckDB(c)
 	devDB := setup3rdPartySigning(c, "devel1", storeDB, db)
 
-	headers := map[string]interface{}{
+	headers := map[string]any{
 		"authority-id":  "devel1",
 		"snap-sha3-384": blobSHA3_384,
 		"snap-id":       "snap-id-1",
@@ -962,7 +1037,7 @@ func (sbs *snapBuildSuite) TestSnapBuildCheckInconsistentTimestamp(c *C) {
 	storeDB, db := makeStoreAndCheckDB(c)
 	devDB := setup3rdPartySigning(c, "devel1", storeDB, db)
 
-	headers := map[string]interface{}{
+	headers := map[string]any{
 		"snap-sha3-384": blobSHA3_384,
 		"snap-id":       "snap-id-1",
 		"grade":         "devel",
@@ -1003,15 +1078,23 @@ func (srs *snapRevSuite) makeValidEncoded() string {
 }
 
 func (srs *snapRevSuite) makeValidEncodedWithIntegrity() string {
+	integrityData := "integrity:\n" +
+		"  -\n" +
+		"    type: dm-verity\n" +
+		"    digest: " + hexSHA256 + "\n" +
+		"    version: 1\n" +
+		"    hash-algorithm: sha256\n" +
+		"    data-block-size: 4096\n" +
+		"    hash-block-size: 4096\n" +
+		"    salt: " + hexSHA256 + "\n"
+
 	return "type: snap-revision\n" +
 		"authority-id: store-id1\n" +
 		"snap-sha3-384: " + blobSHA3_384 + "\n" +
 		"snap-id: snap-id-1\n" +
 		"snap-size: 123\n" +
 		"snap-revision: 1\n" +
-		"integrity:\n" +
-		"  sha3-384: " + blobSHA3_384 + "\n" +
-		"  size: 128\n" +
+		integrityData +
 		"developer-id: dev-id1\n" +
 		"revision: 1\n" +
 		srs.tsLine +
@@ -1021,8 +1104,8 @@ func (srs *snapRevSuite) makeValidEncodedWithIntegrity() string {
 		"AXNpZw=="
 }
 
-func makeSnapRevisionHeaders(overrides map[string]interface{}) map[string]interface{} {
-	headers := map[string]interface{}{
+func makeSnapRevisionHeaders(overrides map[string]any) map[string]any {
+	headers := map[string]any{
 		"authority-id":  "canonical",
 		"snap-sha3-384": blobSHA3_384,
 		"snap-id":       "snap-id-1",
@@ -1038,7 +1121,7 @@ func makeSnapRevisionHeaders(overrides map[string]interface{}) map[string]interf
 	return headers
 }
 
-func (srs *snapRevSuite) makeHeaders(overrides map[string]interface{}) map[string]interface{} {
+func (srs *snapRevSuite) makeHeaders(overrides map[string]any) map[string]any {
 	return makeSnapRevisionHeaders(overrides)
 }
 
@@ -1092,8 +1175,13 @@ func (srs *snapRevSuite) TestDecodeOKWithIntegrity(c *C) {
 	c.Check(snapRev.DeveloperID(), Equals, "dev-id1")
 	c.Check(snapRev.Revision(), Equals, 1)
 	c.Check(snapRev.Provenance(), Equals, "global-upload")
-	c.Check(snapRev.SnapIntegrity().SHA3_384, Equals, blobSHA3_384)
-	c.Check(snapRev.SnapIntegrity().Size, Equals, uint64(128))
+	c.Check(snapRev.SnapIntegrityData()[0].Type, Equals, "dm-verity")
+	c.Check(snapRev.SnapIntegrityData()[0].Version, Equals, uint(1))
+	c.Check(snapRev.SnapIntegrityData()[0].HashAlg, Equals, "sha256")
+	c.Check(snapRev.SnapIntegrityData()[0].DataBlockSize, Equals, uint(4096))
+	c.Check(snapRev.SnapIntegrityData()[0].HashBlockSize, Equals, uint(4096))
+	c.Check(snapRev.SnapIntegrityData()[0].Digest, Equals, hexSHA256)
+	c.Check(snapRev.SnapIntegrityData()[0].Salt, Equals, hexSHA256)
 }
 
 const (
@@ -1140,22 +1228,49 @@ func (srs *snapRevSuite) TestDecodeInvalidWithIntegrity(c *C) {
 	encoded := srs.makeValidEncodedWithIntegrity()
 
 	integrityHdr := "integrity:\n" +
-		"  sha3-384: " + blobSHA3_384 + "\n" +
-		"  size: 128\n"
+		"  -\n" +
+		"    type: dm-verity\n" +
+		"    digest: " + hexSHA256 + "\n" +
+		"    version: 1\n" +
+		"    hash-algorithm: sha256\n" +
+		"    data-block-size: 4096\n" +
+		"    hash-block-size: 4096\n" +
+		"    salt: " + hexSHA256 + "\n"
 
-	integrityShaHdr := "  sha3-384: " + blobSHA3_384 + "\n"
+	integrityTypeHdr := "    type: dm-verity\n"
+	integrityVersionHdr := "    version: 1\n"
+	integrityHashAlgHdr := "    hash-algorithm: sha256\n"
+	integrityDataBlockSizeHdr := "    data-block-size: 4096\n"
+	integrityHashBlockSizeHdr := "    hash-block-size: 4096\n"
+	integrityDigestHdr := "    digest: " + hexSHA256 + "\n"
+	integritySaltHdr := "    salt: " + hexSHA256 + "\n"
 
-	integritySizeHdr := "  size: 128\n"
-
-	invalidTests := []struct{ original, invalid, expectedErr string }{
-		{integrityHdr, "integrity: \n", `"integrity" header must be a map`},
-		{integrityShaHdr, "  sha3-384: \n", `"sha3-384" of integrity header should not be empty`},
-		{integrityShaHdr, "  sha3-384: #\n", `"sha3-384" of integrity header cannot be decoded:.*`},
-		{integrityShaHdr, "  sha3-384: eHl6\n", `"sha3-384" of integrity header does not have the expected bit length: 24`},
-		{integritySizeHdr, "", `"size" of integrity header is mandatory`},
-		{integritySizeHdr, "  size: \n", `"size" of integrity header should not be empty`},
-		{integritySizeHdr, "  size: -1\n", `"size" of integrity header is not an unsigned integer: -1`},
-		{integritySizeHdr, "  size: zzz\n", `"size" of integrity header is not an unsigned integer: zzz`},
+	invalidTests := []struct {
+		original,
+		invalid,
+		expectedErr string
+	}{
+		{integrityHdr, "integrity: test\n", `"integrity" header must contain a list of integrity data`},
+		{integrityTypeHdr, "", `"type" of integrity data \[0\] is mandatory`},
+		{integrityTypeHdr, "    type: foo\n", `"type" of integrity data \[0\] must be one of \(dm-verity\)`},
+		{integrityVersionHdr, "", `"version" of integrity data \[0\] of type "dm-verity" is mandatory`},
+		{integrityVersionHdr, "    version: a\n", `"version" of integrity data \[0\] of type "dm-verity" is not an unsigned integer: a`},
+		{integrityVersionHdr, "    version: 2\n", `version of integrity data \[0\] of type "dm-verity" must be one of ` + regexp.QuoteMeta("[1]")},
+		{integrityHashAlgHdr, "", `"hash-algorithm" of integrity data \[0\] of type "dm-verity" is mandatory`},
+		{integrityHashAlgHdr, "    hash-algorithm: 0\n", `hash algorithm of integrity data \[0\] of type "dm-verity" must be one of .*`},
+		{integrityHashAlgHdr, "    hash-algorithm: a\n", `hash algorithm of integrity data \[0\] of type "dm-verity" must be one of .*`},
+		{integrityHashAlgHdr, "    hash-algorithm: sha384\n", `hash algorithm of integrity data \[0\] of type "dm-verity" must be one of .*`},
+		{integrityHashAlgHdr, "    hash-algorithm: sm3\n", `hash algorithm of integrity data \[0\] of type "dm-verity" must be one of .*`},
+		{integrityDataBlockSizeHdr, "", `"data-block-size" of integrity data \[0\] of type "dm-verity" \(sha256\) is mandatory`},
+		{integrityDataBlockSizeHdr, "    data-block-size: a\n", `"data-block-size" of integrity data \[0\] of type "dm-verity" \(sha256\) is not an unsigned integer: a`},
+		{integrityHashBlockSizeHdr, "", `"hash-block-size" of integrity data \[0\] of type "dm-verity" \(sha256\) is mandatory`},
+		{integrityHashBlockSizeHdr, "    hash-block-size: a\n", `"hash-block-size" of integrity data \[0\] of type "dm-verity" \(sha256\) is not an unsigned integer: a`},
+		{integrityDigestHdr, "", `"digest" of integrity data \[0\] of type "dm-verity" \(sha256\) is mandatory`},
+		{integrityDigestHdr, "    digest: a\n", `"digest" of integrity data \[0\] of type "dm-verity" \(sha256\) cannot be decoded: encoding/hex: odd length hex string`},
+		{integrityDigestHdr, "    digest: ab\n", `"digest" of integrity data \[0\] of type "dm-verity" \(sha256\) does not have the expected bit length: 8`},
+		{integritySaltHdr, "", `"salt" of integrity data \[0\] of type "dm-verity" \(sha256\) is mandatory`},
+		{integritySaltHdr, "    salt: a\n", `"salt" of integrity data \[0\] of type "dm-verity" \(sha256\) cannot be decoded: encoding/hex: odd length hex string`},
+		{integritySaltHdr, "    salt: ab\n", `"salt" of integrity data \[0\] of type "dm-verity" \(sha256\) does not have the expected bit length: 8`},
 	}
 
 	for _, test := range invalidTests {
@@ -1166,7 +1281,7 @@ func (srs *snapRevSuite) TestDecodeInvalidWithIntegrity(c *C) {
 }
 
 func prereqSnapDecl(c *C, storeDB assertstest.SignerDB, db *asserts.Database) {
-	snapDecl, err := storeDB.Sign(asserts.SnapDeclarationType, map[string]interface{}{
+	snapDecl, err := storeDB.Sign(asserts.SnapDeclarationType, map[string]any{
 		"series":       "16",
 		"snap-id":      "snap-id-1",
 		"snap-name":    "foo",
@@ -1195,7 +1310,7 @@ func (srs *snapRevSuite) TestSnapRevisionCheck(c *C) {
 func (srs *snapRevSuite) TestSnapRevisionCheckInconsistentTimestamp(c *C) {
 	storeDB, db := makeStoreAndCheckDB(c)
 
-	headers := srs.makeHeaders(map[string]interface{}{
+	headers := srs.makeHeaders(map[string]any{
 		"timestamp": "2013-01-01T14:00:00Z",
 	})
 	snapRev, err := storeDB.Sign(asserts.SnapRevisionType, headers, nil, "")
@@ -1210,7 +1325,7 @@ func (srs *snapRevSuite) TestSnapRevisionCheckUntrustedAuthority(c *C) {
 
 	otherDB := setup3rdPartySigning(c, "other", storeDB, db)
 
-	headers := srs.makeHeaders(map[string]interface{}{
+	headers := srs.makeHeaders(map[string]any{
 		"authority-id": "other",
 	})
 	snapRev, err := otherDB.Sign(asserts.SnapRevisionType, headers, nil, "")
@@ -1248,7 +1363,7 @@ func (srs *snapRevSuite) TestRevisionAuthorityCheck(c *C) {
 	storeDB, db := makeStoreAndCheckDB(c)
 
 	delegatedDB := setup3rdPartySigning(c, "delegated-id", storeDB, db)
-	headers := srs.makeHeaders(map[string]interface{}{
+	headers := srs.makeHeaders(map[string]any{
 		"authority-id":  "delegated-id",
 		"developer-id":  "delegated-id",
 		"snap-revision": "200",
@@ -1343,7 +1458,7 @@ AXNpZw==`))
 	storeDB, db := makeStoreAndCheckDB(c)
 
 	delegatedDB := setup3rdPartySigning(c, "my-brand", storeDB, db)
-	headers := srs.makeHeaders(map[string]interface{}{
+	headers := srs.makeHeaders(map[string]any{
 		"authority-id":  "my-brand",
 		"developer-id":  "my-brand",
 		"snap-revision": "200",
@@ -1428,7 +1543,7 @@ func (srs *snapRevSuite) TestSnapRevisionDelegation(c *C) {
 
 	delegatedDB := setup3rdPartySigning(c, "delegated-id", storeDB, db)
 
-	snapDecl, err := storeDB.Sign(asserts.SnapDeclarationType, map[string]interface{}{
+	snapDecl, err := storeDB.Sign(asserts.SnapDeclarationType, map[string]any{
 		"series":       "16",
 		"snap-id":      "snap-id-1",
 		"snap-name":    "foo",
@@ -1439,7 +1554,7 @@ func (srs *snapRevSuite) TestSnapRevisionDelegation(c *C) {
 	err = db.Add(snapDecl)
 	c.Assert(err, IsNil)
 
-	headers := srs.makeHeaders(map[string]interface{}{
+	headers := srs.makeHeaders(map[string]any{
 		"authority-id": "delegated-id",
 		"developer-id": "delegated-id",
 		"provenance":   "prov1",
@@ -1451,20 +1566,20 @@ func (srs *snapRevSuite) TestSnapRevisionDelegation(c *C) {
 	c.Check(err, ErrorMatches, `snap-revision assertion with provenance "prov1" for snap id "snap-id-1" is not signed by an authorized authority: delegated-id`)
 
 	// establish delegation
-	snapDecl, err = storeDB.Sign(asserts.SnapDeclarationType, map[string]interface{}{
+	snapDecl, err = storeDB.Sign(asserts.SnapDeclarationType, map[string]any{
 		"series":       "16",
 		"snap-id":      "snap-id-1",
 		"snap-name":    "foo",
 		"publisher-id": "delegated-id",
 		"revision":     "1",
-		"revision-authority": []interface{}{
-			map[string]interface{}{
+		"revision-authority": []any{
+			map[string]any{
 				"account-id": "delegated-id",
-				"provenance": []interface{}{
+				"provenance": []any{
 					"prov1",
 				},
 				// present but not checked at this level
-				"on-store": []interface{}{
+				"on-store": []any{
 					"store1",
 				},
 			},
@@ -1486,19 +1601,19 @@ func (srs *snapRevSuite) TestSnapRevisionDelegationRevisionOutOfRange(c *C) {
 	delegatedDB := setup3rdPartySigning(c, "delegated-id", storeDB, db)
 
 	// establish delegation
-	snapDecl, err := storeDB.Sign(asserts.SnapDeclarationType, map[string]interface{}{
+	snapDecl, err := storeDB.Sign(asserts.SnapDeclarationType, map[string]any{
 		"series":       "16",
 		"snap-id":      "snap-id-1",
 		"snap-name":    "foo",
 		"publisher-id": "delegated-id",
-		"revision-authority": []interface{}{
-			map[string]interface{}{
+		"revision-authority": []any{
+			map[string]any{
 				"account-id": "delegated-id",
-				"provenance": []interface{}{
+				"provenance": []any{
 					"prov1",
 				},
 				// present but not checked at this level
-				"on-store": []interface{}{
+				"on-store": []any{
 					"store1",
 				},
 				"max-revision": "200",
@@ -1510,7 +1625,7 @@ func (srs *snapRevSuite) TestSnapRevisionDelegationRevisionOutOfRange(c *C) {
 	err = db.Add(snapDecl)
 	c.Assert(err, IsNil)
 
-	headers := srs.makeHeaders(map[string]interface{}{
+	headers := srs.makeHeaders(map[string]any{
 		"authority-id":  "delegated-id",
 		"developer-id":  "delegated-id",
 		"provenance":    "prov1",
@@ -1582,8 +1697,8 @@ func (vs *validationSuite) makeValidEncoded() string {
 		"AXNpZw=="
 }
 
-func (vs *validationSuite) makeHeaders(overrides map[string]interface{}) map[string]interface{} {
-	headers := map[string]interface{}{
+func (vs *validationSuite) makeHeaders(overrides map[string]any) map[string]any {
+	headers := map[string]any{
 		"authority-id":           "dev-id1",
 		"series":                 "16",
 		"snap-id":                "snap-id-1",
@@ -1645,7 +1760,7 @@ func (vs *validationSuite) TestDecodeInvalid(c *C) {
 }
 
 func prereqSnapDecl2(c *C, storeDB assertstest.SignerDB, db *asserts.Database) {
-	snapDecl, err := storeDB.Sign(asserts.SnapDeclarationType, map[string]interface{}{
+	snapDecl, err := storeDB.Sign(asserts.SnapDeclarationType, map[string]any{
 		"series":       "16",
 		"snap-id":      "snap-id-2",
 		"snap-name":    "bar",
@@ -1679,7 +1794,7 @@ func (vs *validationSuite) TestValidationCheckWrongAuthority(c *C) {
 	prereqSnapDecl(c, storeDB, db)
 	prereqSnapDecl2(c, storeDB, db)
 
-	headers := vs.makeHeaders(map[string]interface{}{
+	headers := vs.makeHeaders(map[string]any{
 		"authority-id": "canonical", // not the publisher
 	})
 	validation, err := storeDB.Sign(asserts.ValidationType, headers, nil, "")
@@ -1785,262 +1900,6 @@ func (vs *validationSuite) TestPrerequisites(c *C) {
 		Type:       asserts.SnapDeclarationType,
 		PrimaryKey: []string{"16", "snap-id-2"},
 	})
-}
-
-type baseDeclSuite struct{}
-
-func (s *baseDeclSuite) TestDecodeOK(c *C) {
-	encoded := `type: base-declaration
-authority-id: canonical
-series: 16
-plugs:
-  interface1:
-    deny-installation: false
-    allow-auto-connection:
-      slot-snap-type:
-        - app
-      slot-publisher-id:
-        - acme
-      slot-attributes:
-        a1: /foo/.*
-      plug-attributes:
-        b1: B1
-    deny-auto-connection:
-      slot-attributes:
-        a1: !A1
-      plug-attributes:
-        b1: !B1
-  interface2:
-    allow-installation: true
-    allow-connection:
-      plug-attributes:
-        a2: A2
-      slot-attributes:
-        b2: B2
-    deny-connection:
-      slot-snap-id:
-        - snapidsnapidsnapidsnapidsnapid01
-        - snapidsnapidsnapidsnapidsnapid02
-      plug-attributes:
-        a2: !A2
-      slot-attributes:
-        b2: !B2
-slots:
-  interface3:
-    deny-installation: false
-    allow-auto-connection:
-      plug-snap-type:
-        - app
-      plug-publisher-id:
-        - acme
-      slot-attributes:
-        c1: /foo/.*
-      plug-attributes:
-        d1: C1
-    deny-auto-connection:
-      slot-attributes:
-        c1: !C1
-      plug-attributes:
-        d1: !D1
-  interface4:
-    allow-connection:
-      plug-attributes:
-        c2: C2
-      slot-attributes:
-        d2: D2
-    deny-connection:
-      plug-snap-id:
-        - snapidsnapidsnapidsnapidsnapid01
-        - snapidsnapidsnapidsnapidsnapid02
-      plug-attributes:
-        c2: !D2
-      slot-attributes:
-        d2: !D2
-    allow-installation:
-      slot-snap-type:
-        - app
-      slot-attributes:
-        e1: E1
-timestamp: 2016-09-29T19:50:49Z
-sign-key-sha3-384: Jv8_JiHiIzJVcO9M55pPdqSDWUvuhfDIBJUS-3VW7F_idjix7Ffn5qMxB21ZQuij
-
-AXNpZw==`
-	a, err := asserts.Decode([]byte(encoded))
-	c.Assert(err, IsNil)
-	baseDecl := a.(*asserts.BaseDeclaration)
-	c.Check(baseDecl.Series(), Equals, "16")
-	ts, err := time.Parse(time.RFC3339, "2016-09-29T19:50:49Z")
-	c.Assert(err, IsNil)
-	c.Check(baseDecl.Timestamp().Equal(ts), Equals, true)
-
-	c.Check(baseDecl.PlugRule("interfaceX"), IsNil)
-	c.Check(baseDecl.SlotRule("interfaceX"), IsNil)
-
-	plug := emptyAttrerObject{}
-	slot := emptyAttrerObject{}
-
-	plugRule1 := baseDecl.PlugRule("interface1")
-	c.Assert(plugRule1, NotNil)
-	c.Assert(plugRule1.DenyInstallation, HasLen, 1)
-	c.Check(plugRule1.DenyInstallation[0].PlugAttributes, Equals, asserts.NeverMatchAttributes)
-	c.Assert(plugRule1.AllowAutoConnection, HasLen, 1)
-	c.Check(plugRule1.AllowAutoConnection[0].SlotAttributes.Check(slot, nil), ErrorMatches, `attribute "a1".*`)
-	c.Check(plugRule1.AllowAutoConnection[0].PlugAttributes.Check(plug, nil), ErrorMatches, `attribute "b1".*`)
-	c.Check(plugRule1.AllowAutoConnection[0].SlotSnapTypes, DeepEquals, []string{"app"})
-	c.Check(plugRule1.AllowAutoConnection[0].SlotPublisherIDs, DeepEquals, []string{"acme"})
-	c.Assert(plugRule1.DenyAutoConnection, HasLen, 1)
-	c.Check(plugRule1.DenyAutoConnection[0].SlotAttributes.Check(slot, nil), ErrorMatches, `attribute "a1".*`)
-	c.Check(plugRule1.DenyAutoConnection[0].PlugAttributes.Check(plug, nil), ErrorMatches, `attribute "b1".*`)
-	plugRule2 := baseDecl.PlugRule("interface2")
-	c.Assert(plugRule2, NotNil)
-	c.Assert(plugRule2.AllowInstallation, HasLen, 1)
-	c.Check(plugRule2.AllowInstallation[0].PlugAttributes, Equals, asserts.AlwaysMatchAttributes)
-	c.Assert(plugRule2.AllowConnection, HasLen, 1)
-	c.Check(plugRule2.AllowConnection[0].PlugAttributes.Check(plug, nil), ErrorMatches, `attribute "a2".*`)
-	c.Check(plugRule2.AllowConnection[0].SlotAttributes.Check(slot, nil), ErrorMatches, `attribute "b2".*`)
-	c.Assert(plugRule2.DenyConnection, HasLen, 1)
-	c.Check(plugRule2.DenyConnection[0].PlugAttributes.Check(plug, nil), ErrorMatches, `attribute "a2".*`)
-	c.Check(plugRule2.DenyConnection[0].SlotAttributes.Check(slot, nil), ErrorMatches, `attribute "b2".*`)
-	c.Check(plugRule2.DenyConnection[0].SlotSnapIDs, DeepEquals, []string{"snapidsnapidsnapidsnapidsnapid01", "snapidsnapidsnapidsnapidsnapid02"})
-
-	slotRule3 := baseDecl.SlotRule("interface3")
-	c.Assert(slotRule3, NotNil)
-	c.Assert(slotRule3.DenyInstallation, HasLen, 1)
-	c.Check(slotRule3.DenyInstallation[0].SlotAttributes, Equals, asserts.NeverMatchAttributes)
-	c.Assert(slotRule3.AllowAutoConnection, HasLen, 1)
-	c.Check(slotRule3.AllowAutoConnection[0].SlotAttributes.Check(slot, nil), ErrorMatches, `attribute "c1".*`)
-	c.Check(slotRule3.AllowAutoConnection[0].PlugAttributes.Check(plug, nil), ErrorMatches, `attribute "d1".*`)
-	c.Check(slotRule3.AllowAutoConnection[0].PlugSnapTypes, DeepEquals, []string{"app"})
-	c.Check(slotRule3.AllowAutoConnection[0].PlugPublisherIDs, DeepEquals, []string{"acme"})
-	c.Assert(slotRule3.DenyAutoConnection, HasLen, 1)
-	c.Check(slotRule3.DenyAutoConnection[0].SlotAttributes.Check(slot, nil), ErrorMatches, `attribute "c1".*`)
-	c.Check(slotRule3.DenyAutoConnection[0].PlugAttributes.Check(plug, nil), ErrorMatches, `attribute "d1".*`)
-	slotRule4 := baseDecl.SlotRule("interface4")
-	c.Assert(slotRule4, NotNil)
-	c.Assert(slotRule4.AllowConnection, HasLen, 1)
-	c.Check(slotRule4.AllowConnection[0].PlugAttributes.Check(plug, nil), ErrorMatches, `attribute "c2".*`)
-	c.Check(slotRule4.AllowConnection[0].SlotAttributes.Check(slot, nil), ErrorMatches, `attribute "d2".*`)
-	c.Assert(slotRule4.DenyConnection, HasLen, 1)
-	c.Check(slotRule4.DenyConnection[0].PlugAttributes.Check(plug, nil), ErrorMatches, `attribute "c2".*`)
-	c.Check(slotRule4.DenyConnection[0].SlotAttributes.Check(slot, nil), ErrorMatches, `attribute "d2".*`)
-	c.Check(slotRule4.DenyConnection[0].PlugSnapIDs, DeepEquals, []string{"snapidsnapidsnapidsnapidsnapid01", "snapidsnapidsnapidsnapidsnapid02"})
-	c.Assert(slotRule4.AllowInstallation, HasLen, 1)
-	c.Check(slotRule4.AllowInstallation[0].SlotAttributes.Check(slot, nil), ErrorMatches, `attribute "e1".*`)
-	c.Check(slotRule4.AllowInstallation[0].SlotSnapTypes, DeepEquals, []string{"app"})
-
-}
-
-func (s *baseDeclSuite) TestBaseDeclarationCheckUntrustedAuthority(c *C) {
-	storeDB, db := makeStoreAndCheckDB(c)
-
-	otherDB := setup3rdPartySigning(c, "other", storeDB, db)
-
-	headers := map[string]interface{}{
-		"series":    "16",
-		"timestamp": time.Now().Format(time.RFC3339),
-	}
-	baseDecl, err := otherDB.Sign(asserts.BaseDeclarationType, headers, nil, "")
-	c.Assert(err, IsNil)
-
-	err = db.Check(baseDecl)
-	c.Assert(err, ErrorMatches, `base-declaration assertion for series 16 is not signed by a directly trusted authority: other`)
-}
-
-const (
-	baseDeclErrPrefix = "assertion base-declaration: "
-)
-
-func (s *baseDeclSuite) TestDecodeInvalid(c *C) {
-	tsLine := "timestamp: 2016-09-29T19:50:49Z\n"
-
-	encoded := "type: base-declaration\n" +
-		"authority-id: canonical\n" +
-		"series: 16\n" +
-		"plugs:\n  interface1: true\n" +
-		"slots:\n  interface2: true\n" +
-		tsLine +
-		"sign-key-sha3-384: Jv8_JiHiIzJVcO9M55pPdqSDWUvuhfDIBJUS-3VW7F_idjix7Ffn5qMxB21ZQuij" +
-		"\n\n" +
-		"AXNpZw=="
-
-	invalidTests := []struct{ original, invalid, expectedErr string }{
-		{"series: 16\n", "", `"series" header is mandatory`},
-		{"series: 16\n", "series: \n", `"series" header should not be empty`},
-		{"plugs:\n  interface1: true\n", "plugs: \n", `"plugs" header must be a map`},
-		{"plugs:\n  interface1: true\n", "plugs:\n  intf1:\n    foo: bar\n", `plug rule for interface "intf1" must specify at least one of.*`},
-		{"slots:\n  interface2: true\n", "slots: \n", `"slots" header must be a map`},
-		{"slots:\n  interface2: true\n", "slots:\n  intf1:\n    foo: bar\n", `slot rule for interface "intf1" must specify at least one of.*`},
-		{tsLine, "", `"timestamp" header is mandatory`},
-		{tsLine, "timestamp: 12:30\n", `"timestamp" header is not a RFC3339 date: .*`},
-	}
-
-	for _, test := range invalidTests {
-		invalid := strings.Replace(encoded, test.original, test.invalid, 1)
-		_, err := asserts.Decode([]byte(invalid))
-		c.Check(err, ErrorMatches, baseDeclErrPrefix+test.expectedErr)
-	}
-
-}
-
-func (s *baseDeclSuite) TestBuiltin(c *C) {
-	baseDecl := asserts.BuiltinBaseDeclaration()
-	c.Check(baseDecl, IsNil)
-
-	defer asserts.InitBuiltinBaseDeclaration(nil)
-
-	const headers = `
-type: base-declaration
-authority-id: canonical
-series: 16
-revision: 0
-plugs:
-  network: true
-slots:
-  network:
-    allow-installation:
-      slot-snap-type:
-        - core
-`
-
-	err := asserts.InitBuiltinBaseDeclaration([]byte(headers))
-	c.Assert(err, IsNil)
-
-	baseDecl = asserts.BuiltinBaseDeclaration()
-	c.Assert(baseDecl, NotNil)
-
-	cont, _ := baseDecl.Signature()
-	c.Check(string(cont), Equals, strings.TrimSpace(headers))
-
-	c.Check(baseDecl.AuthorityID(), Equals, "canonical")
-	c.Check(baseDecl.Series(), Equals, "16")
-	c.Check(baseDecl.PlugRule("network").AllowAutoConnection[0].SlotAttributes, Equals, asserts.AlwaysMatchAttributes)
-	c.Check(baseDecl.SlotRule("network").AllowInstallation[0].SlotSnapTypes, DeepEquals, []string{"core"})
-
-	enc := asserts.Encode(baseDecl)
-	// it's expected that it cannot be decoded
-	_, err = asserts.Decode(enc)
-	c.Check(err, NotNil)
-}
-
-func (s *baseDeclSuite) TestBuiltinInitErrors(c *C) {
-	defer asserts.InitBuiltinBaseDeclaration(nil)
-
-	tests := []struct {
-		headers string
-		err     string
-	}{
-		{"", `header entry missing ':' separator: ""`},
-		{"type: foo\n", `the builtin base-declaration "type" header is not set to expected value "base-declaration"`},
-		{"type: base-declaration", `the builtin base-declaration "authority-id" header is not set to expected value "canonical"`},
-		{"type: base-declaration\nauthority-id: canonical", `the builtin base-declaration "series" header is not set to expected value "16"`},
-		{"type: base-declaration\nauthority-id: canonical\nseries: 16\nrevision: zzz", `cannot assemble the builtin-base declaration: "revision" header is not an integer: zzz`},
-		{"type: base-declaration\nauthority-id: canonical\nseries: 16\nplugs: foo", `cannot assemble the builtin base-declaration: "plugs" header must be a map`},
-	}
-
-	for _, t := range tests {
-		err := asserts.InitBuiltinBaseDeclaration([]byte(t.headers))
-		c.Check(err, ErrorMatches, t.err, Commentf(t.headers))
-	}
 }
 
 type snapDevSuite struct {
@@ -2181,7 +2040,7 @@ func (sds *snapDevSuite) TestAuthorityIsPublisher(c *C) {
 	storeDB, db := makeStoreAndCheckDB(c)
 	devDB := setup3rdPartySigning(c, "dev-id1", storeDB, db)
 
-	snapDecl, err := storeDB.Sign(asserts.SnapDeclarationType, map[string]interface{}{
+	snapDecl, err := storeDB.Sign(asserts.SnapDeclarationType, map[string]any{
 		"series":       "16",
 		"snap-id":      "snap-id-1",
 		"snap-name":    "snap-name-1",
@@ -2192,7 +2051,7 @@ func (sds *snapDevSuite) TestAuthorityIsPublisher(c *C) {
 	err = db.Add(snapDecl)
 	c.Assert(err, IsNil)
 
-	snapDev, err := devDB.Sign(asserts.SnapDeveloperType, map[string]interface{}{
+	snapDev, err := devDB.Sign(asserts.SnapDeveloperType, map[string]any{
 		"snap-id":      "snap-id-1",
 		"publisher-id": "dev-id1",
 	}, nil, "")
@@ -2209,7 +2068,7 @@ func (sds *snapDevSuite) TestAuthorityIsNotPublisher(c *C) {
 	storeDB, db := makeStoreAndCheckDB(c)
 	devDB := setup3rdPartySigning(c, "dev-id1", storeDB, db)
 
-	snapDecl, err := storeDB.Sign(asserts.SnapDeclarationType, map[string]interface{}{
+	snapDecl, err := storeDB.Sign(asserts.SnapDeclarationType, map[string]any{
 		"series":       "16",
 		"snap-id":      "snap-id-1",
 		"snap-name":    "snap-name-1",
@@ -2220,7 +2079,7 @@ func (sds *snapDevSuite) TestAuthorityIsNotPublisher(c *C) {
 	err = db.Add(snapDecl)
 	c.Assert(err, IsNil)
 
-	snapDev, err := devDB.Sign(asserts.SnapDeveloperType, map[string]interface{}{
+	snapDev, err := devDB.Sign(asserts.SnapDeveloperType, map[string]any{
 		"authority-id": "dev-id1",
 		"snap-id":      "snap-id-1",
 		"publisher-id": "dev-id2",
@@ -2237,7 +2096,7 @@ func (sds *snapDevSuite) TestAuthorityIsNotPublisher(c *C) {
 func (sds *snapDevSuite) TestAuthorityIsNotPublisherButIsTrusted(c *C) {
 	storeDB, db := makeStoreAndCheckDB(c)
 
-	account, err := storeDB.Sign(asserts.AccountType, map[string]interface{}{
+	account, err := storeDB.Sign(asserts.AccountType, map[string]any{
 		"account-id":   "dev-id1",
 		"display-name": "dev-id1",
 		"validation":   "unknown",
@@ -2247,7 +2106,7 @@ func (sds *snapDevSuite) TestAuthorityIsNotPublisherButIsTrusted(c *C) {
 	err = db.Add(account)
 	c.Assert(err, IsNil)
 
-	snapDecl, err := storeDB.Sign(asserts.SnapDeclarationType, map[string]interface{}{
+	snapDecl, err := storeDB.Sign(asserts.SnapDeclarationType, map[string]any{
 		"series":       "16",
 		"snap-id":      "snap-id-1",
 		"snap-name":    "snap-name-1",
@@ -2258,7 +2117,7 @@ func (sds *snapDevSuite) TestAuthorityIsNotPublisherButIsTrusted(c *C) {
 	err = db.Add(snapDecl)
 	c.Assert(err, IsNil)
 
-	snapDev, err := storeDB.Sign(asserts.SnapDeveloperType, map[string]interface{}{
+	snapDev, err := storeDB.Sign(asserts.SnapDeveloperType, map[string]any{
 		"snap-id":      "snap-id-1",
 		"publisher-id": "dev-id1",
 	}, nil, "")
@@ -2274,7 +2133,7 @@ func (sds *snapDevSuite) TestAuthorityIsNotPublisherButIsTrusted(c *C) {
 func (sds *snapDevSuite) TestCheckNewPublisherAccountExists(c *C) {
 	storeDB, db := makeStoreAndCheckDB(c)
 
-	account, err := storeDB.Sign(asserts.AccountType, map[string]interface{}{
+	account, err := storeDB.Sign(asserts.AccountType, map[string]any{
 		"account-id":   "dev-id1",
 		"display-name": "dev-id1",
 		"validation":   "unknown",
@@ -2284,7 +2143,7 @@ func (sds *snapDevSuite) TestCheckNewPublisherAccountExists(c *C) {
 	err = db.Add(account)
 	c.Assert(err, IsNil)
 
-	snapDecl, err := storeDB.Sign(asserts.SnapDeclarationType, map[string]interface{}{
+	snapDecl, err := storeDB.Sign(asserts.SnapDeclarationType, map[string]any{
 		"series":       "16",
 		"snap-id":      "snap-id-1",
 		"snap-name":    "snap-name-1",
@@ -2295,7 +2154,7 @@ func (sds *snapDevSuite) TestCheckNewPublisherAccountExists(c *C) {
 	err = db.Add(snapDecl)
 	c.Assert(err, IsNil)
 
-	snapDev, err := storeDB.Sign(asserts.SnapDeveloperType, map[string]interface{}{
+	snapDev, err := storeDB.Sign(asserts.SnapDeveloperType, map[string]any{
 		"snap-id":      "snap-id-1",
 		"publisher-id": "dev-id2",
 	}, nil, "")
@@ -2309,7 +2168,7 @@ func (sds *snapDevSuite) TestCheckNewPublisherAccountExists(c *C) {
 	c.Assert(err, ErrorMatches, `snap-developer assertion for snap-id "snap-id-1" does not have a matching account assertion for the publisher "dev-id2"`)
 
 	// But once the dev-id2 account is added the snap-developer is ok.
-	account, err = storeDB.Sign(asserts.AccountType, map[string]interface{}{
+	account, err = storeDB.Sign(asserts.AccountType, map[string]any{
 		"account-id":   "dev-id2",
 		"display-name": "dev-id2",
 		"validation":   "unknown",
@@ -2327,7 +2186,7 @@ func (sds *snapDevSuite) TestCheckDeveloperAccountExists(c *C) {
 	storeDB, db := makeStoreAndCheckDB(c)
 	devDB := setup3rdPartySigning(c, "dev-id1", storeDB, db)
 
-	snapDecl, err := storeDB.Sign(asserts.SnapDeclarationType, map[string]interface{}{
+	snapDecl, err := storeDB.Sign(asserts.SnapDeclarationType, map[string]any{
 		"series":       "16",
 		"snap-id":      "snap-id-1",
 		"snap-name":    "snap-name-1",
@@ -2338,11 +2197,11 @@ func (sds *snapDevSuite) TestCheckDeveloperAccountExists(c *C) {
 	err = db.Add(snapDecl)
 	c.Assert(err, IsNil)
 
-	snapDev, err := devDB.Sign(asserts.SnapDeveloperType, map[string]interface{}{
+	snapDev, err := devDB.Sign(asserts.SnapDeveloperType, map[string]any{
 		"snap-id":      "snap-id-1",
 		"publisher-id": "dev-id1",
-		"developers": []interface{}{
-			map[string]interface{}{
+		"developers": []any{
+			map[string]any{
 				"developer-id": "dev-id2",
 				"since":        "2017-01-01T00:00:00.0Z",
 			},
@@ -2357,7 +2216,7 @@ func (sds *snapDevSuite) TestCheckMissingDeclaration(c *C) {
 	storeDB, db := makeStoreAndCheckDB(c)
 	devDB := setup3rdPartySigning(c, "dev-id1", storeDB, db)
 
-	headers := map[string]interface{}{
+	headers := map[string]any{
 		"authority-id": "dev-id1",
 		"snap-id":      "snap-id-1",
 		"publisher-id": "dev-id1",

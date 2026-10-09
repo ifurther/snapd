@@ -63,7 +63,7 @@ func ClientSnapFromSnapInfo(snapInfo *snap.Info, decorator StatusDecorator) (*cl
 		Icon:        snapInfo.Media.IconURL(),
 		ID:          snapInfo.ID(),
 		InstallDate: snapInfo.InstallDate(),
-		Name:        snapInfo.InstanceName(),
+		Name:        snapInfo.InstanceName().String(),
 		Revision:    snapInfo.Revision,
 		Summary:     snapInfo.Summary(),
 		Type:        string(snapInfo.Type()),
@@ -72,6 +72,7 @@ func ClientSnapFromSnapInfo(snapInfo *snap.Info, decorator StatusDecorator) (*cl
 		Channel:     snapInfo.Channel,
 		Private:     snapInfo.Private,
 		Confinement: string(confinement),
+		Grade:       string(snapInfo.Grade),
 		Apps:        apps,
 		Broken:      snapInfo.Broken,
 		Title:       snapInfo.Title(),
@@ -135,7 +136,7 @@ func ClientAppInfosFromSnapAppInfos(apps []*snap.AppInfo, decorator StatusDecora
 	out := make([]client.AppInfo, 0, len(apps))
 	for _, app := range apps {
 		appInfo := client.AppInfo{
-			Snap:     app.Snap.InstanceName(),
+			Snap:     app.Snap.InstanceName().String(),
 			Name:     app.Name,
 			CommonID: app.CommonID,
 		}

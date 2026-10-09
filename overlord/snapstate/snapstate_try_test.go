@@ -88,6 +88,7 @@ func (s *snapmgrTestSuite) testTrySetsTryMode(flags snapstate.Flags, c *C, extra
 	c.Check(taskKinds(ts.Tasks()), DeepEquals, []string{
 		"prerequisites",
 		"prepare-snap",
+		"prerequisites",
 		"mount-snap",
 		"copy-snap-data",
 		"setup-profiles",
@@ -100,6 +101,7 @@ func (s *snapmgrTestSuite) testTrySetsTryMode(flags snapstate.Flags, c *C, extra
 		"start-snap-services",
 		"run-hook[configure]",
 		"run-hook[check-health]",
+		"mock-process-delayed-security-backend-effects",
 	})
 
 }

@@ -77,21 +77,25 @@ func (s *CameraInterfaceSuite) TestSanitizePlug(c *C) {
 }
 
 func (s *CameraInterfaceSuite) TestAppArmorSpec(c *C) {
-	spec := apparmor.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	appSet, err := interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec := apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.slot), IsNil)
 	c.Assert(spec.SecurityTags(), DeepEquals, []string{"snap.consumer.app"})
-	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "/dev/video[0-9]* rw")
+	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "###PROMPT### /dev/video[0-9]* rw")
 }
 
 func (s *CameraInterfaceSuite) TestUDevSpec(c *C) {
-	spec := udev.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	appSet, err := interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec := udev.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.slot), IsNil)
 	c.Assert(spec.Snippets(), HasLen, 3)
 	c.Assert(spec.Snippets(), testutil.Contains, `# camera
 KERNEL=="video[0-9]*", TAG+="snap_consumer_app"`)
 	c.Assert(spec.Snippets(), testutil.Contains, `# camera
 KERNEL=="vchiq", TAG+="snap_consumer_app"`)
-	c.Assert(spec.Snippets(), testutil.Contains, fmt.Sprintf(`TAG=="snap_consumer_app", SUBSYSTEM!="module", SUBSYSTEM!="subsystem", RUN+="%v/snap-device-helper snap_consumer_app"`, dirs.DistroLibExecDir))
+	c.Assert(spec.Snippets(), testutil.Contains, fmt.Sprintf(`TAG=="snap_consumer_app", SUBSYSTEM!="module", SUBSYSTEM!="subsystem", RUN+="%v/snap-device-helper $env{ACTION} snap_consumer_app $devpath $major:$minor"`, dirs.DistroLibExecDir))
 }
 
 func (s *CameraInterfaceSuite) TestStaticInfo(c *C) {
@@ -108,4 +112,24 @@ func (s *CameraInterfaceSuite) TestAutoConnect(c *C) {
 
 func (s *CameraInterfaceSuite) TestInterfaces(c *C) {
 	c.Check(builtin.Interfaces(), testutil.DeepContains, s.iface)
+}
+
+func (s *CameraInterfaceSuite) TestDetectCameraFromPath(c *C) {
+	for _, path := range []string{
+		"/dev/video0",
+		"/dev/video1",
+		"/dev/video99",
+		"/dev/vchiq",
+	} {
+		c.Check(builtin.DetectCameraFromPath(path), Equals, true, Commentf("%q should be detected as camera path"))
+	}
+
+	for _, path := range []string{
+		"/foo/bar",
+		"/dev/vid",
+		"/dev/vhci",
+		"/home/ubuntu",
+	} {
+		c.Check(builtin.DetectCameraFromPath(path), Equals, false, Commentf("%q should not be detected as camera path"))
+	}
 }

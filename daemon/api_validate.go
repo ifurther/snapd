@@ -48,6 +48,7 @@ var (
 		Path:        "/v2/validation-sets/{account}/{name}",
 		GET:         getValidationSet,
 		POST:        applyValidationSet,
+		Actions:     []string{"forget", "apply"},
 		ReadAccess:  authenticatedAccess{},
 		WriteAccess: authenticatedAccess{},
 	}
@@ -74,7 +75,7 @@ func modeString(mode assertstate.ValidationSetMode) (string, error) {
 }
 
 func validationSetNotFound(accountID, name string, sequence int) Response {
-	v := map[string]interface{}{
+	v := map[string]any{
 		"account-id": accountID,
 		"name":       name,
 	}

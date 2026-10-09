@@ -4,22 +4,28 @@ details: |
   This test checks that preseeding of UC20 image with snap-preseed
   command works.
 
-# TODO: test on 21.10 / 22.04; they fail because new build of snapd cannot
-# be run in core20-based chroot due to old libc.
 # This test cannot be executed in arm architecture because the model
 # assertion is made for amd64
-systems: [ubuntu-20.04-64]
+systems:
+    - ubuntu-20.04-64
+    - ubuntu-22.04-64
+    - ubuntu-24.04-64
 
 environment:
   PREPARE_IMAGE_DIR: uc20image
   STORE_ADDR: localhost:11028
   STORE_DIR: $(pwd)/fake-store-blobdir
 
+skip:
+    - reason: This test needs test keys to be trusted
+      if: |
+        [ "$TRUST_TEST_KEYS" = "false" ]
+
 prepare: |
   #shellcheck source=tests/lib/prepare.sh
   . "$TESTSLIB"/prepare.sh
-  snap download "--channel=${SNAPD_CHANNEL}" snapd
-  repack_snapd_snap_with_deb_content_and_run_mode_firstboot_tweaks /tmp
+  mkdir -p /tmp/tweaked-snapd-snap
+  build_snapd_snap_with_run_mode_firstboot_tweaks /tmp/tweaked-snapd-snap
 
   snap pack systemusers-snap
 
@@ -36,6 +42,7 @@ prepare: |
   gendeveloper1 show-key | gpg --homedir=~/.snap/gnupg --import
 
 restore: |
+  rm -rf /tmp/tweaked-snapd-snap
   rm -rf "$PREPARE_IMAGE_DIR"
   "$TESTSTOOLS"/store-state teardown-fake-store "$STORE_DIR"
 
@@ -47,8 +54,15 @@ execute: |
   export SNAPPY_FORCE_SAS_URL=http://$STORE_ADDR
 
   echo "Running pre-seeding"
-  SNAPD_SNAP=$(ls /tmp/snapd*.snap)
+  for f in /tmp/tweaked-snapd-snap/snapd*.snap; do
+    if [ "${SNAPD_SNAP:+set}" = set ]; then
+      echo "found multiple snaps in /tmp/tweaked-snapd-snap" 1>&2
+      exit 1
+    fi
+    SNAPD_SNAP="${f}"
+  done
 
+  # TODO: use 22/24 models
   # XXX: confusingly, the name of our test key is actually " (test)".
   SNAPD_DEBUG=1 snap prepare-image --preseed --preseed-sign-key=" (test)" --channel=stable \
       --snap="$SNAPD_SNAP" --snap systemusers-snap_1.0_all.snap \
@@ -106,7 +120,6 @@ execute: |
   MATCH "^etc/systemd/system/snapd.spread-tests-run-mode-tweaks.service" < files.log
   MATCH "^etc/systemd/system/dbus-fi.w1.wpa_supplicant1.service" < files.log
   MATCH "^etc/systemd/system/snapd.snap-repair.timer" < files.log
-  MATCH "^etc/systemd/system/sshd-keygen@.service.d/disable-sshd-keygen-if-cloud-init-active.conf" < files.log
   MATCH "^etc/systemd/system/snapd.service.wants/usr-lib-snapd.mount" < files.log
   MATCH "^etc/systemd/system/snapd.autoimport.service" < files.log
   MATCH "^etc/systemd/system/final.target.wants/snapd.system-shutdown.service" < files.log
@@ -182,3 +195,9 @@ execute: |
 
   MATCH "^var/lib/extrausers/group" < files.log
   MATCH "^var/lib/extrausers/passwd" < files.log
+
+  # we're only expecting a bunch of text files, so the compressed artifact
+  # should be tiny, but even keeping some wiggle room it definitely should not
+  # be more than 1MB
+  artifact_size="$(stat -c '%s' "$ARTIFACT")"
+  (( artifact_size < 1*1024*1024))

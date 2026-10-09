@@ -36,7 +36,7 @@ func init() {
 	}
 }
 
-func earlyExperimentalSettingsFilter(values, early map[string]interface{}) {
+func earlyExperimentalSettingsFilter(values, early map[string]any) {
 	for key, v := range values {
 		if strings.HasPrefix(key, "experimental.") && supportedConfigurations["core."+key] {
 			early[key] = v
@@ -86,4 +86,30 @@ func doExportExperimentalFlags(_ sysconfig.Device, tr ConfGetter, opts *fsOnlyCo
 
 func ExportExperimentalFlags(tr ConfGetter) error {
 	return doExportExperimentalFlags(nil, tr, nil)
+}
+
+// IsSupportedExperimentalFlag checks if passed flag is a supported experimental feature.
+func IsSupportedExperimentalFlag(flag string) bool {
+	return supportedConfigurations["core.experimental."+flag]
+}
+
+// MockSupportedExperimentalFlags mocks the supported experimental flags. Should
+// only be used in tests.
+//
+// Keep the restore logic local instead of using testutil: this helper lives in
+// production code so tests in other packages can call it, and importing
+// testutil would leak a test-only dependency into production import graphs.
+func MockSupportedExperimentalFlags(flags []string) (restore func()) {
+	osutil.MustBeTestBinary("MockSupportedExperimentalFlags only can be used in tests")
+
+	backup := supportedConfigurations
+	restore = func() {
+		supportedConfigurations = backup
+	}
+	newConfs := make(map[string]bool, len(flags))
+	for _, flag := range flags {
+		newConfs["core.experimental."+flag] = true
+	}
+	supportedConfigurations = newConfs
+	return restore
 }

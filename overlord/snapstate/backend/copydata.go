@@ -23,12 +23,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/user"
 	"path/filepath"
 
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
+	"github.com/snapcore/snapd/osutil/user"
 	"github.com/snapcore/snapd/progress"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/strutil"
@@ -57,7 +57,7 @@ func (b Backend) CopySnapData(newSnap, oldSnap *snap.Info, opts *dirs.SnapDirOpt
 
 	// Make sure the base data directory exists for instance snaps
 	if newSnap.InstanceKey != "" {
-		err := os.MkdirAll(snap.BaseDataDir(newSnap.SnapName()), 0755)
+		err := os.MkdirAll(snap.BaseDataDir(newSnap.SnapName().String()), 0755)
 		if err != nil && !os.IsExist(err) {
 			return err
 		}
@@ -122,7 +122,7 @@ func (b Backend) SetupSnapSaveData(info *snap.Info, dev snap.Device, meter progr
 		return nil
 	}
 
-	saveDir := snap.CommonDataSaveDir(info.InstanceName())
+	saveDir := snap.CommonDataSaveDir(info.InstanceName().String())
 	return os.MkdirAll(saveDir, 0755)
 }
 
@@ -234,7 +234,7 @@ func (b Backend) UndoHideSnapData(snapName string) error {
 		if firstErr == nil {
 			firstErr = err
 		} else {
-			logger.Noticef(err.Error())
+			logger.Notice(err.Error())
 		}
 	}
 
@@ -308,7 +308,7 @@ type UndoInfo struct {
 // specified revision. If no error occurred, returns a non-nil undoInfo so that
 // the operation can be undone. If an error occurred, an attempt is made to undo
 // so no undoInfo is returned.
-func (b Backend) InitExposedSnapHome(snapName string, rev snap.Revision, opts *dirs.SnapDirOptions) (undoInfo *UndoInfo, err error) {
+func (b Backend) InitExposedSnapHome(snapName string, rev snap.Revision, opts *dirs.SnapDirOptions) (undoInfo *UndoInfo, retErr error) {
 	users, err := allUsers(opts)
 	if err != nil {
 		return nil, err
@@ -316,7 +316,7 @@ func (b Backend) InitExposedSnapHome(snapName string, rev snap.Revision, opts *d
 
 	undoInfo = &UndoInfo{}
 	defer func() {
-		if err != nil {
+		if retErr != nil {
 			if err := b.UndoInitExposedSnapHome(snapName, undoInfo); err != nil {
 				logger.Noticef("cannot undo ~/Snap init for %q after it failed: %v", snapName, err)
 			}
@@ -399,7 +399,7 @@ func (b Backend) UndoInitExposedSnapHome(snapName string, undoInfo *UndoInfo) er
 		if firstErr == nil {
 			firstErr = err
 		} else {
-			logger.Noticef(err.Error())
+			logger.Notice(err.Error())
 		}
 	}
 

@@ -30,7 +30,9 @@ import (
 	"sync"
 
 	"github.com/snapcore/snapd/jsonutil"
+	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/overlord/state"
+	"github.com/snapcore/snapd/snap/naming"
 )
 
 // Transaction holds a copy of the configuration originally present in the
@@ -43,7 +45,7 @@ type Transaction struct {
 	mu       sync.Mutex
 	state    *state.State
 	pristine map[string]map[string]*json.RawMessage // snap => key => value
-	changes  map[string]map[string]interface{}
+	changes  map[string]map[string]any
 }
 
 // NewTransaction creates a new configuration transaction initialized with the given state.
@@ -51,7 +53,7 @@ type Transaction struct {
 // The provided state must be locked by the caller.
 func NewTransaction(st *state.State) *Transaction {
 	transaction := &Transaction{state: st}
-	transaction.changes = make(map[string]map[string]interface{})
+	transaction.changes = make(map[string]map[string]any)
 
 	// Record the current state of the map containing the config of every snap
 	// in the system. We'll use it for this transaction.
@@ -69,15 +71,15 @@ func (t *Transaction) State() *state.State {
 	return t.state
 }
 
-func changes(cfgStr string, cfg map[string]interface{}) []string {
+func changes(cfgStr string, cfg map[string]any) []string {
 	var out []string
 	for k := range cfg {
 		switch subCfg := cfg[k].(type) {
-		case map[string]interface{}:
+		case map[string]any:
 			out = append(out, changes(cfgStr+"."+k, subCfg)...)
 		case *json.RawMessage:
 			// check if we need to dive into a sub-config
-			var configm map[string]interface{}
+			var configm map[string]any
 			if err := jsonutil.DecodeWithNumber(bytes.NewReader(*subCfg), &configm); err == nil {
 				// curiously, json decoder decodes json.RawMessage("null") into a nil map, so no change is
 				// reported when we recurse into it. This happens when unsetting a key and the underlying
@@ -110,7 +112,7 @@ func (t *Transaction) Changes() []string {
 // "network.netplan" is external it must be impossible to set
 // "network=false" or getting the document under "network" would be
 // wrong.
-func shadowsExternalConfig(instanceName string, key string, value interface{}) error {
+func shadowsExternalConfig(instanceName string, key string, value any) error {
 	// maps never block the path
 	if v := reflect.ValueOf(value); v.Kind() == reflect.Map {
 		return nil
@@ -133,6 +135,33 @@ func shadowsExternalConfig(instanceName string, key string, value interface{}) e
 	return nil
 }
 
+// snapBase returns the base for the given instance name. State must be locked
+// by caller.
+func snapBase(st *state.State, instanceName string) (string, error) {
+	type partialSnap struct {
+		Base string `json:"base"`
+	}
+
+	var snaps map[string]*json.RawMessage
+	err := st.Get("snaps", &snaps)
+	if err != nil {
+		return "", err
+	}
+
+	raw, ok := snaps[instanceName]
+	if !ok {
+		return "", state.ErrNoState
+	}
+
+	var snap partialSnap
+	err = json.Unmarshal(*raw, &snap)
+	if err != nil {
+		return "", fmt.Errorf("cannot unmarshal snap state: %v", err)
+	}
+
+	return snap.Base, nil
+}
+
 // Set sets the provided snap's configuration key to the given value.
 // The provided key may be formed as a dotted key path through nested maps.
 // For example, the "a.b.c" key describes the {a: {b: {c: value}}} map.
@@ -141,13 +170,36 @@ func shadowsExternalConfig(instanceName string, key string, value interface{}) e
 //
 // The provided value must marshal properly by encoding/json.
 // Changes are not persisted until Commit is called.
-func (t *Transaction) Set(instanceName, key string, value interface{}) error {
+// State must be locked by caller.
+func (t *Transaction) Set(instanceName, key string, value any) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	if key == "" {
+		return errors.New("internal error: key cannot be an empty string")
+	}
+
+	if keyErr := validateMapKeys(value); keyErr != nil {
+		if instanceName == "system" || instanceName == "core" {
+			return keyErr
+		}
+
+		base, err := snapBase(t.state, instanceName)
+		if err != nil {
+			return fmt.Errorf("cannot set option for %q: %w", instanceName, err)
+		}
+
+		coreVer, err := naming.CoreVersion(base)
+		if err == nil && coreVer >= 26 {
+			return keyErr
+		}
+
+		t.state.Warnf("Option value has invalid field name %q. For core26+ snaps, fields must be dash separated lowercase alphanumerics.", keyErr.field)
+	}
+
 	config := t.changes[instanceName]
 	if config == nil {
-		config = make(map[string]interface{})
+		config = make(map[string]any)
 	}
 
 	data, err := json.Marshal(value)
@@ -164,7 +216,7 @@ func (t *Transaction) Set(instanceName, key string, value interface{}) error {
 	// Check whether it's trying to traverse a non-map from pristine. This
 	// would go unperceived by the configuration patching below.
 	if len(subkeys) > 1 {
-		var result interface{}
+		var result any
 		err = getFromConfig(instanceName, subkeys, 0, t.pristine[instanceName], &result)
 		if err != nil && !IsNoOption(err) {
 			return err
@@ -176,8 +228,7 @@ func (t *Transaction) Set(instanceName, key string, value interface{}) error {
 	}
 
 	// config here is never nil and PatchConfig always operates
-	// directly on and returns config if it's a
-	// map[string]interface{}
+	// directly on and returns config if it's a map[string]any
 	_, err = PatchConfig(instanceName, subkeys, 0, config, &raw)
 	if err != nil {
 		return err
@@ -203,7 +254,7 @@ func (t *Transaction) copyPristine(snapName string) map[string]*json.RawMessage 
 // For example, the "a.b.c" key describes the {a: {b: {c: value}}} map.
 //
 // Transactions do not see updates from the current state or from other transactions.
-func (t *Transaction) Get(snapName, key string, result interface{}) error {
+func (t *Transaction) Get(snapName, key string, result any) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -227,7 +278,7 @@ func (t *Transaction) Get(snapName, key string, result interface{}) error {
 // If the key does not exist, no error is returned.
 //
 // Transactions do not see updates from the current state or from other transactions.
-func (t *Transaction) GetMaybe(instanceName, key string, result interface{}) error {
+func (t *Transaction) GetMaybe(instanceName, key string, result any) error {
 	err := t.Get(instanceName, key, result)
 	if err != nil && !IsNoOption(err) {
 		return err
@@ -240,7 +291,7 @@ func (t *Transaction) GetMaybe(instanceName, key string, result interface{}) err
 // result.
 //
 // If the key does not exist, an error of type *NoOptionError is returned.
-func (t *Transaction) GetPristine(snapName, key string, result interface{}) error {
+func (t *Transaction) GetPristine(snapName, key string, result any) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -257,7 +308,7 @@ func (t *Transaction) GetPristine(snapName, key string, result interface{}) erro
 // result.
 //
 // If the key does not exist, no error is returned.
-func (t *Transaction) GetPristineMaybe(instanceName, key string, result interface{}) error {
+func (t *Transaction) GetPristineMaybe(instanceName, key string, result any) error {
 	err := t.GetPristine(instanceName, key, result)
 	if err != nil && !IsNoOption(err) {
 		return err
@@ -265,7 +316,7 @@ func (t *Transaction) GetPristineMaybe(instanceName, key string, result interfac
 	return nil
 }
 
-func getFromConfig(instanceName string, subkeys []string, pos int, config map[string]*json.RawMessage, result interface{}) error {
+func getFromConfig(instanceName string, subkeys []string, pos int, config map[string]*json.RawMessage, result any) error {
 	// special case - get root document
 	if len(subkeys) == 0 {
 		if len(config) == 0 {
@@ -343,16 +394,16 @@ func (t *Transaction) Commit() {
 	t.state.Set("config", t.pristine)
 
 	// The cache has been flushed, reset it.
-	t.changes = make(map[string]map[string]interface{})
+	t.changes = make(map[string]map[string]any)
 }
 
-func applyChanges(config map[string]*json.RawMessage, changes map[string]interface{}) {
+func applyChanges(config map[string]*json.RawMessage, changes map[string]any) {
 	for k, v := range changes {
 		config[k] = commitChange(config[k], v)
 	}
 }
 
-func jsonRaw(v interface{}) *json.RawMessage {
+func jsonRaw(v any) *json.RawMessage {
 	data, err := json.Marshal(v)
 	if err != nil {
 		panic(fmt.Errorf("internal error: cannot marshal configuration: %v", err))
@@ -361,11 +412,11 @@ func jsonRaw(v interface{}) *json.RawMessage {
 	return &raw
 }
 
-func commitChange(pristine *json.RawMessage, change interface{}) *json.RawMessage {
+func commitChange(pristine *json.RawMessage, change any) *json.RawMessage {
 	switch change := change.(type) {
 	case *json.RawMessage:
 		return change
-	case map[string]interface{}:
+	case map[string]any:
 		if pristine == nil {
 			return jsonRaw(change)
 		}
@@ -419,7 +470,7 @@ func mergeConfigWithExternal(instanceName, requestedKey string, origConfig *map[
 	}
 
 	// create a "patch" from the external entries
-	patch := make(map[string]interface{})
+	patch := make(map[string]any)
 	for externalKey, externalFn := range km {
 		if externalFn == nil {
 			continue
@@ -482,7 +533,7 @@ func mergeConfigWithExternal(instanceName, requestedKey string, origConfig *map[
 // clearExternalConfig iterates over a given config and removes any values
 // that come from external configuration. This is used before committing a
 // config to disk.
-func clearExternalConfig(instanceName string, snapChanges map[string]interface{}) {
+func clearExternalConfig(instanceName string, snapChanges map[string]any) {
 	externalConfigMu.Lock()
 	km := externalConfigMap[instanceName]
 	externalConfigMu.Unlock()
@@ -490,7 +541,7 @@ func clearExternalConfig(instanceName string, snapChanges map[string]interface{}
 	clearExternalConfigRecursive(km, snapChanges, "")
 }
 
-func clearExternalConfigRecursive(km map[string]ExternalCfgFunc, config map[string]interface{}, keyprefix string) {
+func clearExternalConfigRecursive(km map[string]ExternalCfgFunc, config map[string]any, keyprefix string) {
 	if len(keyprefix) > 0 {
 		keyprefix += "."
 	}
@@ -503,7 +554,7 @@ func clearExternalConfigRecursive(km map[string]ExternalCfgFunc, config map[stri
 			continue
 		}
 		// and nested configs are inspected
-		if m, ok := value.(map[string]interface{}); ok {
+		if m, ok := value.(map[string]any); ok {
 			clearExternalConfigRecursive(km, m, keyprefix+key)
 		}
 	}
@@ -529,7 +580,7 @@ func (e *NoOptionError) Error() string {
 }
 
 // ExternalCfgFunc can be used for external "transaction.Get()" calls
-type ExternalCfgFunc func(key string) (result interface{}, err error)
+type ExternalCfgFunc func(key string) (result any, err error)
 
 // externalConfigMap contain hook functions for "external" configuration. The
 // first level of the map is the snapName and then the external keys in
@@ -565,4 +616,13 @@ func RegisterExternalConfig(snapName, key string, vf ExternalCfgFunc) error {
 	}
 	externalConfigMap[snapName][key] = vf
 	return nil
+}
+
+// ClearExternalConfigMap must only be used for testing.
+func ClearExternalConfigMap() {
+	osutil.MustBeTestBinary("ClearExternalConfigMap only can be used in tests")
+
+	externalConfigMu.Lock()
+	defer externalConfigMu.Unlock()
+	externalConfigMap = nil
 }

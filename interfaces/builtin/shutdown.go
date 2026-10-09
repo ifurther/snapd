@@ -51,7 +51,7 @@ dbus (send)
     bus=system
     path=/org/freedesktop/login1
     interface=org.freedesktop.login1.Manager
-    member={Inhibit,PowerOff,Reboot,Suspend,Hibernate,HybridSleep,CanPowerOff,CanReboot,CanSuspend,CanHibernate,CanHybridSleep,ScheduleShutdown,CancelScheduledShutdown,SetWallMessage,SetRebootParameter}
+    member={ListInhibitors,Inhibit,PowerOff,Reboot,RebootWithFlags,Suspend,Hibernate,SuspendThenHibernate,HybridSleep,CanPowerOff,CanReboot,CanSuspend,CanHibernate,CanSuspendThenHibernate,CanHybridSleep,ScheduleShutdown,CancelScheduledShutdown,SetWallMessage,SetRebootParameter}
     peer=(label=unconfined),
 
 # Allow clients to introspect
@@ -66,16 +66,36 @@ dbus (send)
     path=/org/freedesktop/login1
     interface=org.freedesktop.DBus.Introspectable
     member=Introspect,
+
+# systemctl needs to be able to query scheduled shutdowns
+dbus (send)
+    bus=system
+    path=/org/freedesktop/login1
+    interface=org.freedesktop.DBus.Properties
+    member=Get{,All}
+    peer=(label=unconfined),
+
+# systemctl needs to bind the client side of the socket.
+# Because systemctl has multiple symlinks, its comm can be
+# multiple names.
+unix (bind) type=stream addr="@*/bus/*/system",
+`
+
+const shutdownConnectedPlugSecComp = `
+# systemctl needs to bind the client side of the socket
+bind
 `
 
 func init() {
 	registerIface(&commonInterface{
-		name:                  "shutdown",
-		summary:               shutdownSummary,
-		implicitOnCore:        true,
-		implicitOnClassic:     true,
-		baseDeclarationPlugs:  shutdownBaseDeclarationPlugs,
-		baseDeclarationSlots:  shutdownBaseDeclarationSlots,
-		connectedPlugAppArmor: shutdownConnectedPlugAppArmor,
+		name:                     "shutdown",
+		summary:                  shutdownSummary,
+		implicitOnCore:           true,
+		implicitOnClassic:        true,
+		baseDeclarationPlugs:     shutdownBaseDeclarationPlugs,
+		baseDeclarationSlots:     shutdownBaseDeclarationSlots,
+		connectedPlugAppArmor:    shutdownConnectedPlugAppArmor,
+		connectedPlugSecComp:     shutdownConnectedPlugSecComp,
+		parallelInstancesSlotErr: errParallelInstancesSystemSlot,
 	})
 }

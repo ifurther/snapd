@@ -43,15 +43,16 @@ owner @{HOME}/.config/dconf/user w,
 dbus (receive, send)
     bus=session
     interface="ca.desrt.dconf.Writer"
-    peer=(label=unconfined),
+    peer=(label="{dconf-service,unconfined}"),
 `
 
 func init() {
 	registerIface(&commonInterface{
-		name:                  "gsettings",
-		summary:               gsettingsSummary,
-		implicitOnClassic:     true,
-		connectedPlugAppArmor: gsettingsConnectedPlugAppArmor,
-		baseDeclarationSlots:  gsettingsBaseDeclarationSlots,
+		name:                     "gsettings",
+		summary:                  gsettingsSummary,
+		implicitOnClassic:        true,
+		connectedPlugAppArmor:    gsettingsConnectedPlugAppArmor,
+		baseDeclarationSlots:     gsettingsBaseDeclarationSlots,
+		parallelInstancesSlotErr: errParallelInstancesSystemSlot,
 	})
 }

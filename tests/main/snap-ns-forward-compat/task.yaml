@@ -1,7 +1,21 @@
 summary: Test that snap-confine errors in the right way
 
-# Skip 32-bit architectures because the core20 snap is not available there
-systems: [-*-32]
+details: |
+    Check that snap-confine and snap-update-ns are compatible with a filesystem
+    based on a tmpfs, as part of the work to support homedirs in arbitrary
+    locations.
+
+systems:
+  # Skip 32-bit architectures because the core20 snap is not available there
+  - -*-32
+  # pivot_root not on Ubuntu Core 26 either
+  - -ubuntu-core-26*
+
+skip:
+    - reason: Unshare command doesn't support saving the namespace
+      if: |
+        # Check if `unshare --mount=<file>` is supported
+        unshare --mount=/something true 2>&1 | grep "option '--mount' doesn't allow an argument"
 
 prepare: |
     echo "Install test snap"
@@ -9,15 +23,6 @@ prepare: |
     "$TESTSTOOLS"/snaps-state install-local testsnap
 
 execute: |
-    echo "Checking if the unshare command supports saving the namespace"
-    unshare --mount=/something true 2> error.log || true
-    tests.cleanup defer rm error.log
-    if grep "option '--mount' doesn't allow an argument" error.log; then
-        echo "unshare --mount=<file> is not supported, skipping test"
-        exit 0
-    fi
-
-
     echo "Creating a mount namespace whose root is a tmpfs"
     mkdir -p /run/snapd/ns/
     mount -o bind --make-private /run/snapd/ns/ /run/snapd/ns/

@@ -1,9 +1,12 @@
 summary: smoke test for the remote.pull tool
 
-backends: [google]
+details: |
+    Check the remote.pull tool is able to retrieve files from the
+    remote instance through scp
 
-# Amazon linux is skipped because no sshpass available
-systems: [-amazon-linux-*]
+backends: [openstack*]
+
+systems: [ubuntu-22.04-64]
 
 prepare: |
     tests.pkgs install sshpass

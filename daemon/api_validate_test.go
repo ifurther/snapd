@@ -97,8 +97,8 @@ func (s *apiValidationSetsSuite) SetUpTest(c *check.C) {
 }
 
 func (s *apiValidationSetsSuite) mockValidationSetsTracking(st *state.State) {
-	st.Set("validation-sets", map[string]interface{}{
-		fmt.Sprintf("%s/foo", s.dev1acct.AccountID()): map[string]interface{}{
+	st.Set("validation-sets", map[string]any{
+		fmt.Sprintf("%s/foo", s.dev1acct.AccountID()): map[string]any{
 			"account-id": s.dev1acct.AccountID(),
 			"name":       "foo",
 			"mode":       assertstate.Enforce,
@@ -106,7 +106,7 @@ func (s *apiValidationSetsSuite) mockValidationSetsTracking(st *state.State) {
 			// Current should equal pinned-at if pinned-at != 0 but let's check api_validate is robust
 			"current": 99,
 		},
-		fmt.Sprintf("%s/baz", s.dev1acct.AccountID()): map[string]interface{}{
+		fmt.Sprintf("%s/baz", s.dev1acct.AccountID()): map[string]any{
 			"account-id": s.dev1acct.AccountID(),
 			"name":       "baz",
 			"mode":       assertstate.Monitor,
@@ -117,13 +117,13 @@ func (s *apiValidationSetsSuite) mockValidationSetsTracking(st *state.State) {
 }
 
 func (s *apiValidationSetsSuite) mockAssert(c *check.C, name, sequence string) asserts.Assertion {
-	snaps := []interface{}{map[string]interface{}{
+	snaps := []any{map[string]any{
 		"id":       "yOqKhntON3vR7kwEbVPsILm7bUViPDzz",
 		"name":     "snap-b",
 		"presence": "required",
 		"revision": "1",
 	}}
-	headers := map[string]interface{}{
+	headers := map[string]any{
 		"authority-id": s.dev1acct.AccountID(),
 		"account-id":   s.dev1acct.AccountID(),
 		"name":         name,
@@ -202,7 +202,7 @@ func (s *apiValidationSetsSuite) TestQueryValidationSetsErrors(c *check.C) {
 		}
 		req, err := http.NewRequest("GET", fmt.Sprintf("/v2/validation-sets/%s?%s", tc.validationSet, q.Encode()), nil)
 		c.Assert(err, check.IsNil)
-		rspe := s.errorReq(c, req, nil)
+		rspe := s.errorReq(c, req, nil, actionIsExpected)
 		c.Check(rspe.Status, check.Equals, tc.status, check.Commentf("case #%d", i))
 		c.Check(rspe.Message, check.Matches, tc.message)
 	}
@@ -212,7 +212,7 @@ func (s *apiValidationSetsSuite) TestGetValidationSetsNone(c *check.C) {
 	req, err := http.NewRequest("GET", "/v2/validation-sets", nil)
 	c.Assert(err, check.IsNil)
 
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 	c.Assert(rsp.Status, check.Equals, 200)
 	res := rsp.Result.([]daemon.ValidationSetResult)
 	c.Check(res, check.HasLen, 0)
@@ -233,7 +233,7 @@ func (s *apiValidationSetsSuite) TestListValidationSets(c *check.C) {
 
 	req, err := http.NewRequest("GET", "/v2/validation-sets", nil)
 	c.Assert(err, check.IsNil)
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 	c.Assert(rsp.Status, check.Equals, 200)
 	res := rsp.Result.([]daemon.ValidationSetResult)
 	c.Check(res, check.DeepEquals, []daemon.ValidationSetResult{
@@ -272,7 +272,7 @@ func (s *apiValidationSetsSuite) TestGetValidationSetOne(c *check.C) {
 	req, err := http.NewRequest("GET", fmt.Sprintf("/v2/validation-sets/%s/baz", s.dev1acct.AccountID()), nil)
 	c.Assert(err, check.IsNil)
 
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 	c.Assert(rsp.Status, check.Equals, 200)
 	res := rsp.Result.(daemon.ValidationSetResult)
 	c.Check(res, check.DeepEquals, daemon.ValidationSetResult{
@@ -298,7 +298,7 @@ func (s *apiValidationSetsSuite) TestGetValidationSetPinned(c *check.C) {
 	st.Unlock()
 	c.Assert(err, check.IsNil)
 
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 	c.Assert(rsp.Status, check.Equals, 200)
 	res := rsp.Result.(daemon.ValidationSetResult)
 	c.Check(res, check.DeepEquals, daemon.ValidationSetResult{
@@ -326,10 +326,10 @@ func (s *apiValidationSetsSuite) TestGetValidationSetNotFound(c *check.C) {
 	s.mockValidationSetsTracking(st)
 	st.Unlock()
 
-	rspe := s.errorReq(c, req, nil)
+	rspe := s.errorReq(c, req, nil, actionIsExpected)
 	c.Assert(rspe.Status, check.Equals, 404)
 	c.Check(string(rspe.Kind), check.Equals, "validation-set-not-found")
-	c.Check(rspe.Value, check.DeepEquals, map[string]interface{}{
+	c.Check(rspe.Value, check.DeepEquals, map[string]any{
 		"account-id": "foo",
 		"name":       "other",
 	})
@@ -406,7 +406,7 @@ func (s *apiValidationSetsSuite) TestGetValidationSetLatestFromRemote(c *check.C
 
 	st.Unlock()
 
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 	c.Assert(rsp.Status, check.Equals, 200)
 	res := rsp.Result.(daemon.ValidationSetResult)
 	c.Check(res, check.DeepEquals, daemon.ValidationSetResult{
@@ -430,7 +430,7 @@ func (s *apiValidationSetsSuite) TestGetValidationSetLatestFromRemoteValidationF
 
 	req, err := http.NewRequest("GET", "/v2/validation-sets/foo/other", nil)
 	c.Assert(err, check.IsNil)
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 	c.Assert(rsp.Status, check.Equals, 200)
 
 	res := rsp.Result.(daemon.ValidationSetResult)
@@ -470,7 +470,7 @@ func (s *apiValidationSetsSuite) TestGetValidationSetLatestFromRemoteRealValidat
 
 		req, err := http.NewRequest("GET", "/v2/validation-sets/foo/other", nil)
 		c.Assert(err, check.IsNil)
-		rsp := s.syncReq(c, req, nil)
+		rsp := s.syncReq(c, req, nil, actionIsExpected)
 		c.Assert(rsp.Status, check.Equals, 200)
 
 		res := rsp.Result.(daemon.ValidationSetResult)
@@ -526,7 +526,7 @@ func (s *apiValidationSetsSuite) TestGetValidationSetSpecificSequenceFromRemote(
 
 	st.Unlock()
 
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 	c.Assert(rsp.Status, check.Equals, 200)
 	res := rsp.Result.(daemon.ValidationSetResult)
 	c.Check(res, check.DeepEquals, daemon.ValidationSetResult{
@@ -562,7 +562,7 @@ func (s *apiValidationSetsSuite) TestGetValidationSetFromRemoteFallbackToLocalAs
 	req, err := http.NewRequest("GET", fmt.Sprintf("/v2/validation-sets/%s/bar?%s", s.dev1acct.AccountID(), q.Encode()), nil)
 	c.Assert(err, check.IsNil)
 
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 	c.Assert(rsp.Status, check.Equals, 200)
 	res := rsp.Result.(daemon.ValidationSetResult)
 	c.Check(res, check.DeepEquals, daemon.ValidationSetResult{
@@ -590,10 +590,10 @@ func (s *apiValidationSetsSuite) TestGetValidationSetPinnedNotFound(c *check.C) 
 	s.mockValidationSetsTracking(st)
 	st.Unlock()
 
-	rspe := s.errorReq(c, req, nil)
+	rspe := s.errorReq(c, req, nil, actionIsExpected)
 	c.Assert(rspe.Status, check.Equals, 404)
 	c.Check(string(rspe.Kind), check.Equals, "validation-set-not-found")
-	c.Check(rspe.Value, check.DeepEquals, map[string]interface{}{
+	c.Check(rspe.Value, check.DeepEquals, map[string]any{
 		"account-id": "foo",
 		"name":       "bar",
 		"sequence":   333,
@@ -631,7 +631,7 @@ func (s *apiValidationSetsSuite) TestApplyValidationSetMonitorModePinnedLocalOnl
 	req, err := http.NewRequest("POST", fmt.Sprintf("/v2/validation-sets/%s/bar", s.dev1acct.AccountID()), strings.NewReader(body))
 	c.Assert(err, check.IsNil)
 
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 	c.Assert(rsp.Status, check.Equals, 200)
 	res := rsp.Result.(daemon.ValidationSetResult)
 	c.Check(res, check.DeepEquals, daemon.ValidationSetResult{
@@ -655,7 +655,7 @@ func (s *apiValidationSetsSuite) TestApplyValidationSetMonitorModeError(c *check
 	req, err := http.NewRequest("POST", fmt.Sprintf("/v2/validation-sets/%s/bar", s.dev1acct.AccountID()), strings.NewReader(body))
 	c.Assert(err, check.IsNil)
 
-	rspe := s.errorReq(c, req, nil)
+	rspe := s.errorReq(c, req, nil, actionIsExpected)
 	c.Assert(rspe.Status, check.Equals, 400)
 	c.Check(rspe.Message, check.Equals, fmt.Sprintf(`cannot monitor validation set %s/bar: boom`, s.dev1acct.AccountID()))
 }
@@ -687,7 +687,7 @@ func (s *apiValidationSetsSuite) TestForgetValidationSet(c *check.C) {
 
 		req, err := http.NewRequest("POST", fmt.Sprintf("/v2/validation-sets/%s/foo", s.dev1acct.AccountID()), strings.NewReader(body))
 		c.Assert(err, check.IsNil)
-		rsp := s.syncReq(c, req, nil)
+		rsp := s.syncReq(c, req, nil, actionIsExpected)
 		c.Assert(rsp.Status, check.Equals, 200, check.Commentf("case #%d", i))
 
 		// after forget it's removed
@@ -699,7 +699,7 @@ func (s *apiValidationSetsSuite) TestForgetValidationSet(c *check.C) {
 		// and forget again fails
 		req, err = http.NewRequest("POST", fmt.Sprintf("/v2/validation-sets/%s/foo", s.dev1acct.AccountID()), strings.NewReader(body))
 		c.Assert(err, check.IsNil)
-		rspe := s.errorReq(c, req, nil)
+		rspe := s.errorReq(c, req, nil, actionIsExpected)
 		c.Assert(rspe.Status, check.Equals, 404, check.Commentf("case #%d", i))
 	}
 }
@@ -764,7 +764,7 @@ func (s *apiValidationSetsSuite) TestApplyValidationSetsErrors(c *check.C) {
 		}
 		req, err := http.NewRequest("POST", fmt.Sprintf("/v2/validation-sets/%s", tc.validationSet), strings.NewReader(body))
 		c.Assert(err, check.IsNil)
-		rspe := s.errorReq(c, req, nil)
+		rspe := s.errorReq(c, req, nil, actionIsExpected)
 		c.Check(rspe.Status, check.Equals, tc.status, check.Commentf("case #%d", i))
 		c.Check(rspe.Message, check.Matches, tc.message)
 	}
@@ -776,7 +776,7 @@ func (s *apiValidationSetsSuite) TestApplyValidationSetUnsupportedAction(c *chec
 	req, err := http.NewRequest("POST", "/v2/validation-sets/foo/bar", strings.NewReader(body))
 	c.Assert(err, check.IsNil)
 
-	rspe := s.errorReq(c, req, nil)
+	rspe := s.errorReq(c, req, nil, actionIsUnexpected)
 	c.Check(rspe.Status, check.Equals, 400)
 	c.Check(rspe.Message, check.Matches, `unsupported action "baz"`)
 }
@@ -818,7 +818,7 @@ func (s *apiValidationSetsSuite) TestApplyValidationSetEnforceMode(c *check.C) {
 	req, err := http.NewRequest("POST", fmt.Sprintf("/v2/validation-sets/%s/bar", s.dev1acct.AccountID()), strings.NewReader(body))
 	c.Assert(err, check.IsNil)
 
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 	c.Assert(rsp.Status, check.Equals, 200)
 	res := rsp.Result.(daemon.ValidationSetResult)
 	c.Check(res, check.DeepEquals, daemon.ValidationSetResult{
@@ -846,7 +846,7 @@ func (s *apiValidationSetsSuite) TestApplyValidationSetEnforceModeIgnoreValidati
 	restore := daemon.MockAssertstateFetchEnforceValidationSet(func(st *state.State, accountID, name string, sequence int, userID int, snaps []*snapasserts.InstalledSnap, ignoreValidation map[string]bool) (*assertstate.ValidationSetTracking, error) {
 		c.Check(ignoreValidation, check.DeepEquals, map[string]bool{"snap-b": true})
 		c.Check(snaps, testutil.DeepUnsortedMatches, []*snapasserts.InstalledSnap{
-			snapasserts.NewInstalledSnap("snap-b", "yOqKhntON3vR7kwEbVPsILm7bUViPDzz", snap.R("1"))})
+			snapasserts.NewInstalledSnap("snap-b", "yOqKhntON3vR7kwEbVPsILm7bUViPDzz", snap.R("1"), nil)})
 		c.Assert(accountID, check.Equals, s.dev1acct.AccountID())
 		c.Assert(name, check.Equals, "bar")
 		c.Assert(sequence, check.Equals, 0)
@@ -871,7 +871,7 @@ func (s *apiValidationSetsSuite) TestApplyValidationSetEnforceModeIgnoreValidati
 	req, err := http.NewRequest("POST", fmt.Sprintf("/v2/validation-sets/%s/bar", s.dev1acct.AccountID()), strings.NewReader(body))
 	c.Assert(err, check.IsNil)
 
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 	c.Assert(rsp.Status, check.Equals, 200)
 	res := rsp.Result.(daemon.ValidationSetResult)
 	c.Check(res, check.DeepEquals, daemon.ValidationSetResult{
@@ -920,7 +920,7 @@ func (s *apiValidationSetsSuite) TestApplyValidationSetEnforceModeSpecificSequen
 	req, err := http.NewRequest("POST", fmt.Sprintf("/v2/validation-sets/%s/bar", s.dev1acct.AccountID()), strings.NewReader(body))
 	c.Assert(err, check.IsNil)
 
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 	c.Assert(rsp.Status, check.Equals, 200)
 	res := rsp.Result.(daemon.ValidationSetResult)
 	c.Check(res, check.DeepEquals, daemon.ValidationSetResult{
@@ -958,7 +958,7 @@ func (s *apiValidationSetsSuite) TestApplyValidationSetEnforceModeError(c *check
 	req, err := http.NewRequest("POST", fmt.Sprintf("/v2/validation-sets/%s/bar", s.dev1acct.AccountID()), strings.NewReader(body))
 	c.Assert(err, check.IsNil)
 
-	rspe := s.errorReq(c, req, nil)
+	rspe := s.errorReq(c, req, nil, actionIsExpected)
 	c.Assert(rspe.Status, check.Equals, 400)
 	c.Check(string(rspe.Message), check.Equals, "cannot enforce validation set: boom")
 }

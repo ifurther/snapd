@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/osutil"
@@ -96,9 +97,18 @@ func FactoryResetFallbackSaveSealedKeyUnder(seedDeviceFDEDir string) string {
 	return filepath.Join(seedDeviceFDEDir, "ubuntu-save.recovery.sealed-key.factory-reset")
 }
 
-// TpmLockoutAuthUnder return the path of the tpm lockout authority key.
+// TpmLockoutAuthUnder returns the path of the tpm lockout authority key.
 func TpmLockoutAuthUnder(saveDeviceFDEDir string) string {
 	return filepath.Join(saveDeviceFDEDir, "tpm-lockout-auth")
+}
+
+// PreinstallCheckResultUnder returns the path of the preinstall check result.
+func PreinstallCheckResultUnder(deviceFDEDir string) string {
+	// FIXME: this is a bit a bad choice of name since this could
+	// be from a post install check. This is more something like
+	// "run checks context". But we cannot easily rename without
+	// breaking backward compatibility.
+	return filepath.Join(deviceFDEDir, "preinstall")
 }
 
 // ErrNoSealedKeys error if there are no sealed keys
@@ -136,4 +146,177 @@ func SealedKeysMethod(rootdir string) (sm SealingMethod, err error) {
 		return sm, ErrNoSealedKeys
 	}
 	return SealingMethod(content), err
+}
+
+// EncryptionType specifies what encryption backend should be used (if any)
+type EncryptionType string
+
+const (
+	EncryptionTypeNone        EncryptionType = ""
+	EncryptionTypeLUKS        EncryptionType = "cryptsetup"
+	EncryptionTypeLUKSWithICE EncryptionType = "cryptsetup-with-inline-crypto-engine"
+)
+
+// TODO:ICE: all EncryptionTypes are LUKS based now so this could be removed?
+func (et EncryptionType) IsLUKS() bool {
+	return et == EncryptionTypeLUKS || et == EncryptionTypeLUKSWithICE
+}
+
+// ValidatePIN checks that the passed PIN is formatted properly.
+// If the supplied PIN larger than 256 characters or contains
+// anything other than base-10 digits, an error will be returned.
+var ValidatePIN func(pin string) error = validatePINImpl
+
+func validatePINImpl(pin string) error {
+	return errors.New("PIN validation callback not set up")
+}
+
+// AuthMode corresponds to an authentication mechanism.
+type AuthMode string
+
+const (
+	AuthModeNone       AuthMode = "none"
+	AuthModePassphrase AuthMode = "passphrase"
+	AuthModePIN        AuthMode = "pin"
+)
+
+// VolumesAuthOptions contains options for the volumes authentication
+// mechanism (e.g. passphrase authentication).
+type VolumesAuthOptions struct {
+	Mode       AuthMode      `json:"mode,omitempty"`
+	PIN        string        `json:"pin,omitempty"`
+	Passphrase string        `json:"passphrase,omitempty"`
+	KDFType    string        `json:"kdf-type,omitempty"`
+	KDFTime    time.Duration `json:"kdf-time,omitempty"`
+}
+
+// Validates authentication options.
+func (o *VolumesAuthOptions) Validate() error {
+	if o == nil {
+		return nil
+	}
+
+	if len(o.Passphrase) != 0 && len(o.PIN) != 0 {
+		return fmt.Errorf("passphrase and pin cannot be set at the same time")
+	}
+
+	switch o.Mode {
+	case AuthModePassphrase:
+		if len(o.Passphrase) == 0 {
+			return fmt.Errorf("passphrase cannot be empty")
+		}
+	case AuthModePIN:
+		if len(o.PIN) == 0 {
+			return fmt.Errorf("pin cannot be empty")
+		}
+		if err := ValidatePIN(o.PIN); err != nil {
+			return err
+		}
+		if o.KDFType != "" {
+			return fmt.Errorf("%q authentication mode does not support custom kdf types", AuthModePIN)
+		}
+	default:
+		return fmt.Errorf("cannot use authentication mode %q, only %q and %q modes are supported", o.Mode, AuthModePassphrase, AuthModePIN)
+	}
+
+	switch o.KDFType {
+	case "argon2i", "argon2id", "pbkdf2", "":
+	default:
+		return fmt.Errorf("cannot use kdf type %q, only \"argon2i\", \"argon2id\" and \"pbkdf2\" are supported", o.KDFType)
+	}
+
+	if o.KDFTime != 0 {
+		return fmt.Errorf("kdf time cannot be set")
+	}
+
+	return nil
+}
+
+type AuthQualityErrorReason string
+
+const (
+	AuthQualityErrorReasonLowEntropy AuthQualityErrorReason = "low-entropy"
+)
+
+// AuthQualityError contains rich inforamtion on why some auth value
+// did not pass quality checks.
+type AuthQualityError struct {
+	// Reasons is a list of reason enums to explain exactly what quality
+	// criteria failed e.g. AuthQualityErrorReasonLowEntropy.
+	Reasons []AuthQualityErrorReason
+	// Quality contains information about the calculated quality of the
+	// specified auth value.
+	Quality AuthQuality
+
+	err error
+}
+
+func (e *AuthQualityError) Error() string {
+	return e.err.Error()
+}
+
+type AuthQuality struct {
+	// Entropy is the calculated entropy in bits for the passed passphrase
+	// or PIN.
+	Entropy uint32
+	// MinEntropy is the minimum entropy in bits for the corresponding
+	// authentication mode i.e. passhrase or PIN.
+	MinEntropy uint32
+	// OptimalEntropy is the recommended minimum entropy in bits for the
+	// corresponding authentication mode i.e. passhrase or PIN.
+	OptimalEntropy uint32
+}
+
+// Hook setup by secboot to calculate entropy for PINs and passphrases.
+// PINs will be supplied as a numeric passphrase.
+//
+// Note: in most cases CheckAuthQuality should be used instead
+// as it provides structured errors instead of raw entropy values.
+var EntropyBits func(authVal string) (uint32, error) = entropyBitsImpl
+
+func entropyBitsImpl(authVal string) (uint32, error) {
+	return 0, errors.New("entropy bits calculation callback not set up")
+}
+
+const (
+	minPassphraseEntropyBits uint32 = 42
+	// XXX: placeholder, needs a proper value
+	optimalPassphraseEntropyBits uint32 = 100
+
+	minPINEntropyBits uint32 = 13
+	// XXX: placeholder, needs a proper value
+	optimalPINEntropyBits uint32 = 64
+)
+
+// CheckAuthQuality checks quality of given passphrase or PIN based
+// on their entropy. An AuthQualityError error is returned which contains
+// more information about the given passphrase or PIN quality.
+//
+// PINs will be supplied as a numeric passphrase.
+func CheckAuthQuality(mode AuthMode, authVal string) (AuthQuality, error) {
+	minEntropy, optimalEntropy := minPassphraseEntropyBits, optimalPassphraseEntropyBits
+	if mode == AuthModePIN {
+		minEntropy, optimalEntropy = minPINEntropyBits, optimalPINEntropyBits
+	}
+
+	entropy, err := EntropyBits(authVal)
+	if err != nil {
+		return AuthQuality{}, err
+	}
+
+	result := AuthQuality{
+		Entropy:        entropy,
+		MinEntropy:     minEntropy,
+		OptimalEntropy: optimalEntropy,
+	}
+
+	if entropy >= minEntropy {
+		return result, nil
+	}
+
+	return AuthQuality{}, &AuthQualityError{
+		Reasons: []AuthQualityErrorReason{AuthQualityErrorReasonLowEntropy},
+		Quality: result,
+		err:     fmt.Errorf("calculated entropy (%d bits) is less than the required minimum entropy (%d bits) for the %q authentication mode", entropy, minEntropy, mode),
+	}
 }

@@ -1,12 +1,25 @@
 summary: Check that `snap auto-import` works as expected
 
+details: |
+    The auto-import command searches available mounted devices looking for
+    assertions that are signed by trusted authorities, and potentially
+    performs system changes based on them.
+
+    Assertions to be imported must be made available in the auto-import.assert file
+    in the root of the filesystem.
+
+    Having created a ramdisk with the account-key assertion, this test verifies that
+    an account key can be imported by the `snap auto-import` command from the
+    mounted ramdisk. 
+
 systems: [ubuntu-core-*-64]
 
+skip:
+    - reason: This test needs test keys to be trusted
+      if: |
+        [ "$TRUST_TEST_KEYS" = "false" ]
+
 prepare: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
     echo "Ensure the testrootorg-store.account-key is not already added"
     output=$(snap known account-key | grep -c "name: test-store" || true)
     if [ "$output" != "0" ]; then
@@ -23,17 +36,9 @@ prepare: |
     sync
 
 restore: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
     umount /mnt
 
 execute: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
     echo "$(snap auto-import) imports assertions from the mounted ramdisk"
     snap auto-import
     snap known account-key | MATCH "name: test-store"

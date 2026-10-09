@@ -29,6 +29,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -61,11 +62,11 @@ func MockUdevPropertiesForDevice(new func(string, string) (map[string]string, er
 			return []byte(err.Error()), []byte{}, err
 		}
 		// put it into udevadm format output, i.e. "KEY=VALUE\n"
-		output := ""
+		var output strings.Builder
 		for k, v := range props {
-			output += fmt.Sprintf("%s=%s\n", k, v)
+			output.WriteString(fmt.Sprintf("%s=%s\n", k, v))
 		}
-		return []byte(output), []byte{}, nil
+		return []byte(output.String()), []byte{}, nil
 	}
 	return func() {
 		udevadmProperties = old
@@ -211,6 +212,7 @@ func diskFromUDevProps(deviceIdentifier string, deviceIDType string, props map[s
 		devname:       devname,
 		devpath:       devpath,
 		hasPartitions: len(paths) != 0,
+		model:         props["ID_MODEL"],
 	}, nil
 }
 
@@ -326,6 +328,8 @@ type disk struct {
 	// whether the disk device has partitions, and thus is of type "disk", or
 	// whether the disk device is a volume that is not a physical disk
 	hasPartitions bool
+
+	model string
 }
 
 func (d *disk) KernelDeviceNode() string {
@@ -338,6 +342,10 @@ func (d *disk) KernelDevicePath() string {
 
 func (d *disk) DiskID() string {
 	return d.diskID
+}
+
+func (d *disk) Model() string {
+	return d.model
 }
 
 func (d *disk) Partitions() ([]Partition, error) {
@@ -587,6 +595,7 @@ func diskFromPartUDevProps(props map[string]string) (*disk, error) {
 
 	d.schema = schema
 	d.diskID = partTableID
+	d.model = realDiskProps["ID_MODEL"]
 
 	// since the mountpoint device has a disk, the mountpoint source itself
 	// must be a partition from a disk, thus the disk has partitions
@@ -609,7 +618,7 @@ func partitionPropsFromMountPoint(mountpoint string) (source string, props map[s
 		}
 	}
 	if source == "" {
-		return "", nil, fmt.Errorf("cannot find mountpoint %q", mountpoint)
+		return "", nil, errMountPointNotFoundImpl{path: mountpoint}
 	}
 
 	// now we have the partition for this mountpoint, we need to tie that back
@@ -847,6 +856,23 @@ func (d *disk) populatePartitions() error {
 	return nil
 }
 
+func (d *disk) FindMatchingPartitionWithPartUUID(uuid string) (Partition, error) {
+	if err := d.populatePartitions(); err != nil {
+		return Partition{}, err
+	}
+
+	for _, p := range d.partitions {
+		if p.PartitionUUID == uuid {
+			return p, nil
+		}
+	}
+
+	return Partition{}, PartitionNotFoundError{
+		SearchType:  "partition-uuid",
+		SearchQuery: uuid,
+	}
+}
+
 func (d *disk) FindMatchingPartitionWithPartLabel(label string) (Partition, error) {
 	// always encode the label
 	encodedLabel := BlkIDEncodeLabel(label)
@@ -963,45 +989,68 @@ func AllPhysicalDisks() ([]Disk, error) {
 	return disks, nil
 }
 
-// PartitionUUIDFromMountPoint returns the UUID of the partition which is a
-// source of a given mount point.
-func PartitionUUIDFromMountPoint(mountpoint string, opts *Options) (string, error) {
+var dmUUIDRe = regexp.MustCompile(`^CRYPT-(?P<type>.*)-(?P<uuid1>[0-9a-f]{8})(?P<uuid2>[0-9a-f]{4})(?P<uuid3>[0-9a-f]{4})(?P<uuid4>[0-9a-f]{4})(?P<uuid5>[0-9a-f]{12})-(?P<name>.*)$`)
+
+// DMCryptUUIDFromMountPoint finds the UUID of a device mapper device
+// mounted at mountpoint.
+func DMCryptUUIDFromMountPoint(mountpoint string) (string, error) {
 	_, props, err := partitionPropsFromMountPoint(mountpoint)
 	if err != nil {
 		return "", err
 	}
 
-	if opts != nil && opts.IsDecryptedDevice {
-		props, err = parentPartitionPropsForOptions(props)
-		if err != nil {
-			return "", err
+	dmUUID, hasDmUUID := props["DM_UUID"]
+	if !hasDmUUID {
+		// There is a bug in old UC20 kernels where udev does
+		// not retrieve data from cold plugged disks
+		// initialized in initrd.
+		// https://github.com/canonical/core-initrd/pull/58
+		// https://github.com/canonical/core-initrd/pull/203
+		devPath, hasDevPath := props["DEVPATH"]
+		if !hasDevPath {
+			return "", ErrNoDmUUID
 		}
+		devUUIDPath := filepath.Join(dirs.SysfsDir, devPath, "dm", "uuid")
+		data, err := os.ReadFile(devUUIDPath)
+		if err != nil {
+			return "", ErrNoDmUUID
+		}
+		dmUUID = strings.TrimSuffix(string(data), "\n")
+
 	}
-	partUUID := props["ID_PART_ENTRY_UUID"]
-	if partUUID == "" {
-		partDev := filepath.Join("/dev", props["DEVNAME"])
-		return "", fmt.Errorf("cannot get required partition UUID udev property for device %s", partDev)
+
+	match := dmUUIDRe.FindStringSubmatchIndex(dmUUID)
+	if match == nil {
+		return "", fmt.Errorf("value of DM_UUID is not recognized")
 	}
-	return partUUID, nil
+
+	result := []byte{}
+	result = dmUUIDRe.ExpandString(result, "${uuid1}-${uuid2}-${uuid3}-${uuid4}-${uuid5}", dmUUID, match)
+	return string(result), nil
 }
 
-// PartitionUUID returns the UUID of a given partition
-func PartitionUUID(node string) (string, error) {
+// FilesystemUUID retrieves the UUID of the filesystem for a give node
+// path
+func FilesystemUUID(node string) (string, error) {
 	props, err := udevPropertiesForName(node)
 	if err != nil && props == nil {
 		// only fail here if props is nil, if it's available we validate it
 		// below
 		return "", fmt.Errorf("cannot process udev properties: %v", err)
 	}
-	partUUID := props["ID_PART_ENTRY_UUID"]
-	if partUUID == "" {
-		return "", fmt.Errorf("cannot get required udev partition UUID property")
+	uuid := props["ID_FS_UUID"]
+	if uuid == "" {
+		return "", fmt.Errorf("cannot get required udev ID_FS_UUID property")
 	}
-	return partUUID, nil
+	return uuid, nil
 }
 
 func SectorSize(devname string) (uint64, error) {
 	return blockDeviceSectorSize(devname)
+}
+
+func SizeInBytes(devname string) (uint64, error) {
+	return blockDeviceSize(devname)
 }
 
 // filesystemTypeForPartition returns the filesystem type for a
@@ -1014,4 +1063,17 @@ func filesystemTypeForPartition(devname string) (string, error) {
 	}
 
 	return props["ID_FS_TYPE"], nil
+}
+
+// Devlinks returns all the /dev symlinks for a node
+func Devlinks(node string) ([]string, error) {
+	props, err := udevPropertiesForName(node)
+	if err != nil && props == nil {
+		return []string{}, fmt.Errorf("cannot process udev properties: %v", err)
+	}
+	devlinks := props["DEVLINKS"]
+	if devlinks == "" {
+		return []string{}, fmt.Errorf("cannot get required udev DEVLINKS property")
+	}
+	return strings.Split(devlinks, " "), nil
 }

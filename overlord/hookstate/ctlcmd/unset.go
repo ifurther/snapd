@@ -20,14 +20,21 @@
 package ctlcmd
 
 import (
+	"errors"
 	"fmt"
+	"strings"
+	"time"
 
+	"github.com/snapcore/snapd/client"
+	"github.com/snapcore/snapd/features"
 	"github.com/snapcore/snapd/i18n"
 	"github.com/snapcore/snapd/overlord/configstate"
 )
 
 type unsetCommand struct {
 	baseCommand
+	View    bool   `long:"view" description:"unset confdb values in the view declared in the plug"`
+	WaitFor string `long:"wait-for" description:"maximum duration to wait for confdb access (e.g. 10s)"`
 
 	Positional struct {
 		ConfKeys []string
@@ -48,13 +55,23 @@ Nested values may be removed via a dotted path:
 $ snapctl unset user.name
 `)
 
+var longConfdbUnsetHelp = i18n.G(`
+If the --view flag is used, 'snapctl unset' expects the name of a connected
+interface plug referencing a confdb view. In that case, the command removes
+the data at the provided paths according to the view referenced by the plug.
+`)
+
 func init() {
+	if features.Confdb.IsEnabled() {
+		longUnsetHelp += longConfdbUnsetHelp
+	}
+
 	addCommand("unset", shortUnsetHelp, longUnsetHelp, func() command { return &unsetCommand{} })
 }
 
 func (s *unsetCommand) Execute(args []string) error {
 	if len(s.Positional.ConfKeys) == 0 {
-		return fmt.Errorf(i18n.G("unset which option?"))
+		return errors.New(i18n.G("unset which option?"))
 	}
 
 	context, err := s.ensureContext()
@@ -62,13 +79,54 @@ func (s *unsetCommand) Execute(args []string) error {
 		return err
 	}
 
-	context.Lock()
-	tr := configstate.ContextTransaction(context)
-	context.Unlock()
+	if !s.View {
+		context.Lock()
+		defer context.Unlock()
+		tr := configstate.ContextTransaction(context)
 
-	for _, confKey := range s.Positional.ConfKeys {
-		tr.Set(context.InstanceName(), confKey, nil)
+		// unsetting options
+		for _, confKey := range s.Positional.ConfKeys {
+			tr.Set(context.InstanceName().String(), confKey, nil)
+		}
+		return nil
 	}
 
-	return nil
+	if err := validateConfdbFeatureFlag(context.State()); err != nil {
+		return err
+	}
+
+	// unsetting confdb data
+	if !strings.HasPrefix(s.Positional.ConfKeys[0], ":") {
+		return fmt.Errorf(i18n.G("cannot unset confdb: plug must conform to format \":<plug-name>\": %s"), s.Positional.ConfKeys[0])
+	}
+
+	plugName := strings.TrimPrefix(s.Positional.ConfKeys[0], ":")
+	if plugName == "" {
+		return errors.New(i18n.G("cannot unset confdb: plug name was not provided"))
+	}
+
+	if len(s.Positional.ConfKeys) == 1 {
+		return errors.New(i18n.G("cannot unset confdb: no paths provided to unset"))
+	}
+
+	confs := make(map[string]any, len(s.Positional.ConfKeys)-1)
+	for _, key := range s.Positional.ConfKeys[1:] {
+		confs[key] = nil
+	}
+
+	opts := &client.ConfdbOptions{}
+	if s.WaitFor != "" {
+		timeout, err := time.ParseDuration(s.WaitFor)
+		if err != nil {
+			return fmt.Errorf("cannot parse --wait-for value %s: %v", s.WaitFor, err)
+		}
+
+		if timeout < 0 {
+			return fmt.Errorf("--wait-for value must be non-negative")
+		}
+
+		opts.AccessTimeout = &timeout
+	}
+
+	return setConfdbValues(context, plugName, confs, opts)
 }

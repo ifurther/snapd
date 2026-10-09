@@ -53,10 +53,7 @@ func (s *binariesTestSuite) SetUpTest(c *C) {
 	s.tempdir = c.MkDir()
 	dirs.SetRootDir(s.tempdir)
 	c.Assert(os.MkdirAll(filepath.Dir(dirs.BashCompletionScript), 0755), IsNil)
-	f, err := os.OpenFile(dirs.BashCompletionScript, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
-	c.Assert(err, IsNil)
-	f.Write([]byte("#\nBASH_COMPLETION_VERSINFO=(2 6)\n"))
-	f.Close()
+	c.Assert(os.WriteFile(dirs.BashCompletionScript, []byte("#\nBASH_COMPLETION_VERSINFO=(2 6)\n"), 0644), IsNil)
 }
 
 func (s *binariesTestSuite) TearDownTest(c *C) {
@@ -125,19 +122,23 @@ func (s *binariesTestSuite) prepareReadOnlyLegacyDir(c *C) {
 
 	c.Assert(os.MkdirAll(filepath.Dir(dirs.CompleteShPath(s.base)), 0755), IsNil)
 	c.Assert(os.WriteFile(dirs.CompleteShPath(s.base), nil, 0644), IsNil)
-
-	f, err := os.OpenFile(dirs.BashCompletionScript, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
-	c.Assert(err, IsNil)
-	f.Write([]byte("#\n#   RELEASE: 2.1\n"))
-	f.Close()
+	c.Assert(os.WriteFile(dirs.BashCompletionScript, []byte("#\n#   RELEASE: 2.1\n"), 0644), IsNil)
 }
 
 func (s *binariesTestSuite) TestAddSnapBinariesAndRemoveReadOnlyLegacyDir(c *C) {
+	if os.Geteuid() == 0 {
+		c.Skip("this test cannot run as root (root can remove files from read-only directories)")
+	}
+
 	s.prepareReadOnlyLegacyDir(c)
 	s.testAddSnapBinariesAndRemove(c, true, true)
 }
 
 func (s *binariesTestSuite) TestEnsureSnapBinariesAndRemoveReadOnlyLegacyDir(c *C) {
+	if os.Geteuid() == 0 {
+		c.Skip("this test cannot run as root (root can remove files from read-only directories)")
+	}
+
 	s.prepareReadOnlyLegacyDir(c)
 	s.testEnsureSnapBinariesAndRemove(c, true, true)
 }
@@ -151,10 +152,7 @@ func (s *binariesTestSuite) prepareUseLegacy(c *C) {
 	c.Assert(os.MkdirAll(filepath.Dir(dirs.CompleteShPath(s.base)), 0755), IsNil)
 	c.Assert(os.WriteFile(dirs.CompleteShPath(s.base), nil, 0644), IsNil)
 
-	f, err := os.OpenFile(dirs.BashCompletionScript, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
-	c.Assert(err, IsNil)
-	f.Write([]byte("#\n#   RELEASE: 2.1\n"))
-	f.Close()
+	c.Assert(os.WriteFile(dirs.BashCompletionScript, []byte("#\n#   RELEASE: 2.1\n"), 0644), IsNil)
 }
 
 func (s *binariesTestSuite) TestAddSnapBinariesAndRemoveUseLegacy(c *C) {
@@ -175,10 +173,7 @@ func (s *binariesTestSuite) prepareOldButNotThatOld(c *C) {
 	c.Assert(os.MkdirAll(filepath.Dir(dirs.CompleteShPath(s.base)), 0755), IsNil)
 	c.Assert(os.WriteFile(dirs.CompleteShPath(s.base), nil, 0644), IsNil)
 
-	f, err := os.OpenFile(dirs.BashCompletionScript, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
-	c.Assert(err, IsNil)
-	f.Write([]byte("#\n#   RELEASE: 2.2\n"))
-	f.Close()
+	c.Assert(os.WriteFile(dirs.BashCompletionScript, []byte("#\n#   RELEASE: 2.2\n"), 0644), IsNil)
 }
 
 func (s *binariesTestSuite) TestAddSnapBinariesAndRemoveOldButNotThatOld(c *C) {
@@ -198,10 +193,7 @@ func (s *binariesTestSuite) prepareUnknownVersion(c *C) {
 
 	c.Assert(os.MkdirAll(filepath.Dir(dirs.CompleteShPath(s.base)), 0755), IsNil)
 	c.Assert(os.WriteFile(dirs.CompleteShPath(s.base), nil, 0644), IsNil)
-
-	f, err := os.OpenFile(dirs.BashCompletionScript, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
-	c.Assert(err, IsNil)
-	f.Close()
+	c.Assert(os.WriteFile(dirs.BashCompletionScript, nil, 0644), IsNil)
 }
 
 func (s *binariesTestSuite) TestAddSnapBinariesAndRemoveUnknownVersion(c *C) {

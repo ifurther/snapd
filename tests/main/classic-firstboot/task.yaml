@@ -1,16 +1,24 @@
 summary: Check that firstboot assertions are imported and snaps installed also on classic
 
+details: |
+  Verify that the snapd.seeded.service unit is able to import assertions from
+  the seed directory and install the seed snaps on classic systems. We verify
+  this by creating a seed directory with the needed snaps and assertions and
+  then starting the snapd.seeded.service unit. Additionally, we check that any
+  services defined by the seed snaps are restarted before the mark-seeded task
+  is completed.
+
 systems: [-ubuntu-core-*]
 
 environment:
     SEED_DIR: /var/lib/snapd/seed
 
-prepare: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
+skip:
+    - reason: This test needs test keys to be trusted
+      if: |
+       [ "$TRUST_TEST_KEYS" = "false" ] || tests.info is-snapd-from-archive
 
+prepare: |
     snap pack "$TESTSLIB/snaps/basic"
     snap pack "$TESTSLIB/snaps/test-snapd-service"
     snap download "--$CORE_CHANNEL" core
@@ -43,20 +51,10 @@ prepare: |
     cp ./test-snapd-service_1.0_all.snap "$SEED_DIR/snaps/test-snapd-service.snap"
 
 restore: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
-
     rm -rf "$SEED_DIR"
     systemctl start snapd.socket snapd.service
 
 execute: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
-
     echo "Start the daemon with an empty state, this will make it import "
     echo "assertions from the $SEED_DIR/assertions subdirectory and "
     echo "install the seed snaps."
@@ -88,11 +86,10 @@ execute: |
     # precondition check
     snap change 1 | MATCH "Mark system seeded"
     snap change 1 | MATCH "restart of .*test-snapd-service.test-snapd-other-service"
-    snap install --edge jq
     # extract task ids from state
     # XXX: snap change output cannot be used for that; ideally we would have some sort of 'snap debug ..' command.
-    MARKSEEDED_WAIT=$(jq -r '.tasks[] | select (.kind == "mark-seeded") | ."wait-tasks"' < /var/lib/snapd/state.json)
-    SERVICECMD_TASK=$(jq -r '.tasks[] | select (.kind == "exec-command") | .id' < /var/lib/snapd/state.json)
+    MARKSEEDED_WAIT=$(gojq -r '.tasks[] | select (.kind == "mark-seeded") | ."wait-tasks"' < /var/lib/snapd/state.json)
+    SERVICECMD_TASK=$(gojq -r '.tasks[] | select (.kind == "exec-command") | .id' < /var/lib/snapd/state.json)
     if test -z "$SERVICECMD_TASK" ; then
         echo "Could not find exec-command task"
         exit 1

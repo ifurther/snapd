@@ -10,20 +10,22 @@ backends:
   - -external
 
 systems:
-  - -amazon-linux-2-*    # fails to start service daemon-containerd
   - -amazon-linux-2023-* # fails to start service daemon-containerd
-  - -centos-7-*          # doesn't have libseccomp >= 2.4
-  - -centos-8-*          # fails to start service daemon-containerd
   - -centos-9-*          # fails to start service daemon-containerd
-  - -fedora-38-*         # fails to start service daemon-containerd
-  - -fedora-39-*      # fails to start service daemon-containerd
+  - -fedora-44-*          # fails to start service daemon-containerd
   - -ubuntu-14.04-*      # doesn't have libseccomp >= 2.4
-  - -ubuntu-*-32         # no microk8s snap for 32 bit systems
   - -arch-linux-*        # XXX: no curl to the pod for unknown reasons
+  - -opensuse-*          # install hook fails
   - -ubuntu-*-arm*       # not available on arm
+  - -ubuntu-16.04-*      # TODO: remove once it doesn't fail to load rockcraft images
+  - -ubuntu-18.04-*      # TODO: remove once it doesn't fail to load rockcraft images
+  - -ubuntu-core-22-*    # TODO: remove once it doesn't fail to load rockcraft images
+
+# TODO : remove the manual when the test works with the version 1.32-strict which is newer
+manual: true
 
 environment:
-    CHANNEL/edge: 1.25-strict/edge
+    CHANNEL/edge: 1.26-strict/edge
     # apparmor profile of microk8s can make snapd exceed its spread memory limit
     SNAPD_NO_MEMORY_LIMIT: 1
 
@@ -41,6 +43,24 @@ prepare: |
     cp /etc/systemd/system/snapd.service.d/local.conf /etc/systemd/system/snapd.service.d/local.conf.bak
     sed 's/SNAPD_CONFIGURE_HOOK_TIMEOUT=.*s/SNAPD_CONFIGURE_HOOK_TIMEOUT=180s/g' -i /etc/systemd/system/snapd.service.d/local.conf
     tests.cleanup defer mv /etc/systemd/system/snapd.service.d/local.conf.bak /etc/systemd/system/snapd.service.d/local.conf
+
+    if [ -n "${http_proxy:-}" ] || [ -n "${https_proxy:-}" ] ; then
+        ENV_FILE=/etc/environment
+        ENV_FILE_BAK="$PWD"/environment.bak
+
+        # Configuration done following https://microk8s.io/docs/install-proxy
+        cp "$ENV_FILE" "$ENV_FILE_BAK"
+        {
+        echo "http_proxy=$http_proxy"
+        echo "HTTP_PROXY=$https_proxy"
+        echo "https_proxy=$https_proxy"
+        echo "HTTPS_PROXY=$https_proxy"
+        echo "NO_PROXY=10.0.0.0/8,192.168.0.0/16,127.0.0.1,172.16.0.0/16,.svc,localhost"
+        echo "no_proxy=10.0.0.0/8,192.168.0.0/16,127.0.0.1,172.16.0.0/16,.svc,localhost"
+        } >> "$ENV_FILE"
+        tests.cleanup defer cp "$ENV_FILE_BAK" "$ENV_FILE"
+    fi
+
     systemctl daemon-reload
     tests.cleanup defer systemctl daemon-reload
     systemctl restart snapd.socket
@@ -63,9 +83,26 @@ restore: |
         groupdel "$user" || groupdel --extrausers "$user" || true
     done
 
+    if os.query is-xenial || os.query is-bionic; then
+        # old system is not doing cleanups
+        find /sys/fs/cgroup/ -type d -name "snap.*" -prune | while read -r svc; do
+             rmdir "$svc" || true
+        done
+    fi
+
 execute: |
     snap install --channel="$CHANNEL" microk8s
-    microk8s status --wait-ready
+
+    if [ "${SNAPD_USE_PROXY:-}" = true ]; then
+        # Change server from docker to rocks.canonical.com because docker.io has download restrictions
+        CONFIG_FILE=/var/snap/microk8s/current/args/certs.d/docker.io/hosts.toml
+        sed -i 's|"https://docker.io"|"https://rocks.canonical.com"|' "$CONFIG_FILE"
+        microk8s stop
+        microk8s start
+    fi
+
+    microk8s status --wait-ready --timeout 180
+
     # XXX: enable dashboard etc? doing this is slow :/
     #microk8s enable dashboard dns registry istio
     microk8s kubectl get nodes | MATCH Ready
@@ -82,7 +119,11 @@ execute: |
     microk8s kubectl patch svc nginx-np --patch '{"spec":{"ports":[{"port":80,"nodePort":31313}]}}'
 
     echo "Test if nginx can be connected"
-    retry -n 15 sh -c "curl --max-time 3 'http://localhost:31313/' | MATCH 'Welcome to nginx'"
+    no_proxy_param=""
+    if [ -n "${http_proxy:-}" ] || [ -n "${https_proxy:-}" ] ; then
+        no_proxy_param="no_proxy=localhost"
+    fi
+    retry -n 15 sh -c "$no_proxy_param curl --max-time 3 'http://localhost:31313/' | MATCH 'Welcome to nginx'"
 
     echo "Running a microk8s causes no DENIED messages"
     dmesg | not grep DENIED

@@ -33,22 +33,21 @@ environment:
     SNAP_ID_core20: DLqre5XGLbDqg9jPtiAhRRjDuPVa5X1q
     SNAP_ID_core18: CSO04Jhav2yK0uz97cr0ipQRyqg0qQL6
     SNAP_ID_core: 99T7MUlRhtI3U0QFgl5mXXESAiSwt776
-    # pc-kernel snap is specific to i386/x86-64
+    # pc-kernel snap is specific to x86-64
     SNAP_ID_pc_kernel: pYVQrBcKmBa0mZ4CCN7ExT6jH8rY1hza
 
+skip:
+    - reason: This test needs test keys to be trusted
+      if: |
+        [ "$TRUST_TEST_KEYS" = "false" ]
+    - reason: Variant not supported on ARM architectures
+      if: |
+        [ "$TARGET_SNAP" = "kernel" ] && os.query is-arm
+    - reason: The kernel snap used for openstack cannot be refreshed with Canonical model
+      if: |
+        [ "$TARGET_SNAP" = "kernel" ] && os.query is-core18 && [[ "$SPREAD_BACKEND" =~ openstack ]]
+
 prepare: |
-    if [ "$TARGET_SNAP" = "kernel" ] && os.query is-arm; then
-        echo "variant not supported on ARM architectures"
-        exit 0
-    fi
-
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
-    snap install jq
-    snap install remarshal
-
     snap ack "$TESTSLIB/assertions/testrootorg-store.account-key"
     snap ack "$TESTSLIB/assertions/developer1.account"
     snap ack "$TESTSLIB/assertions/developer1.account-key"
@@ -57,15 +56,6 @@ prepare: |
     mkdir -p "$BUILD_DIR"
 
 restore: |
-    if [ "$TARGET_SNAP" = "kernel" ] && os.query is-arm; then
-        echo "variant not supported on ARM architectures"
-        exit 0
-    fi
-
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
     "$TESTSTOOLS"/store-state teardown-fake-store "$BLOB_DIR"
 
     rm -rf "$BUILD_DIR"
@@ -76,16 +66,6 @@ debug: |
     snap changes || true
 
 execute: |
-    if [ "$TARGET_SNAP" = "kernel" ] && os.query is-arm; then
-        echo "variant not supported on ARM architectures"
-        exit 0
-    fi
-
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
-
     inject_rclocalcrash_failure(){
         chmod a+x "$BUILD_DIR/unpack/etc/rc.local"
         cat <<EOF > "$BUILD_DIR/unpack/etc/rc.local"

@@ -217,7 +217,7 @@ func (iface *locationControlInterface) StaticInfo() interfaces.StaticInfo {
 
 func (iface *locationControlInterface) AppArmorConnectedPlug(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	old := "###SLOT_SECURITY_TAGS###"
-	new := spec.SnapAppSet().SlotLabelExpression(slot)
+	new := slot.LabelExpression()
 	snippet := strings.Replace(locationControlConnectedPlugAppArmor, old, new, -1)
 	spec.AddSnippet(snippet)
 	return nil
@@ -240,7 +240,7 @@ func (iface *locationControlInterface) AppArmorPermanentSlot(spec *apparmor.Spec
 
 func (iface *locationControlInterface) AppArmorConnectedSlot(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	old := "###PLUG_SECURITY_TAGS###"
-	new := spec.SnapAppSet().PlugLabelExpression(plug)
+	new := plug.LabelExpression()
 	snippet := strings.Replace(locationControlConnectedSlotAppArmor, old, new, -1)
 	spec.AddSnippet(snippet)
 	return nil
@@ -249,6 +249,12 @@ func (iface *locationControlInterface) AppArmorConnectedSlot(spec *apparmor.Spec
 func (iface *locationControlInterface) AutoConnect(*snap.PlugInfo, *snap.SlotInfo) bool {
 	// allow what declarations allowed
 	return true
+}
+
+func (iface *locationControlInterface) ParallelInstancesSupportedForSlot(_ *snap.SlotInfo) error {
+	// the location service owns the well-known bus name com.ubuntu.location.Service
+	// on the system bus; only one snap instance can hold it at a time.
+	return errParallelInstancesUniqueResourceOwner
 }
 
 func init() {

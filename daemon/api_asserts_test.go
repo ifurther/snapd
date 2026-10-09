@@ -58,7 +58,7 @@ func (s *assertsSuite) SetUpTest(c *check.C) {
 func (s *assertsSuite) TestGetAsserts(c *check.C) {
 	req, err := http.NewRequest("GET", "/v2/assertions", nil)
 	c.Assert(err, check.IsNil)
-	resp := s.syncReq(c, req, nil)
+	resp := s.syncReq(c, req, nil, actionIsExpected)
 	c.Check(resp.Status, check.Equals, 200)
 	c.Check(resp.Result, check.DeepEquals, map[string][]string{"types": asserts.TypeNames()})
 }
@@ -82,7 +82,7 @@ func (s *assertsSuite) TestAssertOK(c *check.C) {
 	// Execute
 	req, err := http.NewRequest("POST", "/v2/assertions", buf)
 	c.Assert(err, check.IsNil)
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 	// Verify (external)
 	c.Check(rsp.Status, check.Equals, 200)
 	// Verify (internal)
@@ -108,7 +108,7 @@ func (s *assertsSuite) TestAssertStreamOK(c *check.C) {
 	// Execute
 	req, err := http.NewRequest("POST", "/v2/assertions", buf)
 	c.Assert(err, check.IsNil)
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 	// Verify (external)
 	c.Check(rsp.Status, check.Equals, 200)
 	// Verify (internal)
@@ -153,7 +153,7 @@ func (s *assertsSuite) TestAssertError(c *check.C) {
 }
 
 func (s *assertsSuite) TestAssertsFindManyAll(c *check.C) {
-	acct := assertstest.NewAccount(s.StoreSigning, "developer1", map[string]interface{}{
+	acct := assertstest.NewAccount(s.StoreSigning, "developer1", map[string]any{
 		"account-id": "developer1-id",
 	}, "")
 	s.addAsserts(acct)
@@ -271,11 +271,11 @@ func (s *assertsSuite) testAssertsFindManyJSONFilter(c *check.C, urlPath string)
 	c.Check(rec.Code, check.Equals, 200, check.Commentf("body %q", rec.Body))
 	c.Check(rec.Header().Get("Content-Type"), check.Equals, "application/json")
 
-	var body map[string]interface{}
+	var body map[string]any
 	err = json.Unmarshal(rec.Body.Bytes(), &body)
 	c.Assert(err, check.IsNil)
-	c.Check(body["result"], check.DeepEquals, []interface{}{
-		map[string]interface{}{
+	c.Check(body["result"], check.DeepEquals, []any{
+		map[string]any{
 			"headers": acct.Headers(),
 		},
 	})
@@ -296,10 +296,10 @@ func (s *assertsSuite) TestAssertsFindManyJSONNoResults(c *check.C) {
 	c.Check(rec.Code, check.Equals, 200, check.Commentf("body %q", rec.Body))
 	c.Check(rec.Header().Get("Content-Type"), check.Equals, "application/json")
 
-	var body map[string]interface{}
+	var body map[string]any
 	err = json.Unmarshal(rec.Body.Bytes(), &body)
 	c.Assert(err, check.IsNil)
-	c.Check(body["result"], check.DeepEquals, []interface{}{})
+	c.Check(body["result"], check.DeepEquals, []any{})
 }
 
 func (s *assertsSuite) TestAssertsFindManyJSONWithBody(c *check.C) {
@@ -318,16 +318,16 @@ func (s *assertsSuite) TestAssertsFindManyJSONWithBody(c *check.C) {
 	c.Check(rec.Header().Get("Content-Type"), check.Equals, "application/json")
 
 	var got []string
-	var body map[string]interface{}
+	var body map[string]any
 	err = json.Unmarshal(rec.Body.Bytes(), &body)
 	c.Assert(err, check.IsNil)
-	for _, a := range body["result"].([]interface{}) {
-		h := a.(map[string]interface{})["headers"].(map[string]interface{})
+	for _, a := range body["result"].([]any) {
+		h := a.(map[string]any)["headers"].(map[string]any)
 		got = append(got, h["account-id"].(string)+"/"+h["name"].(string))
 		// check body
 		l, err := strconv.Atoi(h["body-length"].(string))
 		c.Assert(err, check.IsNil)
-		c.Check(a.(map[string]interface{})["body"], check.HasLen, l)
+		c.Check(a.(map[string]any)["body"], check.HasLen, l)
 	}
 	sort.Strings(got)
 	c.Check(got, check.DeepEquals, []string{"can0nical/root", "can0nical/store", "canonical/root", "generic/models"})
@@ -349,14 +349,14 @@ func (s *assertsSuite) TestAssertsFindManyJSONHeadersOnly(c *check.C) {
 	c.Check(rec.Header().Get("Content-Type"), check.Equals, "application/json")
 
 	var got []string
-	var body map[string]interface{}
+	var body map[string]any
 	err = json.Unmarshal(rec.Body.Bytes(), &body)
 	c.Assert(err, check.IsNil)
-	for _, a := range body["result"].([]interface{}) {
-		h := a.(map[string]interface{})["headers"].(map[string]interface{})
+	for _, a := range body["result"].([]any) {
+		h := a.(map[string]any)["headers"].(map[string]any)
 		got = append(got, h["account-id"].(string)+"/"+h["name"].(string))
 		// check body absent
-		_, ok := a.(map[string]interface{})["body"]
+		_, ok := a.(map[string]any)["body"]
 		c.Assert(ok, check.Equals, false)
 	}
 	sort.Strings(got)
@@ -382,7 +382,7 @@ func (s *assertsSuite) TestAssertsFindManyJSONInvalidParam(c *check.C) {
 	c.Assert(json.Unmarshal(rec.Body.Bytes(), &rsp), check.IsNil)
 	c.Check(rsp.Status, check.Equals, 400)
 	c.Check(rsp.Type, check.Equals, daemon.ResponseTypeError)
-	c.Check(rsp.Result, check.DeepEquals, map[string]interface{}{
+	c.Check(rsp.Result, check.DeepEquals, map[string]any{
 		"message": `"json" query parameter when used must be set to "true" or "headers"`,
 	})
 }
@@ -426,7 +426,7 @@ func (s *assertsSuite) TestAssertsFindManyRemoteInvalidParam(c *check.C) {
 	c.Assert(json.Unmarshal(rec.Body.Bytes(), &rsp), check.IsNil)
 	c.Check(rsp.Status, check.Equals, 400)
 	c.Check(rsp.Type, check.Equals, daemon.ResponseTypeError)
-	c.Check(rsp.Result, check.DeepEquals, map[string]interface{}{
+	c.Check(rsp.Result, check.DeepEquals, map[string]any{
 		"message": `"remote" query parameter when used must be set to "true" or "false" or left unset`,
 	})
 }

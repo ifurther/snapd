@@ -1,6 +1,11 @@
 summary: smoke test for the tests.systemd tool
 
-backends: [google]
+details: |
+    Check the tests.systemd properly manages systemd services.
+    Verify the tool is able to create units, wait for status and
+    stop units.
+
+backends: [openstack*]
 
 systems: [-ubuntu-14.04-64]
 

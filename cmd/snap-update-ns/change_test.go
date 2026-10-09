@@ -87,18 +87,18 @@ func (s *changeSuite) TestNeededChangesNoProfiles(c *C) {
 
 // When the profiles are the same we don't do anything.
 func (s *changeSuite) TestNeededChangesNoChange(c *C) {
-	current := &osutil.MountProfile{Entries: []osutil.MountEntry{{Dir: "/common/stuff"}}}
-	desired := &osutil.MountProfile{Entries: []osutil.MountEntry{{Dir: "/common/stuff"}}}
+	current := &osutil.MountProfile{Entries: []osutil.MountEntry{{Dir: "/common/stuff", Type: "tmpfs"}}}
+	desired := &osutil.MountProfile{Entries: []osutil.MountEntry{{Dir: "/common/stuff", Type: "tmpfs"}}}
 	changes := update.NeededChanges(current, desired)
 	c.Assert(changes, DeepEquals, []*update.Change{
-		{Entry: osutil.MountEntry{Dir: "/common/stuff"}, Action: update.Keep},
+		{Entry: osutil.MountEntry{Dir: "/common/stuff", Type: "tmpfs"}, Action: update.Keep},
 	})
 }
 
 // When the content interface is connected we should mount the new entry.
 func (s *changeSuite) TestNeededChangesTrivialMount(c *C) {
 	current := &osutil.MountProfile{}
-	desired := &osutil.MountProfile{Entries: []osutil.MountEntry{{Dir: "/common/stuff"}}}
+	desired := &osutil.MountProfile{Entries: []osutil.MountEntry{{Dir: "/common/stuff", Type: "tmpfs"}}}
 	changes := update.NeededChanges(current, desired)
 	c.Assert(changes, DeepEquals, []*update.Change{
 		{Entry: desired.Entries[0], Action: update.Mount},
@@ -107,11 +107,11 @@ func (s *changeSuite) TestNeededChangesTrivialMount(c *C) {
 
 // When the content interface is disconnected we should unmount the mounted entry.
 func (s *changeSuite) TestNeededChangesTrivialUnmount(c *C) {
-	current := &osutil.MountProfile{Entries: []osutil.MountEntry{{Dir: "/common/stuff"}}}
+	current := &osutil.MountProfile{Entries: []osutil.MountEntry{{Dir: "/common/stuff", Type: "tmpfs"}}}
 	desired := &osutil.MountProfile{}
 	changes := update.NeededChanges(current, desired)
 	c.Assert(changes, DeepEquals, []*update.Change{
-		{Entry: current.Entries[0], Action: update.Unmount},
+		{Entry: osutil.MountEntry{Dir: "/common/stuff", Type: "tmpfs", Options: []string{"x-snapd.detach"}}, Action: update.Unmount},
 	})
 }
 
@@ -120,7 +120,7 @@ func (s *changeSuite) TestNeededChangesKeepRootfs(c *C) {
 	current := &osutil.MountProfile{Entries: []osutil.MountEntry{
 		{Dir: "/", Options: []string{"x-snapd.origin=rootfs"}},
 	}}
-	desired := &osutil.MountProfile{Entries: []osutil.MountEntry{{Dir: "/common/stuff"}}}
+	desired := &osutil.MountProfile{Entries: []osutil.MountEntry{{Dir: "/common/stuff", Type: "tmpfs"}}}
 	changes := update.NeededChanges(current, desired)
 	c.Assert(changes, DeepEquals, []*update.Change{
 		{Entry: current.Entries[0], Action: update.Keep},
@@ -134,7 +134,7 @@ func (s *changeSuite) TestNeededChangesUmountRootfs(c *C) {
 		// Like the test above, but without "x-snapd.origin=rootfs"
 		{Dir: "/"},
 	}}
-	desired := &osutil.MountProfile{Entries: []osutil.MountEntry{{Dir: "/common/stuff"}}}
+	desired := &osutil.MountProfile{Entries: []osutil.MountEntry{{Dir: "/common/stuff", Type: "tmpfs"}}}
 	changes := update.NeededChanges(current, desired)
 	c.Assert(changes, DeepEquals, []*update.Change{
 		{Entry: current.Entries[0], Action: update.Unmount},
@@ -145,14 +145,14 @@ func (s *changeSuite) TestNeededChangesUmountRootfs(c *C) {
 // When umounting we unmount children before parents.
 func (s *changeSuite) TestNeededChangesUnmountOrder(c *C) {
 	current := &osutil.MountProfile{Entries: []osutil.MountEntry{
-		{Dir: "/common/stuff"},
-		{Dir: "/common/stuff/extra"},
+		{Dir: "/common/stuff", Type: "tmpfs"},
+		{Dir: "/common/stuff/extra", Type: "tmpfs"},
 	}}
 	desired := &osutil.MountProfile{}
 	changes := update.NeededChanges(current, desired)
 	c.Assert(changes, DeepEquals, []*update.Change{
-		{Entry: osutil.MountEntry{Dir: "/common/stuff/extra"}, Action: update.Unmount},
-		{Entry: osutil.MountEntry{Dir: "/common/stuff"}, Action: update.Unmount},
+		{Entry: osutil.MountEntry{Dir: "/common/stuff/extra", Type: "tmpfs", Options: []string{"x-snapd.detach"}}, Action: update.Unmount},
+		{Entry: osutil.MountEntry{Dir: "/common/stuff", Type: "tmpfs", Options: []string{"x-snapd.detach"}}, Action: update.Unmount},
 	})
 }
 
@@ -167,11 +167,11 @@ func (s *changeSuite) TestNeededChangesMountOrder(c *C) {
 
 	current := &osutil.MountProfile{}
 	desired := &osutil.MountProfile{Entries: []osutil.MountEntry{
-		{Dir: "/c/stuff/dir/symlink1"},
-		{Dir: "/c/stuff/dir/file2", Options: []string{"x-snapd.kind=file"}},
-		{Dir: "/c/stuff/dir"},
-		{Dir: "/c/stuff"},
-		{Dir: "/c/stuff/dir/file1", Options: []string{"x-snapd.kind=file"}},
+		{Dir: "/c/stuff/dir/symlink1", Options: []string{"x-snapd.kind=symlink", "x-snapd.symlink=/origin1"}},
+		{Dir: "/c/stuff/dir/file2", Name: "/origin2", Options: []string{"bind", "x-snapd.kind=file"}},
+		{Dir: "/c/stuff/dir", Type: "tmpfs"},
+		{Dir: "/c/stuff", Type: "tmpfs"},
+		{Dir: "/c/stuff/dir/file1", Name: "/origin1", Options: []string{"bind", "x-snapd.kind=file"}},
 	}}
 
 	for _, testData := range []struct {
@@ -216,12 +216,12 @@ func (s *changeSuite) TestNeededChangesMountFromReal(c *C) {
 
 	current := &osutil.MountProfile{}
 	desired := &osutil.MountProfile{Entries: []osutil.MountEntry{
-		{Dir: "/snap/test-snapd-layout/x1/fooo-top", Options: []string{"x-snapd.origin=layout"}},
-		{Dir: "/snap/test-snapd-layout/x1/fooo/deeper", Options: []string{"x-snapd.origin=layout"}},
-		{Dir: "/usr/lib/x86_64-linux-gnu/wpe-webkit-1.0", Options: []string{"x-snapd.origin=layout"}},
-		{Dir: "/usr/libexec/wpe-webkit-1.0", Options: []string{"x-snapd.origin=layout"}},
-		{Dir: "/var/fooo-top", Options: []string{"x-snapd.origin=layout"}},
-		{Dir: "/var/fooo/deeper", Options: []string{"x-snapd.origin=layout"}},
+		{Dir: "/snap/test-snapd-layout/x1/fooo-top", Name: "/xxx/fooo-top", Options: []string{"rbind", "x-snapd.origin=layout"}},
+		{Dir: "/snap/test-snapd-layout/x1/fooo/deeper", Name: "/xxx/deeper", Options: []string{"rbind", "x-snapd.origin=layout"}},
+		{Dir: "/usr/lib/x86_64-linux-gnu/wpe-webkit-1.0", Name: "/xxx/wpe-webkit-1.0", Options: []string{"rbind", "x-snapd.origin=layout"}},
+		{Dir: "/usr/libexec/wpe-webkit-1.0", Name: "/xxx/libexec/wpe-webkit-1.0", Options: []string{"rbind", "x-snapd.origin=layout"}},
+		{Dir: "/var/fooo-top", Name: "/xxx/var/foo-top", Options: []string{"rbind", "x-snapd.origin=layout"}},
+		{Dir: "/var/fooo/deeper", Name: "/xxx/var/deeper", Options: []string{"rbind", "x-snapd.origin=layout"}},
 	}}
 
 	for _, testData := range []struct {
@@ -267,13 +267,13 @@ func (s *changeSuite) TestNeededChangesMountFromReal(c *C) {
 func (s *changeSuite) TestNeededChangesKind(c *C) {
 	current := &osutil.MountProfile{}
 	desired := &osutil.MountProfile{Entries: []osutil.MountEntry{
-		{Dir: "/common/file", Options: []string{"x-snapd.kind=file"}},
-		{Dir: "/common/symlink", Options: []string{"x-snapd.kind=symlink"}},
+		{Dir: "/common/file", Name: "/foo", Options: []string{"bind", "x-snapd.kind=file"}},
+		{Dir: "/common/symlink", Options: []string{"x-snapd.kind=symlink", "x-snapd.symlink=/bar"}},
 	}}
 	changes := update.NeededChanges(current, desired)
 	c.Assert(changes, DeepEquals, []*update.Change{
-		{Entry: osutil.MountEntry{Dir: "/common/file", Options: []string{"x-snapd.kind=file"}}, Action: update.Mount},
-		{Entry: osutil.MountEntry{Dir: "/common/symlink", Options: []string{"x-snapd.kind=symlink"}}, Action: update.Mount},
+		{Entry: osutil.MountEntry{Dir: "/common/file", Name: "/foo", Options: []string{"bind", "x-snapd.kind=file"}}, Action: update.Mount},
+		{Entry: osutil.MountEntry{Dir: "/common/symlink", Options: []string{"x-snapd.kind=symlink", "x-snapd.symlink=/bar"}}, Action: update.Mount},
 	})
 }
 
@@ -281,43 +281,43 @@ func (s *changeSuite) TestNeededChangesKind(c *C) {
 
 func (s *changeSuite) TestNeededChangesChangedParentSameChild(c *C) {
 	current := &osutil.MountProfile{Entries: []osutil.MountEntry{
-		{Dir: "/common/stuff", Name: "/dev/sda1"},
-		{Dir: "/common/stuff/extra"},
-		{Dir: "/common/unrelated"},
+		{Dir: "/common/stuff", Name: "/dev/sda1", Type: "tmpfs"},
+		{Dir: "/common/stuff/extra", Type: "tmpfs"},
+		{Dir: "/common/unrelated", Type: "tmpfs"},
 	}}
 	desired := &osutil.MountProfile{Entries: []osutil.MountEntry{
-		{Dir: "/common/stuff", Name: "/dev/sda2"},
-		{Dir: "/common/stuff/extra"},
-		{Dir: "/common/unrelated"},
+		{Dir: "/common/stuff", Name: "/dev/sda2", Type: "tmpfs"},
+		{Dir: "/common/stuff/extra", Type: "tmpfs"},
+		{Dir: "/common/unrelated", Type: "tmpfs"},
 	}}
 	changes := update.NeededChanges(current, desired)
 	c.Assert(changes, DeepEquals, []*update.Change{
-		{Entry: osutil.MountEntry{Dir: "/common/unrelated"}, Action: update.Keep},
-		{Entry: osutil.MountEntry{Dir: "/common/stuff/extra"}, Action: update.Unmount},
-		{Entry: osutil.MountEntry{Dir: "/common/stuff", Name: "/dev/sda1"}, Action: update.Unmount},
-		{Entry: osutil.MountEntry{Dir: "/common/stuff", Name: "/dev/sda2"}, Action: update.Mount},
-		{Entry: osutil.MountEntry{Dir: "/common/stuff/extra"}, Action: update.Mount},
+		{Entry: osutil.MountEntry{Dir: "/common/unrelated", Type: "tmpfs"}, Action: update.Keep},
+		{Entry: osutil.MountEntry{Dir: "/common/stuff/extra", Type: "tmpfs", Options: []string{"x-snapd.detach"}}, Action: update.Unmount},
+		{Entry: osutil.MountEntry{Dir: "/common/stuff", Name: "/dev/sda1", Type: "tmpfs", Options: []string{"x-snapd.detach"}}, Action: update.Unmount},
+		{Entry: osutil.MountEntry{Dir: "/common/stuff", Name: "/dev/sda2", Type: "tmpfs"}, Action: update.Mount},
+		{Entry: osutil.MountEntry{Dir: "/common/stuff/extra", Type: "tmpfs"}, Action: update.Mount},
 	})
 }
 
 // When child changes we don't touch the unchanged parent
 func (s *changeSuite) TestNeededChangesSameParentChangedChild(c *C) {
 	current := &osutil.MountProfile{Entries: []osutil.MountEntry{
-		{Dir: "/common/stuff"},
-		{Dir: "/common/stuff/extra", Name: "/dev/sda1"},
-		{Dir: "/common/unrelated"},
+		{Dir: "/common/stuff", Type: "tmpfs"},
+		{Dir: "/common/stuff/extra", Name: "/dev/sda1", Type: "tmpfs"},
+		{Dir: "/common/unrelated", Type: "tmpfs"},
 	}}
 	desired := &osutil.MountProfile{Entries: []osutil.MountEntry{
-		{Dir: "/common/stuff"},
-		{Dir: "/common/stuff/extra", Name: "/dev/sda2"},
-		{Dir: "/common/unrelated"},
+		{Dir: "/common/stuff", Type: "tmpfs"},
+		{Dir: "/common/stuff/extra", Name: "/dev/sda2", Type: "tmpfs"},
+		{Dir: "/common/unrelated", Type: "tmpfs"},
 	}}
 	changes := update.NeededChanges(current, desired)
 	c.Assert(changes, DeepEquals, []*update.Change{
-		{Entry: osutil.MountEntry{Dir: "/common/unrelated"}, Action: update.Keep},
-		{Entry: osutil.MountEntry{Dir: "/common/stuff/extra", Name: "/dev/sda1"}, Action: update.Unmount},
-		{Entry: osutil.MountEntry{Dir: "/common/stuff"}, Action: update.Keep},
-		{Entry: osutil.MountEntry{Dir: "/common/stuff/extra", Name: "/dev/sda2"}, Action: update.Mount},
+		{Entry: osutil.MountEntry{Dir: "/common/unrelated", Type: "tmpfs"}, Action: update.Keep},
+		{Entry: osutil.MountEntry{Dir: "/common/stuff/extra", Name: "/dev/sda1", Type: "tmpfs", Options: []string{"x-snapd.detach"}}, Action: update.Unmount},
+		{Entry: osutil.MountEntry{Dir: "/common/stuff", Type: "tmpfs"}, Action: update.Keep},
+		{Entry: osutil.MountEntry{Dir: "/common/stuff/extra", Name: "/dev/sda2", Type: "tmpfs"}, Action: update.Mount},
 	})
 }
 
@@ -428,50 +428,48 @@ func (s *changeSuite) TestNeededChangesTmpfsBindMountFarmUsed(c *C) {
 // We are smart about comparing entries as directories. Here even though "/a/b"
 // is a prefix of "/a/b-1" it is correctly reused.
 func (s *changeSuite) TestNeededChangesSmartEntryComparisonOld(c *C) {
-
 	current := &osutil.MountProfile{Entries: []osutil.MountEntry{
-		{Dir: "/a/b", Name: "/dev/sda1"},
-		{Dir: "/a/b/c"},
-		{Dir: "/a/b-1"},
-		{Dir: "/a/b-1/3"},
+		{Dir: "/a/b", Name: "/dev/sda1", Type: "tmpfs"},
+		{Dir: "/a/b/c", Type: "tmpfs"},
+		{Dir: "/a/b-1", Type: "tmpfs"},
+		{Dir: "/a/b-1/3", Type: "tmpfs"},
 	}}
 	desired := &osutil.MountProfile{Entries: []osutil.MountEntry{
-		{Dir: "/a/b", Name: "/dev/sda2"},
-		{Dir: "/a/b-1"},
-		{Dir: "/a/b/c"},
+		{Dir: "/a/b", Name: "/dev/sda2", Type: "tmpfs"},
+		{Dir: "/a/b-1", Type: "tmpfs"},
+		{Dir: "/a/b/c", Type: "tmpfs"},
 	}}
 	changes := update.NeededChanges(current, desired)
 	for _, chg := range changes {
 		c.Logf("- %+v", chg)
 	}
 	c.Assert(changes, DeepEquals, []*update.Change{
-		{Entry: osutil.MountEntry{Dir: "/a/b-1/3"}, Action: update.Unmount},
-		{Entry: osutil.MountEntry{Dir: "/a/b-1"}, Action: update.Keep},
-		{Entry: osutil.MountEntry{Dir: "/a/b/c"}, Action: update.Unmount},
-		{Entry: osutil.MountEntry{Dir: "/a/b", Name: "/dev/sda1"}, Action: update.Unmount},
+		{Entry: osutil.MountEntry{Dir: "/a/b-1/3", Type: "tmpfs", Options: []string{"x-snapd.detach"}}, Action: update.Unmount},
+		{Entry: osutil.MountEntry{Dir: "/a/b-1", Type: "tmpfs"}, Action: update.Keep},
+		{Entry: osutil.MountEntry{Dir: "/a/b/c", Type: "tmpfs", Options: []string{"x-snapd.detach"}}, Action: update.Unmount},
+		{Entry: osutil.MountEntry{Dir: "/a/b", Name: "/dev/sda1", Type: "tmpfs", Options: []string{"x-snapd.detach"}}, Action: update.Unmount},
 
-		{Entry: osutil.MountEntry{Dir: "/a/b", Name: "/dev/sda2"}, Action: update.Mount},
-		{Entry: osutil.MountEntry{Dir: "/a/b/c"}, Action: update.Mount},
+		{Entry: osutil.MountEntry{Dir: "/a/b", Name: "/dev/sda2", Type: "tmpfs"}, Action: update.Mount},
+		{Entry: osutil.MountEntry{Dir: "/a/b/c", Type: "tmpfs"}, Action: update.Mount},
 	})
 }
 
 // Parallel instance changes are executed first
 func (s *changeSuite) TestNeededChangesParallelInstancesManyComeFirst(c *C) {
-
 	desired := &osutil.MountProfile{Entries: []osutil.MountEntry{
-		{Dir: "/common/stuff", Name: "/dev/sda1"},
-		{Dir: "/common/stuff/extra"},
-		{Dir: "/common/unrelated"},
-		{Dir: "/foo/bar", Name: "/foo/bar_bar", Options: []string{osutil.XSnapdOriginOvername()}},
-		{Dir: "/snap/foo", Name: "/snap/foo_bar", Options: []string{osutil.XSnapdOriginOvername()}},
+		{Dir: "/common/stuff", Name: "/dev/sda1", Type: "tmpfs"},
+		{Dir: "/common/stuff/extra", Type: "tmpfs"},
+		{Dir: "/common/unrelated", Type: "tmpfs"},
+		{Dir: "/foo/bar", Name: "/foo/bar_bar", Options: []string{"rbind", osutil.XSnapdOriginOvername()}},
+		{Dir: "/snap/foo", Name: "/snap/foo_bar", Options: []string{"rbind", osutil.XSnapdOriginOvername()}},
 	}}
 	changes := update.NeededChanges(&osutil.MountProfile{}, desired)
 	c.Assert(changes, DeepEquals, []*update.Change{
-		{Entry: osutil.MountEntry{Dir: "/foo/bar", Name: "/foo/bar_bar", Options: []string{osutil.XSnapdOriginOvername()}}, Action: update.Mount},
-		{Entry: osutil.MountEntry{Dir: "/snap/foo", Name: "/snap/foo_bar", Options: []string{osutil.XSnapdOriginOvername()}}, Action: update.Mount},
-		{Entry: osutil.MountEntry{Dir: "/common/stuff", Name: "/dev/sda1"}, Action: update.Mount},
-		{Entry: osutil.MountEntry{Dir: "/common/stuff/extra"}, Action: update.Mount},
-		{Entry: osutil.MountEntry{Dir: "/common/unrelated"}, Action: update.Mount},
+		{Entry: osutil.MountEntry{Dir: "/foo/bar", Name: "/foo/bar_bar", Options: []string{"rbind", osutil.XSnapdOriginOvername()}}, Action: update.Mount},
+		{Entry: osutil.MountEntry{Dir: "/snap/foo", Name: "/snap/foo_bar", Options: []string{"rbind", osutil.XSnapdOriginOvername()}}, Action: update.Mount},
+		{Entry: osutil.MountEntry{Dir: "/common/stuff", Name: "/dev/sda1", Type: "tmpfs"}, Action: update.Mount},
+		{Entry: osutil.MountEntry{Dir: "/common/stuff/extra", Type: "tmpfs"}, Action: update.Mount},
+		{Entry: osutil.MountEntry{Dir: "/common/unrelated", Type: "tmpfs"}, Action: update.Mount},
 	})
 }
 
@@ -479,21 +477,21 @@ func (s *changeSuite) TestNeededChangesParallelInstancesManyComeFirst(c *C) {
 func (s *changeSuite) TestNeededChangesParallelInstancesKeep(c *C) {
 
 	desired := &osutil.MountProfile{Entries: []osutil.MountEntry{
-		{Dir: "/common/stuff", Name: "/dev/sda1"},
-		{Dir: "/common/unrelated"},
-		{Dir: "/foo/bar", Name: "/foo/bar_bar", Options: []string{osutil.XSnapdOriginOvername()}},
-		{Dir: "/snap/foo", Name: "/snap/foo_bar", Options: []string{osutil.XSnapdOriginOvername()}},
+		{Dir: "/common/stuff", Name: "/dev/sda1", Type: "tmpfs"},
+		{Dir: "/common/unrelated", Type: "tmpfs"},
+		{Dir: "/foo/bar", Name: "/foo/bar_bar", Options: []string{"rbind", osutil.XSnapdOriginOvername()}},
+		{Dir: "/snap/foo", Name: "/snap/foo_bar", Options: []string{"rbind", osutil.XSnapdOriginOvername()}},
 	}}
 	current := &osutil.MountProfile{Entries: []osutil.MountEntry{
-		{Dir: "/foo/bar", Name: "/foo/bar_bar", Options: []string{osutil.XSnapdOriginOvername()}},
-		{Dir: "/snap/foo", Name: "/snap/foo_bar", Options: []string{osutil.XSnapdOriginOvername()}},
+		{Dir: "/foo/bar", Name: "/foo/bar_bar", Options: []string{"rbind", osutil.XSnapdOriginOvername()}},
+		{Dir: "/snap/foo", Name: "/snap/foo_bar", Options: []string{"rbind", osutil.XSnapdOriginOvername()}},
 	}}
 	changes := update.NeededChanges(current, desired)
 	c.Assert(changes, DeepEquals, []*update.Change{
-		{Entry: osutil.MountEntry{Dir: "/snap/foo", Name: "/snap/foo_bar", Options: []string{osutil.XSnapdOriginOvername()}}, Action: update.Keep},
-		{Entry: osutil.MountEntry{Dir: "/foo/bar", Name: "/foo/bar_bar", Options: []string{osutil.XSnapdOriginOvername()}}, Action: update.Keep},
-		{Entry: osutil.MountEntry{Dir: "/common/stuff", Name: "/dev/sda1"}, Action: update.Mount},
-		{Entry: osutil.MountEntry{Dir: "/common/unrelated"}, Action: update.Mount},
+		{Entry: osutil.MountEntry{Dir: "/snap/foo", Name: "/snap/foo_bar", Options: []string{"rbind", osutil.XSnapdOriginOvername()}}, Action: update.Keep},
+		{Entry: osutil.MountEntry{Dir: "/foo/bar", Name: "/foo/bar_bar", Options: []string{"rbind", osutil.XSnapdOriginOvername()}}, Action: update.Keep},
+		{Entry: osutil.MountEntry{Dir: "/common/stuff", Name: "/dev/sda1", Type: "tmpfs"}, Action: update.Mount},
+		{Entry: osutil.MountEntry{Dir: "/common/unrelated", Type: "tmpfs"}, Action: update.Mount},
 	})
 }
 
@@ -501,21 +499,21 @@ func (s *changeSuite) TestNeededChangesParallelInstancesKeep(c *C) {
 func (s *changeSuite) TestNeededChangesParallelInstancesInsideMount(c *C) {
 
 	desired := &osutil.MountProfile{Entries: []osutil.MountEntry{
-		{Dir: "/foo/bar/baz"},
-		{Dir: "/foo/bar", Name: "/foo/bar_bar", Options: []string{osutil.XSnapdOriginOvername()}},
-		{Dir: "/snap/foo", Name: "/snap/foo_bar", Options: []string{osutil.XSnapdOriginOvername()}},
+		{Dir: "/foo/bar/baz", Type: "tmpfs"},
+		{Dir: "/foo/bar", Name: "/foo/bar_bar", Options: []string{"rbind", osutil.XSnapdOriginOvername()}},
+		{Dir: "/snap/foo", Name: "/snap/foo_bar", Options: []string{"rbind", osutil.XSnapdOriginOvername()}},
 	}}
 	current := &osutil.MountProfile{Entries: []osutil.MountEntry{
-		{Dir: "/foo/bar", Name: "/foo/bar_bar", Options: []string{osutil.XSnapdOriginOvername()}},
-		{Dir: "/foo/bar/zed"},
-		{Dir: "/snap/foo", Name: "/snap/foo_bar", Options: []string{osutil.XSnapdOriginOvername()}},
+		{Dir: "/foo/bar", Name: "/foo/bar_bar", Options: []string{"rbind", osutil.XSnapdOriginOvername()}},
+		{Dir: "/foo/bar/zed", Type: "tmpfs"},
+		{Dir: "/snap/foo", Name: "/snap/foo_bar", Options: []string{"rbind", osutil.XSnapdOriginOvername()}},
 	}}
 	changes := update.NeededChanges(current, desired)
 	c.Assert(changes, DeepEquals, []*update.Change{
-		{Entry: osutil.MountEntry{Dir: "/snap/foo", Name: "/snap/foo_bar", Options: []string{osutil.XSnapdOriginOvername()}}, Action: update.Keep},
-		{Entry: osutil.MountEntry{Dir: "/foo/bar/zed"}, Action: update.Unmount},
-		{Entry: osutil.MountEntry{Dir: "/foo/bar", Name: "/foo/bar_bar", Options: []string{osutil.XSnapdOriginOvername()}}, Action: update.Keep},
-		{Entry: osutil.MountEntry{Dir: "/foo/bar/baz"}, Action: update.Mount},
+		{Entry: osutil.MountEntry{Dir: "/snap/foo", Name: "/snap/foo_bar", Options: []string{"rbind", osutil.XSnapdOriginOvername()}}, Action: update.Keep},
+		{Entry: osutil.MountEntry{Dir: "/foo/bar/zed", Type: "tmpfs", Options: []string{"x-snapd.detach"}}, Action: update.Unmount},
+		{Entry: osutil.MountEntry{Dir: "/foo/bar", Name: "/foo/bar_bar", Options: []string{"rbind", osutil.XSnapdOriginOvername()}}, Action: update.Keep},
+		{Entry: osutil.MountEntry{Dir: "/foo/bar/baz", Type: "tmpfs"}, Action: update.Mount},
 	})
 }
 
@@ -525,7 +523,7 @@ func (s *changeSuite) TestNeededChangesRepeatedDir(c *C) {
 	}}
 	current := &osutil.MountProfile{Entries: []osutil.MountEntry{
 		{Name: "/foo/bar", Dir: "/foo/bar", Type: "none",
-			Options: []string{osutil.XSnapdSynthetic(), osutil.XSnapdNeededBy("/foo/mytmp")}},
+			Options: []string{"rbind", osutil.XSnapdSynthetic(), osutil.XSnapdNeededBy("/foo/mytmp")}},
 		{Name: "tmpfs", Dir: "/foo/mytmp", Type: "tmpfs", Options: []string{osutil.XSnapdOriginLayout()}},
 		{Name: "tmpfs", Dir: "/foo/bar", Type: "tmpfs",
 			Options: []string{osutil.XSnapdSynthetic(), osutil.XSnapdNeededBy("/foo/bar/two")}},
@@ -541,7 +539,134 @@ func (s *changeSuite) TestNeededChangesRepeatedDir(c *C) {
 		{Entry: osutil.MountEntry{Name: "tmpfs", Dir: "/foo/mytmp", Type: "tmpfs",
 			Options: []string{osutil.XSnapdOriginLayout()}}, Action: update.Keep},
 		{Entry: osutil.MountEntry{Name: "/foo/bar", Dir: "/foo/bar", Type: "none",
-			Options: []string{osutil.XSnapdSynthetic(), osutil.XSnapdNeededBy("/foo/mytmp")}}, Action: update.Keep},
+			Options: []string{"rbind", osutil.XSnapdSynthetic(), osutil.XSnapdNeededBy("/foo/mytmp")}}, Action: update.Keep},
+	})
+}
+
+// This models the scenario from LP: #2144666 where a snap has two content
+// plugs: provider-1 (target doesn't exist in snap, triggering a writable mimic)
+// and provider-2 (target exists in snap as an empty directory). The mimic
+// creates synthetic self-rebinds for all existing directories, including
+// provider-2. When provider-2's content interface is subsequently connected,
+// the synthetic self-rebind must be replaced with the real content mount.
+func (s *changeSuite) TestNeededChangesSyntheticNotReusedWhenContentMountDesired(c *C) {
+	// The provider-2 target directory exists on the filesystem (it lives on
+	// the tmpfs from the mimic that is being kept).
+	restore := update.MockIsDirectory(func(path string) bool {
+		return path == "/snap/name/42/provider-2"
+	})
+	defer restore()
+
+	// After connecting provider-1, a writable mimic was created over
+	// /snap/name/42. The current profile reflects the mimic state: a tmpfs,
+	// synthetic self-rebinds for pre-existing directories (provider-2, bin,
+	// meta), and the non-synthetic content mount for provider-1.
+	current := &osutil.MountProfile{Entries: []osutil.MountEntry{
+		{Name: "tmpfs", Dir: "/snap/name/42", Type: "tmpfs",
+			Options: []string{osutil.XSnapdSynthetic(), osutil.XSnapdNeededBy("/snap/name/42/provider-1")}},
+		{Name: "/var/lib/snapd/hostfs/snap/name/42/provider-2", Dir: "/snap/name/42/provider-2",
+			Options: []string{"bind", "ro", osutil.XSnapdSynthetic(), osutil.XSnapdNeededBy("/snap/name/42/provider-1")}},
+		{Name: "/var/lib/snapd/hostfs/snap/name/42/bin", Dir: "/snap/name/42/bin",
+			Options: []string{"bind", "ro", osutil.XSnapdSynthetic(), osutil.XSnapdNeededBy("/snap/name/42/provider-1")}},
+		{Name: "/var/lib/snapd/hostfs/snap/name/42/meta", Dir: "/snap/name/42/meta",
+			Options: []string{"bind", "ro", osutil.XSnapdSynthetic(), osutil.XSnapdNeededBy("/snap/name/42/provider-1")}},
+		{Name: "/snap/provider-1/x1", Dir: "/snap/name/42/provider-1",
+			Options: []string{"bind", "ro"}},
+	}}
+
+	// Now provider-2 is also connected. The desired profile contains both
+	// content mounts.
+	desired := &osutil.MountProfile{Entries: []osutil.MountEntry{
+		{Name: "/snap/provider-1/x1", Dir: "/snap/name/42/provider-1",
+			Options: []string{"bind", "ro"}},
+		{Name: "/snap/provider-2/x1", Dir: "/snap/name/42/provider-2",
+			Options: []string{"bind", "ro"}},
+	}}
+
+	changes := update.NeededChanges(current, desired)
+
+	c.Assert(changes, DeepEquals, []*update.Change{
+		// Keep/Unmount phase (reverse of current profile order):
+		// provider-1 content mount is unchanged.
+		{Entry: osutil.MountEntry{Name: "/snap/provider-1/x1", Dir: "/snap/name/42/provider-1",
+			Options: []string{"bind", "ro"}}, Action: update.Keep},
+		// meta and bin synthetic rebinds still support provider-1.
+		{Entry: osutil.MountEntry{Name: "/var/lib/snapd/hostfs/snap/name/42/meta", Dir: "/snap/name/42/meta",
+			Options: []string{"bind", "ro", osutil.XSnapdSynthetic(), osutil.XSnapdNeededBy("/snap/name/42/provider-1")}}, Action: update.Keep},
+		{Entry: osutil.MountEntry{Name: "/var/lib/snapd/hostfs/snap/name/42/bin", Dir: "/snap/name/42/bin",
+			Options: []string{"bind", "ro", osutil.XSnapdSynthetic(), osutil.XSnapdNeededBy("/snap/name/42/provider-1")}}, Action: update.Keep},
+		// The synthetic self-rebind of provider-2 must NOT be reused: a
+		// real content mount wants the same directory.
+		{Entry: osutil.MountEntry{Name: "/var/lib/snapd/hostfs/snap/name/42/provider-2", Dir: "/snap/name/42/provider-2",
+			Options: []string{"bind", "ro", osutil.XSnapdSynthetic(), osutil.XSnapdNeededBy("/snap/name/42/provider-1"), osutil.XSnapdDetach()}}, Action: update.Unmount},
+		// The mimic tmpfs still supports provider-1.
+		{Entry: osutil.MountEntry{Name: "tmpfs", Dir: "/snap/name/42", Type: "tmpfs",
+			Options: []string{osutil.XSnapdSynthetic(), osutil.XSnapdNeededBy("/snap/name/42/provider-1")}}, Action: update.Keep},
+		// Mount phase: real content mount for provider-2.
+		{Entry: osutil.MountEntry{Name: "/snap/provider-2/x1", Dir: "/snap/name/42/provider-2",
+			Options: []string{"bind", "ro"}}, Action: update.Mount},
+	})
+}
+
+// This is a variation of
+// TestNeededChangesSyntheticNotReusedWhenContentMountDesired which assumes that
+// 2 things have changed in the desired profile:
+// - provider-1 is disconnected (only present in the current profile)
+// - provider-2 is listed in the desired profile
+func (s *changeSuite) TestNeededChangesMimicTornDownWhenNeededByEntryNotDesired(c *C) {
+	// At planning time the mimic is still mounted, so provider-2's target
+	// directory exists on the tmpfs.
+	restore := update.MockIsDirectory(func(path string) bool {
+		return path == "/snap/name/42/provider-2"
+	})
+	defer restore()
+
+	// After connecting provider-1, a writable mimic was created over
+	// /snap/name/42. The current profile reflects the mimic state.
+	// This is the same starting point as
+	// TestNeededChangesSyntheticNotReusedWhenContentMountDesired.
+	current := &osutil.MountProfile{Entries: []osutil.MountEntry{
+		{Name: "tmpfs", Dir: "/snap/name/42", Type: "tmpfs",
+			Options: []string{osutil.XSnapdSynthetic(), osutil.XSnapdNeededBy("/snap/name/42/provider-1")}},
+		{Name: "/var/lib/snapd/hostfs/snap/name/42/provider-2", Dir: "/snap/name/42/provider-2",
+			Options: []string{"bind", "ro", osutil.XSnapdSynthetic(), osutil.XSnapdNeededBy("/snap/name/42/provider-1")}},
+		{Name: "/var/lib/snapd/hostfs/snap/name/42/bin", Dir: "/snap/name/42/bin",
+			Options: []string{"bind", "ro", osutil.XSnapdSynthetic(), osutil.XSnapdNeededBy("/snap/name/42/provider-1")}},
+		{Name: "/var/lib/snapd/hostfs/snap/name/42/meta", Dir: "/snap/name/42/meta",
+			Options: []string{"bind", "ro", osutil.XSnapdSynthetic(), osutil.XSnapdNeededBy("/snap/name/42/provider-1")}},
+		{Name: "/snap/provider-1/x1", Dir: "/snap/name/42/provider-1",
+			Options: []string{"bind", "ro"}},
+	}}
+
+	// Provider-1 is disconnected, provider-2 is now connected.
+	// The needed-by target (/snap/name/42/provider-1) is no longer in
+	// the desired profile, so the synthetic reuse block is never entered.
+	// The tmpfs at /snap/name/42 fails the normal reuse check (no desired
+	// entry at that Dir), setting skipDir which cascades to all children.
+	// The entire mimic tree is torn down and provider-2 is freshly mounted.
+	desired := &osutil.MountProfile{Entries: []osutil.MountEntry{
+		{Name: "/snap/provider-2/x1", Dir: "/snap/name/42/provider-2",
+			Options: []string{"bind", "ro"}},
+	}}
+
+	changes := update.NeededChanges(current, desired)
+
+	c.Assert(changes, DeepEquals, []*update.Change{
+		// Unmount phase (reverse of current profile order):
+		// Everything is unmounted because nothing is reused.
+		{Entry: osutil.MountEntry{Name: "/snap/provider-1/x1", Dir: "/snap/name/42/provider-1",
+			Options: []string{"bind", "ro", osutil.XSnapdDetach()}}, Action: update.Unmount},
+		{Entry: osutil.MountEntry{Name: "/var/lib/snapd/hostfs/snap/name/42/meta", Dir: "/snap/name/42/meta",
+			Options: []string{"bind", "ro", osutil.XSnapdSynthetic(), osutil.XSnapdNeededBy("/snap/name/42/provider-1"), osutil.XSnapdDetach()}}, Action: update.Unmount},
+		{Entry: osutil.MountEntry{Name: "/var/lib/snapd/hostfs/snap/name/42/bin", Dir: "/snap/name/42/bin",
+			Options: []string{"bind", "ro", osutil.XSnapdSynthetic(), osutil.XSnapdNeededBy("/snap/name/42/provider-1"), osutil.XSnapdDetach()}}, Action: update.Unmount},
+		{Entry: osutil.MountEntry{Name: "/var/lib/snapd/hostfs/snap/name/42/provider-2", Dir: "/snap/name/42/provider-2",
+			Options: []string{"bind", "ro", osutil.XSnapdSynthetic(), osutil.XSnapdNeededBy("/snap/name/42/provider-1"), osutil.XSnapdDetach()}}, Action: update.Unmount},
+		{Entry: osutil.MountEntry{Name: "tmpfs", Dir: "/snap/name/42", Type: "tmpfs",
+			Options: []string{osutil.XSnapdSynthetic(), osutil.XSnapdNeededBy("/snap/name/42/provider-1"), osutil.XSnapdDetach()}}, Action: update.Unmount},
+		// Mount phase: provider-2 content mount is freshly created.
+		{Entry: osutil.MountEntry{Name: "/snap/provider-2/x1", Dir: "/snap/name/42/provider-2",
+			Options: []string{"bind", "ro"}}, Action: update.Mount},
 	})
 }
 

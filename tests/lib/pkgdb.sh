@@ -1,5 +1,7 @@
 #!/bin/bash
 
+PKGDB_KERNEL_VERSION="$(uname -r)"
+
 debian_name_package() {
     #shellcheck source=tests/lib/tools/tests.pkgs.apt.sh
     . "$TESTSLIB/tools/tests.pkgs.apt.sh"
@@ -62,7 +64,7 @@ distro_name_package() {
         ubuntu-*|debian-*)
             debian_name_package "$@"
             ;;
-        amazon-*|centos-7-*)
+        amazon-*)
             amazon_name_package "$@"
             ;;
         fedora-*|centos-*)
@@ -75,7 +77,7 @@ distro_name_package() {
             arch_name_package "$1"
             ;;
         *)
-            echo "ERROR: Unsupported distribution $SPREAD_SYSTEM"
+            echo "ERROR: Unsupported distribution $SPREAD_SYSTEM" >&2
             exit 1
             ;;
     esac
@@ -108,7 +110,7 @@ distro_install_local_package() {
             # shellcheck disable=SC2086
             apt install $flags "$@"
             ;;
-        amazon-*|centos-7-*)
+        amazon-*)
             quiet yum -y localinstall "$@"
             ;;
         fedora-*|centos-*)
@@ -121,7 +123,7 @@ distro_install_local_package() {
             pacman -U --noconfirm "$@"
             ;;
         *)
-            echo "ERROR: Unsupported distribution $SPREAD_SYSTEM"
+            echo "ERROR: Unsupported distribution $SPREAD_SYSTEM" >&2
             exit 1
             ;;
     esac
@@ -148,7 +150,6 @@ distro_install_package() {
         # reason, disable weak deps altogether.
         DNF_FLAGS="--setopt=install_weak_deps=False"
     fi
-    YUM_FLAGS=
     ZYPPER_FLAGS=
     while [ -n "$1" ]; do
         case "$1" in
@@ -190,13 +191,9 @@ distro_install_package() {
 
     case "$SPREAD_SYSTEM" in
         ubuntu-*|debian-*)
+            apt update
             # shellcheck disable=SC2086
             quiet eatmydata apt-get install $APT_FLAGS -y "${pkg_names[@]}"
-            retval=$?
-            ;;
-        amazon-linux-2-*|centos-7-*)
-            # shellcheck disable=SC2086
-            quiet yum -y install $YUM_FLAGS "${pkg_names[@]}"
             retval=$?
             ;;
         fedora-*|centos-*|amazon-linux-2023-*)
@@ -223,7 +220,7 @@ distro_install_package() {
             retval=$?
             ;;
         *)
-            echo "ERROR: Unsupported distribution $SPREAD_SYSTEM"
+            echo "ERROR: Unsupported distribution $SPREAD_SYSTEM" >&2
             exit 1
             ;;
     esac
@@ -254,7 +251,7 @@ distro_purge_package() {
             # behind while purging in prepare
             eatmydata apt-get remove -y --purge -y "$@"
             ;;
-        amazon-*|centos-7-*)
+        amazon-*)
             quiet yum -y remove "$@"
             ;;
         fedora-*|centos-*)
@@ -268,7 +265,7 @@ distro_purge_package() {
             pacman -Rnsc --noconfirm "$@"
             ;;
         *)
-            echo "ERROR: Unsupported distribution $SPREAD_SYSTEM"
+            echo "ERROR: Unsupported distribution $SPREAD_SYSTEM" >&2
             exit 1
             ;;
     esac
@@ -279,7 +276,7 @@ distro_update_package_db() {
         ubuntu-*|debian-*)
             quiet eatmydata apt-get update
             ;;
-        amazon-*|centos-7-*)
+        amazon-*)
             quiet yum clean all
             quiet yum makecache
             ;;
@@ -294,7 +291,7 @@ distro_update_package_db() {
             pacman -Syq
             ;;
         *)
-            echo "ERROR: Unsupported distribution $SPREAD_SYSTEM"
+            echo "ERROR: Unsupported distribution $SPREAD_SYSTEM" >&2
             exit 1
             ;;
     esac
@@ -305,7 +302,7 @@ distro_clean_package_cache() {
         ubuntu-*|debian-*)
             quiet eatmydata apt-get clean
             ;;
-        amazon-*|centos-7-*)
+        amazon-*)
             yum clean all
             ;;
         fedora-*|centos-*)
@@ -318,7 +315,7 @@ distro_clean_package_cache() {
             pacman -Sccq --noconfirm
             ;;
         *)
-            echo "ERROR: Unsupported distribution $SPREAD_SYSTEM"
+            echo "ERROR: Unsupported distribution $SPREAD_SYSTEM" >&2
             exit 1
             ;;
     esac
@@ -329,7 +326,7 @@ distro_auto_remove_packages() {
         ubuntu-*|debian-*)
             quiet eatmydata apt-get -y autoremove
             ;;
-        amazon-*|centos-7-*)
+        amazon-*)
             quiet yum -y autoremove
             ;;
         fedora-*|centos-*)
@@ -340,7 +337,7 @@ distro_auto_remove_packages() {
         arch-*)
             ;;
         *)
-            echo "ERROR: Unsupported distribution '$SPREAD_SYSTEM'"
+            echo "ERROR: Unsupported distribution $SPREAD_SYSTEM" >&2
             exit 1
             ;;
     esac
@@ -351,7 +348,7 @@ distro_query_package_info() {
         ubuntu-*|debian-*)
             apt-cache policy "$1"
             ;;
-        amazon-*|centos-7-*)
+        amazon-*)
             yum info "$1"
             ;;
         fedora-*|centos-*)
@@ -364,7 +361,7 @@ distro_query_package_info() {
             pacman -Si "$1"
             ;;
         *)
-            echo "ERROR: Unsupported distribution '$SPREAD_SYSTEM'"
+            echo "ERROR: Unsupported distribution $SPREAD_SYSTEM" >&2
             exit 1
             ;;
     esac
@@ -376,7 +373,7 @@ distro_install_build_snapd(){
         cp /etc/apt/sources.list sources.list.back
         echo "deb http://archive.ubuntu.com/ubuntu/ $(lsb_release -c -s)-proposed restricted main multiverse universe" | tee /etc/apt/sources.list -a
         apt update
-        if os.query is-ubuntu-ge 23.10; then
+        if os.query is-ubuntu-ge 24.04; then
             apt install -y --only-upgrade -t "$(lsb_release -c -s)-proposed" snapd
         else
             apt install -y --only-upgrade snapd
@@ -436,7 +433,7 @@ distro_install_build_snapd(){
         distro_install_local_package $packages
 
         case "$SPREAD_SYSTEM" in
-            fedora-*|centos-*)
+            fedora-*|centos-*|opensuse-*-selinux-*)
                 # We need to wait until the man db cache is updated before do daemon-reexec
                 # Otherwise the service fails and the system will be degraded during tests executions
                 for i in $(seq 20); do
@@ -489,8 +486,10 @@ distro_install_build_snapd(){
         if ! systemctl is-enabled snapd.socket ; then
             # Can't use --now here as not all distributions we run on support it
             systemctl enable snapd.socket
-            systemctl start snapd.socket
         fi
+        # # If this is a re-installation (like in snap-mgmt), snapd.socket and snapd.service might be stopped
+        systemctl restart snapd.socket snapd.service
+        snap wait system seed.loaded
     fi
 }
 
@@ -531,6 +530,7 @@ pkg_dependencies_ubuntu_generic(){
         libglib2.0-dev
         libseccomp-dev
         libudev-dev
+        lsof
         man
         mtools
         netcat-openbsd
@@ -540,7 +540,59 @@ pkg_dependencies_ubuntu_generic(){
         udisks2
         upower
         uuid-runtime
+        pigz
         "
+}
+
+pkg_dependencies_ubuntu_nested(){
+    echo "
+        ca-certificates
+        cloud-image-utils
+        genisoimage
+        kpartx
+        mtools
+        ovmf
+        qemu-utils
+        snapd
+        sshpass
+        xdelta3
+        xz-utils
+        qemu-system
+        "
+    if os.query is-arm; then
+        echo "
+            qemu-efi-aarch64
+        "
+    fi
+
+    if os.query is-ubuntu-ge 20.04; then
+        if os.query is-ubuntu-ge 22.04; then
+            echo "
+                golang
+            "
+        fi
+
+        # These dependencies are used to build the initramfs deb package required for the
+        # kernel snap with initramfs when using Ubuntu 24.04 or later.
+        if os.query is-ubuntu-ge 24.04; then
+            echo "
+                dpkg-dev
+                debhelper
+                devscripts
+                distro-info
+                linux-firmware
+            "
+        else
+            # Add the PPA which is required to install ubuntu-core-initramfs, needed to
+            # build the kernel snap with initramfs when using Ubuntu 20.04 or 22.04.
+            add-apt-repository ppa:snappy-dev/image -y  > /dev/null 2>&1
+            echo "
+                software-properties-common
+                ubuntu-core-initramfs
+                linux-firmware
+            "
+        fi
+    fi
 }
 
 pkg_dependencies_ubuntu_classic(){
@@ -550,14 +602,11 @@ pkg_dependencies_ubuntu_classic(){
         fish
         fontconfig
         gnome-keyring
-        jq
-        man
         nfs-kernel-server
         printer-driver-cups-pdf
         python3-dbus
         python3-gi
         python3-yaml
-        upower
         weston
         xdg-user-dirs
         xdg-utils
@@ -570,6 +619,7 @@ pkg_dependencies_ubuntu_classic(){
             ;;
         ubuntu-16.04-64)
             echo "
+                chrony
                 dbus-user-session
                 evolution-data-server
                 fwupd
@@ -584,22 +634,10 @@ pkg_dependencies_ubuntu_classic(){
                 "
                 pkg_linux_image_extra
             ;;
-        ubuntu-18.04-32)
-            echo "
-                dbus-user-session
-                gccgo-6
-                evolution-data-server
-                fwupd
-                gnome-online-accounts
-                packagekit
-                "
-                pkg_linux_image_extra
-            ;;
         ubuntu-18.04-64)
             echo "
                 dbus-user-session
                 gccgo-8
-                gperf
                 evolution-data-server
                 fwupd
                 packagekit
@@ -614,29 +652,75 @@ pkg_dependencies_ubuntu_classic(){
                 fwupd
                 gccgo-9
                 libvirt-daemon-system
-                linux-tools-$(uname -r)
                 packagekit
-                qemu-kvm
+                qemu-system
                 qemu-utils
                 shellcheck
                 "
+            if [ "${PKGDB_DO_NOT_SEARCH_FOR_KERNEL_PACKAGES:-0}" -eq 0 ]; then
+                echo "linux-tools-$PKGDB_KERNEL_VERSION"
+            fi
             ;;
-        ubuntu-22.*|ubuntu-23.*|ubuntu-24.*)
+        ubuntu-22.04*|ubuntu-24.04*)
             # bpftool is part of linux-tools package
             echo "
+                cifs-utils
                 dbus-user-session
                 fwupd
                 golang
+                gperf
+                libvirt-daemon-system
+                lz4
+                qemu-system
+                qemu-utils
+                "
+            if [ "${PKGDB_DO_NOT_SEARCH_FOR_KERNEL_PACKAGES:-0}" -eq 0 ]; then
+                echo "linux-tools-$PKGDB_KERNEL_VERSION"
+            fi
+            ;;
+        ubuntu-26.*)
+            echo "
+                util-linux-extra
+                dbus-user-session
+                fwupd
+                golang
+                gperf
                 libvirt-daemon-system
                 linux-tools-$(uname -r)
                 lz4
-                qemu-kvm
+                qemu-system
                 qemu-utils
+                systemd-dev
+                linux-modules-zfs-generic
                 "
             ;;
         ubuntu-*)
             echo "
                 squashfs-tools
+                "
+            ;;
+        debian-sid*)
+            echo "
+                busybox
+                debhelper
+                autopkgtest
+                bpftool
+                cryptsetup-bin
+                debootstrap
+                eatmydata
+                evolution-data-server
+                fwupd
+                gcc-multilib
+                libc6-dev-i386
+                linux-libc-dev
+                lsof
+                net-tools
+                packagekit
+                sbuild
+                sbuild-schroot
+                schroot
+                strace
+                systemd-timesyncd
                 "
             ;;
         debian-*)
@@ -664,13 +748,18 @@ pkg_dependencies_ubuntu_classic(){
 }
 
 pkg_linux_image_extra (){
-    if apt-cache show "linux-image-extra-$(uname -r)" > /dev/null 2>&1; then
-        echo "linux-image-extra-$(uname -r)";
+    if [ "${PKGDB_DO_NOT_SEARCH_FOR_KERNEL_PACKAGES:-0}" -eq 1 ]; then
+        # Probing doesn't work, additional packages must be installed manually in cloud-init profiles.
+        return
+    fi
+
+    if apt-cache show "linux-image-extra-$PKGDB_KERNEL_VERSION" > /dev/null 2>&1; then
+        echo "linux-image-extra-$PKGDB_KERNEL_VERSION";
     else
-        if apt-cache show "linux-modules-extra-$(uname -r)" > /dev/null 2>&1; then
-            echo "linux-modules-extra-$(uname -r)";
+        if apt-cache show "linux-modules-extra-$PKGDB_KERNEL_VERSION" > /dev/null 2>&1; then
+            echo "linux-modules-extra-$PKGDB_KERNEL_VERSION";
         else
-            echo "cannot find a matching kernel modules package";
+            echo "cannot find a matching kernel modules package" >&2;
             exit 1;
         fi;
     fi
@@ -697,7 +786,9 @@ pkg_dependencies_fedora_centos_common(){
         git
         golang
         jq
+        iptables
         iptables-services
+        lsof
         man
         net-tools
         nmap-ncat
@@ -714,23 +805,21 @@ pkg_dependencies_fedora_centos_common(){
         xdg-utils
         strace
         zsh
+        glibc-static
+        libcap-devel
         "
-    if ! os.query is-centos 9; then
-        echo "
-            fish
-            redhat-lsb-core
-        "
-    fi
 }
 
 pkg_dependencies_fedora(){
     echo "
-         libcap-static
-        "
+        fish
+        libcap-static
+        script
+    "
 }
 
 pkg_dependencies_amazon(){
-    if os.query is-amazon-linux 2 || os.query is-centos 7; then
+    if os.query is-amazon-linux 2; then
         echo "
             fish
             fwupd
@@ -756,6 +845,7 @@ pkg_dependencies_amazon(){
         jq
         iptables-services
         libcap-static
+        lsof
         man
         nc
         net-tools
@@ -767,6 +857,7 @@ pkg_dependencies_amazon(){
         xdg-utils
         udisks2
         zsh
+        glibc-static
         "
 }
 
@@ -780,6 +871,7 @@ pkg_dependencies_opensuse(){
         clang
         curl
         dbus-1-python3
+        dbus-1-tools
         evolution-data-server
         expect
         fish
@@ -790,25 +882,32 @@ pkg_dependencies_opensuse(){
         iptables
         jq
         lsb-release
+        lsof
         man
         man-pages
         nfs-kernel-server
         nss-mdns
+        osc
         PackageKit
+        procps
         python3-yaml
         strace
+        sysvinit-tools
         netcat-openbsd
-        osc
+        rpm-build
         udisks2
         upower
         uuidd
+        xdelta3
         xdg-user-dirs
         xdg-utils
         zsh
+        libcap-progs
+        glibc-static
         "
     if os.query is-opensuse tumbleweed; then
         echo "
-            libfwupd2
+            libfwupd3
         "
     fi
 }
@@ -834,6 +933,7 @@ pkg_dependencies_arch(){
     libseccomp
     libcap
     libx11
+    lsof
     man
     net-tools
     nfs-utils
@@ -863,10 +963,15 @@ pkg_dependencies(){
             pkg_dependencies_ubuntu_core
             ;;
         ubuntu-*|debian-*)
-            pkg_dependencies_ubuntu_generic
-            pkg_dependencies_ubuntu_classic
+            if tests.nested is-nested &>/dev/null; then
+                pkg_dependencies_ubuntu_generic
+                pkg_dependencies_ubuntu_nested
+            else
+                pkg_dependencies_ubuntu_generic
+                pkg_dependencies_ubuntu_classic
+            fi
             ;;
-        amazon-*|centos-7-*)
+        amazon-*)
             pkg_dependencies_amazon
             ;;
         centos-*)
@@ -897,6 +1002,16 @@ install_pkg_dependencies(){
 # to stdout
 distro_upgrade() {
     case "$SPREAD_SYSTEM" in
+        amazon-linux-2023-*)
+            # Amazon Linux 2023 uses versioned releases, see
+            # https://docs.aws.amazon.com/linux/al2023/ug/deterministic-upgrades-usage.html
+            if [ "$(dnf check-release-update 2>&1)" = "" ]; then
+                return
+            fi
+
+            dnf upgrade --releasever=latest -y
+            echo "reboot"
+            ;;
         arch-*)
             # Arch does not support partial upgrades. On top of this, the image
             # we are running in may have been built some time ago and we need to
@@ -919,7 +1034,7 @@ distro_upgrade() {
             fi
             ;;
         *)
-            echo "WARNING: distro upgrade not supported on $SPREAD_SYSTEM"
+            echo "WARNING: distro upgrade not supported on $SPREAD_SYSTEM" >&2
             ;;
     esac
 }

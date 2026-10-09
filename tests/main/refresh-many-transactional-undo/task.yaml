@@ -1,5 +1,10 @@
 summary: Check that undo for transactional snaps refresh works
 
+details: |
+    Check that a refresh can be run transactionally so that all refresh
+    tasksets are undone when a snap fails to refresh instead of only that
+    snap's tasks being undone.
+
 # ubuntu-14.04: systemd-run not supported
 systems: [-ubuntu-core-*, -ubuntu-14.04*]
 
@@ -8,12 +13,12 @@ environment:
     GOOD_SNAP: test-snapd-python-webserver
     BAD_SNAP: test-snapd-tools
 
-prepare: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
+skip:
+    - reason: This test needs test keys to be trusted
+      if: |
+        [ "$TRUST_TEST_KEYS" = "false" ]
 
+prepare: |
     echo "Given two snaps are installed"
     for snap in $GOOD_SNAP $BAD_SNAP; do
         snap install "$snap"
@@ -23,20 +28,10 @@ prepare: |
     "$TESTSTOOLS"/store-state setup-fake-store "$BLOB_DIR"
 
 restore: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
-
     "$TESTSTOOLS"/store-state teardown-fake-store "$BLOB_DIR"
     rm -rf "$BLOB_DIR"
 
 execute: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
-
     echo "Precondition check for the fake store"
     snap refresh 2>&1 | MATCH "All snaps up to date"
 

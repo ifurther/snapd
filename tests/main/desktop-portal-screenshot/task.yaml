@@ -23,6 +23,10 @@ details: |
 # Expand as needed.
 systems: [ubuntu-18.04-64, ubuntu-2*]
 
+skip:
+    - reason: The snap test-snapd-portal-client is just available for amd64
+      if: not os.query is-pc-amd64
+
 prepare: |
     #shellcheck source=tests/lib/desktop-portal.sh
     . "$TESTSLIB"/desktop-portal.sh
@@ -45,11 +49,6 @@ debug: |
     ps -ef | grep xdg || true
 
 execute: |
-    if not os.query is-pc-amd64; then
-        echo "The snap test-snapd-portal-client is just available for amd64"
-        exit
-    fi
-
     echo "Install the portals test client"
     snap install --edge test-snapd-portal-client
 
@@ -57,7 +56,7 @@ execute: |
     # Taking a screenshot is not supported in ubuntu 23+ yet.
     # The error displayed is the following:
     # dbus.exceptions.DBusException: org.freedesktop.DBus.Error.UnknownMethod: No such interface \u201corg.freedesktop.portal.Screenshot\u201d on object at path /org/freedesktop/portal/desktop
-    if os.query is-ubuntu-ge 23.10; then
+    if os.query is-ubuntu-ge 24.04; then
         exit
     fi
 

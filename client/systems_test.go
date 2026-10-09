@@ -22,11 +22,14 @@ package client_test
 import (
 	"encoding/json"
 	"io"
+	"time"
 
 	"gopkg.in/check.v1"
 
 	"github.com/snapcore/snapd/client"
 	"github.com/snapcore/snapd/gadget"
+	"github.com/snapcore/snapd/gadget/device"
+	"github.com/snapcore/snapd/osutil/keyboard"
 	"github.com/snapcore/snapd/snap"
 )
 
@@ -142,10 +145,10 @@ func (cs *clientSuite) TestRequestSystemActionHappy(c *check.C) {
 
 	body, err := io.ReadAll(cs.req.Body)
 	c.Assert(err, check.IsNil)
-	var req map[string]interface{}
+	var req map[string]any
 	err = json.Unmarshal(body, &req)
 	c.Assert(err, check.IsNil)
-	c.Assert(req, check.DeepEquals, map[string]interface{}{
+	c.Assert(req, check.DeepEquals, map[string]any{
 		"action": "do",
 		"title":  "reinstall",
 		"mode":   "install",
@@ -184,10 +187,10 @@ func (cs *clientSuite) TestRequestSystemRebootHappy(c *check.C) {
 
 	body, err := io.ReadAll(cs.req.Body)
 	c.Assert(err, check.IsNil)
-	var req map[string]interface{}
+	var req map[string]any
 	err = json.Unmarshal(body, &req)
 	c.Assert(err, check.IsNil)
-	c.Assert(req, check.DeepEquals, map[string]interface{}{
+	c.Assert(req, check.DeepEquals, map[string]any{
 		"action": "reboot",
 		"mode":   "install",
 	})
@@ -284,7 +287,7 @@ func (cs *clientSuite) TestSystemDetailsHappy(c *check.C) {
 	c.Check(sys, check.DeepEquals, &client.SystemDetails{
 		Current: true,
 		Label:   "20200101",
-		Model: map[string]interface{}{
+		Model: map[string]any{
 			"model":        "this-is-model-id",
 			"brand-id":     "brand-id-1",
 			"display-name": "wonky model",
@@ -367,9 +370,16 @@ func (cs *clientSuite) TestRequestSystemInstallHappy(c *check.C) {
 			},
 		},
 	}
+	volumesAuth := &device.VolumesAuthOptions{
+		Mode:       device.AuthModePassphrase,
+		Passphrase: "1234",
+		KDFType:    "argon2i",
+		KDFTime:    2 * time.Second,
+	}
 	opts := &client.InstallSystemOptions{
-		Step:      client.InstallStepFinish,
-		OnVolumes: vols,
+		Step:        client.InstallStepFinish,
+		OnVolumes:   vols,
+		VolumesAuth: volumesAuth,
 	}
 	chgID, err := cs.cli.InstallSystem("1234", opts)
 	c.Assert(err, check.IsNil)
@@ -379,19 +389,19 @@ func (cs *clientSuite) TestRequestSystemInstallHappy(c *check.C) {
 
 	body, err := io.ReadAll(cs.req.Body)
 	c.Assert(err, check.IsNil)
-	var req map[string]interface{}
+	var req map[string]any
 	err = json.Unmarshal(body, &req)
 	c.Assert(err, check.IsNil)
-	c.Assert(req, check.DeepEquals, map[string]interface{}{
+	c.Assert(req, check.DeepEquals, map[string]any{
 		"action": "install",
 		"step":   "finish",
-		"on-volumes": map[string]interface{}{
-			"pc": map[string]interface{}{
+		"on-volumes": map[string]any{
+			"pc": map[string]any{
 				"schema":     "dos",
 				"bootloader": "mbr",
 				"id":         "id",
-				"structure": []interface{}{
-					map[string]interface{}{
+				"structure": []any{
+					map[string]any{
 						"device":           "/dev/sda1",
 						"filesystem-label": "label",
 						"name":             "vol-name",
@@ -404,7 +414,7 @@ func (cs *clientSuite) TestRequestSystemInstallHappy(c *check.C) {
 						"offset":           nil,
 						"offset-write":     nil,
 						"content":          nil,
-						"update": map[string]interface{}{
+						"update": map[string]any{
 							"edition":  float64(0),
 							"preserve": nil,
 						},
@@ -412,5 +422,91 @@ func (cs *clientSuite) TestRequestSystemInstallHappy(c *check.C) {
 				},
 			},
 		},
+		"volumes-auth": map[string]any{
+			"mode":       "passphrase",
+			"passphrase": "1234",
+			"kdf-type":   "argon2i",
+			"kdf-time":   float64(2 * time.Second),
+		},
 	})
+}
+
+func (cs *clientSuite) TestRequestGeneratePreInstallRecoveryKey(c *check.C) {
+	cs.rsp = `{
+	    "type": "sync",
+	    "status-code": 200,
+	    "result": {
+			"recovery-key": "some-key"
+		}
+	}`
+
+	rkey, err := cs.cli.GeneratePreInstallRecoveryKey("1234")
+	c.Assert(err, check.IsNil)
+	c.Check(rkey, check.Equals, "some-key")
+
+	c.Check(cs.req.Method, check.Equals, "POST")
+	c.Check(cs.req.URL.Path, check.Equals, "/v2/systems/1234")
+
+	body, err := io.ReadAll(cs.req.Body)
+	c.Assert(err, check.IsNil)
+	var req map[string]any
+	err = json.Unmarshal(body, &req)
+	c.Assert(err, check.IsNil)
+	c.Assert(req, check.DeepEquals, map[string]any{
+		"action": "install",
+		"step":   "generate-recovery-key",
+	})
+}
+
+func (cs *clientSuite) TestRequestGeneratePreInstallRecoveryKeyNoLabel(c *check.C) {
+	_, err := cs.cli.GeneratePreInstallRecoveryKey("")
+	c.Assert(err, check.ErrorMatches, "cannot generate recovery key with an empty system label")
+	// no request was performed
+	c.Check(cs.req, check.IsNil)
+}
+
+func (cs *clientSuite) TestRequestGeneratePreInstallRecoveryKeyError(c *check.C) {
+	cs.rsp = `{
+	    "type": "error",
+	    "status-code": 500,
+	    "result": {"message": "boom!"}
+	}`
+
+	_, err := cs.cli.GeneratePreInstallRecoveryKey("1234")
+	c.Assert(err, check.ErrorMatches, `cannot generate recovery key for system "1234": boom!`)
+	c.Check(cs.req.Method, check.Equals, "POST")
+	c.Check(cs.req.URL.Path, check.Equals, "/v2/systems/1234")
+}
+
+func (s *clientSuite) TestKeyboardConfigXKBConfig(c *check.C) {
+	kb := client.KeyboardConfig{
+		Model:   "pc105",
+		Layout:  "us",
+		Variant: "dvorak",
+		Options: []string{"ctrl:nocaps"},
+	}
+	xkb := kb.XKBConfig()
+	c.Check(xkb, check.DeepEquals, keyboard.XKBConfig{
+		Model:    "pc105",
+		Layouts:  []string{"us"},
+		Variants: []string{"dvorak"},
+		Options:  []string{"ctrl:nocaps"},
+	})
+}
+
+func (s *clientSuite) TestKeyboardConfigValidate(c *check.C) {
+	// Valid configuration
+	kb := client.KeyboardConfig{
+		Model:   "pc105",
+		Layout:  "us",
+		Variant: "dvorak",
+	}
+	c.Assert(kb.Validate(), check.IsNil)
+
+	kb = client.KeyboardConfig{
+		Model:   "pc105,",
+		Layout:  "us",
+		Variant: "dvorak",
+	}
+	c.Assert(kb.Validate(), check.ErrorMatches, `model cannot contain ',': found "pc105,"`)
 }

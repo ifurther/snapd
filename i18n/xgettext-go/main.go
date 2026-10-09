@@ -28,7 +28,7 @@ type msgID struct {
 var msgIDs map[string][]msgID
 
 func formatComment(com string) string {
-	out := ""
+	var out strings.Builder
 	for _, rawline := range strings.Split(com, "\n") {
 		line := rawline
 		line = strings.TrimPrefix(line, "//")
@@ -36,11 +36,11 @@ func formatComment(com string) string {
 		line = strings.TrimSuffix(line, "*/")
 		line = strings.TrimSpace(line)
 		if line != "" {
-			out += fmt.Sprintf("#. %s\n", line)
+			out.WriteString(fmt.Sprintf("#. %s\n", line))
 		}
 	}
 
-	return out
+	return out.String()
 }
 
 func findCommentsForTranslation(fset *token.FileSet, f *ast.File, posCall token.Position) string {
@@ -69,7 +69,7 @@ func findCommentsForTranslation(fset *token.FileSet, f *ast.File, posCall token.
 	return formatedComment
 }
 
-func constructValue(val interface{}) string {
+func constructValue(val any) string {
 	switch val.(type) {
 	case *ast.BasicLit:
 		return val.(*ast.BasicLit).Value
@@ -212,7 +212,7 @@ var formatTime = func() string {
 
 // mustFprintf will write the given format string to the given
 // writer. Any error will make it panic.
-func mustFprintf(w io.Writer, format string, a ...interface{}) {
+func mustFprintf(w io.Writer, format string, a ...any) {
 	_, err := fmt.Fprintf(w, format, a...)
 	if err != nil {
 		panic(fmt.Sprintf("cannot write output: %v", err))

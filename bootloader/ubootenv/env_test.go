@@ -21,6 +21,7 @@ package ubootenv_test
 
 import (
 	"bytes"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"os"
@@ -421,4 +422,298 @@ func (u *uenvTestSuite) TestWritesContentCorrectlyNoHeaderFlagByte(c *C) {
 	c.Assert(env.String(), Equals, "a=b\nc=d\n")
 	c.Assert(env.Size(), Equals, totalSize)
 	c.Assert(env.HeaderFlagByte(), Equals, false)
+}
+
+// Tests for redundant environment support
+
+func (u *uenvTestSuite) TestCreateRedundant(c *C) {
+	env, err := ubootenv.CreateRedundant(u.envFile, ubootenv.DefaultRedundantEnvSize)
+	c.Assert(err, IsNil)
+	c.Assert(env, NotNil)
+	c.Assert(env.Redundant(), Equals, true)
+
+	// Check file size is 2 * size (two copies)
+	fi, err := os.Stat(u.envFile)
+	c.Assert(err, IsNil)
+	c.Assert(fi.Size(), Equals, int64(ubootenv.DefaultRedundantEnvSize*2))
+}
+
+func (u *uenvTestSuite) TestCreateRedundantWithData(c *C) {
+	env, err := ubootenv.CreateRedundant(u.envFile, ubootenv.DefaultRedundantEnvSize)
+	c.Assert(err, IsNil)
+
+	env.Set("foo", "bar")
+	env.Set("snap_mode", "try")
+	err = env.Save()
+	c.Assert(err, IsNil)
+
+	// Reopen and verify
+	env2, err := ubootenv.OpenRedundant(u.envFile, ubootenv.DefaultRedundantEnvSize)
+	c.Assert(err, IsNil)
+	c.Assert(env2.Get("foo"), Equals, "bar")
+	c.Assert(env2.Get("snap_mode"), Equals, "try")
+	c.Assert(env2.Redundant(), Equals, true)
+}
+
+func (u *uenvTestSuite) TestRedundantEnvMultipleSaves(c *C) {
+	env, err := ubootenv.CreateRedundant(u.envFile, ubootenv.DefaultRedundantEnvSize)
+	c.Assert(err, IsNil)
+
+	// First save
+	env.Set("counter", "1")
+	err = env.Save()
+	c.Assert(err, IsNil)
+
+	// Second save
+	env.Set("counter", "2")
+	err = env.Save()
+	c.Assert(err, IsNil)
+
+	// Third save
+	env.Set("counter", "3")
+	err = env.Save()
+	c.Assert(err, IsNil)
+
+	// Verify final value
+	env2, err := ubootenv.OpenRedundant(u.envFile, ubootenv.DefaultRedundantEnvSize)
+	c.Assert(err, IsNil)
+	c.Assert(env2.Get("counter"), Equals, "3")
+}
+
+func (u *uenvTestSuite) TestRedundantEnvFailover(c *C) {
+	env, err := ubootenv.CreateRedundant(u.envFile, ubootenv.DefaultRedundantEnvSize)
+	c.Assert(err, IsNil)
+
+	env.Set("value", "good")
+	err = env.Save()
+	c.Assert(err, IsNil)
+
+	// Corrupt the first copy - should still be able to open using the second
+	u.corruptEnvCRC(c, u.envFile, 1)
+	env2, err := ubootenv.OpenRedundant(u.envFile, ubootenv.DefaultRedundantEnvSize)
+	c.Assert(err, IsNil)
+	c.Assert(env2.Get("value"), Equals, "good")
+}
+
+func (u *uenvTestSuite) TestRedundantEnvBothCopiesCorrupted(c *C) {
+	env, err := ubootenv.CreateRedundant(u.envFile, ubootenv.DefaultRedundantEnvSize)
+	c.Assert(err, IsNil)
+
+	env.Set("value", "test")
+	err = env.Save()
+	c.Assert(err, IsNil)
+
+	// Corrupt both copies
+	u.corruptEnvCRC(c, u.envFile, 1)
+	u.corruptEnvCRC(c, u.envFile, 2)
+
+	// Should fail to open
+	_, err = ubootenv.OpenRedundant(u.envFile, ubootenv.DefaultRedundantEnvSize)
+	c.Assert(err, ErrorMatches, `cannot open redundant environment ".*": both copies invalid:.*`)
+}
+
+func (u *uenvTestSuite) TestRedundantEnvDeviceTooSmall(c *C) {
+	// Create a file that's too small for two copies
+	err := os.WriteFile(u.envFile, make([]byte, 100), 0644)
+	c.Assert(err, IsNil)
+
+	_, err = ubootenv.OpenRedundant(u.envFile, ubootenv.DefaultRedundantEnvSize)
+	c.Assert(err, ErrorMatches, `redundant environment device too small or unreadable`)
+}
+
+func (u *uenvTestSuite) TestRedundantEnvDefaultSize(c *C) {
+	// Test with the default redundant env size (8KiB)
+	env, err := ubootenv.CreateRedundant(u.envFile, ubootenv.DefaultRedundantEnvSize)
+	c.Assert(err, IsNil)
+	c.Assert(env, NotNil)
+
+	fi, err := os.Stat(u.envFile)
+	c.Assert(err, IsNil)
+	// Should be 16KiB (2 * 8KiB)
+	c.Assert(fi.Size(), Equals, int64(ubootenv.DefaultRedundantEnvSize*2))
+}
+
+func (u *uenvTestSuite) TestRedundantFlagByteWraparound(c *C) {
+	// Test that flag byte comparison handles wraparound correctly
+	// (e.g., flag=1 should be considered newer than flag=255 after wrap)
+	env, err := ubootenv.CreateRedundant(u.envFile, ubootenv.DefaultRedundantEnvSize)
+	c.Assert(err, IsNil)
+
+	// Save many times to get close to wraparound
+	// Start at flag=1, need to get to flag=255, then wrap to 0
+	for i := 0; i < 256; i++ {
+		env.Set("counter", fmt.Sprintf("%d", i))
+		err = env.Save()
+		c.Assert(err, IsNil)
+	}
+
+	// After 256 saves starting from flag=1, we should have wrapped
+	env2, err := ubootenv.OpenRedundant(u.envFile, ubootenv.DefaultRedundantEnvSize)
+	c.Assert(err, IsNil)
+	c.Assert(env2.Get("counter"), Equals, "255")
+}
+
+func (u *uenvTestSuite) TestRedundantOffsets(c *C) {
+	copy1, copy2 := ubootenv.RedundantOffsets(ubootenv.DefaultRedundantEnvSize)
+	c.Assert(copy1, Equals, int64(0))
+	c.Assert(copy2, Equals, int64(ubootenv.DefaultRedundantEnvSize))
+}
+
+func (u *uenvTestSuite) TestRedundantAlternatesCopies(c *C) {
+	// Test that saves alternate between copy1 and copy2
+	size := ubootenv.DefaultRedundantEnvSize
+	env, err := ubootenv.CreateRedundant(u.envFile, size)
+	c.Assert(err, IsNil)
+
+	// Helper to read flag bytes from both copies
+	readFlags := func() (byte, byte) {
+		data, err := os.ReadFile(u.envFile)
+		c.Assert(err, IsNil)
+		// Flag byte is at offset 4 (after CRC) in each copy
+		return data[4], data[size+4]
+	}
+
+	// After CreateRedundant (which calls Save twice), both copies are valid
+	// First save writes to copy2 with flag=1, second save writes to copy1 with flag=2
+	flag1, flag2 := readFlags()
+	c.Assert(flag1, Equals, byte(2), Commentf("copy1 flag after create"))
+	c.Assert(flag2, Equals, byte(1), Commentf("copy2 flag after create"))
+
+	// Next save should write to copy2 with flag 3
+	env.Set("key", "value1")
+	err = env.Save()
+	c.Assert(err, IsNil)
+	flag1, flag2 = readFlags()
+	c.Assert(flag1, Equals, byte(2), Commentf("copy1 flag after 1st user save"))
+	c.Assert(flag2, Equals, byte(3), Commentf("copy2 flag after 1st user save"))
+
+	// Next save should write to copy1 with flag 4
+	env.Set("key", "value2")
+	err = env.Save()
+	c.Assert(err, IsNil)
+	flag1, flag2 = readFlags()
+	c.Assert(flag1, Equals, byte(4), Commentf("copy1 flag after 2nd user save"))
+	c.Assert(flag2, Equals, byte(3), Commentf("copy2 flag after 2nd user save"))
+
+	// Next save should write to copy2 with flag 5
+	env.Set("key", "value3")
+	err = env.Save()
+	c.Assert(err, IsNil)
+	flag1, flag2 = readFlags()
+	c.Assert(flag1, Equals, byte(4), Commentf("copy1 flag after 3rd user save"))
+	c.Assert(flag2, Equals, byte(5), Commentf("copy2 flag after 3rd user save"))
+}
+
+// corruptEnvCRC corrupts the CRC of the specified copy (1 or 2) in a redundant
+// environment file, causing that copy to fail validation.
+func (u *uenvTestSuite) corruptEnvCRC(c *C, path string, copyNum int) {
+	offset := int64(0)
+	if copyNum == 2 {
+		offset = ubootenv.DefaultRedundantEnvSize
+	}
+
+	f, err := os.OpenFile(path, os.O_RDWR, 0644)
+	c.Assert(err, IsNil)
+	defer f.Close()
+
+	_, err = f.WriteAt([]byte{0xff, 0xff, 0xff, 0xff}, offset)
+	c.Assert(err, IsNil)
+}
+
+// makeRedundantEnvWithFlags creates a redundant environment file where
+// copy1 has flag1 and copy2 has flag2. Both copies contain the same data.
+func (u *uenvTestSuite) makeRedundantEnvWithFlags(c *C, size int, flag1, flag2 byte, data []byte) {
+	// Build a single copy: CRC32 (4 bytes) + flag (1 byte) + payload
+	buildCopy := func(flag byte) []byte {
+		buf := make([]byte, size)
+		// Fill with 0xff, then overlay the header and data
+		for i := range buf {
+			buf[i] = 0xff
+		}
+		copy(buf[5:], data)
+
+		// CRC is computed over payload only (after header)
+		payload := buf[5:]
+		crc := crc32.ChecksumIEEE(payload)
+		copy(buf[0:4], ubootenv.WriteUint32(crc))
+		buf[4] = flag
+		return buf
+	}
+
+	copy1Data := buildCopy(flag1)
+	copy2Data := buildCopy(flag2)
+
+	f, err := os.Create(u.envFile)
+	c.Assert(err, IsNil)
+	defer f.Close()
+	_, err = f.Write(copy1Data)
+	c.Assert(err, IsNil)
+	_, err = f.Write(copy2Data)
+	c.Assert(err, IsNil)
+}
+
+func (u *uenvTestSuite) TestRedundantSaveInvertedFlags(c *C) {
+	// This test verifies that Save() writes to the inactive copy even when
+	// the flag pattern is inverted from what the code might assume.
+	//
+	// Normal pattern: copy1 has even flags, copy2 has odd flags
+	// Inverted pattern: copy1 has odd flags (5), copy2 has even flags (4)
+	//
+	// With flag1=5 and flag2=4, copy1 is active (higher flag).
+	// Save() should write to copy2 (the inactive copy).
+	// Bug: if Save() uses odd/even to determine which copy to write,
+	// it will incorrectly write to copy1 (overwriting the active copy).
+
+	size := ubootenv.DefaultRedundantEnvSize
+
+	// Create sample env data
+	envData := []byte("key=original\x00\x00")
+
+	// Create a redundant env with an inverted flag pattern:
+	// copy1 = flag 5 (odd, active), copy2 = flag 4 (even, inactive)
+	u.makeRedundantEnvWithFlags(c, size, 5, 4, envData)
+
+	// Open the redundant environment
+	env, err := ubootenv.OpenRedundant(u.envFile, size)
+	c.Assert(err, IsNil)
+
+	// Verify we read the correct data
+	c.Assert(env.Get("key"), Equals, "original")
+
+	// Modify and save
+	env.Set("key", "modified")
+	err = env.Save()
+	c.Assert(err, IsNil)
+
+	// Read the raw file to check which copy was written
+	data, err := os.ReadFile(u.envFile)
+	c.Assert(err, IsNil)
+
+	// Flag bytes are at offset 4 in each copy
+	flag1 := data[4]
+	flag2 := data[size+4]
+
+	// After save, the inactive copy (copy2) should have the new flag (6)
+	// and copy1 should be unchanged (5)
+	c.Assert(flag1, Equals, byte(5), Commentf("copy1 flag should remain 5 (was active, not written)"))
+	c.Assert(flag2, Equals, byte(6), Commentf("copy2 flag should be 6 (was inactive, now updated)"))
+}
+
+func (u *uenvTestSuite) TestIsNewerFlag(c *C) {
+	// Same flags - flag1 is considered "newer" (or equal)
+	c.Assert(ubootenv.IsNewerFlag(0, 0), Equals, true)
+	c.Assert(ubootenv.IsNewerFlag(1, 1), Equals, true)
+	c.Assert(ubootenv.IsNewerFlag(255, 255), Equals, true)
+
+	// Sequential flags - higher is newer
+	c.Assert(ubootenv.IsNewerFlag(2, 1), Equals, true)
+	c.Assert(ubootenv.IsNewerFlag(1, 2), Equals, false)
+	c.Assert(ubootenv.IsNewerFlag(100, 99), Equals, true)
+	c.Assert(ubootenv.IsNewerFlag(99, 100), Equals, false)
+
+	// Wraparound cases - 0 is newer than 255
+	c.Assert(ubootenv.IsNewerFlag(0, 255), Equals, true)
+	c.Assert(ubootenv.IsNewerFlag(255, 0), Equals, false)
+	c.Assert(ubootenv.IsNewerFlag(1, 255), Equals, true)
+	c.Assert(ubootenv.IsNewerFlag(255, 1), Equals, false)
 }

@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2014-2020 Canonical Ltd
+ * Copyright (C) 2014-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -21,9 +21,11 @@ package bootloadertest
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/snapcore/snapd/bootloader"
+	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/snap"
 )
 
@@ -48,6 +50,10 @@ type MockBootloader struct {
 	InstallBootConfigCalled []string
 	InstallBootConfigErr    error
 
+	ReconfigureRecoveryBootConfigCalls int
+	ReconfigureRecoveryBootConfigErr   error
+	ReconfigureRecoveryBootConfigFunc  func() error
+
 	enabledKernel    snap.PlaceInfo
 	enabledTryKernel snap.PlaceInfo
 
@@ -66,6 +72,7 @@ var _ bootloader.NotScriptableBootloader = (*MockNotScriptableBootloader)(nil)
 var _ bootloader.NotScriptableBootloader = (*MockExtractedRecoveryKernelNotScriptableBootloader)(nil)
 var _ bootloader.ExtractedRecoveryKernelImageBootloader = (*MockExtractedRecoveryKernelNotScriptableBootloader)(nil)
 var _ bootloader.RebootBootloader = (*MockRebootBootloader)(nil)
+var _ bootloader.RecoveryBootConfigBootloader = (*MockBootloader)(nil)
 
 func Mock(name, bootdir string) *MockBootloader {
 	return &MockBootloader{
@@ -125,6 +132,12 @@ func (b *MockBootloader) RemoveKernelAssets(s snap.PlaceInfo) error {
 	return nil
 }
 
+func (b *MockBootloader) RequiredByGadget(gadgetDir string) bool {
+	markerConf := filepath.Join(gadgetDir, b.Name()+".conf")
+	// do we have a marker file?
+	return osutil.FileExists(markerConf)
+}
+
 func (b *MockBootloader) SetEnabledKernel(s snap.PlaceInfo) (restore func()) {
 	oldSn := b.enabledTryKernel
 	oldVar := b.BootVars["snap_kernel"]
@@ -152,6 +165,14 @@ func (b *MockBootloader) SetEnabledTryKernel(s snap.PlaceInfo) (restore func()) 
 func (b *MockBootloader) InstallBootConfig(gadgetDir string, opts *bootloader.Options) error {
 	b.InstallBootConfigCalled = append(b.InstallBootConfigCalled, gadgetDir)
 	return b.InstallBootConfigErr
+}
+
+func (b *MockBootloader) Reconfigure() error {
+	b.ReconfigureRecoveryBootConfigCalls++
+	if b.ReconfigureRecoveryBootConfigFunc != nil {
+		return b.ReconfigureRecoveryBootConfigFunc()
+	}
+	return b.ReconfigureRecoveryBootConfigErr
 }
 
 // SetMockToPanic allows setting any method in the Bootloader interface or derived
@@ -426,6 +447,13 @@ type MockTrustedAssetsMixin struct {
 	BootChainRunBl         []bootloader.Bootloader
 	BootChainKernelPath    []string
 
+	RevocationTriggeringAssetsCalls  int
+	RevocationTriggeringAssetsReturn []string
+	RevocationTriggeringAssetsError  error
+
+	KernelBootFileBuilder         func(kernelPath string) bootloader.BootFile
+	RecoveryKernelBootFileBuilder func(kernelPath string) bootloader.BootFile
+
 	UpdateErr                  error
 	UpdateCalls                int
 	Updated                    bool
@@ -433,6 +461,14 @@ type MockTrustedAssetsMixin struct {
 	StaticCommandLine          string
 	CandidateStaticCommandLine string
 	CommandLineErr             error
+}
+
+type MockEfiLoadOptionMixin struct {
+	EfiLoadOptionErr  error
+	EfiLoadOptionDesc string
+	EfiLoadOptionPath string
+	EfiLoadOptionData []byte
+	SeenUpdatedAssets [][]string
 }
 
 // MockTrustedAssetsBootloader mocks a bootloader implementing the
@@ -443,9 +479,31 @@ type MockTrustedAssetsBootloader struct {
 	MockTrustedAssetsMixin
 }
 
+type MockTrustedAssetsBootloaderWithEfi struct {
+	*MockBootloader
+
+	MockTrustedAssetsMixin
+	MockEfiLoadOptionMixin
+}
+
 func (b *MockBootloader) WithTrustedAssets() *MockTrustedAssetsBootloader {
 	return &MockTrustedAssetsBootloader{
 		MockBootloader: b,
+	}
+}
+
+func (b *MockBootloader) WithTrustedAssetsAndEfi() *MockTrustedAssetsBootloaderWithEfi {
+	return &MockTrustedAssetsBootloaderWithEfi{
+		MockBootloader: b,
+	}
+}
+
+func (b *MockEfiLoadOptionMixin) ParametersForEfiLoadOption(updatedAssets []string) (string, string, []byte, error) {
+	b.SeenUpdatedAssets = append(b.SeenUpdatedAssets, updatedAssets)
+	if b.EfiLoadOptionErr != nil {
+		return "", "", nil, b.EfiLoadOptionErr
+	} else {
+		return b.EfiLoadOptionDesc, b.EfiLoadOptionPath, b.EfiLoadOptionData, nil
 	}
 }
 
@@ -508,13 +566,31 @@ func (b *MockTrustedAssetsMixin) TrustedAssets() (map[string]string, error) {
 
 func (b *MockTrustedAssetsMixin) RecoveryBootChains(kernelPath string) ([][]bootloader.BootFile, error) {
 	b.RecoveryBootChainCalls = append(b.RecoveryBootChainCalls, kernelPath)
-	return [][]bootloader.BootFile{b.RecoveryBootChainList}, b.RecoveryBootChainErr
+
+	bootchain := b.RecoveryBootChainList
+	if b.RecoveryKernelBootFileBuilder != nil {
+		bootchain = append(bootchain, b.RecoveryKernelBootFileBuilder(kernelPath))
+	}
+
+	return [][]bootloader.BootFile{bootchain}, b.RecoveryBootChainErr
 }
 
 func (b *MockTrustedAssetsMixin) BootChains(runBl bootloader.Bootloader, kernelPath string) ([][]bootloader.BootFile, error) {
 	b.BootChainRunBl = append(b.BootChainRunBl, runBl)
 	b.BootChainKernelPath = append(b.BootChainKernelPath, kernelPath)
-	return [][]bootloader.BootFile{b.BootChainList}, b.BootChainErr
+
+	bootchain := b.BootChainList
+	if b.KernelBootFileBuilder != nil {
+		bootchain = append(bootchain, b.KernelBootFileBuilder(kernelPath))
+	}
+
+	return [][]bootloader.BootFile{bootchain}, b.BootChainErr
+}
+
+func (b *MockTrustedAssetsMixin) RevocationTriggeringAssets() ([]string, error) {
+	b.RevocationTriggeringAssetsCalls++
+
+	return b.RevocationTriggeringAssetsReturn, b.RevocationTriggeringAssetsError
 }
 
 // MockRecoveryAwareTrustedAssetsBootloader implements the

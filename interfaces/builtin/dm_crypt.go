@@ -19,10 +19,6 @@
 
 package builtin
 
-import (
-	"github.com/snapcore/snapd/snap"
-)
-
 const dmCryptSummary = `allows encryption and decryption of block storage devices`
 
 const dmCryptBaseDeclarationSlots = `
@@ -37,9 +33,6 @@ const dmCryptBaseDeclarationPlugs = `
     allow-installation: false
     deny-auto-connection: true
 `
-
-// The type for this interface
-type dmCryptInterface struct{}
 
 // XXX: this should not hardcode mount points like /run/media/ but unless we
 // have an interface like "mount-control" this is needed
@@ -88,11 +81,6 @@ var dmCryptConnectedPlugUDev = []string{
 	`SUBSYSTEM=="block"`,
 }
 
-func (iface *dmCryptInterface) AutoConnect(*snap.PlugInfo, *snap.SlotInfo) bool {
-	// Allow what is allowed in the declarations
-	return true
-}
-
 func init() {
 	registerIface(&commonInterface{
 		name:                     "dm-crypt",
@@ -105,5 +93,7 @@ func init() {
 		connectedPlugSecComp:     dmCryptConnectedPlugSecComp,
 		connectedPlugKModModules: dmCryptConnectedPlugKmod,
 		connectedPlugUDev:        dmCryptConnectedPlugUDev,
+		parallelInstancesPlugErr: errParallelInstancesSharedResources,
+		parallelInstancesSlotErr: errParallelInstancesSystemSlot,
 	})
 }

@@ -1,7 +1,8 @@
 summary: Check auto-refresh from a pre-download change
 
 details: |
-  Verify that an inhibited auto-refresh triggers a pre-download change and resumes on close
+  Verify that an inhibited auto-refresh triggers a pre-download change,
+  reports the inhibition through the warning fallback, and resumes on close.
 
 
 # Ubuntu 14.04's special version of systemd doesn't have StartTransientUnit API.
@@ -22,18 +23,20 @@ environment:
 prepare: |
   # ensure no other refreshes interfere with the test
   snap refresh
-  snap install --devmode jq
   snap install test-snapd-sh
 
 restore: |
-  snap remove --purge jq || true
   snap remove --purge test-snapd-sh || true
 
 debug: |
   snap changes
-  cat /home/test/notif.log || true
 
 execute: |
+  err_and_exit(){
+    echo "$1"
+    exit 1
+  }
+
   changeAfterID() {
     local OLD_CHANGE="$1"
     local NEW_CHANGE
@@ -49,8 +52,7 @@ execute: |
     done
 
     if [ "$NEW_CHANGE" -le "$OLD_CHANGE" ]; then
-      echo "expected a change with an id greater than $OLD_CHANGE"
-      exit 1
+      err_and_exit "expected a change with an id greater than $OLD_CHANGE"
     fi
   }
 
@@ -62,12 +64,6 @@ execute: |
   APP_PID="$!"
   tests.cleanup defer "kill \"$APP_PID\" || true"
 
-  # TODO: test notifications in other distros as well
-  if os.query is-ubuntu && os.query is-classic; then
-    tests.session -u test exec sh -c 'dbus-monitor > notif.log' &
-    tests.cleanup defer "systemctl kill user-12345.slice || true"
-  fi
-
   # trigger an auto-refresh
   OLD_CHANGE=$(snap changes | tail -n 2 | head -n 1 | awk '{print $1}')
   systemctl stop snapd.{service,socket}
@@ -78,18 +74,14 @@ execute: |
   # check that a change was triggered and it's a pre-download
   changeAfterID "$OLD_CHANGE"
   if ! retry -n 15 sh -c 'snap changes | tail -n 2 | grep "Done.*Pre-download \"test-snapd-sh\" for auto-refresh"'; then
-    echo "expected a completed pre-download change"
-    exit 1
+    snap changes
+    LAST_CHG=$(snap changes | tail -n 2 | head -n 1 | awk '{print $1}')
+    snap change "$LAST_CHG"
+    err_and_exit "expected a completed pre-download change"
   fi
 
-  if os.query is-ubuntu && os.query is-classic; then
-    # check that the pre-download notified the user to close the snap
-    retry -n 20 MATCH 'string "Update available for test-snapd-sh."' < /home/test/notif.log
-    MATCH 'string "Close the application to update now. It will update automatically in .* days."' < /home/test/notif.log
-
-    # stop all the dbus monitoring related processes
-    systemctl kill user-12345.slice 2>/dev/null || true
-  fi
+  echo "Check that snapd reports the inhibited refresh through the warning fallback"
+  retry -n 20 sh -c "snap warnings | tr '\n' ' ' | tr -s ' ' | MATCH 'cannot refresh .*test-snapd-sh.* due running apps; close running apps to continue refresh.'"
 
   OLD_CHANGE=$(snap changes | tail -n 2 | head -n 1 | awk '{print $1}')
   if [ "$VARIANT" == "close" ]; then
@@ -104,8 +96,7 @@ execute: |
     # check the refresh was completed
     changeAfterID "$OLD_CHANGE"
     if ! retry -n 15 sh -c 'snap changes | tail -n 2 | grep "Done.*Refresh \"test-snapd-sh\" snap"'; then
-      echo "expected test-snapd-sh to be refreshed"
-      exit 1
+      err_and_exit "expected test-snapd-sh to be refreshed"
     fi
 
     # stop the snap and check no auto-refresh was triggered
@@ -113,8 +104,7 @@ execute: |
     wait "$APP_PID"
 
     if retry -n 5 sh -c 'snap changes | tail -n 2 | grep "Done.*Auto-refresh.*snap.*test-snapd-sh"'; then
-      echo "unexpected auto-refresh of test-snapd-sh"
-      exit 1
+      err_and_exit "unexpected auto-refresh of test-snapd-sh"
     fi
   elif [ "$VARIANT" == "restart" ]; then
     systemctl stop snapd.{service,socket}
@@ -131,6 +121,5 @@ execute: |
 
     "$TESTSTOOLS"/snapd-state wait-for-snap-autorefresh "test-snapd-sh" "$OLD_CHANGE"
   else
-    echo "unrecognized test variant"
-    exit 1
+    err_and_exit "unrecognized test variant"
   fi

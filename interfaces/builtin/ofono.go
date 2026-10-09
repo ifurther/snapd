@@ -305,7 +305,7 @@ func (iface *ofonoInterface) StaticInfo() interfaces.StaticInfo {
 
 func (iface *ofonoInterface) AppArmorConnectedPlug(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	old := "###SLOT_SECURITY_TAGS###"
-	new := spec.SnapAppSet().SlotLabelExpression(slot)
+	new := slot.LabelExpression()
 	spec.AddSnippet(strings.Replace(ofonoConnectedPlugAppArmor, old, new, -1))
 	if release.OnClassic {
 		// Let confined apps access unconfined ofono on classic
@@ -342,7 +342,7 @@ func (iface *ofonoInterface) UDevPermanentSlot(spec *udev.Specification, slot *s
 
 func (iface *ofonoInterface) AppArmorConnectedSlot(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	old := "###PLUG_SECURITY_TAGS###"
-	new := spec.SnapAppSet().PlugLabelExpression(plug)
+	new := plug.LabelExpression()
 	spec.AddSnippet(strings.Replace(ofonoConnectedSlotAppArmor, old, new, -1))
 	return nil
 }
@@ -355,6 +355,12 @@ func (iface *ofonoInterface) SecCompPermanentSlot(spec *seccomp.Specification, s
 func (iface *ofonoInterface) AutoConnect(*snap.PlugInfo, *snap.SlotInfo) bool {
 	// allow what declarations allowed
 	return true
+}
+
+func (iface *ofonoInterface) ParallelInstancesSupportedForSlot(_ *snap.SlotInfo) error {
+	// ofono owns the well-known bus name org.ofono on the system bus; only
+	// one snap instance can hold it at a time.
+	return errParallelInstancesUniqueResourceOwner
 }
 
 func init() {

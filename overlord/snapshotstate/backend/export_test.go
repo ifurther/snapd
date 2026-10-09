@@ -20,14 +20,15 @@
 package backend
 
 import (
+	"context"
 	"os"
 	"os/exec"
-	"os/user"
 	"time"
 
 	"github.com/snapcore/snapd/client"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/osutil/sys"
+	"github.com/snapcore/snapd/osutil/user"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/testutil"
 )
@@ -41,6 +42,8 @@ var (
 	NewMultiError = newMultiError
 
 	AddSnapDirToZip = addSnapDirToZip
+
+	IsPathAtOrUnderDir = isPathAtOrUnderDir
 )
 
 func MockIsTesting(newIsTesting bool) func() {
@@ -83,7 +86,7 @@ func MockSysGeteuid(newGeteuid func() sys.UserID) (restore func()) {
 	}
 }
 
-func MockTarAsUser(f func(string, ...string) *exec.Cmd) (restore func()) {
+func MockTarAsUser(f func(context.Context, string, ...string) *exec.Cmd) (restore func()) {
 	r := testutil.Backup(&tarAsUser)
 	tarAsUser = f
 	return r

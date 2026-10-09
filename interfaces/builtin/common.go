@@ -20,6 +20,7 @@
 package builtin
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 
@@ -41,6 +42,26 @@ var evalSymlinks = filepath.EvalSymlinks
 // testing.
 var readDir = os.ReadDir
 
+var (
+	errParallelInstancesSystemPlug      = errors.New("system plug cannot have parallel instances")
+	errParallelInstancesSystemSlot      = errors.New("system slot cannot have parallel instances")
+	errParallelInstancesGadgetSlot      = errors.New("gadget slot cannot have parallel instances")
+	errParallelInstancesSharedResources = errors.New("conflicting operations on shared system resources")
+	// errParallelInstancesLibrarySource is used since system*.library-source
+	// files under SnapExportDir use "_" to encode the instance name, slot name
+	// and interface name in their names. Since parallel instance names also
+	// use "_" to append the instance key, some functionality may not correctly
+	// distinguish parallel instances.
+	// TODO: add tests for *-driver-libs interfaces to check if parallel instances on
+	// slot side work and remove this error if they do.
+	errParallelInstancesLibrarySource = errors.New("library-source filenames cannot distinguish parallel instances")
+	// errParallelInstancesUniqueResourceOwner is used for interfaces which
+	// own a globally unique resource (e.g. a well-known D-Bus name or socket):
+	// two parallel instances of the providing snap would conflict with each
+	// other for ownership of it.
+	errParallelInstancesUniqueResourceOwner = errors.New("owning a unique global resource cannot have parallel instances")
+)
+
 type commonInterface struct {
 	name    string
 	summary string
@@ -48,6 +69,9 @@ type commonInterface struct {
 
 	implicitOnCore    bool
 	implicitOnClassic bool
+
+	implicitPlugOnCore    bool
+	implicitPlugOnClassic bool
 
 	affectsPlugOnRefresh bool
 
@@ -87,8 +111,17 @@ type commonInterface struct {
 
 	controlsDeviceCgroup bool
 
-	serviceSnippets []string
+	serviceSnippets []interfaces.PlugServicesSnippet
+
+	conflictingConnectedInterfaces []string
+
+	parallelInstancesPlugErr error
+	parallelInstancesSlotErr error
 }
+
+var _ = interfaces.ConflictingConnectedInterfacesDefiner(&commonInterface{})
+var _ = interfaces.ParallelInstancesPlugDefiner(&commonInterface{})
+var _ = interfaces.ParallelInstancesSlotDefiner(&commonInterface{})
 
 // Name returns the interface name.
 func (iface *commonInterface) Name() string {
@@ -98,12 +131,14 @@ func (iface *commonInterface) Name() string {
 // StaticInfo returns various meta-data about this interface.
 func (iface *commonInterface) StaticInfo() interfaces.StaticInfo {
 	return interfaces.StaticInfo{
-		Summary:              iface.summary,
-		DocURL:               iface.docURL,
-		ImplicitOnCore:       iface.implicitOnCore,
-		ImplicitOnClassic:    iface.implicitOnClassic,
-		BaseDeclarationPlugs: iface.baseDeclarationPlugs,
-		BaseDeclarationSlots: iface.baseDeclarationSlots,
+		Summary:               iface.summary,
+		DocURL:                iface.docURL,
+		ImplicitOnCore:        iface.implicitOnCore,
+		ImplicitOnClassic:     iface.implicitOnClassic,
+		ImplicitPlugOnCore:    iface.implicitPlugOnCore,
+		ImplicitPlugOnClassic: iface.implicitPlugOnClassic,
+		BaseDeclarationPlugs:  iface.baseDeclarationPlugs,
+		BaseDeclarationSlots:  iface.baseDeclarationSlots,
 		// affects the plug snap because of mount backend
 		AffectsPlugOnRefresh:    iface.affectsPlugOnRefresh,
 		AppArmorUnconfinedPlugs: iface.appArmorUnconfinedPlugs,
@@ -111,7 +146,7 @@ func (iface *commonInterface) StaticInfo() interfaces.StaticInfo {
 	}
 }
 
-func (iface *commonInterface) ServicePermanentPlug(plug *snap.PlugInfo) []string {
+func (iface *commonInterface) ServicePermanentPlug(plug *snap.PlugInfo) []interfaces.PlugServicesSnippet {
 	return iface.serviceSnippets
 }
 
@@ -213,4 +248,31 @@ func (iface *commonInterface) UDevConnectedPlug(spec *udev.Specification, plug *
 	}
 
 	return nil
+}
+
+func (iface *commonInterface) ConflictsWithOtherConnectedInterfaces() []string {
+	return iface.conflictingConnectedInterfaces
+}
+
+// ParallelInstancesSupportedForPlug returns parallelInstancesPlugErr, ignoring
+// plug attributes.
+func (iface *commonInterface) ParallelInstancesSupportedForPlug(_ *snap.PlugInfo) error {
+	return iface.parallelInstancesPlugErr
+}
+
+// ParallelInstancesSupportedForSlot returns parallelInstancesSlotErr, ignoring
+// slot attributes.
+func (iface *commonInterface) ParallelInstancesSupportedForSlot(_ *snap.SlotInfo) error {
+	return iface.parallelInstancesSlotErr
+}
+
+// parallelInstancesSystemOrGadgetSlotErr returns the appropriate parallel
+// instances error for interfaces whose slot can only be provided by
+// system or gadget snap, neither of which support parallel instances.
+// The slot must be non-nil.
+func parallelInstancesSystemOrGadgetSlotErr(slot *snap.SlotInfo) error {
+	if implicitSystemPermanentSlot(slot) {
+		return errParallelInstancesSystemSlot
+	}
+	return errParallelInstancesGadgetSlot
 }

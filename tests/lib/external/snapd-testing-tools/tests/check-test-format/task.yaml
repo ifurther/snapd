@@ -1,8 +1,12 @@
 summary: smoke test for the spread checker tool
 
-backends: [google]
+details: |
+    Verify that the check-test-format tool checks properly the desired
+    order and mandatory keys in spread tasks.
 
-systems: [ ubuntu-20.04-64 ]
+backends: [openstack*]
+
+systems: [ubuntu-22.04-64]
 
 prepare: |
     apt install -y python3-yamlordereddictloader

@@ -26,16 +26,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/juju/ratelimit"
+	"golang.org/x/sys/unix"
 	"gopkg.in/retry.v1"
 
 	"github.com/snapcore/snapd/dirs"
@@ -46,7 +48,9 @@ import (
 	"github.com/snapcore/snapd/overlord/auth"
 	"github.com/snapcore/snapd/progress"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/squashfs"
 	"github.com/snapcore/snapd/snapdtool"
+	"github.com/snapcore/snapd/strutil"
 )
 
 var commandFromSystemSnap = snapdtool.CommandFromSystemSnap
@@ -80,82 +84,6 @@ func init() {
 	}
 }
 
-// Deltas enabled by default on classic, but allow opting in or out on both classic and core.
-func (s *Store) useDeltas() (use bool) {
-	s.xdeltaCheckLock.Lock()
-	defer s.xdeltaCheckLock.Unlock()
-
-	// check the cached value if available
-	if s.shouldUseDeltas != nil {
-		return *s.shouldUseDeltas
-	}
-
-	defer func() {
-		// cache whatever value we return for next time
-		s.shouldUseDeltas = &use
-	}()
-
-	// check if deltas were disabled by the environment
-	if !osutil.GetenvBool("SNAPD_USE_DELTAS_EXPERIMENTAL", true) {
-		// then the env var is explicitly false, we can't use deltas
-		logger.Debugf("delta usage disabled by environment variable")
-		return false
-	}
-
-	// TODO: have a per-format checker instead, we currently only support
-	// xdelta3 as a format for deltas
-
-	// check if the xdelta3 config command works from the system snap
-	cmd, err := commandFromSystemSnap("/usr/bin/xdelta3", "config")
-	if err == nil {
-		// we have a xdelta3 from the system snap, make sure it works
-		if runErr := cmd.Run(); runErr == nil {
-			// success using the system snap provided one, setup the callback to
-			// use the cmd we got from CommandFromSystemSnap, but with a small
-			// tweak - this cmd to run xdelta3 from the system snap will likely
-			// have other arguments and a different main exe usually, so
-			// use it exactly as we got it from CommandFromSystemSnap,
-			// but drop the last arg which we know is "config"
-			exe := cmd.Path
-			args := cmd.Args[:len(cmd.Args)-1]
-			env := cmd.Env
-			dir := cmd.Dir
-			s.xdelta3CmdFunc = func(xDelta3args ...string) *exec.Cmd {
-				return &exec.Cmd{
-					Path: exe,
-					Args: append(args, xDelta3args...),
-					Env:  env,
-					Dir:  dir,
-				}
-			}
-			return true
-		} else {
-			logger.Noticef("unable to use system snap provided xdelta3, running config command failed: %v", runErr)
-		}
-	}
-
-	// we didn't have one from a system snap or it didn't work, fallback to
-	// trying xdelta3 from the system
-	loc, err := exec.LookPath("xdelta3")
-	if err != nil {
-		// no xdelta3 in the env, so no deltas
-		logger.Noticef("no host system xdelta3 available to use deltas")
-		return false
-	}
-
-	if err := exec.Command(loc, "config").Run(); err != nil {
-		// xdelta3 in the env failed to run, so no deltas
-		logger.Noticef("unable to use host system xdelta3, running config command failed: %v", err)
-		return false
-	}
-
-	// the xdelta3 in the env worked, so use that one
-	s.xdelta3CmdFunc = func(args ...string) *exec.Cmd {
-		return exec.Command(loc, args...)
-	}
-	return true
-}
-
 func (s *Store) cdnHeader() (string, error) {
 	if s.noCDN {
 		return "none", nil
@@ -187,6 +115,20 @@ type DownloadOptions struct {
 	LeavePartialOnError bool
 }
 
+// Detect most frequent symptoms of corruption (e.g. 0-byte files which may
+// appear on power loss). Does not check for silent bit rot, which may cause
+// bit/byte flips.
+func isDownloadLikelyNotCorrupted(targetPath string, downloadInfo *snap.DownloadInfo) bool {
+	if fi, err := os.Lstat(targetPath); err == nil {
+		// check the size if one was provided by the store, otherwise accept
+		// any non-0 size as correct
+		if fi.Size() > 0 && (fi.Size() == downloadInfo.Size || downloadInfo.Size == 0) {
+			return true
+		}
+	}
+	return false
+}
+
 // Download downloads the snap addressed by download info and returns its
 // filename.
 // The file is saved in temporary storage, and should be removed
@@ -203,23 +145,60 @@ func (s *Store) Download(ctx context.Context, name string, targetPath string, do
 		return err
 	}
 
+	// TODO: we trust the cache to contain valid/uncorrupted data, but we could
+	// Get() to a target path with the .partial suffix and run through the
+	// resumed download verification code path which would automatically
+	// redownload the file if it's found to be corrupted; however this comes
+	// with the cost of hashing the whole file again
 	if s.cacher.Get(downloadInfo.Sha3_384, targetPath) {
-		logger.Debugf("Cache hit for SHA3_384 …%.5s.", downloadInfo.Sha3_384)
-		return nil
+		// we either got the file entry from the cache, or it already existed at
+		// the target path. More sophisticated corruption cases are expected to
+		// be caught by the caller at some point, for which they can call
+		// CleanupDownloadArtifacts() to have the invalid snap blobs removed.
+		if isDownloadLikelyNotCorrupted(targetPath, downloadInfo) {
+			logger.Debugf("Cache hit for SHA3_384 …%.5s.", downloadInfo.Sha3_384)
+			return nil
+		}
+		// remove the target path and try to recover from the cache again,
+		// maybe only the preexisting target path is corrupted
+		_ = os.Remove(targetPath)
+
+		if s.cacher.Get(downloadInfo.Sha3_384, targetPath) && isDownloadLikelyNotCorrupted(targetPath, downloadInfo) {
+			logger.Debugf("Recovered snap file from cache for SHA3_384 …%.5s.", downloadInfo.Sha3_384)
+			return nil
+		}
+		// best effort attempt failed, the cache entry is likely bad as well, remove both
+		_ = os.Remove(targetPath)
+		_ = s.cacher.Drop(downloadInfo.Sha3_384)
+		// ... and re-download.
+		logger.Debugf("Cache entry for SHA3_384 …%.5s has unexpected size, re-downloading.", downloadInfo.Sha3_384)
 	}
 
-	if s.useDeltas() {
+	if len(s.supportedDeltaFormats()) > 0 {
 		logger.Debugf("Available deltas returned by store: %v", downloadInfo.Deltas)
-
-		if len(downloadInfo.Deltas) == 1 {
-			err := s.downloadAndApplyDelta(name, targetPath, downloadInfo, pbar, user, dlOpts)
+		if len(downloadInfo.Deltas) > 0 {
+			err := s.downloadAndApplyDelta(ctx, name, targetPath, downloadInfo, pbar, user, dlOpts)
 			if err == nil {
-				return nil
+				// try to place the file in the cacher
+				if err = s.cacher.Put(downloadInfo.Sha3_384, targetPath); err == nil {
+					// file is in the cache now
+					return nil
+				} else {
+					logger.Noticef("Cannot place rebuilt blob for %s in cache: %v", name, err)
+				}
+			} else {
+				// We revert to normal downloads if there is any error.
+				logger.Noticef("Cannot download or apply deltas for %s: %v", name, err)
 			}
-			// We revert to normal downloads if there is any error.
-			logger.Noticef("Cannot download or apply deltas for %s: %v", name, err)
 		}
 	}
+
+	// open to sync the directory
+	d, err := os.Open(filepath.Dir(targetPath))
+	if err != nil {
+		return err
+	}
+	defer d.Close()
 
 	partialPath := targetPath + ".partial"
 	w, err := os.OpenFile(partialPath, os.O_RDWR|os.O_CREATE, 0600)
@@ -230,6 +209,7 @@ func (s *Store) Download(ctx context.Context, name string, targetPath string, do
 	if err != nil {
 		return err
 	}
+
 	defer func() {
 		fi, _ := w.Stat()
 		if cerr := w.Close(); cerr != nil && err == nil {
@@ -240,8 +220,13 @@ func (s *Store) Download(ctx context.Context, name string, targetPath string, do
 		}
 		if dlOpts == nil || !dlOpts.LeavePartialOnError || fi == nil || fi.Size() == 0 {
 			os.Remove(w.Name())
+			if serr := d.Sync(); serr != nil {
+				// TODO:GOVERSION: use errors.Join
+				err = strutil.JoinErrors(err, serr)
+			}
 		}
 	}()
+
 	if resume > 0 {
 		logger.Debugf("Resuming download of %q at %d.", partialPath, resume)
 	} else {
@@ -257,7 +242,7 @@ func (s *Store) Download(ctx context.Context, name string, targetPath string, do
 	} else {
 		// we're done! check the hash though
 		h := crypto.SHA3_384.New()
-		if _, err := w.Seek(0, os.SEEK_SET); err != nil {
+		if _, err := w.Seek(0, io.SeekStart); err != nil {
 			return err
 		}
 		if _, err := io.Copy(h, w); err != nil {
@@ -298,7 +283,95 @@ func (s *Store) Download(ctx context.Context, name string, targetPath string, do
 		return err
 	}
 
+	if err := d.Sync(); err != nil {
+		return err
+	}
+
 	return s.cacher.Put(downloadInfo.Sha3_384, targetPath)
+}
+
+var errIconUnchanged = errors.New("existing icon unchanged")
+
+const (
+	// Etags should all be smaller than 256B.
+	maxEtagSize   = 256
+	etagXattrName = "user.snap_store_etag"
+)
+
+var (
+	ErrProxyStoreIconDownloadUnsupported = errors.New("icon download unsupported with proxy store")
+)
+
+// DownloadIcon downloads the icon for the snap from the given download URL to
+// the given target path. Snap icons are small (<256kB) files served from an
+// ordinary unauthenticated file server, so this does not require store
+// authentication or user state, nor a progress bar. They are also not revision-
+// specific, and do not use a download cache.
+func (s *Store) DownloadIcon(ctx context.Context, name string, targetPath string, downloadURL string) error {
+	if s.dauthCtx != nil {
+		// custom proxy store, which historically had not supported icon
+		// downloads through its APIs
+		psID, psU, err := s.dauthCtx.ProxyStoreParams(s.baseURL(s.cfg.StoreBaseURL))
+		if err == nil && psID != "" {
+			if !strings.HasPrefix(downloadURL, psU.String()) {
+				return ErrProxyStoreIconDownloadUnsupported
+			}
+		}
+	}
+
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+		return err
+	}
+
+	// Read etag of existing file at targetPath, if it exists
+	var etag string
+	etagBuf := make([]byte, maxEtagSize)
+	if size, err := unix.Getxattr(targetPath, etagXattrName, etagBuf); err == nil {
+		// if an error occurs, ignore it, and don't include an etag in the request
+		etag = string(etagBuf[:size])
+	}
+
+	// Download icon to a temporary file location, since there may be an active
+	// snap icon hard-linked to targetPath. If download fails, don't want to
+	// corrupt the existing icon file contents. Instead, commit the new file
+	// once the download succeeds, thus leaving any previous icon linked to the
+	// original unchanged icon contents, until a future task re-links to the
+	// new contents.
+	aw, err := osutil.NewAtomicFile(targetPath, 0o644, 0, osutil.NoChown, osutil.NoChown)
+	if err != nil {
+		return fmt.Errorf("cannot create file for snap icon for snap %s: %v", name, err)
+	}
+	// on success, Cancel becomes a no-op
+	defer aw.Cancel()
+
+	logger.Debugf("Starting download of %q to %q.", downloadURL, targetPath)
+
+	etag, err = downloadIcon(ctx, name, etag, downloadURL, s, aw)
+	if err != nil {
+		if errors.Is(err, errIconUnchanged) {
+			logger.Debugf("download of snap icon skipped for snap %s: icon unchanged", name)
+			return nil
+		}
+		return err
+	}
+
+	if err = aw.Commit(); err != nil {
+		return fmt.Errorf("cannot commit snap icon file for snap %s: %v", name, err)
+	}
+
+	// Success, now try to store the etag
+	if etag != "" {
+		if len(etag) >= maxEtagSize { // len doesn't include trailing '\0'
+			logger.Debugf("snap icon etag exceeds maximum etag length (%d): %d", maxEtagSize, len(etag))
+		} else {
+			// If the filesystem does not support xattrs, we'll just redownload
+			// the whole icon next time, so log but do not return any error.
+			if err := unix.Setxattr(targetPath, etagXattrName, []byte(etag), 0); err != nil {
+				logger.Debugf("cannot save etag in icon file xattrs: %v", err)
+			}
+		}
+	}
+	return nil
 }
 
 func downloadReqOpts(storeURL *url.URL, cdnHeader string, opts *DownloadOptions) *requestOptions {
@@ -402,7 +475,7 @@ func (w *TransferSpeedMonitoringWriter) Monitor() (quit chan bool) {
 					return
 				}
 				// reset the measurement every downloadSpeedMeasureWindow,
-				// we want average speed per second over the mesure time window,
+				// we want average speed per second over the measure time window,
 				// otherwise a large download with initial good download
 				// speed could get stuck at the end of the download, and it
 				// would take long time for overall average to "catch up".
@@ -478,7 +551,7 @@ func downloadImpl(ctx context.Context, name, sha3_384, downloadURL string, user 
 			return fmt.Errorf("the download has been cancelled: %s", downloadCtx.Err())
 		}
 		var resp *http.Response
-		cli := s.newHTTPClient(nil)
+		cli := s.newHTTPClient(nil) // XXX: there's no timeout defined for this client, and the context is context.TODO(), so it won't be cancelled
 		oldCheckRedirect := cli.CheckRedirect
 		if oldCheckRedirect == nil {
 			panic("internal error: the httputil.NewHTTPClient-produced http.Client must have CheckRedirect defined")
@@ -593,6 +666,114 @@ func downloadImpl(ctx context.Context, name, sha3_384, downloadURL string, user 
 	return finalErr
 }
 
+type ReadWriteSeekTruncater interface {
+	io.Reader
+	io.Writer
+	io.Seeker
+
+	Truncate(size int64) error
+}
+
+var (
+	maxIconFilesize int64 = 300000
+	downloadIcon          = downloadIconImpl
+	// downloadIconTimeout is the duration of time to wait for a complete
+	// request to download a snap icon. Most icons are <100kB, and we limit the
+	// max size to 300kB. If the machine is behind a firewall which blocks
+	// connections aside from the store proxy, we want to more quickly abort, as
+	// this will otherwise hang until the 15 minute request timeout expires.
+	// Unfortunately, the request will retry 5 times total on request
+	// cancellation (e.g. by timeout), so we'll really wait 5x this value. But
+	// on very slow internet we still need to be able to download icons up to
+	// several hundred kB within this time limit.
+	downloadIconTimeout = 20 * time.Second
+)
+
+// downloadIconImpl writes an http.Request which does not require authentication
+// or a progress.Meter. Returns the etag of the downloaded icon, if it exists.
+// If the icon file on disk is unchanged on the server, returns errIconUnchanged.
+func downloadIconImpl(ctx context.Context, name, etag, downloadURL string, s *Store, w ReadWriteSeekTruncater) (newEtag string, err error) {
+	iconURL, err := url.Parse(downloadURL)
+	if err != nil {
+		return "", err
+	}
+
+	startTime := time.Now()
+	errRetry := errors.New("retry")
+	for attempt := retry.Start(downloadRetryStrategy, nil); attempt.Next(); {
+		httputil.MaybeLogRetryAttempt(iconURL.String(), attempt, startTime)
+
+		err = func() error {
+			cli := s.newHTTPClient(&httputil.ClientOptions{Timeout: downloadIconTimeout})
+			reqOptions := iconRequestOptions{
+				url:  iconURL,
+				etag: etag,
+			}
+			var resp *http.Response
+			resp, err = doIconRequest(ctx, cli, reqOptions)
+			if err != nil {
+				if httputil.ShouldRetryAttempt(attempt, err) {
+					return errRetry
+				}
+				return err
+			}
+
+			defer resp.Body.Close()
+
+			if httputil.ShouldRetryHttpResponse(attempt, resp) {
+				return errRetry
+			}
+
+			switch resp.StatusCode {
+			case 200: // all good
+			case 304:
+				// etag matched, icon is unchanged, so abort
+				return errIconUnchanged
+			default:
+				return &DownloadError{Code: resp.StatusCode, URL: resp.Request.URL}
+			}
+
+			if resp.ContentLength == 0 || resp.ContentLength > maxIconFilesize {
+				return fmt.Errorf("unsupported Content-Length for %s (must be nonzero and <%dB): %d", downloadURL, maxIconFilesize, resp.ContentLength)
+			}
+			logger.Debugf("download size for %s: %d", downloadURL, resp.ContentLength)
+
+			_, err = io.CopyN(w, resp.Body, resp.ContentLength)
+
+			if err != nil {
+				if httputil.ShouldRetryAttempt(attempt, err) {
+					if _, err := w.Seek(0, io.SeekStart); err != nil {
+						return err
+					}
+					if err := w.Truncate(0); err != nil {
+						return err
+					}
+					return errRetry
+				}
+				return err
+			}
+
+			// Save etag, if it exists.
+			newEtag = resp.Header.Get("etag")
+
+			return nil
+		}()
+
+		if err == errRetry {
+			continue
+		}
+
+		if err == nil {
+			logger.Debugf("icon download succeeded for %s", name)
+		}
+
+		return newEtag, err
+	}
+	// The loop will return an error directly if retries are exhausted and an
+	// error occurs, so we never actually break out of the loop and get here.
+	return "", errors.New("icon download retries exhausted")
+}
+
 // DownloadStream will copy the snap from the request to the io.Reader
 func (s *Store) DownloadStream(ctx context.Context, name string, downloadInfo *snap.DownloadInfo, resume int64, user *auth.UserState) (io.ReadCloser, int, error) {
 	// most other store network operations use s.endpointURL, which returns an
@@ -604,19 +785,26 @@ func (s *Store) DownloadStream(ctx context.Context, name string, downloadInfo *s
 
 	// XXX: coverage of this is rather poor
 	if path := s.cacher.GetPath(downloadInfo.Sha3_384); path != "" {
-		logger.Debugf("Cache hit for SHA3_384 …%.5s.", downloadInfo.Sha3_384)
 		file, err := os.OpenFile(path, os.O_RDONLY, 0600)
 		if err != nil {
-			return nil, 0, err
+			// There's a TOCTOU race between getting a path from the cache and
+			// opening the file. It is possible that a cache cleanup running in
+			// parallel may have removed the file by the time we try to open it.
+			if !errors.Is(err, fs.ErrNotExist) {
+				return nil, 0, err
+			}
+			// file not found, proceed to store download
+		} else {
+			logger.Debugf("Cache hit for SHA3_384 …%.5s.", downloadInfo.Sha3_384)
+			if resume == 0 {
+				return file, 200, nil
+			}
+			_, err = file.Seek(resume, io.SeekStart)
+			if err != nil {
+				return nil, 0, err
+			}
+			return file, 206, nil
 		}
-		if resume == 0 {
-			return file, 200, nil
-		}
-		_, err = file.Seek(resume, io.SeekStart)
-		if err != nil {
-			return nil, 0, err
-		}
-		return file, 206, nil
 	}
 
 	storeURL, err := url.Parse(downloadInfo.DownloadURL)
@@ -647,30 +835,39 @@ func doDownloadReqImpl(ctx context.Context, storeURL *url.URL, cdnHeader string,
 	return s.doRequest(ctx, cli, reqOptions, user)
 }
 
-// downloadDelta downloads the delta for the preferred format, returning the path.
-func (s *Store) downloadDelta(deltaName string, downloadInfo *snap.DownloadInfo, w io.ReadWriteSeeker, pbar progress.Meter, user *auth.UserState, dlOpts *DownloadOptions) error {
-
-	if len(downloadInfo.Deltas) != 1 {
-		return errors.New("store returned more than one download delta")
+// selectDelta selects the preferred delta format amongst the options in downloadInfo.
+func (s *Store) selectDelta(downloadInfo *snap.DownloadInfo) (*snap.DeltaInfo, error) {
+	var deltaInfo snap.DeltaInfo
+	deltaFormats := s.supportedDeltaFormats()
+	idx := len(deltaFormats)
+	for _, info := range downloadInfo.Deltas {
+		// Priority is determined by the order returned by
+		// squashfsSupportedDeltaFormats(): lower index is higher priority. So
+		// once we find one at position idx, we do not want to look to higher
+		// indexes in the strings returned by the store.
+		for i := 0; i < idx; i++ {
+			if deltaFormats[i] == info.Format {
+				deltaInfo = info
+				idx = i
+				break
+			}
+		}
 	}
 
-	deltaInfo := downloadInfo.Deltas[0]
-
-	if deltaInfo.Format != s.deltaFormat {
-		return fmt.Errorf("store returned unsupported delta format %q (only xdelta3 currently)", deltaInfo.Format)
+	if idx == len(deltaFormats) {
+		return nil, fmt.Errorf("store does not support any of our snap delta formats")
 	}
-
-	url := deltaInfo.DownloadURL
-
-	return download(context.TODO(), deltaName, deltaInfo.Sha3_384, url, user, s, w, 0, pbar, dlOpts)
+	return &deltaInfo, nil
 }
 
 // applyDelta generates a target snap from a previously downloaded snap and a downloaded delta.
-var applyDelta = func(s *Store, name string, deltaPath string, deltaInfo *snap.DeltaInfo, targetPath string, targetSha3_384 string) error {
-	return s.applyDeltaImpl(name, deltaPath, deltaInfo, targetPath, targetSha3_384)
+var applyDelta = func(ctx context.Context, s *Store, name string, deltaPath string, deltaInfo *snap.DeltaInfo, targetPath string, targetSha3_384 string) error {
+	return s.applyDeltaImpl(ctx, name, deltaPath, deltaInfo, targetPath, targetSha3_384)
 }
 
-func (s *Store) applyDeltaImpl(name string, deltaPath string, deltaInfo *snap.DeltaInfo, targetPath string, targetSha3_384 string) error {
+var squashfsApplyDelta = squashfs.ApplyDelta
+
+func (s *Store) applyDeltaImpl(ctx context.Context, name string, deltaPath string, deltaInfo *snap.DeltaInfo, targetPath string, targetSha3_384 string) error {
 	snapBase := fmt.Sprintf("%s_%d.snap", name, deltaInfo.FromRevision)
 	snapPath := filepath.Join(dirs.SnapBlobDir, snapBase)
 
@@ -678,22 +875,15 @@ func (s *Store) applyDeltaImpl(name string, deltaPath string, deltaInfo *snap.De
 		return fmt.Errorf("snap %q revision %d not found at %s", name, deltaInfo.FromRevision, snapPath)
 	}
 
-	if deltaInfo.Format != "xdelta3" {
-		return fmt.Errorf("cannot apply unsupported delta format %q (only xdelta3 currently)", deltaInfo.Format)
-	}
-
 	partialTargetPath := targetPath + ".partial"
-
-	xdelta3Args := []string{"-d", "-s", snapPath, deltaPath, partialTargetPath}
 
 	// validity check that deltas are available and that the path for the xdelta3
 	// command is set
-	if ok := s.useDeltas(); !ok {
+	if ok := len(s.supportedDeltaFormats()) > 0; !ok {
 		return fmt.Errorf("internal error: applyDelta used when deltas are not available")
 	}
 
-	// run the xdelta3 command, cleaning up if we fail and logging about it
-	if runErr := s.xdelta3CmdFunc(xdelta3Args...).Run(); runErr != nil {
+	if runErr := squashfsApplyDelta(ctx, snapPath, deltaPath, partialTargetPath); runErr != nil {
 		logger.Noticef("encountered error applying delta: %v", runErr)
 		if err := os.Remove(partialTargetPath); err != nil {
 			logger.Noticef("error cleaning up partial delta target %q: %s", partialTargetPath, err)
@@ -725,11 +915,14 @@ func (s *Store) applyDeltaImpl(name string, deltaPath string, deltaInfo *snap.De
 }
 
 // downloadAndApplyDelta downloads and then applies the delta to the current snap.
-func (s *Store) downloadAndApplyDelta(name, targetPath string, downloadInfo *snap.DownloadInfo, pbar progress.Meter, user *auth.UserState, dlOpts *DownloadOptions) error {
-	deltaInfo := &downloadInfo.Deltas[0]
+func (s *Store) downloadAndApplyDelta(ctx context.Context, name, targetPath string, downloadInfo *snap.DownloadInfo, pbar progress.Meter, user *auth.UserState, dlOpts *DownloadOptions) error {
+	deltaInfo, err := s.selectDelta(downloadInfo)
+	if err != nil {
+		return err
+	}
 
-	deltaPath := fmt.Sprintf("%s.%s-%d-to-%d.partial", targetPath, deltaInfo.Format, deltaInfo.FromRevision, deltaInfo.ToRevision)
-	deltaName := fmt.Sprintf(i18n.G("%s (delta)"), name)
+	deltaPath := fmt.Sprintf("%s.%s-%d-to-%d.partial", targetPath,
+		deltaInfo.Format, deltaInfo.FromRevision, deltaInfo.ToRevision)
 
 	w, err := os.OpenFile(deltaPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
@@ -742,29 +935,97 @@ func (s *Store) downloadAndApplyDelta(name, targetPath string, downloadInfo *sna
 		os.Remove(deltaPath)
 	}()
 
-	err = s.downloadDelta(deltaName, downloadInfo, w, pbar, user, dlOpts)
+	deltaName := fmt.Sprintf(i18n.G("%s (delta)"), name)
+	err = download(ctx, deltaName, deltaInfo.Sha3_384,
+		deltaInfo.DownloadURL, user, s, w, 0, pbar, dlOpts)
 	if err != nil {
 		return err
 	}
 
 	logger.Debugf("Successfully downloaded delta for %q at %s", name, deltaPath)
-	if err := applyDelta(s, name, deltaPath, deltaInfo, targetPath, downloadInfo.Sha3_384); err != nil {
+	if err := applyDelta(ctx, s, name, deltaPath, deltaInfo, targetPath, downloadInfo.Sha3_384); err != nil {
 		return err
 	}
 
-	logger.Debugf("Successfully applied delta for %q at %s, saving %d bytes.", name, deltaPath, downloadInfo.Size-deltaInfo.Size)
+	logger.Debugf("Successfully applied delta for %q at %s, saving %d bytes.",
+		name, deltaPath, downloadInfo.Size-deltaInfo.Size)
 	return nil
 }
 
-func (s *Store) CacheDownloads() int {
-	return s.cfg.CacheDownloads
+// CacheDownloads returns the configured cache policy.
+func (s *Store) CachePolicy() CachePolicy {
+	return s.cfg.CachePolicy
 }
 
-func (s *Store) SetCacheDownloads(fileCount int) {
-	s.cfg.CacheDownloads = fileCount
-	if fileCount > 0 {
-		s.cacher = NewCacheManager(dirs.SnapDownloadCacheDir, fileCount)
+// SetCachePolicy configures the snap downloads cache mechanism. With a zero
+// value policy, no downloads are cached.
+func (s *Store) SetCachePolicy(policy CachePolicy) {
+	s.cfg.CachePolicy = policy
+	zero := CachePolicy{}
+	if policy != zero {
+		s.cacher = NewCacheManager(dirs.SnapDownloadCacheDir, policy)
 	} else {
 		s.cacher = &nullCache{}
 	}
+}
+
+// CleanDownloadsCache attempts cleanup of snap downloads cache.
+//
+// Returns ErrCleanupBusy if the cache was locked for other operations.
+func (s *Store) CleanDownloadsCache() error {
+	return s.cacher.Cleanup()
+}
+
+// CleanupDownloadArtifacts attempts to clean up download artifacts associated
+// with a given snap. The downloaded blob file is always removed because it can
+// be re-linked from cache on the next download attempt. The cache entry is only
+// dropped if it appears corrupted (size or hash mismatch), so that a valid
+// cached copy can be reused.
+func (s *Store) CleanupDownloadArtifacts(targetFn string, dl *snap.DownloadInfo) error {
+	var err error
+	// TODO:GOVERSION: use errors.Join
+	// Always remove the blob; it can be re-linked from cache if needed.
+	if rerr := os.Remove(targetFn); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
+		err = strutil.JoinErrors(err, fmt.Errorf("cannot remove downloaded file: %w", rerr))
+	}
+
+	if dl != nil {
+		maybeDropIfCorrupted := func() error {
+			f, sz, oerr := s.cacher.Open(dl.Sha3_384)
+			if oerr != nil {
+				if errors.Is(oerr, fs.ErrNotExist) {
+					return nil
+				}
+				return fmt.Errorf("cannot open: %w", oerr)
+			}
+			defer f.Close()
+
+			// If different size, we drop directly, otherwise we check also the hash
+			if sz == dl.Size {
+				h := crypto.SHA3_384.New()
+				if _, cerr := io.Copy(h, f); cerr != nil {
+					return fmt.Errorf("cannot read: %w", cerr)
+				}
+
+				actualSha3 := fmt.Sprintf("%x", h.Sum(nil))
+				if dl.Sha3_384 == actualSha3 {
+					// the cached entry appears to be correct, let's keep it
+					return nil
+				}
+			}
+
+			// takes a lock inside, could block, ignore ENOENT as the entry may have
+			// been dropped while we were processing it
+			if derr := s.cacher.Drop(dl.Sha3_384); derr != nil && !errors.Is(derr, fs.ErrNotExist) {
+				return fmt.Errorf("cannot drop: %w", derr)
+			}
+
+			return nil
+		}
+
+		if merr := maybeDropIfCorrupted(); merr != nil {
+			err = strutil.JoinErrors(err, fmt.Errorf("cannot drop cached download entry: %w", merr))
+		}
+	}
+	return err
 }

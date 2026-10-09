@@ -12,12 +12,15 @@ systems: [-ubuntu-core-*, -ubuntu-14.04-*]
 environment:
     SEED_DIR: /var/lib/snapd/seed
 
-prepare: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
+skip:
+    - reason: This test needs test keys to be trusted
+      if: |
+        [ "$TRUST_TEST_KEYS" = "false" ]
+    - reason: Known packaging bug in snapd 2.76.x on Ubuntu 26.04 and 26.10
+      if: |
+        ( os.query is-ubuntu 26.04 || os.query is-ubuntu 26.10 ) && ( dpkg -l snapd | MATCH '\s+2\.76(\.[0-9]+)*\+ubuntu' )
 
+prepare: |
     snap pack "$TESTSLIB/snaps/basic18"
     snap download "--$CORE_CHANNEL" core
 
@@ -48,20 +51,10 @@ prepare: |
     cp ./basic18_1.0_all.snap "$SEED_DIR/snaps/basic.snap"
 
 restore: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
-
     rm -rf "$SEED_DIR"
     systemctl start snapd.socket snapd.service
 
 execute: |
-    if [ "$TRUST_TEST_KEYS" = "false" ]; then
-        echo "This test needs test keys to be trusted"
-        exit
-    fi
-
     echo "Start the daemon with an empty state"
     systemctl start snapd.service
 

@@ -5,7 +5,11 @@ details: |
   command works, and the resulting image boots and finalizes seeding.
   The test assumes cloud image with a core and lxd snaps in its seeds/.
 
-systems: [ubuntu-2*]
+systems:
+  # FIXME: make it work on 26
+  - ubuntu-20*
+  - ubuntu-22*
+  - ubuntu-24*
 
 environment:
   IMAGE_MOUNTPOINT: /mnt/cloudimg
@@ -27,8 +31,10 @@ prepare: |
   # into seeds/ to make snap-preseed and the test happy.
 
   # add snapd from this branch into the seed
-  "$TESTSTOOLS"/snaps-state repack_snapd_deb_into_snap snapd
-  mv snapd-from-deb.snap snapd.snap
+  # shellcheck source=tests/lib/prepare.sh
+  . "$TESTSLIB"/prepare.sh
+  build_snapd_snap .
+  mv snapd_*.snap snapd.snap
   inject_snap_into_seed "$IMAGE_MOUNTPOINT" snapd
 
   # test-postgres-system-usernames injected below uses core18 base, while the
@@ -88,7 +94,7 @@ execute: |
   # the host VM as the nested VM, currently we are not, and as such there is a 
   # diff between the preseed apparmor-features and the nested VM actual 
   # system-key
-  if not os.query is-focal && not os.query is-jammy; then
+  if not os.query is-focal && not os.query is-jammy && not os.query is-noble && not os.query is-resolute; then
     # note, this doesn't actually test the functionality, but acts as a canary:
     # the test is run against a vm image with ubuntu release matching that from spread host;
     # system-key check can fail if the nested vm image differs too much from the spread host system,
@@ -106,18 +112,19 @@ execute: |
 
   remote.exec "snap debug seeding" | MATCH "preseeded:\s+true"
   remote.exec "snap debug seeding" | MATCH "seeded:\s+true"
-  # FIXME: this just checks that the time is of the form "xxx.xxxs", which could
-  # break if the preseeding takes more than 60s and golang formats the 
-  # time.Duration as "1m2.03s", etc. but for now this should be good enough
-  remote.exec "snap debug seeding" | MATCH "image-preseeding:\s+[0-9]+\.[0-9]+s"
-  remote.exec "snap debug seeding" | MATCH "seed-completion:\s+[0-9]+\.[0-9]+s"
+  remote.exec "snap debug seeding" | MATCH "image-preseeding:\s+([0-9]+m)?[0-9]+\.[0-9]+s"
+  remote.exec "snap debug seeding" | MATCH "seed-completion:\s+([0-9]+m)?[0-9]+\.[0-9]+s"
 
-  echo "Checking that lxd snap is operational"
-  remote.exec "snap list" | NOMATCH "broken"
-  remote.exec "snap services" | MATCH "lxd.activate +enabled +inactive"
-  remote.exec "snap services" | MATCH "lxd.daemon +enabled +inactive +socket-activated"
-  remote.exec "sudo lxd init --auto"
-  remote.exec "snap services" | MATCH "+lxd.daemon +enabled +active +socket-activated"
+  # there is no longer any seeded snaps in base or minimal cloud images
+  # in noble, skip lxd checks for noble
+  if not os.query is-noble; then
+    echo "Checking that lxd snap is operational"
+    remote.exec "snap list" | NOMATCH "broken"
+    remote.exec "snap services" | MATCH "lxd.activate +enabled +inactive"
+    remote.exec "snap services" | MATCH "lxd.daemon +enabled +inactive +socket-activated"
+    remote.exec "sudo lxd init --auto"
+    remote.exec "snap services" | MATCH "+lxd.daemon +enabled +active +socket-activated"
+  fi
 
   echo "Checking that the test-postgres-system-usernames snap is operational"
   remote.exec "sudo snap start --enable test-postgres-system-usernames.postgres"

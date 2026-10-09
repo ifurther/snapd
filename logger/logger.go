@@ -17,6 +17,16 @@
  *
  */
 
+// The logger package implements logging facilities for snapd.
+// When built with the structuredlogging build tag, it offers the ability
+// to use structured JSON for log entries and to turn on trace logging.
+// To activate JSON logging, the SNAPD_JSON_LOGGING environment variable
+// should be set at the time of logger creation. Trace logging can be
+// activated by setting the SNAPD_TRACE env variable.
+//
+// When built without the structuredlogging build tag, the logger package
+// offers only the simple logger and will not activate trace logging even
+// if the SNAPD_TRACE env variable is set.
 package logger
 
 import (
@@ -41,6 +51,8 @@ type Logger interface {
 	// NoGuardDebug is for messages that we always want to print (e.g., configurations
 	// were checked by the caller, etc)
 	NoGuardDebug(msg string)
+	// Trace is for messages useful for tracing execution
+	Trace(msg string, attrs ...any)
 }
 
 const (
@@ -50,9 +62,10 @@ const (
 
 type nullLogger struct{}
 
-func (nullLogger) Notice(string)       {}
-func (nullLogger) Debug(string)        {}
-func (nullLogger) NoGuardDebug(string) {}
+func (nullLogger) Notice(string)        {}
+func (nullLogger) Debug(string)         {}
+func (nullLogger) NoGuardDebug(string)  {}
+func (nullLogger) Trace(string, ...any) {}
 
 // NullLogger is a logger that does nothing
 var NullLogger = nullLogger{}
@@ -63,7 +76,7 @@ var (
 )
 
 // Panicf notifies the user and then panics
-func Panicf(format string, v ...interface{}) {
+func Panicf(format string, v ...any) {
 	msg := fmt.Sprintf(format, v...)
 
 	lock.Lock()
@@ -74,9 +87,16 @@ func Panicf(format string, v ...interface{}) {
 }
 
 // Noticef notifies the user of something
-func Noticef(format string, v ...interface{}) {
+func Noticef(format string, v ...any) {
 	msg := fmt.Sprintf(format, v...)
+	lock.Lock()
+	defer lock.Unlock()
 
+	logger.Notice(msg)
+}
+
+// Notice notifies the user of something
+func Notice(msg string) {
 	lock.Lock()
 	defer lock.Unlock()
 
@@ -84,17 +104,32 @@ func Noticef(format string, v ...interface{}) {
 }
 
 // Debugf records something in the debug log
-func Debugf(format string, v ...interface{}) {
+func Debugf(format string, v ...any) {
 	msg := fmt.Sprintf(format, v...)
-
 	lock.Lock()
 	defer lock.Unlock()
 
 	logger.Debug(msg)
 }
 
+// Debug records something in the debug log
+func Debug(msg string) {
+	lock.Lock()
+	defer lock.Unlock()
+
+	logger.Debug(msg)
+}
+
+// Trace records something in the trace log
+func Trace(msg string, attrs ...any) {
+	lock.Lock()
+	defer lock.Unlock()
+
+	logger.Trace(msg, attrs...)
+}
+
 // NoGuardDebugf records something in the debug log
-func NoGuardDebugf(format string, v ...interface{}) {
+func NoGuardDebugf(format string, v ...any) {
 	msg := fmt.Sprintf(format, v...)
 
 	lock.Lock()
@@ -106,12 +141,19 @@ func NoGuardDebugf(format string, v ...interface{}) {
 // MockLogger replaces the existing logger with a buffer and returns
 // the log buffer and a restore function.
 func MockLogger() (buf *bytes.Buffer, restore func()) {
+	return mockLogger(&LoggerOptions{})
+}
+
+// MockDebugLogger replaces the existing logger with a buffer and returns
+// the log buffer and a restore function. The logger records debug messages.
+func MockDebugLogger() (buf *bytes.Buffer, restore func()) {
+	return mockLogger(&LoggerOptions{ForceDebug: true})
+}
+
+func mockLogger(opts *LoggerOptions) (buf *bytes.Buffer, restore func()) {
 	buf = &bytes.Buffer{}
 	oldLogger := logger
-	l, err := New(buf, DefaultFlags)
-	if err != nil {
-		panic(err)
-	}
+	l := New(buf, DefaultFlags, opts)
 	SetLogger(l)
 	return buf, func() {
 		SetLogger(oldLogger)
@@ -140,6 +182,7 @@ type Log struct {
 
 	debug bool
 	quiet bool
+	flags int
 }
 
 func (l *Log) debugEnabled() bool {
@@ -149,30 +192,48 @@ func (l *Log) debugEnabled() bool {
 // Debug only prints if SNAPD_DEBUG is set
 func (l *Log) Debug(msg string) {
 	if l.debugEnabled() {
-		l.NoGuardDebug(msg)
+		// this frame + single package level API func() + actual caller
+		calldepth := 1 + 1 + 1
+		l.log.Output(calldepth, "DEBUG: "+msg)
 	}
 }
 
 // Notice alerts the user about something, as well as putting in syslog
 func (l *Log) Notice(msg string) {
 	if !l.quiet || l.debugEnabled() {
-		l.log.Output(3, msg)
+		// this frame + single package level API func() + actual caller
+		calldepth := 1 + 1 + 1
+		l.log.Output(calldepth, msg)
 	}
 }
+
+// Trace only prints if SNAPD_TRACE is set and the structured logger is used
+func (l *Log) Trace(string, ...any) {}
 
 // NoGuardDebug always prints the message, w/o gating it based on environment
 // variables or other configurations.
 func (l *Log) NoGuardDebug(msg string) {
-	l.log.Output(3, "DEBUG: "+msg)
+	// this frame + single package level API func() + actual caller
+	calldepth := 1 + 1 + 1
+	l.log.Output(calldepth, "DEBUG: "+msg)
 }
 
-// New creates a log.Logger using the given io.Writer and flag.
-func New(w io.Writer, flag int) (Logger, error) {
+func newLog(w io.Writer, flag int, opts *LoggerOptions) Logger {
 	logger := &Log{
 		log:   log.New(w, "", flag),
-		debug: debugEnabledOnKernelCmdline(),
+		debug: opts.ForceDebug || debugEnabledOnKernelCmdline(),
+		flags: flag,
+		quiet: opts.Quiet,
 	}
-	return logger, nil
+	return logger
+}
+
+type LoggerOptions struct {
+	// ForceDebug can be set if we want debug traces even if not directly
+	// enabled by environment or kernel command line.
+	ForceDebug bool
+	// Quiet suppresses notice-level logs unless debugging is enabled.
+	Quiet bool
 }
 
 func buildFlags() int {
@@ -185,13 +246,10 @@ func buildFlags() int {
 }
 
 // SimpleSetup creates the default (console) logger
-func SimpleSetup() error {
+func SimpleSetup(opts *LoggerOptions) {
 	flags := buildFlags()
-	l, err := New(os.Stderr, flags)
-	if err == nil {
-		SetLogger(l)
-	}
-	return err
+	l := New(os.Stderr, flags, opts)
+	SetLogger(l)
 }
 
 // BootSetup creates a logger meant to be used when running from
@@ -200,13 +258,11 @@ func BootSetup() error {
 	flags := buildFlags()
 	m, _ := kcmdline.KeyValues("quiet")
 	_, quiet := m["quiet"]
-	logger := &Log{
-		log:   log.New(os.Stderr, "", flags),
-		debug: debugEnabledOnKernelCmdline(),
-		quiet: quiet,
+	opts := &LoggerOptions{
+		Quiet: quiet,
 	}
+	logger := New(os.Stderr, flags, opts)
 	SetLogger(logger)
-
 	return nil
 }
 

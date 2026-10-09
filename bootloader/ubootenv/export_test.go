@@ -20,5 +20,7 @@
 package ubootenv
 
 var (
-	WriteUint32 = writeUint32
+	WriteUint32      = writeUint32
+	RedundantOffsets = redundantOffsets
+	IsNewerFlag      = isNewerFlag
 )

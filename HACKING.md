@@ -1,7 +1,7 @@
 # Hacking on snapd
 
 Hacking on `snapd` is fun and straightforward. The code is extensively unit
-tested and we use the [spread](https://github.com/snapcore/spread)
+tested and we use the [spread](https://github.com/canonical/spread-plus)
 integration test framework for the integration/system level tests.
 
 For non-technical details on contributing to the project, including how to
@@ -45,11 +45,24 @@ the `snapd` project, please see [Contributing to snapd](./CONTRIBUTING.md).
 
 Build dependencies can automatically be resolved using `build-dep` on Ubuntu:
 
+<!-- test:ubuntu-deps -->
+
     cd ~/snapd
-    sudo apt-get build-dep .
+    ln -sfn packaging/ubuntu-16.04 debian
+    sudo apt build-dep -y .
+
+> [!NOTE]
+> The `debian` symbolic link is intentionally not part of the tree, and is explicitly listed in the .gitignore file.
 
 Package build dependencies for other distributions can be found under the
-[./packaging/](./packaging/) directory.
+[./packaging/](./packaging/) directory. Eg. for Fedora use:
+
+<!-- test:fedora-deps -->
+
+    cd packaging/fedora
+    sudo dnf install -y rpmdevtools
+    sudo dnf install -y $(rpmspec -q --buildrequires snapd.spec)
+    sudo dnf install -y glibc-static.i686 glibc-devel.i686
 
 Source dependencies are automatically retrieved at build time.
 Sometimes, it might be useful to pull them without building:
@@ -65,25 +78,23 @@ go get ./... && ./get-deps.sh
 
 The easiest (though not the most efficient) way to test changes to snapd is to
 build the snapd snap using _snapcraft_ and then install that snapd snap. The
-[snapcraft.yaml](./build-aux/snapcraft.yaml) for the snapd snap is located at 
+[snapcraft.yaml](./build-aux/snap/snapcraft.yaml) for the snapd snap is located at
 [./build-aux/](./build-aux/), and
-can be built using snapcraft either in a LXD container or a multipass VM (or
-natively with `--destructive-mode` on a Ubuntu 16.04 host).
+can be built using snapcraft.
 
-> Currently, snapcraft's default track of 5.x does not support building the 
-snapd snap, since the snapd snap uses `build-base: core`. Building with a 
-`build-base` of core uses Ubuntu 16.04 as the base operating system (and thus 
-root filesystem) for building and Ubuntu 16.04 is now in Extended Security 
-Maintenance (ESM, see 
-[Ubuntu 16.04 LTS ESM](https://ubuntu.com/blog/ubuntu-16-04-lts-transitions-to-extended-security-maintenance-esm)),
-and as such only is buildable using snapcraft's 4.x channel. At some point in the future,
-the snapd snap should be moved to a newer `build-base`, but until then `4.x` 
-needs to be used.
+Snapcraft 8.x or later is expected.
 
-Install snapcraft from the 4.x channel:
+Install snapcraft:
 
 ```
-sudo snap install snapcraft --channel=4.x
+sudo snap install snapcraft --classic
+```
+
+Install and init lxd:
+
+```
+sudo snap install lxd
+sudo lxd init --minimal
 ```
 
 Then run snapcraft:
@@ -95,7 +106,7 @@ snapcraft
 Now the snapd snap that was just built can be installed with:
 
 ```
-snap install --dangerous snapd_*.snap
+sudo snap install --dangerous snapd_*.snap
 ```
 
 To go back to using snapd from the store instead of the custom version we 
@@ -106,27 +117,13 @@ can either use `snap revert snapd`, or you can refresh directly with
 #### Building for other architectures with snapcraft
 
 It is also sometimes useful to use snapcraft to build the snapd snap for
-other architectures using the `remote-build` feature. In order to build
-remotely with snapcraft, make sure you have at least version `6.x` installed:
-if the command `snap info snapcraft` shows that you are running an older
-version, upgrade with:
+other architectures using the `remote-build` feature.
 
-```
-snap refresh snapcraft --channel=latest/stable
-```
-
-Now you can use remote-build with snapcraft on the snapd tree for any desired 
+You can use remote-build with snapcraft on the snapd tree for any desired
 architectures:
 
 ```
 snapcraft remote-build --build-for=armhf,s390x,arm64
-```
-
-And to go back to building the snapd snap locally, just revert the channel back
-to 4.x:
-
-```
-snap refresh snapcraft --channel=4.x/stable
 ```
 
 #### Splicing the snapd snap into the core snap
@@ -190,24 +187,34 @@ to identify which snap file is which.
 
 ### Building natively
 
-To build the `snap` command line client:
+The `snap` command line client and `snapd` are the exact same binary, with
+different entrypoints that are selected by inspecting the value of `argv[0]`. To
+build it:
 
-```
-cd ~/snapd
-mkdir -p /tmp/build
-go build -o /tmp/build/snap ./cmd/snap
-```
-
-To build the `snapd` REST API daemon:
-
+<!-- test:build-snapd -->
 ```
 cd ~/snapd
 mkdir -p /tmp/build
 go build -o /tmp/build/snapd ./cmd/snapd
 ```
 
+At this point you can invoke the `snap` functionality by creating a symbolic
+link named `snap`:
+
+<!-- test:build-snap -->
+```
+ln -s -r /tmp/build/snapd /tmp/build/snap
+```
+
+or setting `argv[0]` explicitly when running the binary:
+
+```
+/bin/bash -c 'exec -a snap /tmp/build/snapd'
+```
+
 To build all the `snapd` Go components:
 
+<!-- test:build-go -->
 ```
 cd ~/snapd
 mkdir -p /tmp/build
@@ -336,83 +343,65 @@ There is more to read about the testing framework on the [website](https://labix
 #### Downloading spread framework
 
 To run the integration tests locally via QEMU, you need the latest version of
-the [spread](https://github.com/snapcore/spread) framework. 
-You can get spread, QEMU, and the build tools to build QEMU images with:
+the [spread](https://github.com/canonical/spread-plus) framework. For local testing
+you can install the `image-garden` snap that comes with pre-built releases of
+spread-plus, qemu and all the support tools. Alternatively you may install
+[image-garden](https://gitlab.com/zygoon/image-garden) from source or from a
+distribution package.
 
-    $ sudo apt update && sudo apt install -y qemu-kvm autopkgtest
-    $ curl https://storage.googleapis.com/snapd-spread-tests/spread/spread-amd64.tar.gz | tar -xz -C <target-directory>
+To install `image-garden` as a snap run `sudo snap install image-garden`. To
+use the bundled copy of spread from image-garden separately run `sudo snap
+alias image-garden.spread spread`. As running spread tests in snapd requires
+spread-plus, additionally set `snap set image-garden spread-variant=plus`.
+Up-to-date versions of image-garden snap automatically detect the right version
+of spread to use, so this may not be necessary.
 
-> `<target-directory>` can be any directory that is listed in `$PATH`, 
-as it is assumed further in the guidelines of this document. 
-You may consider creating a dedicated directory and adding it to `$PATH`, 
-or you may choose to use one of the conventional Linux directories (e.g. `/usr/local/bin`)
+#### Running spread
 
-#### Building spread VM images
+For regular development work, the integration tests will be run with a prebuilt
+test variant of the snapd snap. The build happens automatically when starting
+the tests using `run-spread` helper like so:
 
-To run the spread tests via QEMU you need to create VM images in the
-`~/.spread/qemu` directory:
+    $ ./run-spread <spread-args>
 
-    $ mkdir -p ~/.spread/qemu
-    $ cd ~/.spread/qemu
+Make sure you set up snapcraft following the [snapcraft build
+section](#building-the-snap-with-snapcraft).
 
-Assuming you are building on Ubuntu 18.04 LTS ([Bionic Beaver](https://releases.ubuntu.com/18.04/)) 
-(or later), run the following to build a 64-bit Ubuntu 16.04 LTS (or later):
+The test variant of the snapd snap may be built manually by invoking a helper
+script:
 
-    $ autopkgtest-buildvm-ubuntu-cloud -r <release-short-name>
-    $ mv autopkgtest-<release-short-name>-amd64.img ubuntu-<release-version>-64.img  
+    $ ./tests/build-test-snapd-snap
+    
+The artifact will be placed under `$PWD/built-snap`.
 
-For the correct values of `<release-short-name>` and `<release-version>`, please refer
-to the official list of [Ubuntu releases](https://wiki.ubuntu.com/Releases). 
+On occasion, when working on a test and it is known that the snapd snap need not
+be rebuilt, the tests may be invoked with `NO_REBUILD=1` like so:
 
-> `<release-short-name>` is the first word in the release's full name, 
-e.g. for "Bionic Beaver" it is `bionic`.
+    $ NO_REBUILD=1 ./run-spread <spread-args>
 
-To build an Ubuntu 14.04 (Trusty Tahr) based VM, use:
+#### Running spread without a cloud account
 
-    $ autopkgtest-buildvm-ubuntu-cloud -r trusty --post-command='sudo apt-get install -y --install-recommends linux-generic-lts-xenial && update-grub'
-    $ mv autopkgtest-trusty-amd64.img ubuntu-14.04-64.img
+You can run most of the tests locally, using the `garden` backend. For example,
+to run integration tests for Ubuntu 18.04 LTS 64-bit, invoke spread as follows:
 
-> This is because we need at least 4.4+ kernel for snapd to run on Ubuntu 14.04 
-LTS, which is available through the `linux-generic-lts-xenial` package.
+    $ ./run-spread -v garden:ubuntu-18.04-64
 
-If you are running Ubuntu 16.04 LTS, use 
-`adt-buildvm-ubuntu-cloud` instead of `autopkgtest-buildvm-ubuntu-cloud` (the
-latter replaced the former in 18.04):
+> Look at the `spread.yaml` file for a list of systems that are supported by
+> the garden backend.
 
-    $ adt-buildvm-ubuntu-cloud -r xenial
-    $ mv adt-<release-name>-amd64-cloud.img ubuntu-<release-version>-64.img
-
-#### Downloading spread VM images
-
-Alternatively, instead of building the QEMU images manually, you can download
-pre-built and somewhat maintained images from 
-[spread.zygoon.pl](https://spread.zygoon.pl/). The images will need to be extracted 
-with `gunzip` and placed into `~/.spread/qemu` as above.
-
-> An image for Ubuntu Core 20 that is pre-built for KVM can be downloaded from 
-[here](https://cdimage.ubuntu.com/ubuntu-core/20/stable/current/ubuntu-core-20-amd64.img.xz).
-
-#### Running spread with QEMU
-
-Finally, you can run the spread tests for Ubuntu 18.04 LTS 64-bit with:
-
-    $ spread -v qemu:ubuntu-18.04-64
-
->To run for a different system, replace `ubuntu-18.04-64` with a different system
-name, which should be a basename of the [built](#building-spread-vm-images) or 
-[downloaded](#downloading-spread-vm-images) Ubuntu image file.
+The `garden` backend automatically downloads and initializes each base system.
+During testing additional scratch space is used to hold ephemeral chances to
+the disk image. This may require significant amount of space in `/tmp` so if
+your system uses `tmpfs` in `/tmp` you may want look at available free space.
+This especially affects the snap version of `image-garden`, as snap
+packages cannot use `/var/tmp` for scratch space.
 
 For quick reuse you can use:
 
-    $ spread -reuse qemu:ubuntu-18.04-64
+    $ ./run-spread -reuse garden:ubuntu-18.04-64
 
 It will print how to reuse the systems. Make sure to use
 `export REUSE_PROJECT=1` in your environment too.
-
-> Spread tests can be exercised on Ubuntu Core 20, but need UEFI.
-UEFI support with QEMU backend of spread requires a BIOS from the 
-[OVMF](https://wiki.ubuntu.com/UEFI/OVMF) package, 
-which can be installed with `sudo apt install ovmf`.
 
 ### Testing the snapd daemon
 
@@ -457,10 +446,10 @@ this case each test runs in a new image which is created following the rules
 defined for the test.
 
 The nested tests are executed using the [spread framework](#downloading-spread-framework). 
-See the following examples using the QEMU and Google backends.
+See the following examples using the QEMU and openstack backends.
 
 - _QEMU_: `spread qemu-nested:ubuntu-20.04-64:tests/nested/core20/tpm`  
-- _Google_: `spread google-nested:ubuntu-20.04-64:tests/nested/core20/tpm`  
+- _Openstack_: `spread opentack-ext:ubuntu-20.04-64:tests/nested/core20/tpm`  
 
 The nested system in all the cases is selected based on the host system. The following lines 
 show the relation between host and nested `systemd` (same applies to the classic nested tests):
@@ -505,30 +494,35 @@ Hey, welcome to the nice, low-level world of snap-confine
 
 To get started from a pristine tree you want to do this:
 
-```
-./mkversion.sh
+<!-- test:build-c -->
+```bash
+cd ~/snapd
+# overriding the version to 1337, or leave empty to let the script figure
+# the version out automatically (on Ubuntu/Debian)
+./mkversion.sh 1337
 cd cmd/
-autoreconf -i -f
-./configure --prefix=/usr --libexecdir=/usr/lib/snapd --enable-nvidia-multiarch --with-host-arch-triplet="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
+./autogen.sh
+make
 ```
 
 This will drop makefiles and let you build stuff. You may find the `make hack`
 target, available in [./cmd/](./cmd/) handy `(cd cmd; make hack)`. It installs the locally built
 version on your system and reloads the [AppArmor](https://apparmor.net/) profile.
 
->The above configure options assume you are on Ubuntu and are generally
-necessary to run/test graphical applications with your local version of
-snap-confine. The `--with-host-arch-triplet` option sets your specific 
-architecture and `--enable-nvidia-multiarch` allows the host's graphics drivers
-and libraries to be shared with snaps. If you are on a distro other than
-Ubuntu, try `--enable-nvidia-biarch` (though you'll likely need to add further
-system-specific options too).
+>The `autogen.sh` script automatically detects your distribution (from `/etc/os-release`)
+and applies the appropriate configure options. On Ubuntu it uses `--enable-nvidia-multiarch`
+with the host architecture triplet, while on Fedora it uses `--enable-nvidia-biarch` with
+SELinux support. The script also handles running `autoreconf -i -f` and calling `mkversion.sh`
+if needed.
+>
+>If you need manual control over configure options, you can run `autoreconf -i -f` followed
+by `./configure` with your desired flags. See `./configure --help` for available options.
 
 ## Testing your changes locally 
 
 After building the code locally as explained in the previous section, you can run the 
 test suite available for snap-confine (among other low-level tools) by running the 
-`make check` target available in [./cmd]((./cmd/)).
+`make check` target available in [./cmd](./cmd/).
 
 ## Submitting patches
 

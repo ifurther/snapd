@@ -28,11 +28,15 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/snapcore/snapd/cmd/snaplock"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
+	"github.com/snapcore/snapd/strutil"
 )
 
 // defaultInhibitDir is the directory where inhibition files are stored.
@@ -61,6 +65,10 @@ const (
 	// HintInhibitedForPreDownload represents inhibition of a "snap run" while a
 	// pre-download is triggering a refresh.
 	HintInhibitedForPreDownload Hint = "pre-download"
+	// HintInhibitedForRemove represents inhibition of a "snap run" while a remove change is being performed.
+	HintInhibitedForRemove Hint = "remove"
+	// HintInhibitedForDisable represents inhibition of a "snap run" while a snap is disabled.
+	HintInhibitedForDisable Hint = "disable"
 )
 
 const hintFilePostfix = "lock"
@@ -80,12 +88,12 @@ func HintFile(snapName string) string {
 	return filepath.Join(InhibitDir, fmt.Sprintf("%s.%s", snapName, hintFilePostfix))
 }
 
-func InhibitInfoFile(snapName string, hint Hint) string {
-	return filepath.Join(InhibitDir, fmt.Sprintf("%s.%s", snapName, hint))
+func InhibitInfoFile(instanceName naming.InstanceName, hint Hint) string {
+	return filepath.Join(InhibitDir, fmt.Sprintf("%s.%s", instanceName, hint))
 }
 
-func openHintFileLock(snapName string) (*osutil.FileLock, error) {
-	return osutil.NewFileLockWithMode(HintFile(snapName), 0644)
+func openHintFileLock(instanceName naming.InstanceName) (*osutil.FileLock, error) {
+	return osutil.NewFileLockWithMode(HintFile(instanceName.String()), 0644)
 }
 
 // InhibitInfo holds data of the previous snap revision that will be needed by
@@ -122,6 +130,12 @@ func removeInhibitInfoFiles(snapName string) error {
 	return nil
 }
 
+// Unlocker functions are passed from code using runinhibit to indicate that global
+// state should be unlocked during file lock operations to avoid having deadlocks where
+// both inhibition hint file and state are locked and waiting for each other. Unlocker
+// being nil indicates not to do this.
+type Unlocker func() (relock func())
+
 // LockWithHint sets a persistent "snap run" inhibition lock, for the given snap, with a given hint
 // and saves given info that will be needed by "snap run" during inhibition (e.g. snap revision).
 //
@@ -130,7 +144,17 @@ func removeInhibitInfoFiles(snapName string) error {
 // start and will block, presenting a user interface if possible. Also
 // info.Previous corresponding to the snap revision that was installed must be
 // provided and cannot be unset.
-func LockWithHint(snapName string, hint Hint, info InhibitInfo) error {
+//
+// If unlocker is passed it indicates that the global state needs to be unlocked
+// before taking the inhibition hint file lock. It is the responsibility of the
+// caller to make sure state is locked if a non-nil unlocker is passed.
+func LockWithHint(instanceName naming.InstanceName, hint Hint, info InhibitInfo, unlocker Unlocker) error {
+	if unlocker != nil {
+		// unlock/relock global state
+		relock := unlocker()
+		defer relock()
+	}
+
 	if err := hint.validate(); err != nil {
 		return err
 	}
@@ -140,7 +164,7 @@ func LockWithHint(snapName string, hint Hint, info InhibitInfo) error {
 	if err := os.MkdirAll(InhibitDir, 0755); err != nil {
 		return err
 	}
-	flock, err := openHintFileLock(snapName)
+	flock, err := openHintFileLock(instanceName)
 	if err != nil {
 		return err
 	}
@@ -156,7 +180,7 @@ func LockWithHint(snapName string, hint Hint, info InhibitInfo) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(InhibitInfoFile(snapName, hint), buf, 0644); err != nil {
+	if err := os.WriteFile(InhibitInfoFile(instanceName, hint), buf, 0644); err != nil {
 		return err
 	}
 	// Write hint
@@ -177,8 +201,18 @@ func LockWithHint(snapName string, hint Hint, info InhibitInfo) error {
 // Unlock truncates the run inhibition lock, for the given snap.
 //
 // An empty inhibition lock means uninhibited "snap run".
-func Unlock(snapName string) error {
-	flock, err := openHintFileLock(snapName)
+//
+// If unlocker is passed it indicates that the global state needs to be unlocked
+// before taking the inhibition hint file lock. It is the responsibility of the
+// caller to make sure state is locked if a non-nil unlocker is passed.
+func Unlock(instanceName naming.InstanceName, unlocker Unlocker) error {
+	if unlocker != nil {
+		// unlock/relock global state
+		relock := unlocker()
+		defer relock()
+	}
+
+	flock, err := openHintFileLock(instanceName)
 	if os.IsNotExist(err) {
 		return nil
 	}
@@ -201,19 +235,119 @@ func Unlock(snapName string) error {
 		return err
 	}
 	// Remove inhibit info file
-	if err := removeInhibitInfoFiles(snapName); err != nil {
+	if err := removeInhibitInfoFiles(instanceName.String()); err != nil {
 		return err
 	}
 
 	return nil
 }
 
+// UnlockStaleGateRefreshLocks releases all run inhibition locks that have the
+// HintInhibitedGateRefresh hint. It returns the names of the snaps whose locks
+// it released.
+//
+// The gate-auto-refresh hook is no longer supported, and nothing sets this hint
+// anymore. An older snapd can have set the hint before the hook was
+// interrupted. Use this function only to release such locks.
+//
+// The function finds the candidate snaps from their HintInhibitedGateRefresh
+// inhibit info files. LockWithHint writes the info file before the hint, and
+// Unlock removes the info files after it clears the hint. Thus each snap that
+// has the hint also has the info file. A snap can have the info file and a
+// different hint. The lock of such a snap is not changed. The function takes
+// the snap lock of each candidate snap before it examines the run inhibition
+// lock. If the function cannot release the lock of a snap, it continues with
+// the subsequent snaps and returns all errors.
+//
+// If unlocker is passed it indicates that the global state needs to be unlocked
+// while the locks are released. It is the responsibility of the caller to make
+// sure state is locked if a non-nil unlocker is passed.
+func UnlockStaleGateRefreshLocks(unlocker Unlocker) (unlocked []string, err error) {
+	if unlocker != nil {
+		// unlock/relock global state
+		relock := unlocker()
+		defer relock()
+	}
+
+	suffix := "." + string(HintInhibitedGateRefresh)
+	matches, err := filepath.Glob(filepath.Join(InhibitDir, "*"+suffix))
+	if err != nil {
+		return nil, err
+	}
+
+	var errs []error
+	for _, m := range matches {
+		instanceName := strings.TrimSuffix(filepath.Base(m), suffix)
+		err := snaplock.WithLock(instanceName, func() error {
+			ok, err := unlockStaleGateRefresh(instanceName)
+			if ok {
+				unlocked = append(unlocked, instanceName)
+			}
+			return err
+		})
+		if err != nil {
+			errs = append(errs, fmt.Errorf("cannot release gate-refresh inhibition lock of snap %q: %v", instanceName, err))
+		}
+	}
+
+	return unlocked, strutil.JoinErrors(errs...)
+}
+
+// unlockStaleGateRefresh releases the run inhibition lock of the given snap
+// only if the lock has the HintInhibitedGateRefresh hint. The function does not
+// create the lock file if it does not exist.
+func unlockStaleGateRefresh(instanceName string) (unlocked bool, err error) {
+	f, err := os.OpenFile(HintFile(instanceName), os.O_RDWR, 0)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	flock := osutil.NewFileLockWithFile(f)
+	defer flock.Close()
+
+	// the hint is read and released while the same lock is held, so that the
+	// hint cannot change between the two operations.
+	if err := flock.Lock(); err != nil {
+		return false, err
+	}
+	hint, err := hintFromFile(f)
+	if err != nil {
+		return false, err
+	}
+	if hint != HintInhibitedGateRefresh {
+		return false, nil
+	}
+	if err := f.Truncate(0); err != nil {
+		return false, err
+	}
+	if err := f.Sync(); err != nil {
+		return false, err
+	}
+	if err := removeInhibitInfoFiles(instanceName); err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
 // IsLocked returns the state of the run inhibition lock for the given snap.
 //
 // It returns the current, non-empty hint if inhibition is in place. Otherwise
 // it returns an empty hint.
-func IsLocked(snapName string) (Hint, InhibitInfo, error) {
-	hintFlock, err := osutil.OpenExistingLockForReading(HintFile(snapName))
+//
+// If unlocker is passed it indicates that the global state needs to be unlocked
+// before taking the inhibition hint file lock. It is the responsibility of the
+// caller to make sure state is locked if a non-nil unlocker is passed.
+func IsLocked(instanceName naming.InstanceName, unlocker Unlocker) (Hint, InhibitInfo, error) {
+	if unlocker != nil {
+		// unlock/relock global state
+		relock := unlocker()
+		defer relock()
+	}
+
+	hintFlock, err := osutil.OpenExistingLockForReading(HintFile(instanceName.String()))
 	if os.IsNotExist(err) {
 		return "", InhibitInfo{}, nil
 	}
@@ -236,7 +370,7 @@ func IsLocked(snapName string) (Hint, InhibitInfo, error) {
 		return hint, InhibitInfo{}, nil
 	}
 	// Read inhibit info
-	info, err := readInhibitInfo(snapName, hint)
+	info, err := readInhibitInfo(instanceName, hint)
 	if err != nil {
 		return "", InhibitInfo{}, err
 	}
@@ -252,7 +386,17 @@ func IsLocked(snapName string) (Hint, InhibitInfo, error) {
 // it.
 //
 // The function does not fail if the inhibition lock does not exist.
-func RemoveLockFile(snapName string) error {
+//
+// If unlocker is passed it indicates that the global state needs to be unlocked
+// before taking the inhibition hint file lock. It is the responsibility of the
+// caller to make sure state is locked if a non-nil unlocker is passed.
+func RemoveLockFile(snapName string, unlocker Unlocker) error {
+	if unlocker != nil {
+		// unlock/relock global state
+		relock := unlocker()
+		defer relock()
+	}
+
 	hintFlock, err := osutil.OpenExistingLockForReading(HintFile(snapName))
 	if os.IsNotExist(err) {
 		return nil
@@ -309,7 +453,7 @@ var newTicker = func(interval time.Duration) ticker {
 // NOTE: A snap without a hint file is considered not inhibited and a nil FileLock is returned.
 //
 // NOTE: It is the caller's responsibility to release the returned file lock.
-var WaitWhileInhibited = func(ctx context.Context, snapName string, notInhibited func(ctx context.Context) error, inhibited func(ctx context.Context, hint Hint, inhibitInfo *InhibitInfo) (cont bool, err error), interval time.Duration) (flock *osutil.FileLock, err error) {
+var WaitWhileInhibited = func(ctx context.Context, instanceName naming.InstanceName, notInhibited func(ctx context.Context) error, inhibited func(ctx context.Context, hint Hint, inhibitInfo *InhibitInfo) (cont bool, err error), interval time.Duration) (flock *osutil.FileLock, err error) {
 	ticker := newTicker(interval)
 
 	// Release lock if we return early with an error
@@ -322,7 +466,7 @@ var WaitWhileInhibited = func(ctx context.Context, snapName string, notInhibited
 	}()
 
 	for {
-		flock, err = osutil.OpenExistingLockForReading(HintFile(snapName))
+		flock, err = osutil.OpenExistingLockForReading(HintFile(instanceName.String()))
 		// We must return flock alongside errors so that cleanup defer can close it.
 		if os.IsNotExist(err) {
 			if notInhibited != nil {
@@ -358,7 +502,7 @@ var WaitWhileInhibited = func(ctx context.Context, snapName string, notInhibited
 			return flock, nil
 		} else {
 			if inhibited != nil {
-				inhibitInfo, err := readInhibitInfo(snapName, hint)
+				inhibitInfo, err := readInhibitInfo(instanceName, hint)
 				if err != nil {
 					return flock, err
 				}
@@ -390,8 +534,8 @@ func hintFromFile(hintFile *os.File) (Hint, error) {
 	return Hint(string(buf)), nil
 }
 
-func readInhibitInfo(snapName string, hint Hint) (InhibitInfo, error) {
-	buf, err := os.ReadFile(InhibitInfoFile(snapName, hint))
+func readInhibitInfo(instanceName naming.InstanceName, hint Hint) (InhibitInfo, error) {
+	buf, err := os.ReadFile(InhibitInfoFile(instanceName, hint))
 	if err != nil {
 		return InhibitInfo{}, err
 	}

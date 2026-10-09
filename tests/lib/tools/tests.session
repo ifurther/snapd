@@ -1,7 +1,7 @@
 #!/bin/bash -e
 
 show_help() {
-	echo "usage: tests.session exec [-u USER] [-p PID_FILE] [--] <CMD>"
+	echo "usage: tests.session [-u USER] [-p PID_FILE] exec <CMD>"
 	echo "       tests.session prepare | restore [-u USER | -u USER1,USER2,...]"
 	echo "       tests.session kill-leaked"
 	echo "       tests.session dump"
@@ -31,10 +31,6 @@ main() {
 				fi
 				pid_file="$2"
 				shift 2
-				;;
-			--)
-				shift
-				break
 				;;
 			kill-leaked)
 				action=kill-leaked
@@ -116,6 +112,15 @@ main() {
 				fi
 			done
 
+			case $SPREAD_SYSTEM in
+				opensuse-*-selinux-*)
+					# allow optional transition from unconfined_service_t to
+					# unconfined_t which enables running things in the context
+					# of other user
+					setsebool unconfined_service_transition_to_unconfined_user 1
+				;;
+			esac
+
 			for u in $(echo "$user" | tr ',' ' '); do
 				# We've enabled linger, now let's explicitly start the
 				# default.target. This ensures that test code does not need to pay
@@ -184,6 +189,13 @@ main() {
 			# Make sure there is not neither stopping nor abandoned user sessions
 			systemctl restart systemd-logind.service
 
+			case $SPREAD_SYSTEM in
+				opensuse-*-selinux-*)
+					# restore the default
+					setsebool unconfined_service_transition_to_unconfined_user 0
+				;;
+			esac
+
 			exit 0
 			;;
 		dump)
@@ -247,9 +259,15 @@ main() {
 	)>"$tmp_dir/exec"
 	chmod +x "$tmp_dir/exec"
 
+	# check for --whitelist-environment
+	runuser_env_arg=
+	if runuser --help 2>&1 | grep -q whitelist-environment ; then
+		runuser_env_arg="-w SNAP_REEXEC,SNAPD_DEBUG,SNAP_CONFINE_DEBUG"
+	fi
+
 	# When systemd version is higher than 252 we use systemd-run to execute
 	# In other scenarios we use the older approach: bustctl with the dbus monitor
-	if [ "$(systemctl --version | awk '/systemd [0-9]+/ { print $2 }')" -gt 252 ]; then
+	if [ "$(systemctl --version | awk '/systemd [0-9]+/ { print $2 }' | cut -f1 -d"~")" -gt 252 ]; then
 		local selinux_context_arg=""
 		if os.query is-fedora || os.query is-centos; then
 			selinux_context_arg="--property SELinuxContext=unconfined_u:unconfined_r:unconfined_t:s0"
@@ -258,30 +276,30 @@ main() {
 		# It is needed to have '|| true' to make sure in case systemd-run fails,
 		# the command systemctl reset-failed is called
 		# shellcheck disable=SC2086
- 		systemd-run \
-  		--unit="$unit_name" \
+		systemd-run \
+		--unit="$unit_name" \
 		--description "tests.session running $* as $user" \
 		--quiet \
 		--wait \
 		--pipe \
 		--service-type simple \
 		--setenv TERM=xterm-256color \
-		--property "Environment=SNAPD_DEBUG=$SNAPD_DEBUG SNAP_CONFINE_DEBUG=$SNAP_CONFINE_DEBUG" \
+		--property "Environment=SNAPD_DEBUG=$SNAPD_DEBUG SNAP_REEXEC=$SNAP_REEXEC SNAP_CONFINE_DEBUG=$SNAP_CONFINE_DEBUG" \
 		$selinux_context_arg \
-		"$(command -v runuser)" -l "$user" - -c "exec $tmp_dir/exec" || true
+		"$(command -v runuser)" $runuser_env_arg -l "$user" -c "exec $tmp_dir/exec" || true
 
 		# Prevent accumulation of failed sessions.
 		if systemctl cat "$unit_name" &>/dev/null; then
-			if systemctl is-failed "$unit_name"; then
+			# only the exit status matters here; keep stdout quiet so that a
+			# failed payload does not print a stray "failed" line that could be
+			# mistaken for the wrapped command's own output
+			if systemctl is-failed --quiet "$unit_name"; then
 				systemctl reset-failed "$unit_name"
 				exit 1
-			else
-				exit 0
 			fi
-		else
-			exit 0
 		fi
-  	fi
+		exit 0
+	fi
 
 	mkfifo -m 0666 "$tmp_dir/result.pipe" "$tmp_dir/stdin.pipe" "$tmp_dir/stdout.pipe" "$tmp_dir/stderr.pipe"
 	# Use busctl to spawn a command. The command is wrapped in shell, runuser -l
@@ -297,8 +315,8 @@ main() {
 	cat <"$tmp_dir/stderr.pipe" >&2 &
 	cat_stderr_pid=$!
 
-  	mkfifo -m 0666 "$tmp_dir/dbus-monitor.pipe" "$tmp_dir/ready.pipe"
-  	monitor_expr="type='signal', sender='org.freedesktop.systemd1', interface='org.freedesktop.systemd1.Manager', path='/org/freedesktop/systemd1', member='JobRemoved'"
+	mkfifo -m 0666 "$tmp_dir/dbus-monitor.pipe" "$tmp_dir/ready.pipe"
+	monitor_expr="type='signal', sender='org.freedesktop.systemd1', interface='org.freedesktop.systemd1.Manager', path='/org/freedesktop/systemd1', member='JobRemoved'"
 	stdbuf -oL dbus-monitor --system --monitor "$monitor_expr" > "$tmp_dir/dbus-monitor.pipe" 2>"$tmp_dir/dbus-monitor.stderr" &
 	dbus_monitor_pid=$!
 
@@ -353,8 +371,10 @@ BEGIN {
 	# The typical user context as reported by id -Z is: unconfined_u:unconfined_r:unconfined_t:s0
 	selinux_context_arg=
 	case $SPREAD_SYSTEM in
-		fedora-*|centos-*)
-			if [ "$(systemctl --version | head -n 1 | awk '{ print $2 }')" -gt 219 ]; then
+		fedora-*|centos-*|opensuse-*-selinux-*)
+			local systemd_ver
+			systemd_ver="$(systemctl --version | awk '/systemd [0-9]+/ { print $2 }' | cut -f1 -d"~")"
+			if [ "$systemd_ver" -gt 219 ]; then
 				selinux_context_arg="SELinuxContext s unconfined_u:unconfined_r:unconfined_t:s0"
 			fi
 			;;
@@ -377,7 +397,8 @@ BEGIN {
 			Environment as 1 TERM=xterm-256color \
 			$selinux_context_arg \
 			ExecStart "a(sasb)" 1 \
-				"$(command -v runuser)" 6 "$(command -v runuser)" -l "$user" - -c "SNAPD_DEBUG=$SNAPD_DEBUG SNAP_CONFINE_DEBUG=$SNAP_CONFINE_DEBUG exec $tmp_dir/exec <$tmp_dir/stdin.pipe >$tmp_dir/stdout.pipe 2>$tmp_dir/stderr.pipe" false \
+				"$(command -v runuser)" "$(if [ -n "$runuser_env_arg" ]; then echo 8; else echo 6; fi)" \
+				"$(command -v runuser)" $runuser_env_arg -l "$user" - -c "SNAPD_DEBUG=$SNAPD_DEBUG SNAP_REEXEC=$SNAP_REEXEC SNAP_CONFINE_DEBUG=$SNAP_CONFINE_DEBUG exec $tmp_dir/exec <$tmp_dir/stdin.pipe >$tmp_dir/stdout.pipe 2>$tmp_dir/stderr.pipe" false \
 		0
 	# This is done so that we can configure file redirects. Once Ubuntu 16.04 is no
 	# longer supported we can use Standard{Input,Output,Error}=file:path property

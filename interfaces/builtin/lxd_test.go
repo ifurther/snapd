@@ -49,16 +49,16 @@ apps:
   plugs: [lxd]
 `
 
-const lxdCoreYaml = `name: core
+const lxdProviderYaml = `name: lxd
 version: 0
-type: os
-slots:
-  lxd:
+apps:
+ app:
+  slots: [lxd]
 `
 
 func (s *LxdInterfaceSuite) SetUpTest(c *C) {
 	s.plug, s.plugInfo = MockConnectedPlug(c, lxdConsumerYaml, nil, "lxd")
-	s.slot, s.slotInfo = MockConnectedSlot(c, lxdCoreYaml, nil, "lxd")
+	s.slot, s.slotInfo = MockConnectedSlot(c, lxdProviderYaml, nil, "lxd")
 }
 
 func (s *LxdInterfaceSuite) TestName(c *C) {
@@ -81,14 +81,31 @@ func (s *LxdInterfaceSuite) TestSanitizePlug(c *C) {
 }
 
 func (s *LxdInterfaceSuite) TestAppArmorSpec(c *C) {
-	spec := apparmor.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	appSet, err := interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec := apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.slot), IsNil)
 	c.Assert(spec.SecurityTags(), DeepEquals, []string{"snap.consumer.app"})
 	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "/var/snap/lxd/common/lxd/unix.socket rw,\n")
 }
 
+func (s *LxdInterfaceSuite) TestAppArmorSpecParallelInstance(c *C) {
+	// a parallel installed lxd snap must grant access to its own socket, not
+	// the one of the non-instanced lxd snap
+	s.slotInfo.Snap.InstanceKey = "foo"
+	appSet, err := interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec := apparmor.NewSpecification(appSet)
+	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.slot), IsNil)
+	c.Assert(spec.SecurityTags(), DeepEquals, []string{"snap.consumer.app"})
+	c.Assert(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "/var/snap/lxd_foo/common/lxd/unix.socket rw,\n")
+	c.Assert(spec.SnippetForTag("snap.consumer.app"), Not(testutil.Contains), "/var/snap/lxd/common/lxd/unix.socket rw,\n")
+}
+
 func (s *LxdInterfaceSuite) TestSecCompSpec(c *C) {
-	spec := seccomp.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	appSet, err := interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec := seccomp.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.slot), IsNil)
 	c.Assert(spec.SecurityTags(), DeepEquals, []string{"snap.consumer.app"})
 	c.Check(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "socket AF_NETLINK - NETLINK_GENERIC\n")

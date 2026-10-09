@@ -9,14 +9,16 @@ systems:
     - -fedora-*
     - -debian-*
     - -arch-*
-    - -opensuse-tumbleweed-*
+    - -opensuse-*
     - -centos-9-*
     - -amazon-linux-2023-*
     - -ubuntu-22.*
-    - -ubuntu-23.*
     - -ubuntu-24.*
+    - -ubuntu-25.*
+    - -ubuntu-26.*
     - -ubuntu-core-22-*
-    - -ubuntu-core-24-*    
+    - -ubuntu-core-24-*
+    - -ubuntu-core-26-*
 
 prepare: |
     "$TESTSTOOLS"/snaps-state install-local test-snapd-sh

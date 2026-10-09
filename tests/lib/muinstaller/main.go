@@ -1,9 +1,8 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 //go:build !nosecboot
-// +build !nosecboot
 
 /*
- * Copyright (C) 2022 Canonical Ltd
+ * Copyright (C) 2022-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -23,7 +22,9 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -36,13 +37,13 @@ import (
 	"github.com/snapcore/snapd/client"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/gadget"
+	"github.com/snapcore/snapd/gadget/device"
 	"github.com/snapcore/snapd/gadget/install"
 	"github.com/snapcore/snapd/gadget/quantity"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/osutil/disks"
 	"github.com/snapcore/snapd/osutil/mkfs"
-	"github.com/snapcore/snapd/secboot"
 )
 
 func waitForDevice() string {
@@ -154,7 +155,7 @@ func maybeCreatePartitionTable(bootDevice, schema string) error {
 	return nil
 }
 
-func createPartitions(bootDevice string, volumes map[string]*gadget.Volume, encType secboot.EncryptionType) ([]*gadget.OnDiskAndGadgetStructurePair, error) {
+func createPartitions(bootDevice string, volumes map[string]*gadget.Volume) ([]*gadget.OnDiskAndGadgetStructurePair, error) {
 	vol := firstVol(volumes)
 	// snapd does not create partition tables so we have to do it here
 	// or gadget.OnDiskVolumeFromDevice() will fail
@@ -188,9 +189,39 @@ func runMntFor(label string) string {
 	return filepath.Join(dirs.GlobalRootDir, "/run/muinstaller-mnt/", label)
 }
 
+type volumeAuthOptions struct {
+	pin        string
+	passphrase string
+	kdfType    string
+	kdfTime    time.Duration
+}
+
+func parseKeyboardConfig(s string) *client.KeyboardConfig {
+	if s == "" {
+		return nil
+	}
+	parts := strings.SplitN(s, ",", 4)
+	kc := &client.KeyboardConfig{}
+	if len(parts) > 0 {
+		kc.Layout = parts[0]
+	}
+	if len(parts) > 1 {
+		kc.Model = parts[1]
+	}
+	if len(parts) > 2 {
+		kc.Variant = parts[2]
+	}
+	if len(parts) > 3 && parts[3] != "" {
+		kc.Options = strings.Split(parts[3], ",")
+	}
+	return kc
+}
+
 func postSystemsInstallSetupStorageEncryption(cli *client.Client,
 	details *client.SystemDetails, bootDevice string,
-	dgpairs []*gadget.OnDiskAndGadgetStructurePair) (map[string]string, error) {
+	dgpairs []*gadget.OnDiskAndGadgetStructurePair,
+	volumesAuth volumeAuthOptions,
+	keyboardConfig *client.KeyboardConfig) (map[string]string, error) {
 
 	// We are modifiying the details struct here
 	for _, gadgetVol := range details.Volumes {
@@ -207,8 +238,24 @@ func postSystemsInstallSetupStorageEncryption(cli *client.Client,
 
 	// Storage encryption makes specified partitions encrypted
 	opts := &client.InstallSystemOptions{
-		Step:      client.InstallStepSetupStorageEncryption,
-		OnVolumes: details.Volumes,
+		Step:           client.InstallStepSetupStorageEncryption,
+		OnVolumes:      details.Volumes,
+		KeyboardConfig: keyboardConfig,
+	}
+	if volumesAuth.passphrase != "" {
+		opts.VolumesAuth = &device.VolumesAuthOptions{
+			Mode:       device.AuthModePassphrase,
+			Passphrase: volumesAuth.passphrase,
+			KDFType:    volumesAuth.kdfType,
+			KDFTime:    volumesAuth.kdfTime,
+		}
+	}
+	if volumesAuth.pin != "" {
+		opts.VolumesAuth = &device.VolumesAuthOptions{
+			Mode:    device.AuthModePIN,
+			PIN:     volumesAuth.pin,
+			KDFTime: volumesAuth.kdfTime,
+		}
 	}
 	chgId, err := cli.InstallSystem(details.Label, opts)
 	if err != nil {
@@ -265,7 +312,7 @@ func nodeForPartLabel(dgpairs []*gadget.OnDiskAndGadgetStructurePair, name strin
 // TODO laidoutStructs is used to get the devices, when encryption is
 // happening maybe we need to find the information differently.
 func postSystemsInstallFinish(cli *client.Client,
-	details *client.SystemDetails, bootDevice string,
+	details *client.SystemDetails, bootDevice string, optionalInstallPath string,
 	dgpairs []*gadget.OnDiskAndGadgetStructurePair) error {
 
 	vols := make(map[string]*gadget.Volume)
@@ -282,10 +329,16 @@ func postSystemsInstallFinish(cli *client.Client,
 		vols[volName] = gadgetVol
 	}
 
+	optionalInstall, err := maybeGetOptionalInstall(optionalInstallPath)
+	if err != nil {
+		return err
+	}
+
 	// Finish steps does the writing of assets
 	opts := &client.InstallSystemOptions{
-		Step:      client.InstallStepFinish,
-		OnVolumes: vols,
+		Step:            client.InstallStepFinish,
+		OnVolumes:       vols,
+		OptionalInstall: optionalInstall,
 	}
 	chgId, err := cli.InstallSystem(details.Label, opts)
 	if err != nil {
@@ -293,6 +346,82 @@ func postSystemsInstallFinish(cli *client.Client,
 	}
 	fmt.Printf("Change %s created\n", chgId)
 	return waitChange(chgId)
+}
+
+// setupPreseedChrootMounts prepares the required chroot mountpoints for preseeding.
+func setupPreseedChrootMounts(chroot string) (func(), error) {
+	var mounts []string
+	cleanup := func() {
+		for i := len(mounts) - 1; i >= 0; i-- {
+			if output, stderr, err := osutil.RunSplitOutput("umount", mounts[i]); err != nil {
+				err = osutil.OutputErrCombine(output, stderr, err)
+				logger.Noticef("error: cannot unmount %q: %v", mounts[i], err)
+			}
+		}
+	}
+
+	targets := []string{
+		"/dev",
+		"/proc",
+		"/sys",
+		"/sys/kernel/security",
+	}
+
+	for _, t := range targets {
+		destination := filepath.Join(chroot, t)
+		if err := os.MkdirAll(destination, 0755); err != nil {
+			return nil, err
+		}
+
+		args := []string{"--bind", t, destination}
+		if output, stderr, err := osutil.RunSplitOutput("mount", args...); err != nil {
+			cleanup()
+			return nil, osutil.OutputErrCombine(output, stderr, err)
+		}
+
+		mounts = append(mounts, filepath.Join(chroot, t))
+	}
+
+	return cleanup, nil
+}
+
+func postSystemsInstallPreseed(cli *client.Client, details *client.SystemDetails, root string) error {
+	cleanup, err := setupPreseedChrootMounts(root)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	opts := &client.InstallSystemOptions{
+		Step:       client.InstallStepPreseed,
+		TargetRoot: &root,
+	}
+	chgID, err := cli.InstallSystem(details.Label, opts)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Change %s created\n", chgID)
+
+	return waitChange(chgID)
+}
+
+func maybeGetOptionalInstall(path string) (*client.OptionalInstallRequest, error) {
+	if path == "" {
+		return nil, nil
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var req client.OptionalInstallRequest
+	if err := json.NewDecoder(f).Decode(&req); err != nil {
+		return nil, err
+	}
+
+	return &req, nil
 }
 
 // createAndMountFilesystems creates and mounts filesystems. It returns
@@ -370,8 +499,11 @@ func unmountFilesystems(mntPts []string) (err error) {
 func createClassicRootfsIfNeeded(rootfsCreator string) error {
 	dst := runMntFor("ubuntu-data")
 
-	if output, stderr, err := osutil.RunSplitOutput(rootfsCreator, dst); err != nil {
-		return osutil.OutputErrCombine(output, stderr, err)
+	cmd := exec.Command(rootfsCreator, dst)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return err
 	}
 
 	return nil
@@ -403,7 +535,7 @@ func copySeedToDataPartition() error {
 	return copySeedDir(src, dst)
 }
 
-func detectStorageEncryption(seedLabel string) (bool, error) {
+func detectStorageEncryption(seedLabel string, volumesAuth volumeAuthOptions) (bool, error) {
 	cli := client.New(nil)
 	details, err := cli.SystemDetails(seedLabel)
 	if err != nil {
@@ -413,6 +545,33 @@ func detectStorageEncryption(seedLabel string) (bool, error) {
 	if details.StorageEncryption.Support == client.StorageEncryptionSupportDefective {
 		return false, errors.New(details.StorageEncryption.UnavailableReason)
 	}
+
+	if volumesAuth.passphrase != "" {
+		passphraseAuthAvailable := false
+		for _, feat := range details.StorageEncryption.Features {
+			if feat == client.StorageEncryptionFeaturePassphraseAuth {
+				passphraseAuthAvailable = true
+				break
+			}
+		}
+		if !passphraseAuthAvailable {
+			return false, errors.New("-passphrase specified but snapd support for passphrases is missing")
+		}
+	}
+
+	if volumesAuth.pin != "" {
+		pinAuthAvailable := false
+		for _, feat := range details.StorageEncryption.Features {
+			if feat == client.StorageEncryptionFeaturePINAuth {
+				pinAuthAvailable = true
+				break
+			}
+		}
+		if !pinAuthAvailable {
+			return false, errors.New("-pin specified but snapd support for PIN authentication is missing")
+		}
+	}
+
 	return details.StorageEncryption.Support == client.StorageEncryptionSupportAvailable, nil
 }
 
@@ -497,8 +656,7 @@ func fillPartiallyDefinedVolume(vol *gadget.Volume, bootDevice string) error {
 	return nil
 }
 
-func run(seedLabel, bootDevice, rootfsCreator string) error {
-	isCore := rootfsCreator == ""
+func run(seedLabel, bootDevice, rootfsCreator, optionalInstallPath, recoveryKeyOut string, preseedRootfs bool, volumesAuth volumeAuthOptions, keyboardConfig *client.KeyboardConfig) error {
 	logger.Noticef("installing on %q", bootDevice)
 
 	cli := client.New(nil)
@@ -506,7 +664,7 @@ func run(seedLabel, bootDevice, rootfsCreator string) error {
 	if err != nil {
 		return err
 	}
-	shouldEncrypt, err := detectStorageEncryption(seedLabel)
+	shouldEncrypt, err := detectStorageEncryption(seedLabel, volumesAuth)
 	if err != nil {
 		return err
 	}
@@ -521,64 +679,129 @@ func run(seedLabel, bootDevice, rootfsCreator string) error {
 	}
 
 	// TODO: grow the data-partition based on disk size
-	encType := secboot.EncryptionTypeNone
-	if shouldEncrypt {
-		encType = secboot.EncryptionTypeLUKS
-	}
-	dgpairs, err := createPartitions(bootDevice, details.Volumes, encType)
+	dgpairs, err := createPartitions(bootDevice, details.Volumes)
 	if err != nil {
 		return fmt.Errorf("cannot setup partitions: %v", err)
 	}
 	var encryptedDevices = make(map[string]string)
 	if shouldEncrypt {
-		encryptedDevices, err = postSystemsInstallSetupStorageEncryption(cli, details, bootDevice, dgpairs)
+		encryptedDevices, err = postSystemsInstallSetupStorageEncryption(cli, details, bootDevice, dgpairs, volumesAuth, keyboardConfig)
 		if err != nil {
 			return fmt.Errorf("cannot setup storage encryption: %v", err)
 		}
+
+		if recoveryKeyOut != "" {
+			rkey, err := cli.GeneratePreInstallRecoveryKey(seedLabel)
+			if err != nil {
+				return fmt.Errorf("cannot generate recovery key: %v", err)
+			}
+			logger.Debugf("writing  generated recovery key at %q", recoveryKeyOut)
+			if err := os.WriteFile(recoveryKeyOut, []byte(rkey), 0644); err != nil {
+				return fmt.Errorf("cannot write generated recovery key at %q: %v", recoveryKeyOut, err)
+			}
+		}
 	}
+	logger.Noticef("creating and mounting filesystems")
+
 	mntPts, err := createAndMountFilesystems(bootDevice, details.Volumes, encryptedDevices)
 	if err != nil {
 		return fmt.Errorf("cannot create filesystems: %v", err)
 	}
+
+	hasSystemSeed := checkForRole(details, gadget.SystemSeed)
+	logger.Noticef("has system seed %v", hasSystemSeed)
+	isCore := rootfsCreator == ""
+	if isCore || !hasSystemSeed {
+		logger.Noticef("copying seed to partition")
+		if err := copySeedToDataPartition(); err != nil {
+			return fmt.Errorf("cannot create seed on data partition: %v", err)
+		}
+	}
+
 	if !isCore {
+		logger.Noticef("creating classic rootfs")
 		if err := createClassicRootfsIfNeeded(rootfsCreator); err != nil {
 			return fmt.Errorf("cannot create classic rootfs: %v", err)
 		}
 	}
-	if err := copySeedToDataPartition(); err != nil {
-		return fmt.Errorf("cannot create seed on data partition: %v", err)
+
+	if preseedRootfs {
+		logger.Noticef("preseeding classic rootfs")
+		if err := postSystemsInstallPreseed(cli, details, runMntFor("ubuntu-data")); err != nil {
+			return fmt.Errorf("cannot preseed installed system: %w", err)
+		}
 	}
+
 	if err := unmountFilesystems(mntPts); err != nil {
 		return fmt.Errorf("cannot unmount filesystems: %v", err)
 	}
-	if err := postSystemsInstallFinish(cli, details, bootDevice, dgpairs); err != nil {
+
+	if err := postSystemsInstallFinish(cli, details, bootDevice, optionalInstallPath, dgpairs); err != nil {
 		return fmt.Errorf("cannot finalize install: %v", err)
 	}
+
 	// TODO: reboot here automatically (optional)
 
 	return nil
 }
 
+func checkForRole(details *client.SystemDetails, role string) bool {
+	for _, v := range details.Volumes {
+		for _, vs := range v.Structure {
+			if vs.Role == role {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func main() {
-	if len(os.Args) < 3 || len(os.Args) > 4 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <seed-label> <target-device> [rootfs-creator]\n"+
-			"If [rootfs-creator] is specified, classic Ubuntu with core boot will be installed.\n"+
-			"Otherwise, Ubuntu Core will be installed\n", os.Args[0])
+	seedLabel := flag.String("label", "", "seed label (required)")
+	bootDevice := flag.String("device", "", "target device (required)")
+	rootfsCreator := flag.String("rootfs-creator", "", "rootfs creator (optional). If specified, classic Ubuntu with core boot will be installed.\nOtherwise, Ubuntu Core will be installed")
+	optionalInstallPath := flag.String("optional", "", "path to optional snaps and components JSON file (optional)")
+	passphrase := flag.String("passphrase", "", "encryption passphrase (optional). If specified and encryption is suppported, passphrase authentication will be enabled")
+	pin := flag.String("pin", "", "encryption PIN (optional). If specified and encryption is supported, PIN authentication will be enabled")
+	kdfType := flag.String("kdf-type", "", "KDF type for passphrase [\"argon2id\", \"argon2i\" or \"pbkdf2\"] (optional)")
+	kdfTime := flag.Duration("kdf-time", 0, "length of time to run the KDF (optional)")
+	recoveryKeyOut := flag.String("recovery-key-out", "", "indicate that a recovery key should be created and stored at given path (optional)")
+	preseedRootfs := flag.Bool("preseed-rootfs", false, "Preseed rootfs")
+	keyboardConfigRaw := flag.String("keyboard-config", "", "keyboard configuration as a comma-separated string: <layout>,<model>,<variant>,<opt1>,<opt2> (optional)")
+
+	flag.Parse()
+
+	if *seedLabel == "" || *bootDevice == "" {
+		flag.Usage()
 		os.Exit(1)
 	}
-	logger.SimpleSetup()
 
-	seedLabel := os.Args[1]
-	bootDevice := os.Args[2]
-	rootfsCreator := ""
-	if len(os.Args) > 3 {
-		rootfsCreator = os.Args[3]
-	}
-	if bootDevice == "auto" {
-		bootDevice = waitForDevice()
+	if *preseedRootfs && *rootfsCreator == "" {
+		fmt.Fprintf(os.Stderr, "Cannot preseed rootfs for Ubuntu Core\n")
+		os.Exit(1)
 	}
 
-	if err := run(seedLabel, bootDevice, rootfsCreator); err != nil {
+	if *passphrase != "" && *pin != "" {
+		fmt.Fprintf(os.Stderr, "cannot use -passphrase and -pin at the same time\n")
+		os.Exit(1)
+	}
+
+	logger.SimpleSetup(nil)
+
+	if *bootDevice == "auto" {
+		*bootDevice = waitForDevice()
+	}
+
+	volumesAuth := volumeAuthOptions{
+		pin:        *pin,
+		passphrase: *passphrase,
+		kdfType:    *kdfType,
+		kdfTime:    *kdfTime,
+	}
+
+	keyboardConfig := parseKeyboardConfig(*keyboardConfigRaw)
+
+	if err := run(*seedLabel, *bootDevice, *rootfsCreator, *optionalInstallPath, *recoveryKeyOut, *preseedRootfs, volumesAuth, keyboardConfig); err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
 		os.Exit(1)
 	}

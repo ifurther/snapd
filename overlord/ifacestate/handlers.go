@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2016-2022 Canonical Ltd
+ * Copyright (C) 2016-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -25,7 +25,9 @@ import (
 	"path"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"gopkg.in/tomb.v2"
@@ -35,13 +37,19 @@ import (
 	"github.com/snapcore/snapd/interfaces"
 	"github.com/snapcore/snapd/interfaces/hotplug"
 	"github.com/snapcore/snapd/logger"
+	"github.com/snapcore/snapd/osutil"
+	"github.com/snapcore/snapd/overlord/assertstate"
+	"github.com/snapcore/snapd/overlord/configstate/config"
 	"github.com/snapcore/snapd/overlord/hookstate"
 	"github.com/snapcore/snapd/overlord/ifacestate/schema"
+	"github.com/snapcore/snapd/overlord/restart"
 	"github.com/snapcore/snapd/overlord/servicestate"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/snap/quota"
+	"github.com/snapcore/snapd/strutil"
 	"github.com/snapcore/snapd/timings"
 )
 
@@ -49,7 +57,7 @@ var snapstateFinishRestart = snapstate.FinishRestart
 
 // journalQuotaLayout returns the necessary journal quota mount layouts
 // to mimick what systemd does for services with log namespaces.
-func journalQuotaLayout(quotaGroup *quota.Group) []snap.Layout {
+func journalQuotaLayout(info *snap.Info, quotaGroup *quota.Group) []snap.Layout {
 	if quotaGroup.JournalLimit == nil {
 		return nil
 	}
@@ -57,6 +65,7 @@ func journalQuotaLayout(quotaGroup *quota.Group) []snap.Layout {
 	// bind mount the journal namespace folder on top of the journal folder
 	// /run/systemd/journal.<ns> -> /run/systemd/journal
 	layouts := []snap.Layout{{
+		Snap: info,
 		Bind: path.Join(dirs.SnapSystemdRunDir, fmt.Sprintf("journal.%s", quotaGroup.JournalNamespaceName())),
 		Path: path.Join(dirs.SnapSystemdRunDir, "journal"),
 		Mode: 0755,
@@ -75,27 +84,35 @@ func getExtraLayouts(st *state.State, snapInfo *snap.Info) ([]snap.Layout, error
 
 	var extraLayouts []snap.Layout
 	if snapOpts.QuotaGroup != nil {
-		extraLayouts = append(extraLayouts, journalQuotaLayout(snapOpts.QuotaGroup)...)
+		extraLayouts = append(extraLayouts, journalQuotaLayout(snapInfo, snapOpts.QuotaGroup)...)
 	}
 
 	return extraLayouts, nil
 }
 
-func buildConfinementOptions(st *state.State, snapInfo *snap.Info, flags snapstate.Flags) (interfaces.ConfinementOptions, error) {
+func (m *InterfaceManager) buildConfinementOptions(st *state.State, task *state.Task, snapInfo *snap.Info, flags snapstate.Flags) (interfaces.ConfinementOptions, error) {
 	extraLayouts, err := getExtraLayouts(st, snapInfo)
 	if err != nil {
 		return interfaces.ConfinementOptions{}, fmt.Errorf("cannot get extra mount layouts of snap %q: %s", snapInfo.InstanceName(), err)
 	}
 
+	kernelSnap := ""
+	deviceCtx, err := snapstate.DeviceCtx(st, task, nil)
+	if err == nil {
+		kernelSnap = deviceCtx.Kernel()
+	}
+
 	return interfaces.ConfinementOptions{
-		DevMode:      flags.DevMode,
-		JailMode:     flags.JailMode,
-		Classic:      flags.Classic,
-		ExtraLayouts: extraLayouts,
+		DevMode:           flags.DevMode,
+		JailMode:          flags.JailMode,
+		Classic:           flags.Classic,
+		ExtraLayouts:      extraLayouts,
+		AppArmorPrompting: m.useAppArmorPrompting,
+		KernelSnap:        kernelSnap,
 	}, nil
 }
 
-func (m *InterfaceManager) setupAffectedSnaps(task *state.Task, affectingSnap string, affectedSnaps []string, tm timings.Measurer) error {
+func (m *InterfaceManager) setupAffectedSnaps(task *state.Task, affectingSnap naming.InstanceName, affectedSnaps []naming.InstanceName, tm timings.Measurer) error {
 	st := task.State()
 
 	// Setup security of the affected snaps.
@@ -105,7 +122,7 @@ func (m *InterfaceManager) setupAffectedSnaps(task *state.Task, affectingSnap st
 			continue
 		}
 		var snapst snapstate.SnapState
-		if err := snapstate.Get(st, affectedInstanceName, &snapst); err != nil {
+		if err := snapstate.Get(st, affectedInstanceName.String(), &snapst); err != nil {
 			task.Errorf("skipping security profiles setup for snap %q when handling snap %q: %v", affectedInstanceName, affectingSnap, err)
 			continue
 		}
@@ -113,29 +130,51 @@ func (m *InterfaceManager) setupAffectedSnaps(task *state.Task, affectingSnap st
 		if err != nil {
 			return err
 		}
-		if err := addImplicitSlots(st, affectedSnapInfo); err != nil {
+		if err := addImplicitInterfaces(st, affectedSnapInfo); err != nil {
 			return err
 		}
 
-		appSet := interfaces.NewSnapAppSet(affectedSnapInfo)
+		affectedAppSet, err := appSetForSnapRevision(st, affectedSnapInfo)
+		if err != nil {
+			return fmt.Errorf("building app set for snap %q: %v", affectingSnap, err)
+		}
 
-		opts, err := buildConfinementOptions(st, affectedSnapInfo, snapst.Flags)
+		opts, err := m.buildConfinementOptions(st, task, affectedSnapInfo, snapst.Flags)
 		if err != nil {
 			return err
 		}
-		if err := m.setupSnapSecurity(task, appSet, opts, tm); err != nil {
+		if err := m.setupSnapSecurity(task, affectedAppSet, opts, tm); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+func delayedEffectsTask(chg *state.Change) *state.Task {
+	for _, t := range chg.Tasks() {
+		if t.Kind() == "process-delayed-security-backend-effects" {
+			return t
+		}
+	}
+	return nil
+}
+
+func hasPrepareConnectionHook(snapInfo *snap.Info) bool {
+	for hookName := range snapInfo.Hooks {
+		if strings.HasPrefix(hookName, "prepare-plug-") || strings.HasPrefix(hookName, "prepare-slot-") {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *InterfaceManager) doSetupProfiles(task *state.Task, tomb *tomb.Tomb) error {
-	task.State().Lock()
-	defer task.State().Unlock()
+	st := task.State()
+	st.Lock()
+	defer st.Unlock()
 
 	perfTimings := state.TimingsForTask(task)
-	defer perfTimings.Save(task.State())
+	defer perfTimings.Save(st)
 
 	// Get snap.Info from bits handed by the snap manager.
 	snapsup, err := snapstate.TaskSnapSetup(task)
@@ -143,13 +182,30 @@ func (m *InterfaceManager) doSetupProfiles(task *state.Task, tomb *tomb.Tomb) er
 		return err
 	}
 
+	var prepareProfiles bool
+	if err := task.Get("prepare-profiles", &prepareProfiles); err != nil && !errors.Is(err, state.ErrNoState) {
+		return err
+	}
+
+	var newConns []string
+	if err := task.Get("new-connections", &newConns); err != nil && !errors.Is(err, state.ErrNoState) {
+		return err
+	}
+
+	logger.Debugf("new connections: %v", newConns)
+
+	delayedTask := delayedEffectsTask(task.Change())
+	// we can only delay side effects if we have the delay task
+	canDelay := delayedTask != nil
+	logger.Debugf("has delayed effects support? %v", canDelay)
+
 	snapInfo, err := snap.ReadInfo(snapsup.InstanceName(), snapsup.SideInfo)
 	if err != nil {
 		return err
 	}
 
 	if len(snapInfo.BadInterfaces) > 0 {
-		task.State().Warnf("%s", snap.BadInterfacesSummary(snapInfo))
+		st.Warnf("%s", snap.BadInterfacesSummary(snapInfo))
 	}
 
 	// We no longer do/need core-phase-2, see
@@ -165,20 +221,90 @@ func (m *InterfaceManager) doSetupProfiles(task *state.Task, tomb *tomb.Tomb) er
 		return nil
 	}
 
-	opts, err := buildConfinementOptions(task.State(), snapInfo, snapsup.Flags)
+	opts, err := m.buildConfinementOptions(st, task, snapInfo, snapsup.Flags)
 	if err != nil {
 		return err
 	}
-	if err := m.setupProfilesForSnap(task, tomb, snapInfo, opts, perfTimings); err != nil {
+
+	if err := addImplicitInterfaces(st, snapInfo); err != nil {
 		return err
 	}
-	return setPendingProfilesSideInfo(task.State(), snapsup.InstanceName(), snapsup.SideInfo)
+
+	// this app set is derived from the current task, which will include any
+	// components that are already installed, with the addition of any new
+	// components that are getting setup up by this task
+	appSet, err := appSetForTask(task, snapInfo)
+	if err != nil {
+		return err
+	}
+
+	if prepareProfiles {
+		// In prepare mode we refresh repository state and run backend
+		// preparation. Full connection-aware regeneration is deferred to the
+		// later setup-profiles task after auto-connect, but snaps that declare
+		// prepare connection hooks still need baseline setup now so those hooks
+		// can execute under confinement.
+		if _, _, err = m.refreshAppSetConnections(task, appSet); err != nil {
+			return err
+		}
+
+		for _, backend := range m.repo.Backends() {
+			if err := backend.Prepare(appSet); err != nil {
+				return err
+			}
+		}
+		if hasPrepareConnectionHook(snapInfo) {
+			// prepare-{plug,slot}- hooks run before the later full setup-profiles
+			// task, so their hook context still needs baseline confinement and
+			// backend artifacts such as snap device cgroup policy files.
+			sctxs := map[string]interfaces.SetupContext{
+				appSet.InstanceName().String(): {
+					Reason:          interfaces.SnapSetupReasonOwnUpdate,
+					CanDelayEffects: false,
+				},
+			}
+			if err := m.setupSecurityByBackend(task, []*interfaces.SnapAppSet{appSet}, []interfaces.ConfinementOptions{opts}, sctxs, perfTimings); err != nil {
+				return err
+			}
+		}
+
+		// Keep PendingSecurity updated for restart durability while this
+		// revision remains inactive.
+		return setPendingProfilesSideInfo(task.State(), snapsup.InstanceName().String(), appSet)
+	}
+
+	delayedEffects, err := m.setupProfilesForAppSet(task, appSet, opts, newConns, canDelay, perfTimings)
+	if err != nil {
+		return err
+	}
+
+	if err := setPendingProfilesSideInfo(task.State(), snapsup.InstanceName().String(), appSet); err != nil {
+		return err
+	}
+
+	if len(delayedEffects) != 0 {
+		if delayedTask == nil {
+			return fmt.Errorf("internal error: cannot delay backend effects without a handler task")
+		}
+		logger.Debugf("has delayed effects for snaps: %v", delayedEffects)
+		err := DelayedBackendEffectsFor(delayedTask, triggeringSnap(snapsup.InstanceName()), delayedEffects)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // setupPendingProfilesSideInfo helps updating information about any
 // revision for which security profiles are set up while the snap is
 // not yet active.
-func setPendingProfilesSideInfo(st *state.State, instanceName string, si *snap.SideInfo) error {
+//
+// This state is still required for correctness after the prepare-profiles
+// split: it preserves restart durability while a snap is inactive during
+// refresh, and lets ifacestate pick the most recent inactive
+// revision/components when regenerating security for affected snaps.
+func setPendingProfilesSideInfo(st *state.State, instanceName string, appSet *interfaces.SnapAppSet) error {
 	var snapst snapstate.SnapState
 	if err := snapstate.Get(st, instanceName, &snapst); err != nil && !errors.Is(err, state.ErrNoState) {
 		return err
@@ -191,21 +317,58 @@ func setPendingProfilesSideInfo(st *state.State, instanceName string, si *snap.S
 		// nothing is pending
 		return nil
 	}
-	snapst.PendingSecurity = &snapstate.PendingSecurityState{
-		SideInfo: si,
+
+	if appSet != nil {
+		csis := make([]*snap.ComponentSideInfo, 0, len(appSet.Components()))
+		for _, ci := range appSet.Components() {
+			csis = append(csis, &ci.ComponentSideInfo)
+		}
+
+		snapst.PendingSecurity = &snapstate.PendingSecurityState{
+			SideInfo:   &appSet.Info().SideInfo,
+			Components: csis,
+		}
+	} else {
+		snapst.PendingSecurity = &snapstate.PendingSecurityState{}
 	}
+
 	snapstate.Set(st, instanceName, &snapst)
 	return nil
 }
 
-func (m *InterfaceManager) setupProfilesForSnap(task *state.Task, _ *tomb.Tomb, snapInfo *snap.Info, opts interfaces.ConfinementOptions, tm timings.Measurer) error {
-	st := task.State()
+// triggeringSnap is the snap name of a snap that triggered the side effect.
+type triggeringSnap string
 
-	if err := addImplicitSlots(task.State(), snapInfo); err != nil {
-		return err
+// affectedSnap is the name of a snap that is affected.
+type affectedSnap string
+
+// delayedEffectsForSnaps captures all affected snaps and delayed side effects for
+// each security backend for each snap.
+type delayedEffectsForSnaps map[affectedSnap]map[interfaces.SecuritySystem][]interfaces.DelayedSideEffect
+
+// delayedEffects captures all delayed side effects grouped by snaps that triggered them.
+type delayedEffects struct {
+	// snap owning the slot -> plug snaps -> []work items
+	TriggeringSnaps map[triggeringSnap]delayedEffectsForSnaps `json:"triggering-snaps"`
+}
+
+func newDelayedEffectsForSnaps() delayedEffectsForSnaps {
+	return delayedEffectsForSnaps(make(map[affectedSnap]map[interfaces.SecuritySystem][]interfaces.DelayedSideEffect))
+}
+
+func (d delayedEffectsForSnaps) EnqueueFor(snapName affectedSnap, backend interfaces.SecuritySystem, item interfaces.DelayedSideEffect) {
+	if d[snapName] == nil {
+		d[snapName] = make(map[interfaces.SecuritySystem][]interfaces.DelayedSideEffect)
 	}
+	d[snapName][backend] = append(d[snapName][backend], item)
+}
 
-	snapName := snapInfo.InstanceName()
+// refreshAppSetConnections refreshes repository connections for appSet and, on
+// the setup-profiles do path, records undo data for persisted connection state
+// that reloadConnections changed or dropped.
+func (m *InterfaceManager) refreshAppSetConnections(task *state.Task, appSet *interfaces.SnapAppSet) ([]naming.InstanceName, []string, error) {
+	snapInfo := appSet.Info()
+	instanceName := appSet.InstanceName()
 
 	// The snap may have been updated so perform the following operation to
 	// ensure that we are always working on the correct state:
@@ -217,85 +380,229 @@ func (m *InterfaceManager) setupProfilesForSnap(task *state.Task, _ *tomb.Tomb, 
 	// - restore connections based on what is kept in the state
 	//   - if a connection cannot be restored then remove it from the state
 	// - setup the security of all the affected snaps
-	disconnectedSnaps, err := m.repo.DisconnectSnap(snapName)
+	disconnectedSnaps, err := m.repo.DisconnectSnap(instanceName)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
+
 	// XXX: what about snap renames? We should remove the old name (or switch
 	// to IDs in the interfaces repository)
-	if err := m.repo.RemoveSnap(snapName); err != nil {
-		return err
+	if err := m.repo.RemoveSnap(instanceName); err != nil {
+		return nil, nil, err
 	}
-	if err := m.repo.AddSnap(snapInfo); err != nil {
-		return err
+	if err := m.repo.AddAppSet(appSet); err != nil {
+		return nil, nil, err
 	}
+
 	if len(snapInfo.BadInterfaces) > 0 {
 		task.Logf("%s", snap.BadInterfacesSummary(snapInfo))
 	}
 
-	// Reload the connections and compute the set of affected snaps. The set
-	// affectedSet set contains name of all the affected snap instances.  The
-	// arrays affectedNames and affectedSnaps contain, arrays of snap names and
-	// snapInfo's, respectively. The arrays are sorted by name with the special
-	// exception that the snap being setup is always first. The affectedSnaps
-	// array may be shorter than the set of affected snaps in case any of the
-	// snaps cannot be found in the state.
-	reconnectedSnaps, err := m.reloadConnections(snapName)
+	reloadedConns, changedOrDroppedConns, err := m.reloadConnections(instanceName)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-	affectedSet := make(map[string]bool)
+
+	// if this task modified any connection states, take a snapshot of the
+	// original connections so that setup-profiles' undo can restore them, if
+	// needed
+	if task.Status() != state.UndoingStatus {
+		if err := snapshotChangedConnectionsForUndo(task, instanceName.String(), changedOrDroppedConns); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	return disconnectedSnaps, reloadedConns, nil
+}
+
+func (m *InterfaceManager) setupProfilesForAppSet(
+	task *state.Task, appSet *interfaces.SnapAppSet, opts interfaces.ConfinementOptions,
+	newConns []string,
+	canDelay bool,
+	tm timings.Measurer,
+) (delayedEffects delayedEffectsForSnaps, err error) {
+	st := task.State()
+
+	instanceName := appSet.InstanceName()
+	disconnectedSnaps, reloadedConns, err := m.refreshAppSetConnections(task, appSet)
+	if err != nil {
+		return nil, err
+	}
+
+	affectedSet := make(map[naming.InstanceName]bool)
 	for _, name := range disconnectedSnaps {
 		affectedSet[name] = true
 	}
-	for _, name := range reconnectedSnaps {
-		affectedSet[name] = true
+
+	snapsWithConnectedPlugs := make(map[naming.InstanceName]bool)
+	snapsWithConnectedSlots := make(map[naming.InstanceName]bool)
+	newConnectedSnaps := make(map[naming.InstanceName]bool)
+	// Identify affected snaps on either side of the connection.
+	for _, connID := range reloadedConns {
+		connRef, err := interfaces.ParseConnRef(connID)
+		if err != nil {
+			return nil, fmt.Errorf("internal error: cannot parse existing connection: %w", err)
+		}
+
+		affectedSet[connRef.PlugRef.Snap] = true
+		affectedSet[connRef.SlotRef.Snap] = true
+
+		// Snaps on the plug or slot side, other than the current one, are
+		// indirectly affected.
+		if connRef.PlugRef.Snap != instanceName {
+			snapsWithConnectedPlugs[connRef.PlugRef.Snap] = true
+		}
+		if connRef.SlotRef.Snap != instanceName {
+			snapsWithConnectedSlots[connRef.SlotRef.Snap] = true
+		}
 	}
 
-	// Sort the set of affected names, ensuring that the snap being setup
-	// is first regardless of the name it has.
-	affectedNames := make([]string, 0, len(affectedSet))
+	for _, connId := range newConns {
+		connRef, err := interfaces.ParseConnRef(connId)
+		if err != nil {
+			return nil, fmt.Errorf("internal error: cannot parse new connection: %w", err)
+		}
+		newConnectedSnaps[connRef.PlugRef.Snap] = true
+		newConnectedSnaps[connRef.SlotRef.Snap] = true
+	}
+
+	// back to a slice
+	affectedNames := make([]naming.InstanceName, 0, len(affectedSet))
 	for name := range affectedSet {
-		if name != snapName {
+		if name != instanceName {
 			affectedNames = append(affectedNames, name)
 		}
 	}
-	sort.Strings(affectedNames)
-	affectedNames = append([]string{snapName}, affectedNames...)
+	sort.Slice(affectedNames, func(i, j int) bool {
+		return affectedNames[i] < affectedNames[j]
+	})
+	// the snap for which profiles are being set up comes first
+	affectedNames = append([]naming.InstanceName{instanceName}, affectedNames...)
 
 	// Obtain interfaces.SnapAppSet for each affected snap, skipping those that
 	// cannot be found and compute the confinement options that apply to it.
 	affectedSnapSets := make([]*interfaces.SnapAppSet, 0, len(affectedSet))
 	confinementOpts := make([]interfaces.ConfinementOptions, 0, len(affectedSet))
+	setupContexts := make(map[string]interfaces.SetupContext, len(affectedSet))
 
 	// For the snap being setup we know exactly what was requested.
-	affectedSnapSets = append(affectedSnapSets, interfaces.NewSnapAppSet(snapInfo))
+	affectedSnapSets = append(affectedSnapSets, appSet)
 	confinementOpts = append(confinementOpts, opts)
+	setupContexts[appSet.InstanceName().String()] = interfaces.SetupContext{
+		// We are being updated
+		Reason:          interfaces.SnapSetupReasonOwnUpdate,
+		CanDelayEffects: false,
+	}
+
+	var delayedEffectsLock sync.Mutex
+	var delayErr error
+	delayedEffects = newDelayedEffectsForSnaps()
 
 	// For remaining snaps we need to interrogate the state.
 	for _, name := range affectedNames[1:] {
 		var snapst snapstate.SnapState
-		if err := snapstate.Get(st, name, &snapst); err != nil {
+		if err := snapstate.Get(st, name.String(), &snapst); err != nil {
 			task.Errorf("cannot obtain state of snap %s: %s", name, err)
 			continue
 		}
 		snapInfo, err := snapst.CurrentInfo()
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if err := addImplicitSlots(st, snapInfo); err != nil {
-			return err
-		}
-		opts, err := buildConfinementOptions(st, snapInfo, snapst.Flags)
-		if err != nil {
-			return err
+		if err := addImplicitInterfaces(st, snapInfo); err != nil {
+			return nil, err
 		}
 
-		affectedSnapSets = append(affectedSnapSets, interfaces.NewSnapAppSet(snapInfo))
+		var appSet *interfaces.SnapAppSet
+		if snapst.PendingSecurity != nil {
+			// a content plug/slot may have already updated in this change, so the appSet
+			// should reflect in the revision (otherwise, we may regenerate the
+			// profile for the wrong revision)
+			snapInfo.SideInfo = *snapst.PendingSecurity.SideInfo
+
+			var comps []*snap.ComponentInfo
+			for _, csi := range snapst.PendingSecurity.Components {
+				ci, err := snapstate.ReadComponentInfo(snapInfo, csi)
+				if err != nil {
+					return nil, fmt.Errorf("cannot read component info when building app set %q: %v", name, err)
+				}
+
+				comps = append(comps, ci)
+			}
+
+			appSet, err = interfaces.NewSnapAppSet(snapInfo, comps)
+		} else {
+			appSet, err = appSetForSnapRevision(st, snapInfo)
+		}
+
+		if err != nil {
+			return nil, fmt.Errorf("building app set for snap %q: %v", name, err)
+		}
+
+		opts, err := m.buildConfinementOptions(st, task, snapInfo, snapst.Flags)
+		if err != nil {
+			return nil, err
+		}
+
+		// The snap is affected though a connection, set the context for the
+		// Setup() call, depending on which side of the connection it is.
+		sctx := interfaces.SetupContext{}
+		switch {
+		case snapsWithConnectedPlugs[name] && snapsWithConnectedSlots[name]:
+			// Same snap appears on both the plug side and slot side,
+			// indicating a cyclic connection
+			sctx.Reason = interfaces.SnapSetupReasonCyclicallyConnectedUpdate
+		case snapsWithConnectedPlugs[name]:
+			sctx.Reason = interfaces.SnapSetupReasonConnectedSlotProviderUpdate
+		case snapsWithConnectedSlots[name]:
+			sctx.Reason = interfaces.SnapSetupReasonConnectedPlugConsumerUpdate
+		}
+
+		// TODO: the safe bet right now is to only allow side effects when the
+		// snap is on the plug side of the connection
+		if sctx.Reason == interfaces.SnapSetupReasonConnectedSlotProviderUpdate {
+			// for newly established connections, especially ones with plug side
+			// connection hook, the side effects cannot be delayed
+			_, isNewConnected := newConnectedSnaps[name]
+			sctx.CanDelayEffects = canDelay && !isNewConnected
+			if sctx.CanDelayEffects {
+				// callback only makes sense if side effects can be delayed
+				sctx.DelayEffect = func(backend interfaces.SecurityBackend, item interfaces.DelayedSideEffect) {
+					delayedEffectsLock.Lock()
+					defer delayedEffectsLock.Unlock()
+
+					if backend == nil {
+						// TODO:GOVERSION: use errors.Join
+						delayErr = strutil.JoinErrors(delayErr,
+							fmt.Errorf("internal error: attempt to delay effects without a backend"))
+						return
+					}
+					if !interfaces.SupportsDelayingEffects(backend) {
+						// TODO:GOVERSION: use errors.Join
+						delayErr = strutil.JoinErrors(delayErr,
+							fmt.Errorf("internal error: attempt to delay effects for backend %q without support for it",
+								backend.Name()))
+						return
+					}
+					delayedEffects.EnqueueFor(affectedSnap(snapst.InstanceName()), backend.Name(), item)
+				}
+			}
+		}
+		setupContexts[name.String()] = sctx
+
+		affectedSnapSets = append(affectedSnapSets, appSet)
 		confinementOpts = append(confinementOpts, opts)
 	}
 
-	return m.setupSecurityByBackend(task, affectedSnapSets, confinementOpts, tm)
+	if err := m.setupSecurityByBackend(task, affectedSnapSets, confinementOpts, setupContexts, tm); err != nil {
+		return nil, err
+	}
+
+	if delayErr != nil {
+		return nil, delayErr
+	}
+
+	return delayedEffects, nil
 }
 
 func (m *InterfaceManager) doRemoveProfiles(task *state.Task, tomb *tomb.Tomb) error {
@@ -311,41 +618,82 @@ func (m *InterfaceManager) doRemoveProfiles(task *state.Task, tomb *tomb.Tomb) e
 	if err != nil {
 		return err
 	}
-	snapName := snapSetup.InstanceName()
+	instanceName := snapSetup.InstanceName()
 
-	if err := m.removeProfilesForSnap(task, tomb, snapName, perfTimings); err != nil {
+	if err := m.removeProfilesForSnap(task, tomb, instanceName, perfTimings); err != nil {
 		return err
 	}
 
 	// no pending profiles on disk
-	return setPendingProfilesSideInfo(task.State(), snapName, nil)
+	return setPendingProfilesSideInfo(task.State(), instanceName.String(), nil)
 }
 
-func (m *InterfaceManager) removeProfilesForSnap(task *state.Task, _ *tomb.Tomb, snapName string, tm timings.Measurer) error {
+func (m *InterfaceManager) removeProfilesForSnap(task *state.Task, _ *tomb.Tomb, instanceName naming.InstanceName, tm timings.Measurer) error {
 	// Disconnect the snap entirely.
 	// This is required to remove the snap from the interface repository.
 	// The returned list of affected snaps will need to have its security setup
 	// to reflect the change.
-	affectedSnaps, err := m.repo.DisconnectSnap(snapName)
+	affectedSnaps, err := m.repo.DisconnectSnap(instanceName)
 	if err != nil {
 		return err
 	}
-	if err := m.setupAffectedSnaps(task, snapName, affectedSnaps, tm); err != nil {
+	if err := m.setupAffectedSnaps(task, instanceName, affectedSnaps, tm); err != nil {
 		return err
 	}
 
 	// Remove the snap from the interface repository.
 	// This discards all the plugs and slots belonging to that snap.
-	if err := m.repo.RemoveSnap(snapName); err != nil {
+	if err := m.repo.RemoveSnap(instanceName); err != nil {
 		return err
 	}
 
 	// Remove security artefacts of the snap.
-	if err := m.removeSnapSecurity(task, snapName); err != nil {
+	if err := m.removeSnapSecurity(task, instanceName); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+// shouldUndoSetupProfiles determines whether the undo is actually required given
+// the current task-set, and based on the name of the current task.
+func shouldUndoSetupProfiles(task *state.Task, instanceName string) bool {
+	// If there are no setup-profiles tasks marked as prepare mode in this
+	// change, we're likely handling either an older change shape or a
+	// component-only change; in those cases undo should run for
+	// setup-profiles tasks.
+	var isPrepareTask bool
+	var hasPrepareProfiles bool
+	for _, t := range task.Change().Tasks() {
+		if t.Kind() != "setup-profiles" {
+			continue
+		}
+		taskSnapSetup, err := snapstate.TaskSnapSetup(t)
+		if err != nil || taskSnapSetup.InstanceName().String() != instanceName {
+			continue
+		}
+
+		var prepareProfiles bool
+		if err := t.Get("prepare-profiles", &prepareProfiles); err != nil && !errors.Is(err, state.ErrNoState) {
+			continue
+		}
+
+		if prepareProfiles {
+			// We must observe a task with prepare-profiles=true to know the new flow
+			// exists for the task-set of this snap, otherwise this was created using the old
+			// flow, and undo should always run
+			hasPrepareProfiles = true
+			if task == t {
+				// this is the prepare-profiles task for the snap, undo should run for it
+				isPrepareTask = true
+			}
+			break
+		}
+	}
+
+	// With the split flow encoded as setup-profiles+flag, only the prepare-mode
+	// setup-profiles task should run undo.
+	return !hasPrepareProfiles || isPrepareTask
 }
 
 func (m *InterfaceManager) undoSetupProfiles(task *state.Task, tomb *tomb.Tomb) error {
@@ -369,33 +717,79 @@ func (m *InterfaceManager) undoSetupProfiles(task *state.Task, tomb *tomb.Tomb) 
 	if err != nil {
 		return err
 	}
-	snapName := snapsup.InstanceName()
+
+	instanceName := snapsup.InstanceName()
+	if !shouldUndoSetupProfiles(task, instanceName.String()) {
+		logger.Debugf("skipping undo of setup-profiles for task %q", task.ID())
+		return nil
+	}
+
+	// The previous task's undo (link-snap) may have triggered a restart, if this
+	// is the case we can only proceed once the restart has happened or we
+	// may be invoking tools (like apparmor) from the wrong snapd. We set
+	// the default to true as we cannot set it otherwise since the change will
+	// always have been created by the old snapd (that may not have "finish-restart")
+	logger.Debugf("finish restart from undoLinkSnap")
+	finishOpts := snapstate.FinishRestartOptions{
+		// Only default to true for snapd snap
+		FinishRestartDefault: snapsup.Type == snap.TypeSnapd,
+	}
+	if err := snapstateFinishRestart(task, snapsup, finishOpts); err != nil {
+		return err
+	}
+
+	// restore any connection state snapshot saved by refreshAppSetConnections on
+	// the original setup-profiles do path before rebuilding profiles for the old
+	// revision
+	if err := restoreConnectionsForSetupProfiles(task); err != nil {
+		return err
+	}
 
 	// Get the name from SnapSetup and use it to find the current SideInfo
 	// about the snap, if there is one.
 	var snapst snapstate.SnapState
-	err = snapstate.Get(st, snapName, &snapst)
+	err = snapstate.Get(st, instanceName.String(), &snapst)
 	if err != nil && !errors.Is(err, state.ErrNoState) {
 		return err
 	}
 	sideInfo := snapst.CurrentSideInfo()
 	if sideInfo == nil {
 		// The snap was not installed before so undo should remove security profiles.
-		return m.removeProfilesForSnap(task, tomb, snapName, perfTimings)
+		return m.removeProfilesForSnap(task, tomb, instanceName, perfTimings)
 	} else {
 		// The snap was installed before so undo should setup the old security profiles.
-		snapInfo, err := snap.ReadInfo(snapName, sideInfo)
+		snapInfo, err := snap.ReadInfo(instanceName, sideInfo)
 		if err != nil {
 			return err
 		}
-		opts, err := buildConfinementOptions(task.State(), snapInfo, snapst.Flags)
+
+		// When undoing, ignore any component setup data attached to the task and
+		// regenerate profiles based on the components that are currently installed
+		// for this revision.
+		// TODO: The relevant confinement flags (devmode, jailmode and classic)
+		// should be split out into a separate struct here to avoid passing all
+		// of snapst.Flags.
+		// OBS: It's important here that we are passing snapst.Flags
+		// and not snapsup.Flags, as the latter may contain different flags optins that
+		// impact profile generation while we want to be setting up the old profiles
+		// based on the old flags. (Specifically the Classic flag may have changed)
+		opts, err := m.buildConfinementOptions(st, task, snapInfo, snapst.Flags)
 		if err != nil {
 			return err
 		}
-		if err := m.setupProfilesForSnap(task, tomb, snapInfo, opts, perfTimings); err != nil {
+		if err := addImplicitInterfaces(st, snapInfo); err != nil {
 			return err
 		}
-		return setPendingProfilesSideInfo(task.State(), snapName, sideInfo)
+		appSet, err := appSetForSnapRevision(st, snapInfo)
+		if err != nil {
+			return err
+		}
+
+		const canDefer = false
+		if _, err := m.setupProfilesForAppSet(task, appSet, opts, nil, canDefer, perfTimings); err != nil {
+			return err
+		}
+		return setPendingProfilesSideInfo(st, instanceName.String(), appSet)
 	}
 }
 
@@ -412,7 +806,7 @@ func (m *InterfaceManager) doDiscardConns(task *state.Task, _ *tomb.Tomb) error 
 	instanceName := snapSetup.InstanceName()
 
 	var snapst snapstate.SnapState
-	err = snapstate.Get(st, instanceName, &snapst)
+	err = snapstate.Get(st, instanceName.String(), &snapst)
 	if err != nil && !errors.Is(err, state.ErrNoState) {
 		return err
 	}
@@ -464,7 +858,7 @@ func (m *InterfaceManager) undoDiscardConns(task *state.Task, _ *tomb.Tomb) erro
 	return nil
 }
 
-func getDynamicHookAttributes(task *state.Task) (plugAttrs, slotAttrs map[string]interface{}, err error) {
+func getDynamicHookAttributes(task *state.Task) (plugAttrs, slotAttrs map[string]any, err error) {
 	if err = task.Get("plug-dynamic", &plugAttrs); err != nil && !errors.Is(err, state.ErrNoState) {
 		return nil, nil, err
 	}
@@ -472,16 +866,16 @@ func getDynamicHookAttributes(task *state.Task) (plugAttrs, slotAttrs map[string
 		return nil, nil, err
 	}
 	if plugAttrs == nil {
-		plugAttrs = make(map[string]interface{})
+		plugAttrs = make(map[string]any)
 	}
 	if slotAttrs == nil {
-		slotAttrs = make(map[string]interface{})
+		slotAttrs = make(map[string]any)
 	}
 
 	return plugAttrs, slotAttrs, nil
 }
 
-func setDynamicHookAttributes(task *state.Task, plugAttrs, slotAttrs map[string]interface{}) {
+func setDynamicHookAttributes(task *state.Task, plugAttrs, slotAttrs map[string]any) {
 	task.Set("plug-dynamic", plugAttrs)
 	task.Set("slot-dynamic", slotAttrs)
 }
@@ -525,7 +919,7 @@ func (m *InterfaceManager) doConnect(task *state.Task, _ *tomb.Tomb) (err error)
 	connRef := &interfaces.ConnRef{PlugRef: plugRef, SlotRef: slotRef}
 
 	var plugSnapst snapstate.SnapState
-	if err := snapstate.Get(st, plugRef.Snap, &plugSnapst); err != nil {
+	if err := snapstate.Get(st, plugRef.Snap.String(), &plugSnapst); err != nil {
 		if autoConnect && errors.Is(err, state.ErrNoState) {
 			// conflict logic should prevent this
 			return fmt.Errorf("internal error: snap %q is no longer available for auto-connecting", plugRef.Snap)
@@ -534,7 +928,7 @@ func (m *InterfaceManager) doConnect(task *state.Task, _ *tomb.Tomb) (err error)
 	}
 
 	var slotSnapst snapstate.SnapState
-	if err := snapstate.Get(st, slotRef.Snap, &slotSnapst); err != nil {
+	if err := snapstate.Get(st, slotRef.Snap.String(), &slotSnapst); err != nil {
 		if autoConnect && errors.Is(err, state.ErrNoState) {
 			// conflict logic should prevent this
 			return fmt.Errorf("internal error: snap %q is no longer available for auto-connecting", slotRef.Snap)
@@ -548,8 +942,10 @@ func (m *InterfaceManager) doConnect(task *state.Task, _ *tomb.Tomb) (err error)
 		return fmt.Errorf("snap %q has no %q plug", connRef.PlugRef.Snap, connRef.PlugRef.Name)
 	}
 
-	// TODO: should the repo return an app set here?
-	plugAppSet := interfaces.NewSnapAppSet(plug.Snap)
+	plugAppSet, err := appSetForSnapRevision(st, plug.Snap)
+	if err != nil {
+		return fmt.Errorf("building app set for snap %q: %v", plug.Snap.InstanceName(), err)
+	}
 
 	slot := m.repo.Slot(connRef.SlotRef.Snap, connRef.SlotRef.Name)
 	if slot == nil {
@@ -557,8 +953,10 @@ func (m *InterfaceManager) doConnect(task *state.Task, _ *tomb.Tomb) (err error)
 		return fmt.Errorf("snap %q has no %q slot", connRef.SlotRef.Snap, connRef.SlotRef.Name)
 	}
 
-	// TODO: should the repo return an app set here?
-	slotAppSet := interfaces.NewSnapAppSet(slot.Snap)
+	slotAppSet, err := appSetForSnapRevision(st, slot.Snap)
+	if err != nil {
+		return fmt.Errorf("building app set for snap %q: %v", slot.Snap.InstanceName(), err)
+	}
 
 	// attributes are always present, even if there are no hooks (they're initialized by Connect).
 	plugDynamicAttrs, slotDynamicAttrs, err := getDynamicHookAttributes(task)
@@ -572,7 +970,7 @@ func (m *InterfaceManager) doConnect(task *state.Task, _ *tomb.Tomb) (err error)
 	// policy "connection" rules, other auto-connections obey the
 	// "auto-connection" rules
 	if autoConnect && !byGadget {
-		autochecker, err := newAutoConnectChecker(st, task, m.repo, deviceCtx)
+		autochecker, err := newAutoConnectChecker(st, m.repo, deviceCtx)
 		if err != nil {
 			return err
 		}
@@ -606,7 +1004,7 @@ func (m *InterfaceManager) doConnect(task *state.Task, _ *tomb.Tomb) (err error)
 		if err != nil {
 			return err
 		}
-		slotOpts, err := buildConfinementOptions(st, slotSnapInfo, slotSnapst.Flags)
+		slotOpts, err := m.buildConfinementOptions(st, task, slotSnapInfo, slotSnapst.Flags)
 		if err != nil {
 			return err
 		}
@@ -618,7 +1016,7 @@ func (m *InterfaceManager) doConnect(task *state.Task, _ *tomb.Tomb) (err error)
 		if err != nil {
 			return err
 		}
-		plugOpts, err := buildConfinementOptions(st, plugSnapInfo, plugSnapst.Flags)
+		plugOpts, err := m.buildConfinementOptions(st, task, plugSnapInfo, plugSnapst.Flags)
 		if err != nil {
 			return err
 		}
@@ -683,7 +1081,7 @@ func (m *InterfaceManager) doDisconnect(task *state.Task, _ *tomb.Tomb) error {
 	}
 
 	var snapStates []snapstate.SnapState
-	for _, instanceName := range []string{plugRef.Snap, slotRef.Snap} {
+	for _, instanceName := range []string{plugRef.Snap.String(), slotRef.Snap.String()} {
 		var snapst snapstate.SnapState
 		if err := snapstate.Get(st, instanceName, &snapst); err != nil {
 			if errors.Is(err, state.ErrNoState) {
@@ -723,11 +1121,12 @@ func (m *InterfaceManager) doDisconnect(task *state.Task, _ *tomb.Tomb) error {
 			return err
 		}
 
-		// TODO: we do this a lot, would it be possible for something like a
-		// SnapState.CurrentAppSet()?
-		appSet := interfaces.NewSnapAppSet(snapInfo)
+		appSet, err := appSetForSnapRevision(st, snapInfo)
+		if err != nil {
+			return fmt.Errorf("building app set for snap %q: %v", snapInfo.InstanceName(), err)
+		}
 
-		opts, err := buildConfinementOptions(st, snapInfo, snapst.Flags)
+		opts, err := m.buildConfinementOptions(st, task, snapInfo, snapst.Flags)
 		if err != nil {
 			return err
 		}
@@ -804,11 +1203,11 @@ func (m *InterfaceManager) undoDisconnect(task *state.Task, _ *tomb.Tomb) error 
 	}
 
 	var plugSnapst snapstate.SnapState
-	if err := snapstate.Get(st, plugRef.Snap, &plugSnapst); err != nil {
+	if err := snapstate.Get(st, plugRef.Snap.String(), &plugSnapst); err != nil {
 		return err
 	}
 	var slotSnapst snapstate.SnapState
-	if err := snapstate.Get(st, slotRef.Snap, &slotSnapst); err != nil {
+	if err := snapstate.Get(st, slotRef.Snap.String(), &slotSnapst); err != nil {
 		return err
 	}
 
@@ -832,8 +1231,15 @@ func (m *InterfaceManager) undoDisconnect(task *state.Task, _ *tomb.Tomb) error 
 		return fmt.Errorf("snap %q has no %q slot", connRef.SlotRef.Snap, connRef.SlotRef.Name)
 	}
 
-	plugAppSet := interfaces.NewSnapAppSet(plug.Snap)
-	slotAppSet := interfaces.NewSnapAppSet(slot.Snap)
+	plugAppSet, err := appSetForSnapRevision(st, plug.Snap)
+	if err != nil {
+		return fmt.Errorf("building app set for snap %q: %v", plug.Snap.InstanceName(), err)
+	}
+
+	slotAppSet, err := appSetForSnapRevision(st, slot.Snap)
+	if err != nil {
+		return fmt.Errorf("building app set for snap %q: %v", slot.Snap.InstanceName(), err)
+	}
 
 	_, err = m.repo.Connect(connRef, nil, oldconn.DynamicPlugAttrs, nil, oldconn.DynamicSlotAttrs, nil)
 	if err != nil {
@@ -844,7 +1250,7 @@ func (m *InterfaceManager) undoDisconnect(task *state.Task, _ *tomb.Tomb) error 
 	if err != nil {
 		return err
 	}
-	slotOpts, err := buildConfinementOptions(st, slotSnapInfo, slotSnapst.Flags)
+	slotOpts, err := m.buildConfinementOptions(st, task, slotSnapInfo, slotSnapst.Flags)
 	if err != nil {
 		return err
 	}
@@ -856,7 +1262,7 @@ func (m *InterfaceManager) undoDisconnect(task *state.Task, _ *tomb.Tomb) error 
 	if err != nil {
 		return err
 	}
-	plugOpts, err := buildConfinementOptions(st, plugSnapInfo, plugSnapst.Flags)
+	plugOpts, err := m.buildConfinementOptions(st, task, plugSnapInfo, plugSnapst.Flags)
 	if err != nil {
 		return err
 	}
@@ -917,16 +1323,24 @@ func (m *InterfaceManager) undoConnect(task *state.Task, _ *tomb.Tomb) error {
 	if plug == nil {
 		return fmt.Errorf("internal error: snap %q has no %q plug", connRef.PlugRef.Snap, connRef.PlugRef.Name)
 	}
-	plugAppSet := interfaces.NewSnapAppSet(plug.Snap)
+
+	plugAppSet, err := appSetForSnapRevision(st, plug.Snap)
+	if err != nil {
+		return fmt.Errorf("building app set for snap %q: %v", plug.Snap.InstanceName(), err)
+	}
 
 	slot := m.repo.Slot(connRef.SlotRef.Snap, connRef.SlotRef.Name)
 	if slot == nil {
 		return fmt.Errorf("internal error: snap %q has no %q slot", connRef.SlotRef.Snap, connRef.SlotRef.Name)
 	}
-	slotAppSet := interfaces.NewSnapAppSet(slot.Snap)
+
+	slotAppSet, err := appSetForSnapRevision(st, slot.Snap)
+	if err != nil {
+		return fmt.Errorf("building app set for snap %q: %v", slot.Snap.InstanceName(), err)
+	}
 
 	var plugSnapst snapstate.SnapState
-	err = snapstate.Get(st, plugRef.Snap, &plugSnapst)
+	err = snapstate.Get(st, plugRef.Snap.String(), &plugSnapst)
 	if errors.Is(err, state.ErrNoState) {
 		return fmt.Errorf("internal error: snap %q is no longer available", plugRef.Snap)
 	}
@@ -934,7 +1348,7 @@ func (m *InterfaceManager) undoConnect(task *state.Task, _ *tomb.Tomb) error {
 		return err
 	}
 	var slotSnapst snapstate.SnapState
-	err = snapstate.Get(st, slotRef.Snap, &slotSnapst)
+	err = snapstate.Get(st, slotRef.Snap.String(), &slotSnapst)
 	if errors.Is(err, state.ErrNoState) {
 		return fmt.Errorf("internal error: snap %q is no longer available", slotRef.Snap)
 	}
@@ -946,7 +1360,7 @@ func (m *InterfaceManager) undoConnect(task *state.Task, _ *tomb.Tomb) error {
 	if err != nil {
 		return err
 	}
-	slotOpts, err := buildConfinementOptions(st, slotSnapInfo, slotSnapst.Flags)
+	slotOpts, err := m.buildConfinementOptions(st, task, slotSnapInfo, slotSnapst.Flags)
 	if err != nil {
 		return err
 	}
@@ -958,7 +1372,7 @@ func (m *InterfaceManager) undoConnect(task *state.Task, _ *tomb.Tomb) error {
 	if err != nil {
 		return err
 	}
-	plugOpts, err := buildConfinementOptions(st, plugSnapInfo, plugSnapst.Flags)
+	plugOpts, err := m.buildConfinementOptions(st, task, plugSnapInfo, plugSnapst.Flags)
 	if err != nil {
 		return err
 	}
@@ -987,7 +1401,7 @@ func obsoleteCorePhase2SetupProfiles(kind string, task *state.Task) (bool, error
 	return corePhase2, nil
 }
 
-func checkAutoconnectConflicts(st *state.State, autoconnectTask *state.Task, plugSnap, slotSnap string) error {
+func checkAutoconnectConflicts(st *state.State, autoconnectTask *state.Task, plugSnap, slotSnap naming.InstanceName) error {
 	for _, task := range st.Tasks() {
 		if task.Status().Ready() {
 			continue
@@ -1023,10 +1437,10 @@ func checkAutoconnectConflicts(st *state.State, autoconnectTask *state.Task, plu
 			continue
 		}
 
-		otherSnapName := snapsup.InstanceName()
+		otherInstanceName := snapsup.InstanceName()
 
 		// different snaps - no conflict
-		if otherSnapName != plugSnap && otherSnapName != slotSnap {
+		if otherInstanceName != plugSnap && otherInstanceName != slotSnap {
 			continue
 		}
 
@@ -1057,7 +1471,7 @@ func checkAutoconnectConflicts(st *state.State, autoconnectTask *state.Task, plu
 
 			// if snap is getting removed, we will retry but the snap will be gone and auto-connect becomes no-op
 			// if snap is getting installed/refreshed - temporary conflict, retry later
-			return &state.Retry{After: connectRetryTimeout, Reason: fmt.Sprintf("conflicting snap %s with task %q", otherSnapName, k)}
+			return &state.Retry{After: connectRetryTimeout, Reason: fmt.Sprintf("conflicting snap %s with task %q", otherInstanceName, k)}
 		}
 	}
 	return nil
@@ -1078,7 +1492,7 @@ func checkDisconnectConflicts(st *state.State, disconnectingSnap, plugSnap, slot
 			if err != nil {
 				return err
 			}
-			if plugRef.Snap == plugSnap || slotRef.Snap == slotSnap {
+			if plugRef.Snap.String() == plugSnap || slotRef.Snap.String() == slotSnap {
 				return &state.Retry{After: connectRetryTimeout}
 			}
 			continue
@@ -1090,15 +1504,15 @@ func checkDisconnectConflicts(st *state.State, disconnectingSnap, plugSnap, slot
 			continue
 		}
 
-		otherSnapName := snapsup.InstanceName()
+		otherInstanceName := snapsup.InstanceName()
 
 		// different snaps - no conflict
-		if otherSnapName != plugSnap && otherSnapName != slotSnap {
+		if otherInstanceName.String() != plugSnap && otherInstanceName.String() != slotSnap {
 			continue
 		}
 
 		// another task related to same snap op (unrelated op would be blocked by snapstate conflict logic)
-		if otherSnapName == disconnectingSnap {
+		if otherInstanceName.String() == disconnectingSnap {
 			continue
 		}
 
@@ -1125,10 +1539,10 @@ func checkHotplugDisconnectConflicts(st *state.State, plugSnap, slotSnap string)
 			if err != nil {
 				return err
 			}
-			if plugRef.Snap == plugSnap {
+			if plugRef.Snap.String() == plugSnap {
 				return &state.Retry{After: connectRetryTimeout, Reason: fmt.Sprintf("conflicting plug snap %s, task %q", plugSnap, k)}
 			}
-			if slotRef.Snap == slotSnap {
+			if slotRef.Snap.String() == slotSnap {
 				return &state.Retry{After: connectRetryTimeout, Reason: fmt.Sprintf("conflicting slot snap %s, task %q", slotSnap, k)}
 			}
 			continue
@@ -1139,16 +1553,16 @@ func checkHotplugDisconnectConflicts(st *state.State, plugSnap, slotSnap string)
 		if err != nil {
 			continue
 		}
-		otherSnapName := snapsup.InstanceName()
+		otherInstanceName := snapsup.InstanceName()
 
 		// different snaps - no conflict
-		if otherSnapName != plugSnap && otherSnapName != slotSnap {
+		if otherInstanceName.String() != plugSnap && otherInstanceName.String() != slotSnap {
 			continue
 		}
 
 		if k == "link-snap" || k == "setup-profiles" || k == "unlink-snap" {
 			// other snap is getting installed/refreshed/removed - temporary conflict
-			return &state.Retry{After: connectRetryTimeout, Reason: fmt.Sprintf("conflicting snap %s with task %q", otherSnapName, k)}
+			return &state.Retry{After: connectRetryTimeout, Reason: fmt.Sprintf("conflicting snap %s with task %q", otherInstanceName, k)}
 		}
 	}
 	return nil
@@ -1196,13 +1610,13 @@ func waitChainSearch(startT, searchT *state.Task, seenTasks map[string]bool) boo
 // indicate that doConnect handler should not set security backends up
 // because this will be done later by the setup-profiles task.
 func batchConnectTasks(st *state.State, snapsup *snapstate.SnapSetup, conns map[string]*interfaces.ConnRef, connOpts map[string]*connectOpts) (ts *state.TaskSet, hasInterfaceHooks bool, err error) {
-	if len(conns) == 0 {
-		return nil, false, nil
-	}
-
-	setupProfiles := st.NewTask("setup-profiles", fmt.Sprintf(i18n.G("Setup snap %q (%s) security profiles for auto-connections"), snapsup.InstanceName(), snapsup.Revision()))
+	setupProfiles := st.NewTask("setup-profiles",
+		fmt.Sprintf(
+			i18n.G("Setup snap %q (%s) security profiles"),
+			snapsup.InstanceName(), snapsup.Revision()))
 	setupProfiles.Set("snap-setup", snapsup)
 
+	var newConnections []string
 	ts = state.NewTaskSet()
 	for connID, conn := range conns {
 		var opts connectOpts
@@ -1235,10 +1649,20 @@ func batchConnectTasks(st *state.State, snapsup *snapstate.SnapSetup, conns map[
 			afterConnectTask.WaitFor(setupProfiles)
 		}
 		ts.AddAll(connectTs)
+
+		newConnections = append(newConnections, conn.ID())
 	}
+
 	if len(ts.Tasks()) > 0 {
-		ts.AddTask(setupProfiles)
+		sort.Strings(newConnections)
+		setupProfiles.Set("new-connections", newConnections)
 	}
+
+	// always inject setupProfiles, we no longer generate profiles prior to making the
+	// snap available on the system, so we should always make sure to do this after
+	// connections, even if none needs to be made.
+	ts.AddTask(setupProfiles)
+
 	return ts, hasInterfaceHooks, nil
 }
 
@@ -1274,6 +1698,75 @@ func filterForSlot(slot *snap.SlotInfo) func(candSlots []*snap.SlotInfo) []*snap
 	}
 }
 
+// Keep this separate to allow mocking
+var isSnapVerified = func(st *state.State, snapID string) bool {
+	acc, err := assertstate.Publisher(st, snapID)
+	if err != nil {
+		logger.Debugf("cannot retrieve publisher assertion for %q: %v", snapID, err)
+		return false
+	}
+	return acc.Validation() == "verified"
+}
+
+func getAllowOptionAsString(inter string, tr *config.Transaction) (string, error) {
+	var value any
+	option := fmt.Sprintf("interface.%s.allow-auto-connection", inter)
+	err := tr.Get("core", option, &value)
+	if err != nil && !config.IsNoOption(err) {
+		return "", err
+	}
+
+	switch option := value.(type) {
+	case string:
+		return option, nil
+	case bool:
+		return strconv.FormatBool(option), nil
+	}
+	return "", nil
+}
+
+func isSnapSlotAutoConnectAllowed(st *state.State, snapID string, slot *snap.SlotInfo, tr *config.Transaction) (bool, error) {
+	// Until we decide that we want to support other interfaces, do a
+	// quick allow check for x11 only.
+	if slot.Interface != "x11" {
+		return true, nil
+	}
+
+	option, err := getAllowOptionAsString(slot.Interface, tr)
+	if err != nil {
+		return false, err
+	}
+	switch option {
+	case "", "true":
+		return true, nil
+	case "false":
+		return false, nil
+	case "verified":
+		return isSnapVerified(st, snapID), nil
+	}
+	return false, fmt.Errorf(
+		"internal error: invalid allow-auto-connection status %s for %s",
+		option, slot.Snap.RealName)
+}
+
+func filterAllowedAutoConnectionSlots(st *state.State, snapID string, ssi []*snap.SlotInfo) ([]*snap.SlotInfo, error) {
+	var filtered []*snap.SlotInfo
+	tr := config.NewTransaction(st)
+	for _, slot := range ssi {
+		if allowed, err := isSnapSlotAutoConnectAllowed(st, snapID, slot, tr); err != nil {
+			// In case there is any error of filtering auto-connections, assume something is horribly
+			// wrong and return to the default behaviour. However make sure we log this error from the
+			// caller.
+			return ssi, err
+		} else if allowed {
+			filtered = append(filtered, slot)
+		} else {
+			logger.Debugf("slot %v interface %v disallowed auto-connection, skipping connection", slot, slot.Interface)
+		}
+	}
+	return filtered, nil
+}
+
 // doAutoConnect creates task(s) to connect the given snap to viable candidates.
 func (m *InterfaceManager) doAutoConnect(task *state.Task, _ *tomb.Tomb) error {
 	st := task.State()
@@ -1295,22 +1788,25 @@ func (m *InterfaceManager) doAutoConnect(task *state.Task, _ *tomb.Tomb) error {
 		return err
 	}
 
-	// The previous task (link-snap) may have triggered a restart,
-	// if this is the case we can only proceed once the restart
-	// has happened or we may not have all the interfaces of the
-	// new core/base snap.
-	if err := snapstateFinishRestart(task, snapsup); err != nil {
+	// The previous task (link-snap) may have triggered a restart, if this
+	// is the case we can only proceed once the restart has happened or we
+	// may not have all the interfaces of the new core/base snap. We set
+	// the default to true as we always called FinishRestart in older
+	// snapd.
+	logger.Debugf("finish restart from doAutoConnect")
+	if err := snapstateFinishRestart(task, snapsup,
+		snapstate.FinishRestartOptions{FinishRestartDefault: true}); err != nil {
 		return err
 	}
 
-	snapName := snapsup.InstanceName()
+	instanceName := snapsup.InstanceName()
 
-	autochecker, err := newAutoConnectChecker(st, task, m.repo, deviceCtx)
+	autochecker, err := newAutoConnectChecker(st, m.repo, deviceCtx)
 	if err != nil {
 		return err
 	}
 
-	gadgectConnect := newGadgetConnect(st, task, m.repo, snapName, deviceCtx)
+	gadgectConnect := newGadgetConnect(st, task, m.repo, instanceName.String(), deviceCtx)
 
 	// wait for auto-install, started by prerequisites code, for
 	// the default-providers of content ifaces so we can
@@ -1321,7 +1817,7 @@ func (m *InterfaceManager) doAutoConnect(task *state.Task, _ *tomb.Tomb) error {
 	// forcefully wait for defaultProviders; we just retry for
 	// things in the intersection between defaultProviders here and
 	// snaps with not ready link-snap|setup-profiles tasks
-	defaultProviders := snap.DefaultContentProviders(m.repo.Plugs(snapName))
+	defaultProviders := snap.DefaultContentProviders(m.repo.Plugs(instanceName))
 	for _, chg := range st.Changes() {
 		if chg.IsReady() {
 			continue
@@ -1337,7 +1833,7 @@ func (m *InterfaceManager) doAutoConnect(task *state.Task, _ *tomb.Tomb) error {
 				// Only retry if the task that installs the
 				// content provider is not waiting for us
 				// (or this will just hang forever).
-				_, ok := defaultProviders[snapsup.InstanceName()]
+				_, ok := defaultProviders[snapsup.InstanceName().String()]
 				if ok && !inSameChangeWaitChain(task, t) {
 					return &state.Retry{After: contentLinkRetryTimeout}
 				}
@@ -1345,8 +1841,8 @@ func (m *InterfaceManager) doAutoConnect(task *state.Task, _ *tomb.Tomb) error {
 		}
 	}
 
-	plugs := m.repo.Plugs(snapName)
-	slots := m.repo.Slots(snapName)
+	plugs := m.repo.Plugs(instanceName)
+	slots := m.repo.Slots(instanceName)
 	newconns := make(map[string]*interfaces.ConnRef, len(plugs)+len(slots))
 	var connOpts map[string]*connectOpts
 
@@ -1372,16 +1868,26 @@ func (m *InterfaceManager) doAutoConnect(task *state.Task, _ *tomb.Tomb) error {
 		}
 	}
 
-	// Auto-connect all the plugs
+	// Auto-connect all the plugs unless specifically disallowed
+	checkAutoConnectAllowed := func(css []*snap.SlotInfo) []*snap.SlotInfo {
+		filtered, err := filterAllowedAutoConnectionSlots(st, snapsup.SideInfo.SnapID, css)
+		if err != nil {
+			// Log the error that we failed to filter out the auto-connections. We do not
+			// want to mess up auto-connections because we failed this 'opt-in' support.
+			task.Logf("failed to filter auto-connection slots: %v", err)
+		}
+		return filtered
+	}
+
 	cannotAutoConnectLog := func(plug *snap.PlugInfo, candRefs []string) string {
 		return fmt.Sprintf("cannot auto-connect plug %s, candidates found: %s", plug, strings.Join(candRefs, ", "))
 	}
-	if err := autochecker.addAutoConnections(newconns, plugs, nil, conns, cannotAutoConnectLog, conflictError); err != nil {
+	if err := autochecker.addAutoConnections(task, newconns, plugs, checkAutoConnectAllowed, conns, cannotAutoConnectLog, conflictError); err != nil {
 		return err
 	}
 	// Auto-connect all the slots
 	for _, slot := range slots {
-		candidates := m.repo.AutoConnectCandidatePlugs(snapName, slot.Name, autochecker.check)
+		candidates := m.repo.AutoConnectCandidatePlugs(instanceName, slot.Name, autochecker.check)
 		if len(candidates) == 0 {
 			continue
 		}
@@ -1389,11 +1895,10 @@ func (m *InterfaceManager) doAutoConnect(task *state.Task, _ *tomb.Tomb) error {
 		cannotAutoConnectLog := func(plug *snap.PlugInfo, candRefs []string) string {
 			return fmt.Sprintf("cannot auto-connect slot %s to plug %s, candidates found: %s", slot, plug, strings.Join(candRefs, ", "))
 		}
-		if err := autochecker.addAutoConnections(newconns, candidates, filterForSlot(slot), conns, cannotAutoConnectLog, conflictError); err != nil {
+		if err := autochecker.addAutoConnections(task, newconns, candidates, filterForSlot(slot), conns, cannotAutoConnectLog, conflictError); err != nil {
 			return err
 		}
 	}
-
 	autots, hasInterfaceHooks, err := batchConnectTasks(st, snapsup, newconns, connOpts)
 	if err != nil {
 		return err
@@ -1416,7 +1921,7 @@ func (m *InterfaceManager) doAutoConnect(task *state.Task, _ *tomb.Tomb) error {
 					return fmt.Errorf("internal error: unexpected state of mark-preseeded task: %s", markPreseeded.Status())
 				}
 
-				firstTaskAfterBoot, err := firstTaskAfterBootWhenPreseeding(snapsup.InstanceName(), markPreseeded)
+				firstTaskAfterBoot, err := firstTaskAfterBootWhenPreseeding(snapsup.InstanceName().String(), markPreseeded)
 				if err != nil {
 					return err
 				}
@@ -1438,11 +1943,14 @@ func (m *InterfaceManager) doAutoConnect(task *state.Task, _ *tomb.Tomb) error {
 
 	if autots != nil && len(autots.Tasks()) > 0 {
 		snapstate.InjectTasks(task, autots)
-
 		st.EnsureBefore(0)
 	}
 
 	task.SetStatus(state.DoneStatus)
+
+	// Inject fault after the state is set to done
+	osutil.MaybeInjectFault("after-auto-connect")
+
 	return nil
 }
 
@@ -1457,17 +1965,17 @@ func (m *InterfaceManager) doAutoDisconnect(task *state.Task, _ *tomb.Tomb) erro
 		return err
 	}
 
-	snapName := snapsup.InstanceName()
-	connections, err := m.repo.Connections(snapName)
+	instanceName := snapsup.InstanceName()
+	connections, err := m.repo.Connections(instanceName)
 	if err != nil {
 		return err
 	}
 
 	// check for conflicts on all connections first before creating disconnect hooks
 	for _, connRef := range connections {
-		if err := checkDisconnectConflicts(st, snapName, connRef.PlugRef.Snap, connRef.SlotRef.Snap); err != nil {
+		if err := checkDisconnectConflicts(st, instanceName.String(), connRef.PlugRef.Snap.String(), connRef.SlotRef.Snap.String()); err != nil {
 			if _, retry := err.(*state.Retry); retry {
-				logger.Debugf("disconnecting interfaces of snap %q will be retried because of %q - %q conflict", snapName, connRef.PlugRef.Snap, connRef.SlotRef.Snap)
+				logger.Debugf("disconnecting interfaces of snap %q will be retried because of %q - %q conflict", instanceName, connRef.PlugRef.Snap, connRef.SlotRef.Snap)
 				task.Logf("Waiting for conflicting change in progress...")
 				return err // will retry
 			}
@@ -1484,7 +1992,11 @@ func (m *InterfaceManager) doAutoDisconnect(task *state.Task, _ *tomb.Tomb) erro
 		// "auto-disconnect" flag indicates it's a disconnect triggered as part of snap removal, in which
 		// case we want to skip the logic of marking auto-connections as 'undesired' and instead just remove
 		// them so they can be automatically connected if the snap is installed again.
-		ts, err := disconnectTasks(st, conn, disconnectOpts{AutoDisconnect: true})
+		ts, err := disconnectTasks(st, conn, disconnectOpts{
+			AutoDisconnect: true,
+			// Ignore errors from disconnect hooks.
+			IgnoreHookError: true,
+		})
 		if err != nil {
 			return err
 		}
@@ -1508,7 +2020,7 @@ func (m *InterfaceManager) undoAutoConnect(task *state.Task, _ *tomb.Tomb) error
 // from oldName to newName. Note that this is only useful when you
 // know that newName supports everything that oldName supports,
 // otherwise you will be in a world of pain.
-func (m *InterfaceManager) transitionConnectionsCoreMigration(st *state.State, oldName, newName string) error {
+func (m *InterfaceManager) transitionConnectionsCoreMigration(st *state.State, oldName, newName naming.InstanceName) error {
 	// transition over, ubuntu-core has only slots
 	conns, err := getConns(st)
 	if err != nil {
@@ -1539,7 +2051,7 @@ func (m *InterfaceManager) transitionConnectionsCoreMigration(st *state.State, o
 	// on disk are rewritten. This is ok because core/ubuntu-core have
 	// exactly the same profiles and nothing in the generated policies
 	// has the core snap-name encoded.
-	if _, err := m.reloadConnections(newName); err != nil {
+	if _, _, err := m.reloadConnections(newName); err != nil {
 		return err
 	}
 
@@ -1551,7 +2063,7 @@ func (m *InterfaceManager) doTransitionUbuntuCore(t *state.Task, _ *tomb.Tomb) e
 	st.Lock()
 	defer st.Unlock()
 
-	var oldName, newName string
+	var oldName, newName naming.InstanceName
 	if err := t.Get("old-name", &oldName); err != nil {
 		return err
 	}
@@ -1568,7 +2080,7 @@ func (m *InterfaceManager) undoTransitionUbuntuCore(t *state.Task, _ *tomb.Tomb)
 	defer st.Unlock()
 
 	// symmetrical to the "do" method, just reverse them again
-	var oldName, newName string
+	var oldName, newName naming.InstanceName
 	if err := t.Get("old-name", &oldName); err != nil {
 		return err
 	}
@@ -1626,7 +2138,7 @@ func (m *InterfaceManager) doHotplugConnect(task *state.Task, _ *tomb.Tomb) erro
 		conn := conns[id]
 		// device was not unplugged, this is the case if snapd is restarted and we enumerate devices.
 		// note, the situation where device was not unplugged but has changed is handled
-		// by hotlugDeviceAdded handler - updateDevice.
+		// by hotplugDeviceAdded handler - updateDevice.
 		if !conn.HotplugGone || conn.Undesired {
 			continue
 		}
@@ -1645,7 +2157,7 @@ func (m *InterfaceManager) doHotplugConnect(task *state.Task, _ *tomb.Tomb) erro
 	}
 
 	// find new auto-connections
-	autochecker, err := newAutoConnectChecker(st, task, m.repo, deviceCtx)
+	autochecker, err := newAutoConnectChecker(st, m.repo, deviceCtx)
 	if err != nil {
 		return err
 	}
@@ -1658,7 +2170,7 @@ func (m *InterfaceManager) doHotplugConnect(task *state.Task, _ *tomb.Tomb) erro
 	cannotAutoConnectLog := func(plug *snap.PlugInfo, candRefs []string) string {
 		return fmt.Sprintf("cannot auto-connect hotplug slot %s to plug %s, candidates found: %s", slot, plug, strings.Join(candRefs, ", "))
 	}
-	if err := autochecker.addAutoConnections(newconns, candidates, filterForSlot(slot), conns, cannotAutoConnectLog, conflictError); err != nil {
+	if err := autochecker.addAutoConnections(task, newconns, candidates, filterForSlot(slot), conns, cannotAutoConnectLog, conflictError); err != nil {
 		return err
 	}
 
@@ -1707,7 +2219,7 @@ func (m *InterfaceManager) doHotplugUpdateSlot(task *state.Task, _ *tomb.Tomb) e
 		return fmt.Errorf("internal error: cannot get hotplug task attributes: %s", err)
 	}
 
-	var attrs map[string]interface{}
+	var attrs map[string]any
 	if err := task.Get("slot-attrs", &attrs); err != nil {
 		return fmt.Errorf("internal error: cannot get slot-attrs attribute for device %s, interface %s: %s", hotplugKey, ifaceName, err)
 	}
@@ -1806,7 +2318,7 @@ func (m *InterfaceManager) doHotplugDisconnect(task *state.Task, _ *tomb.Tomb) e
 
 	// check for conflicts on all connections first before creating disconnect hooks
 	for _, connRef := range connections {
-		if err := checkHotplugDisconnectConflicts(st, connRef.PlugRef.Snap, connRef.SlotRef.Snap); err != nil {
+		if err := checkHotplugDisconnectConflicts(st, connRef.PlugRef.Snap.String(), connRef.SlotRef.Snap.String()); err != nil {
 			if retry, ok := err.(*state.Retry); ok {
 				task.Logf("Waiting for conflicting change in progress: %s", retry.Reason)
 				return err // will retry
@@ -1958,5 +2470,310 @@ func (m *InterfaceManager) doHotplugSeqWait(task *state.Task, _ *tomb.Tomb) erro
 	}
 
 	// no conflicting change for same hotplug key found
+	return nil
+}
+
+func (m *InterfaceManager) doRegenerateAllSecurityProfiles(task *state.Task, _ *tomb.Tomb) error {
+	st := task.State()
+
+	st.Lock()
+	defer st.Unlock()
+
+	perfTimings := state.TimingsForTask(task)
+	defer perfTimings.Save(task.State())
+
+	// the reported system key change may have an effect on the security
+	// backends, give them a chance to update their view of the system
+	if err := m.reinitializeBackends(perfTimings); err != nil {
+		return err
+	}
+
+	// regenerating and reloading profiles is time consuming, so allow unlocking
+	// of state for the duration of security backend operations
+	const unlockState = true
+	return m.regenerateAllSecurityProfiles(perfTimings, unlockState)
+}
+
+// DelayedBackendEffectsFor queues delayed backend effects for a bunch of
+// consumer snaps that were triggered by the provided provider snap.
+func DelayedBackendEffectsFor(deferTask *state.Task, snapWithSlot triggeringSnap, newDelayedSnapsWork delayedEffectsForSnaps) error {
+	scheduledDelayedEffects, err := getDelayedEffectsForSnaps(deferTask)
+	if err != nil {
+		return err
+	}
+
+	if scheduledDelayedEffects.TriggeringSnaps == nil {
+		scheduledDelayedEffects.TriggeringSnaps = make(map[triggeringSnap]delayedEffectsForSnaps)
+	}
+
+	forSnap := scheduledDelayedEffects.TriggeringSnaps[snapWithSlot]
+
+	if forSnap == nil {
+		forSnap = newDelayedEffectsForSnaps()
+	}
+
+	// if there's already some work, merge new things
+	for sn := range newDelayedSnapsWork {
+		if len(forSnap[sn]) == 0 {
+			forSnap[sn] = make(map[interfaces.SecuritySystem][]interfaces.DelayedSideEffect, len(newDelayedSnapsWork[sn]))
+		}
+
+		for b := range newDelayedSnapsWork[sn] {
+			forSnap[sn][b] = append(forSnap[sn][b], newDelayedSnapsWork[sn][b]...)
+		}
+	}
+
+	scheduledDelayedEffects.TriggeringSnaps[snapWithSlot] = forSnap
+	deferTask.Set("delayed-effects-for-snaps", scheduledDelayedEffects)
+
+	return nil
+}
+
+// getDelayedEffectsForSnaps returns delayed backend effects.
+func getDelayedEffectsForSnaps(deferTask *state.Task) (delayed delayedEffects, err error) {
+	if err := deferTask.Get("delayed-effects-for-snaps", &delayed); err != nil && !errors.Is(err, state.ErrNoState) {
+		return delayedEffects{}, err
+	}
+	return delayed, nil
+}
+
+var delayedEffectsCoordinationRetryTimeout = time.Second / 2
+
+func (m *InterfaceManager) doProcessDelayedSecurityBackendEffects(task *state.Task, _ *tomb.Tomb) error {
+	// Single catch all task handler for all delayed side effects for snaps.
+	// Looks through all the tasks to identify which snaps are affected, and
+	// whether the snaps that triggered the side effect were successfully
+	// processed. Then schedules new tasks, one for each affected snap to apply
+	// its queued effects.
+
+	st := task.State()
+
+	st.Lock()
+	defer st.Unlock()
+
+	var snapLanes []int
+	var applyInLane int
+
+	if err := task.Get("monitored-lanes", &snapLanes); err != nil && !errors.Is(err, state.ErrNoState) {
+		return err
+	}
+	if err := task.Get("apply-in-lane", &applyInLane); err != nil && !errors.Is(err, state.ErrNoState) {
+		return err
+	}
+
+	logger.Debugf("delayed effects coordination, monitoring lanes: %v", snapLanes)
+
+	if len(snapLanes) == 0 {
+		task.SetStatus(state.DoneStatus)
+		return nil
+	}
+
+	// We are going to apply the effects only for triggering snaps in lanes
+	// which were fully successful. Depending on the scenario there could be one
+	// or more snaps in the lane. Before we start doing any work, all lanes must
+	// have completed.
+	successfulTriggeringSnaps := map[triggeringSnap]bool{}
+	chg := task.Change()
+	considerRestartTriggeringTasks := make(map[string]bool, len(chg.Tasks()))
+
+	unreadyTasks := false
+	for _, lane := range snapLanes {
+		laneFailed := false
+		var seenSnaps []string
+		for _, tsk := range chg.LaneTasks(lane) {
+			considerRestartTriggeringTasks[tsk.ID()] = true
+			switch {
+			case tsk.ID() == task.ID():
+				// our task should only be present in the default '0' lane, not
+				// a dedicated one, unless we're part of a all-snap transaction
+				// which already runs in a dedicated lane
+				if lanes := tsk.Lanes(); len(lanes) >= 2 || (len(lanes) == 1 && lanes[0] != applyInLane) {
+					logger.Noticef("process delayed effects in unexpected lanes: %v", lanes)
+				}
+				delete(considerRestartTriggeringTasks, tsk.ID())
+				continue
+			case tsk.Kind() == "check-rerefresh":
+				// same thing applies to check-rerefresh, although lane
+				// verification should be done in snapstate
+				delete(considerRestartTriggeringTasks, tsk.ID())
+				continue
+			case !tsk.Status().Ready():
+				// Continue iterating to collect all task IDs for restart checking
+				unreadyTasks = true
+			case tsk.Status() != state.DoneStatus:
+				laneFailed = true
+				// keep scanning the lane even after it has failed so restart
+				// detection still sees later wait-for-restart tasks in the same
+				// transactional lane.
+				continue
+			case tsk.Kind() == "link-snap":
+				sup, err := snapstate.TaskSnapSetup(tsk)
+				if err != nil {
+					return fmt.Errorf("internal error: task snap setup not found through link-snap task")
+				}
+				seenSnaps = append(seenSnaps, sup.InstanceName().String())
+			}
+		}
+		if laneFailed {
+			logger.Debugf("lane %v failed", lane)
+		} else {
+			for _, seenSnap := range seenSnaps {
+				successfulTriggeringSnaps[triggeringSnap(seenSnap)] = true
+			}
+		}
+	}
+
+	if unreadyTasks {
+		if restart.PendingForChangeTasks(st, chg, considerRestartTriggeringTasks) {
+			// Tasks in monitored lanes may have requested a restart, in which case we
+			// must put ourselves into the waiting state.
+			return restart.TaskWaitForRestart(task)
+		}
+
+		return &state.Retry{After: delayedEffectsCoordinationRetryTimeout, Reason: "pending snap work"}
+	}
+
+	delayed, err := getDelayedEffectsForSnaps(task)
+	if err != nil {
+		return err
+	}
+
+	if len(delayed.TriggeringSnaps) == 0 {
+		return nil
+	}
+
+	// delayed effects are grouped by snap providing the slot, regroup them by
+	// the affected snap only of the snap that triggered it has been successfully
+	// processed
+	snapsWithDelayedEffects := newDelayedEffectsForSnaps()
+	for triggeredBySnap, affectedSnaps := range delayed.TriggeringSnaps {
+		if _, ok := successfulTriggeringSnaps[triggeredBySnap]; !ok {
+			logger.Noticef("skipping effects triggered by failed snap %q", triggeredBySnap)
+			continue
+		}
+
+		for affected, perBackendEffects := range affectedSnaps {
+			alreadyCollected := snapsWithDelayedEffects[affected]
+			if alreadyCollected == nil {
+				alreadyCollected = make(map[interfaces.SecuritySystem][]interfaces.DelayedSideEffect)
+			}
+
+			for b, items := range perBackendEffects {
+				alreadyCollected[b] = append(alreadyCollected[b], items...)
+			}
+
+			snapsWithDelayedEffects[affected] = alreadyCollected
+		}
+	}
+
+	var perSnapTasks []*state.Task
+	for affectedSnap, backendEffects := range snapsWithDelayedEffects {
+		if len(backendEffects) == 0 {
+			// unlikely
+			continue
+		}
+
+		logger.Noticef("scheduling delayed effects for snap %q", affectedSnap)
+
+		// One task per connected snap instance
+		updateTask := st.NewTask("apply-delayed-snap-security-backend-effects",
+			fmt.Sprintf("Apply delayed security backend side effects for snap %q", affectedSnap))
+		updateTask.Set("effects-data", delayedEffectsForSnapData{
+			AffectedSnapInstance: affectedSnap,
+			Effects:              backendEffects,
+		})
+
+		perSnapTasks = append(perSnapTasks, updateTask)
+	}
+
+	if len(perSnapTasks) > 0 {
+		// unless apply-in-lane is set to a non-0 value indicating an all-snap
+		// transaction, place each task in a dedicated lane, such that their
+		// errors are not affecting anything else (neither the default lane, nor
+		// any other lanes where the triggering snaps are being processed)
+
+		for _, tsk := range perSnapTasks {
+			if applyInLane != 0 {
+				tsk.JoinLane(applyInLane)
+			} else {
+				tsk.JoinLane(st.NewLane())
+			}
+		}
+
+		ts := state.NewTaskSet(perSnapTasks...)
+		ts.WaitFor(task)
+		task.Change().AddAll(ts)
+	}
+
+	// Update the status before we unlock
+	task.SetStatus(state.DoneStatus)
+
+	return nil
+}
+
+type delayedEffectsForSnapData struct {
+	AffectedSnapInstance affectedSnap                                                 `json:"affected-snap-instance"`
+	Effects              map[interfaces.SecuritySystem][]interfaces.DelayedSideEffect `json:"effects"`
+}
+
+func (m *InterfaceManager) doApplyDelayedSnapSecurityBackendEffects(task *state.Task, _ *tomb.Tomb) error {
+	// Process and apply delayed effects to a snap
+
+	st := task.State()
+
+	st.Lock()
+	defer st.Unlock()
+
+	perfTimings := state.TimingsForTask(task)
+	defer perfTimings.Save(task.State())
+
+	var effectsData delayedEffectsForSnapData
+	if err := task.Get("effects-data", &effectsData); err != nil {
+		return err
+	}
+
+	instanceName := string(effectsData.AffectedSnapInstance)
+	delayed := effectsData.Effects
+	logger.Debugf("delayed update for snap %v, effects %v", instanceName, delayed)
+
+	// Get the snap state to build an app set
+	var snapst snapstate.SnapState
+	if err := snapstate.Get(st, instanceName, &snapst); err != nil {
+		return err
+	}
+
+	// Get the current snap info
+	snapInfo, err := snapst.CurrentInfo()
+	if err != nil {
+		return err
+	}
+
+	// Add implicit interfaces if needed
+	if err := addImplicitInterfaces(st, snapInfo); err != nil {
+		return err
+	}
+
+	// Build an app set for the current snap revision
+	appSet, err := appSetForSnapRevision(st, snapInfo)
+	if err != nil {
+		return fmt.Errorf("building app set for snap %q: %v", instanceName, err)
+	}
+
+	// Unlock state for the duration of security backend operations
+	st.Unlock()
+	defer st.Lock()
+
+	// Call SetupDelayed on each backend
+	for _, backend := range m.repo.Backends() {
+		effects := delayed[backend.Name()]
+		if len(effects) == 0 {
+			continue
+		}
+
+		if err := interfaces.ApplyDelayedEffects(m.repo, backend, appSet, effects, perfTimings); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }

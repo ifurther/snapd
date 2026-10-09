@@ -21,10 +21,10 @@
 package install
 
 import (
-	"github.com/snapcore/snapd/boot"
-	"github.com/snapcore/snapd/kernel/fde"
+	"context"
+
+	"github.com/snapcore/snapd/gadget/device"
 	"github.com/snapcore/snapd/secboot"
-	"github.com/snapcore/snapd/secboot/keys"
 	"github.com/snapcore/snapd/testutil"
 )
 
@@ -33,15 +33,17 @@ var (
 	NewEncryptedDeviceLUKS = newEncryptedDeviceLUKS
 )
 
-func MockSecbootFormatEncryptedDevice(f func(key keys.EncryptionKey, encType secboot.EncryptionType, label, node string) error) (restore func()) {
+func MockSecbootFormatEncryptedDevice(f func(key []byte, encType device.EncryptionType, label, node string) error) (restore func()) {
 	r := testutil.Backup(&secbootFormatEncryptedDevice)
 	secbootFormatEncryptedDevice = f
 	return r
 
 }
 
-func MockBootRunFDESetupHook(f func(req *fde.SetupRequest) ([]byte, error)) (restore func()) {
-	r := testutil.Backup(&boot.RunFDESetupHook)
-	boot.RunFDESetupHook = f
-	return r
+func MockSecbootNewSimpleActivateContext(f func(ctx context.Context) (secboot.ActivateContext, error)) (restore func()) {
+	return testutil.Mock(&secbootNewSimpleActivateContext, f)
+}
+
+func MockSecbootUnlockEncryptedVolumeUsingKey(f func(activation secboot.ActivateContext, devNode string, name string, key []byte) (secboot.StorageContainer, error)) (restore func()) {
+	return testutil.Mock(&secbootUnlockEncryptedVolumeUsingKey, f)
 }

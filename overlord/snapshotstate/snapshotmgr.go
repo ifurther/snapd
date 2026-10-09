@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/tomb.v2"
@@ -31,6 +32,7 @@ import (
 	"github.com/snapcore/snapd/client"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/logger"
+	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/overlord/configstate/config"
 	"github.com/snapcore/snapd/overlord/snapshotstate/backend"
 	"github.com/snapcore/snapd/overlord/snapstate"
@@ -51,11 +53,13 @@ var (
 	backendRevert        = (*backend.RestoreState).Revert // ditto
 	backendCleanup       = (*backend.RestoreState).Cleanup
 
-	backendCleanupAbandondedImports = backend.CleanupAbandondedImports
+	backendCleanupAbandonedImports = backend.CleanupAbandonedImports
 
 	autoExpirationInterval = time.Hour * 24 // interval between forgetExpiredSnapshots runs as part of Ensure()
 
 	getSnapDirOpts = snapstate.GetSnapDirOpts
+
+	backendMapSnapDataDirToSnapVar = backend.MapSnapDataDirToSnapVar
 )
 
 // SnapshotManager takes snapshots of active snaps
@@ -94,7 +98,7 @@ func (mgr *SnapshotManager) Ensure() error {
 }
 
 func (mgr *SnapshotManager) StartUp() error {
-	if _, err := backendCleanupAbandondedImports(); err != nil {
+	if _, err := backendCleanupAbandonedImports(); err != nil {
 		logger.Noticef("cannot cleanup incomplete imports: %v", err)
 	}
 	return nil
@@ -175,7 +179,7 @@ type snapshotSetup struct {
 func filename(setID uint64, si *snap.Info) string {
 	skel := &client.Snapshot{
 		SetID:    setID,
-		Snap:     si.InstanceName(),
+		Snap:     si.InstanceName().String(),
 		Revision: si.Revision,
 		Version:  si.Version,
 	}
@@ -184,7 +188,7 @@ func filename(setID uint64, si *snap.Info) string {
 
 // prepareSave does all the steps of doSave that require the state lock;
 // it has no real significance beyond making the lock handling simpler
-func prepareSave(task *state.Task) (snapshot *snapshotSetup, cur *snap.Info, cfg map[string]interface{}, err error) {
+func prepareSave(task *state.Task) (snapshot *snapshotSetup, cur *snap.Info, cfg map[string]any, err error) {
 	st := task.State()
 	st.Lock()
 	defer st.Unlock()
@@ -219,6 +223,7 @@ func prepareSave(task *state.Task) (snapshot *snapshotSetup, cur *snap.Info, cfg
 	return snapshot, cur, cfg, nil
 }
 
+// Expects that the snap's applications and services are not running.
 func doSave(task *state.Task, tomb *tomb.Tomb) error {
 	snapshot, cur, cfg, err := prepareSave(task)
 	if err != nil {
@@ -233,6 +238,9 @@ func doSave(task *state.Task, tomb *tomb.Tomb) error {
 		return err
 	}
 
+	if err := snapshot.excludeMountPoints(cur, opts); err != nil {
+		logger.Noticef("cannot exclude mount points: %v", err)
+	}
 	_, err = backendSave(tomb.Context(nil), snapshot.SetID, cur, cfg, snapshot.Users, snapshot.Options, opts)
 	if err != nil {
 		st.Lock()
@@ -242,9 +250,66 @@ func doSave(task *state.Task, tomb *tomb.Tomb) error {
 	return err
 }
 
+// mapMountPointsInDataDirsToExcludes converts absolute mount point paths
+// for a snap to $SNAP_DATA, $SNAP_COMMON, $SNAP_USER_DATA or $SNAP_USER_COMMON
+// patterns suitable for SnapshotOptions.Exclude. If a non-empty users slice
+// is provided, only those users directories are considered, otherwise all users
+// are considered for an empty users slice. Paths outside the snap's data
+// directories are skipped because they are not included in the snapshot.
+func mapMountPointsInDataDirsToExcludes(si *snap.Info, opts *dirs.SnapDirOptions, users []string, miEntries []*osutil.MountInfoEntry) ([]string, error) {
+	mappings, err := backendMapSnapDataDirToSnapVar(si, opts, users)
+	if err != nil {
+		return nil, err
+	}
+
+	var excludes []string
+	for _, e := range miEntries {
+		where := strings.TrimRight(e.MountDir, "/")
+		// The map iteration order does not matter here:
+		// the snap data directories are mutually exclusive, so at most one
+		// entry can match given mount point. The order of the returned excludes
+		// follows the order of miEntries.
+		for snapDataDir, snapVar := range mappings {
+			if where == snapDataDir {
+				// The mount point is exactly over a snap data directory, so
+				// the whole directory is excluded from the snapshot.
+				excludes = append(excludes, snapVar)
+				break
+			} else if strings.HasPrefix(where, snapDataDir+"/") {
+				excludes = append(excludes, snapVar+where[len(snapDataDir):])
+				break
+			}
+		}
+	}
+	return excludes, nil
+}
+
+// excludeMountPoints appends any currently active mount points under the
+// snap's data directories to s.Options.
+func (s *snapshotSetup) excludeMountPoints(si *snap.Info, opts *dirs.SnapDirOptions) error {
+	entries, err := osutil.LoadMountInfo()
+	if err != nil {
+		return fmt.Errorf("cannot load mount info: %v", err)
+	}
+	excludes, err := mapMountPointsInDataDirsToExcludes(si, opts, s.Users, entries)
+	if err != nil {
+		return fmt.Errorf("cannot map mount points to excludes: %v", err)
+	}
+	if len(excludes) == 0 {
+		return nil
+	}
+	if s.Options == nil {
+		s.Options = &snap.SnapshotOptions{}
+	}
+	if err := s.Options.MergeDynamicExcludes(excludes); err != nil {
+		return fmt.Errorf("internal error: cannot add mount point excludes for %q: %v", si.InstanceName(), err)
+	}
+	return nil
+}
+
 // prepareRestore does the steps of doRestore that require the state lock
 // before the backend Restore call.
-func prepareRestore(task *state.Task) (snapshot *snapshotSetup, oldCfg map[string]interface{}, reader *backend.Reader, err error) {
+func prepareRestore(task *state.Task) (snapshot *snapshotSetup, oldCfg map[string]any, reader *backend.Reader, err error) {
 	st := task.State()
 
 	st.Lock()
@@ -269,7 +334,7 @@ func prepareRestore(task *state.Task) (snapshot *snapshotSetup, oldCfg map[strin
 
 // marshalSnapConfig encodes cfg to JSON and returns raw JSON message, unless
 // cfg is nil - in this case nil is returned.
-func marshalSnapConfig(cfg map[string]interface{}) (*json.RawMessage, error) {
+func marshalSnapConfig(cfg map[string]any) (*json.RawMessage, error) {
 	if cfg == nil {
 		// do not marshal nil - this would result in "null" raw message which
 		// we want to avoid.
@@ -283,12 +348,12 @@ func marshalSnapConfig(cfg map[string]interface{}) (*json.RawMessage, error) {
 	return raw, err
 }
 
-func unmarshalSnapConfig(st *state.State, snapName string) (map[string]interface{}, error) {
+func unmarshalSnapConfig(st *state.State, snapName string) (map[string]any, error) {
 	rawCfg, err := configGetSnapConfig(st, snapName)
 	if err != nil {
 		return nil, fmt.Errorf("internal error: cannot obtain current snap config: %v", err)
 	}
-	var cfg map[string]interface{}
+	var cfg map[string]any
 	if rawCfg != nil {
 		if err := json.Unmarshal(*rawCfg, &cfg); err != nil {
 			return nil, fmt.Errorf("internal error: cannot decode current snap config: %v", err)
@@ -297,6 +362,7 @@ func unmarshalSnapConfig(st *state.State, snapName string) (map[string]interface
 	return cfg, nil
 }
 
+// Expects that the snap's applications and services are not running.
 func doRestore(task *state.Task, tomb *tomb.Tomb) error {
 	snapshot, oldCfg, reader, err := prepareRestore(task)
 	if err != nil {
@@ -305,7 +371,7 @@ func doRestore(task *state.Task, tomb *tomb.Tomb) error {
 	defer reader.Close()
 
 	st := task.State()
-	logf := func(format string, args ...interface{}) {
+	logf := func(format string, args ...any) {
 		st.Lock()
 		defer st.Unlock()
 		task.Logf(format, args...)
@@ -343,6 +409,7 @@ func doRestore(task *state.Task, tomb *tomb.Tomb) error {
 	return nil
 }
 
+// Expects that the snap's applications and services are not running.
 func undoRestore(task *state.Task, _ *tomb.Tomb) error {
 	var restoreState backend.RestoreState
 	var snapshot snapshotSetup
@@ -468,7 +535,7 @@ func delayedCrossMgrInit() {
 	snapstate.EstimateSnapshotSize = EstimateSnapshotSize
 }
 
-func MockBackendSave(f func(context.Context, uint64, *snap.Info, map[string]interface{}, []string, *snap.SnapshotOptions, *dirs.SnapDirOptions) (*client.Snapshot, error)) (restore func()) {
+func MockBackendSave(f func(context.Context, uint64, *snap.Info, map[string]any, []string, *snap.SnapshotOptions, *dirs.SnapDirOptions) (*client.Snapshot, error)) (restore func()) {
 	old := backendSave
 	backendSave = f
 	return func() {

@@ -21,7 +21,7 @@ package strace_test
 
 import (
 	"os"
-	"os/user"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -29,6 +29,7 @@ import (
 
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/osutil/strace"
+	"github.com/snapcore/snapd/osutil/user"
 	"github.com/snapcore/snapd/testutil"
 )
 
@@ -58,84 +59,99 @@ func (s *straceSuite) TearDownTest(c *C) {
 }
 
 func (s *straceSuite) TestStraceCommandHappy(c *C) {
-	u, err := user.Current()
-	c.Assert(err, IsNil)
-
-	cmd, err := strace.Command(nil, "foo")
+	cmd, err := strace.Command(nil)
 	c.Assert(err, IsNil)
 	c.Assert(cmd.Path, Equals, s.mockSudo.Exe())
 	c.Assert(cmd.Args, DeepEquals, []string{
-		s.mockSudo.Exe(), "-E",
-		s.mockStrace.Exe(), "-u", u.Username, "-f",
+		s.mockSudo.Exe(), "--",
+		s.mockStrace.Exe(),
+		"-f",
 		"-e", strace.ExcludedSyscalls,
-		// the command
-		"foo",
+	})
+
+	cmd, err = strace.CommandWithTraceePid(123, nil)
+	c.Assert(err, IsNil)
+	c.Assert(cmd.Path, Equals, s.mockSudo.Exe())
+	c.Assert(cmd.Args, DeepEquals, []string{
+		s.mockSudo.Exe(), "--",
+		s.mockStrace.Exe(),
+		"-f",
+		"-e", strace.ExcludedSyscalls,
+		"-p", "123",
 	})
 }
 
 func (s *straceSuite) TestStraceCommandHappyFromSnap(c *C) {
-	u, err := user.Current()
-	c.Assert(err, IsNil)
-
 	straceStaticPath := filepath.Join(dirs.SnapMountDir, "strace-static", "current", "bin", "strace")
-	err = os.MkdirAll(filepath.Dir(straceStaticPath), 0755)
+	err := os.MkdirAll(filepath.Dir(straceStaticPath), 0755)
 	c.Assert(err, IsNil)
 	mockStraceStatic := testutil.MockCommand(c, straceStaticPath, "")
 	defer mockStraceStatic.Restore()
 
-	cmd, err := strace.Command(nil, "foo")
+	cmd, err := strace.Command(nil)
 	c.Assert(err, IsNil)
 	c.Check(cmd.Path, Equals, s.mockSudo.Exe())
 	c.Check(cmd.Args, DeepEquals, []string{
-		s.mockSudo.Exe(), "-E",
+		s.mockSudo.Exe(), "--",
 		mockStraceStatic.Exe(),
-		"--uid", u.Uid, "--gid", u.Gid,
 		"-f",
 		"-e", strace.ExcludedSyscalls,
-		// the command
-		"foo",
 	})
 }
 
 func (s *straceSuite) TestStraceCommandNoSudo(c *C) {
+	tmp := c.MkDir()
+
+	if user.GetentBased {
+		getEntPath, err := exec.LookPath("getent")
+		c.Assert(err, IsNil)
+		err = os.Symlink(getEntPath, filepath.Join(tmp, "getent"))
+		c.Assert(err, IsNil)
+	}
+
 	origPath := os.Getenv("PATH")
 	defer func() { os.Setenv("PATH", origPath) }()
+	os.Setenv("PATH", tmp)
 
-	os.Setenv("PATH", "/not-exists")
-	_, err := strace.Command(nil, "foo")
+	_, err := strace.Command(nil)
 	c.Assert(err, ErrorMatches, `cannot use strace without sudo: exec: "sudo": executable file not found in \$PATH`)
 }
 
 func (s *straceSuite) TestStraceCommandNoStrace(c *C) {
+	tmp := c.MkDir()
+
+	if user.GetentBased {
+		getEntPath, err := exec.LookPath("getent")
+		c.Assert(err, IsNil)
+		err = os.Symlink(getEntPath, filepath.Join(tmp, "getent"))
+		c.Assert(err, IsNil)
+	}
+
 	origPath := os.Getenv("PATH")
 	defer func() { os.Setenv("PATH", origPath) }()
 
-	tmp := c.MkDir()
 	os.Setenv("PATH", tmp)
 	err := os.WriteFile(filepath.Join(tmp, "sudo"), nil, 0755)
 	c.Assert(err, IsNil)
 
-	_, err = strace.Command(nil, "foo")
+	_, err = strace.Command(nil)
 	c.Assert(err, ErrorMatches, `cannot find an installed strace, please try 'snap install strace-static'`)
 }
 
 func (s *straceSuite) TestTraceExecCommand(c *C) {
-	u, err := user.Current()
-	c.Assert(err, IsNil)
-
-	cmd, err := strace.TraceExecCommand("/run/snapd/strace.log", "cmd")
+	cmd, err := strace.TraceExecCommandForPid(123, "/run/snapd/strace.log")
 	c.Assert(err, IsNil)
 	c.Assert(cmd.Path, Equals, s.mockSudo.Exe())
 	c.Assert(cmd.Args, DeepEquals, []string{
-		s.mockSudo.Exe(), "-E",
-		s.mockStrace.Exe(), "-u", u.Username, "-f",
+		s.mockSudo.Exe(), "--",
+		s.mockStrace.Exe(),
+		"-f",
 		"-e", strace.ExcludedSyscalls,
 		// timing specific trace
 		"-ttt",
 		"-e", "trace=execve,execveat",
 		"-o", "/run/snapd/strace.log",
-		// the command
-		"cmd",
+		"-p", "123",
 	})
 
 }

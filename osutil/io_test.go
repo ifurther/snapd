@@ -21,7 +21,7 @@ package osutil_test
 
 import (
 	"errors"
-	"math/rand"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,7 +31,6 @@ import (
 
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/osutil/sys"
-	"github.com/snapcore/snapd/randutil"
 	"github.com/snapcore/snapd/testutil"
 )
 
@@ -76,6 +75,9 @@ func (ts *AtomicWriteTestSuite) TestAtomicWriteFileOverwrite(c *C) {
 }
 
 func (ts *AtomicWriteTestSuite) TestAtomicWriteFileSymlinkNoFollow(c *C) {
+	if os.Geteuid() == 0 {
+		c.Skip("this test cannot run as root (root bypasses directory write permissions)")
+	}
 	tmpdir := c.MkDir()
 	rodir := filepath.Join(tmpdir, "ro")
 	p := filepath.Join(rodir, "foo")
@@ -89,83 +91,61 @@ func (ts *AtomicWriteTestSuite) TestAtomicWriteFileSymlinkNoFollow(c *C) {
 	c.Assert(err, NotNil)
 }
 
-func (ts *AtomicWriteTestSuite) TestAtomicWriteFileAbsoluteSymlinks(c *C) {
+func (ts *AtomicWriteTestSuite) TestAtomicWriteFileAsteriskInDirOkay(c *C) {
 	tmpdir := c.MkDir()
-	rodir := filepath.Join(tmpdir, "ro")
-	p := filepath.Join(rodir, "foo")
-	s := filepath.Join(tmpdir, "foo")
-	c.Assert(os.MkdirAll(rodir, 0755), IsNil)
-	c.Assert(os.Symlink(s, p), IsNil)
-	c.Assert(os.Chmod(rodir, 0500), IsNil)
-	defer os.Chmod(rodir, 0700)
 
-	err := osutil.AtomicWriteFile(p, []byte("hi"), 0600, osutil.AtomicWriteFollow)
+	dir := filepath.Join(tmpdir, "foo*bar")
+	c.Assert(os.MkdirAll(dir, 0o755), IsNil)
+
+	p := filepath.Join(dir, "baz")
+	err := osutil.AtomicWriteFile(p, []byte("hi"), 0600, 0)
 	c.Assert(err, IsNil)
-
-	c.Assert(p, testutil.FileEquals, "hi")
 }
 
-func (ts *AtomicWriteTestSuite) TestAtomicWriteFileOverwriteAbsoluteSymlink(c *C) {
+func (ts *AtomicWriteTestSuite) TestAtomicWriteFileAsteriskInBasenameError(c *C) {
 	tmpdir := c.MkDir()
-	rodir := filepath.Join(tmpdir, "ro")
-	p := filepath.Join(rodir, "foo")
-	s := filepath.Join(tmpdir, "foo")
-	c.Assert(os.MkdirAll(rodir, 0755), IsNil)
-	c.Assert(os.Symlink(s, p), IsNil)
-	c.Assert(os.Chmod(rodir, 0500), IsNil)
-	defer os.Chmod(rodir, 0700)
 
-	c.Assert(os.WriteFile(s, []byte("hello"), 0644), IsNil)
-	c.Assert(osutil.AtomicWriteFile(p, []byte("hi"), 0600, osutil.AtomicWriteFollow), IsNil)
-
-	c.Assert(p, testutil.FileEquals, "hi")
+	p := filepath.Join(tmpdir, "foo*bar")
+	err := osutil.AtomicWriteFile(p, []byte("hi"), 0600, 0)
+	c.Assert(err, ErrorMatches, `cannot create tempfile for filename containing '\*': "foo\*bar"`)
 }
 
-func (ts *AtomicWriteTestSuite) TestAtomicWriteFileRelativeSymlinks(c *C) {
+func (ts *AtomicWriteTestSuite) TestAtomicWriteFileTmpFileCreateError(c *C) {
+	if os.Geteuid() == 0 {
+		c.Skip("this test cannot run as root (root bypasses directory write permissions)")
+	}
 	tmpdir := c.MkDir()
-	rodir := filepath.Join(tmpdir, "ro")
-	p := filepath.Join(rodir, "foo")
-	c.Assert(os.MkdirAll(rodir, 0755), IsNil)
-	c.Assert(os.Symlink("../foo", p), IsNil)
-	c.Assert(os.Chmod(rodir, 0500), IsNil)
-	defer os.Chmod(rodir, 0700)
 
-	err := osutil.AtomicWriteFile(p, []byte("hi"), 0600, osutil.AtomicWriteFollow)
+	err := os.Chmod(tmpdir, 0o644) // no directory traversal allowed
 	c.Assert(err, IsNil)
-
-	c.Assert(p, testutil.FileEquals, "hi")
-}
-
-func (ts *AtomicWriteTestSuite) TestAtomicWriteFileOverwriteRelativeSymlink(c *C) {
-	tmpdir := c.MkDir()
-	rodir := filepath.Join(tmpdir, "ro")
-	p := filepath.Join(rodir, "foo")
-	s := filepath.Join(tmpdir, "foo")
-	c.Assert(os.MkdirAll(rodir, 0755), IsNil)
-	c.Assert(os.Symlink("../foo", p), IsNil)
-	c.Assert(os.Chmod(rodir, 0500), IsNil)
-	defer os.Chmod(rodir, 0700)
-
-	c.Assert(os.WriteFile(s, []byte("hello"), 0644), IsNil)
-	c.Assert(osutil.AtomicWriteFile(p, []byte("hi"), 0600, osutil.AtomicWriteFollow), IsNil)
-
-	c.Assert(p, testutil.FileEquals, "hi")
-}
-
-func (ts *AtomicWriteTestSuite) TestAtomicWriteFileNoOverwriteTmpExisting(c *C) {
-	tmpdir := c.MkDir()
-	// ensure we always get the same result
-	rand.Seed(1)
-	expectedRandomness := randutil.RandomString(12) + "~"
-	// ensure we always get the same result
-	rand.Seed(1)
 
 	p := filepath.Join(tmpdir, "foo")
-	err := os.WriteFile(p+"."+expectedRandomness, []byte(""), 0644)
-	c.Assert(err, IsNil)
-
 	err = osutil.AtomicWriteFile(p, []byte(""), 0600, 0)
-	c.Assert(err, ErrorMatches, "open .*: file exists")
+	c.Assert(err, ErrorMatches, `open /.*/foo\..*~: permission denied`)
+}
+
+func (ts *AtomicWriteTestSuite) TestAtomicWriteFileTmpFileChmodError(c *C) {
+	tmpdir := c.MkDir()
+
+	// Nothing in the directory to begin
+	entries, err := os.ReadDir(tmpdir)
+	c.Assert(err, IsNil)
+	c.Check(entries, HasLen, 0)
+
+	customError := errors.New("something happened")
+	restore := osutil.MockFChmod(func(file *os.File, mode os.FileMode) error {
+		return customError
+	})
+	defer restore()
+
+	p := filepath.Join(tmpdir, "foo")
+	err = osutil.AtomicWriteFile(p, []byte(""), 0o644, 0)
+	c.Assert(err, Equals, customError)
+
+	// Nothing in the directory after error
+	entries, err = os.ReadDir(tmpdir)
+	c.Assert(err, IsNil)
+	c.Check(entries, HasLen, 0)
 }
 
 func (ts *AtomicWriteTestSuite) TestAtomicFileChownError(c *C) {
@@ -315,6 +295,9 @@ type AtomicSymlinkTestSuite struct{}
 var _ = Suite(&AtomicSymlinkTestSuite{})
 
 func (ts *AtomicSymlinkTestSuite) TestAtomicSymlink(c *C) {
+	if os.Geteuid() == 0 {
+		c.Skip("this test cannot run as root (root bypasses directory write permissions)")
+	}
 	mustReadSymlink := func(p, exp string) {
 		target, err := os.Readlink(p)
 		c.Assert(err, IsNil)
@@ -342,7 +325,7 @@ func (ts *AtomicSymlinkTestSuite) TestAtomicSymlink(c *C) {
 	nested := filepath.Join(d, "nested")
 	nestedBarSymlink := filepath.Join(nested, "bar")
 	err = osutil.AtomicSymlink("target", nestedBarSymlink)
-	c.Assert(err, ErrorMatches, `symlink target /.*/nested/bar\..*~: no such file or directory`)
+	c.Assert(err, ErrorMatches, `stat /.*/nested: no such file or directory`)
 	checkLeftoverFiles(nestedBarSymlink, nil)
 
 	if os.Geteuid() != 0 {
@@ -352,7 +335,7 @@ func (ts *AtomicSymlinkTestSuite) TestAtomicSymlink(c *C) {
 
 		// no permission to write in dir
 		err = osutil.AtomicSymlink("target", nestedBarSymlink)
-		c.Assert(err, ErrorMatches, `symlink target /.*/nested/bar\..*~: permission denied`)
+		c.Assert(err, ErrorMatches, `mkdir /.*/nested/bar\..*~: permission denied`)
 		checkLeftoverFiles(nestedBarSymlink, nil)
 
 		err = os.Chmod(nested, 0755)
@@ -377,39 +360,123 @@ func (ts *AtomicSymlinkTestSuite) TestAtomicSymlink(c *C) {
 	checkLeftoverFiles(nestedBarSymlink, []string{nestedBarSymlink})
 }
 
-func (ts *AtomicSymlinkTestSuite) createCollisionSequence(c *C, baseName string, many int) {
-	for i := 0; i < many; i++ {
-		expectedRandomness := randutil.RandomString(12) + "~"
-		// ensure we always get the same result
-		err := os.WriteFile(baseName+"."+expectedRandomness, []byte(""), 0644)
+func (ts *AtomicSymlinkTestSuite) TestAtomicSymlinkAsteriskInDirOkay(c *C) {
+	tmpdir := c.MkDir()
+
+	target := filepath.Join(tmpdir, "target")
+	c.Assert(os.WriteFile(target, []byte("some data"), 0o644), IsNil)
+
+	dir := filepath.Join(tmpdir, "foo*bar")
+	c.Assert(os.MkdirAll(dir, 0o755), IsNil)
+
+	p := filepath.Join(dir, "baz")
+	err := osutil.AtomicSymlink(target, p)
+	c.Assert(err, IsNil)
+}
+
+func (ts *AtomicSymlinkTestSuite) TestAtomicSymlinkAsteriskInBasenameError(c *C) {
+	tmpdir := c.MkDir()
+
+	target := filepath.Join(tmpdir, "target")
+	c.Assert(os.WriteFile(target, []byte("some data"), 0o644), IsNil)
+
+	p := filepath.Join(tmpdir, "foo*bar")
+	err := osutil.AtomicSymlink(target, p)
+	c.Assert(err, ErrorMatches, `cannot create tempfile for link path containing '\*': "foo\*bar"`)
+}
+
+type AtomicLinkTestSuite struct{}
+
+var _ = Suite(&AtomicLinkTestSuite{})
+
+func (ts *AtomicLinkTestSuite) TestAtomicLink(c *C) {
+	if os.Geteuid() == 0 {
+		c.Skip("this test cannot run as root (root bypasses directory write permissions)")
+	}
+	mustReadLink := func(target, link string) {
+		match, err := osutil.ComparePathsByDeviceInode(target, link)
+		c.Assert(err, IsNil)
+		c.Check(match, Equals, true)
+	}
+
+	checkLeftoverFiles := func(link string, exp []string) {
+		res, err := filepath.Glob(link + "*")
+		c.Assert(err, IsNil)
+		if len(exp) != 0 {
+			c.Assert(res, DeepEquals, exp)
+		} else {
+			c.Assert(res, HasLen, 0)
+		}
+	}
+
+	d := c.MkDir()
+	target := filepath.Join(d, "target")
+	c.Assert(os.WriteFile(target, []byte("some data"), 0o644), IsNil)
+
+	barLink := filepath.Join(d, "bar")
+	err := osutil.AtomicLink(target, barLink)
+	c.Assert(err, IsNil)
+	mustReadLink(barLink, target)
+	checkLeftoverFiles(barLink, []string{barLink})
+
+	// no nested directory
+	nested := filepath.Join(d, "nested")
+	nestedBarLink := filepath.Join(nested, "bar")
+	err = osutil.AtomicLink(target, nestedBarLink)
+	c.Assert(err, ErrorMatches, fmt.Sprintf(`stat /.*/nested: no such file or directory`))
+	checkLeftoverFiles(nestedBarLink, nil)
+
+	if os.Geteuid() != 0 {
+		// create a dir without write permission
+		err = os.MkdirAll(nested, 0o644)
+		c.Assert(err, IsNil)
+
+		// no permission to write in dir
+		err = osutil.AtomicLink(target, nestedBarLink)
+		c.Assert(err, ErrorMatches, fmt.Sprintf(`mkdir /.*/nested/bar\..*~: permission denied`))
+		checkLeftoverFiles(nestedBarLink, nil)
+
+		err = os.Chmod(nested, 0o755)
 		c.Assert(err, IsNil)
 	}
-}
 
-func (ts *AtomicSymlinkTestSuite) TestAtomicSymlinkCollisionError(c *C) {
-	tmpdir := c.MkDir()
-	// ensure we always get the same result
-	rand.Seed(1)
-	p := filepath.Join(tmpdir, "foo")
-	ts.createCollisionSequence(c, p, osutil.MaxSymlinkTries)
-	// restart random number sequence
-	rand.Seed(1)
-
-	err := osutil.AtomicSymlink("target", p)
-	c.Assert(err, ErrorMatches, "cannot create a temporary symlink")
-}
-
-func (ts *AtomicSymlinkTestSuite) TestAtomicSymlinkCollisionHappy(c *C) {
-	tmpdir := c.MkDir()
-	// ensure we always get the same result
-	rand.Seed(1)
-	p := filepath.Join(tmpdir, "foo")
-	ts.createCollisionSequence(c, p, osutil.MaxSymlinkTries/2)
-	// restart random number sequence
-	rand.Seed(1)
-
-	err := osutil.AtomicSymlink("target", p)
+	err = osutil.AtomicLink(target, nestedBarLink)
 	c.Assert(err, IsNil)
+	mustReadLink(nestedBarLink, target)
+	checkLeftoverFiles(nestedBarLink, []string{nestedBarLink})
+
+	// link gets replaced
+	newTarget := filepath.Join(d, "new-target")
+	c.Assert(os.WriteFile(newTarget, []byte(""), 0o644), IsNil)
+	err = osutil.AtomicLink(newTarget, nestedBarLink)
+	c.Assert(err, IsNil)
+	mustReadLink(nestedBarLink, newTarget)
+	checkLeftoverFiles(nestedBarLink, []string{nestedBarLink})
+}
+
+func (ts *AtomicLinkTestSuite) TestAtomicLinkAsteriskInDirOkay(c *C) {
+	tmpdir := c.MkDir()
+
+	target := filepath.Join(tmpdir, "target")
+	c.Assert(os.WriteFile(target, []byte("some data"), 0o644), IsNil)
+
+	dir := filepath.Join(tmpdir, "foo*bar")
+	c.Assert(os.MkdirAll(dir, 0o755), IsNil)
+
+	p := filepath.Join(dir, "baz")
+	err := osutil.AtomicLink(target, p)
+	c.Assert(err, IsNil)
+}
+
+func (ts *AtomicLinkTestSuite) TestAtomicLinkAsteriskInBasenameError(c *C) {
+	tmpdir := c.MkDir()
+
+	target := filepath.Join(tmpdir, "target")
+	c.Assert(os.WriteFile(target, []byte("some data"), 0o644), IsNil)
+
+	p := filepath.Join(tmpdir, "foo*bar")
+	err := osutil.AtomicLink(target, p)
+	c.Assert(err, ErrorMatches, `cannot create tempfile for link path containing '\*': "foo\*bar"`)
 }
 
 type AtomicRenameTestSuite struct{}
@@ -417,6 +484,9 @@ type AtomicRenameTestSuite struct{}
 var _ = Suite(&AtomicRenameTestSuite{})
 
 func (ts *AtomicRenameTestSuite) TestAtomicRenameFile(c *C) {
+	if os.Geteuid() == 0 {
+		c.Skip("this test cannot run as root (root bypasses directory write permissions)")
+	}
 	d := c.MkDir()
 
 	err := os.WriteFile(filepath.Join(d, "foo"), []byte("foobar"), 0644)

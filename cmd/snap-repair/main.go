@@ -50,15 +50,14 @@ which are used to do emergency repairs on the device.
 )
 
 func init() {
-	err := logger.SimpleSetup()
-	if err != nil {
-		fmt.Fprintf(Stderr, "WARNING: failed to activate logging: %v\n", err)
-	}
+	logger.SimpleSetup(nil)
 }
 
 var errOnClassic = fmt.Errorf("cannot use snap-repair on a classic system")
 
 func main() {
+	// TODO setup FIPS if needed?
+
 	if err := run(); err != nil {
 		fmt.Fprintf(Stderr, "error: %v\n", err)
 		if err != errOnClassic {
@@ -76,7 +75,7 @@ func run() error {
 	if osGetuid() != 0 {
 		return fmt.Errorf("must be run as root")
 	}
-	snapdenv.SetUserAgentFromVersion(snapdtool.Version, nil, "snap-repair")
+	snapdenv.SetUserAgentFromVersion(snapdtool.FullVersion(), nil, "snap-repair")
 
 	if err := parseArgs(os.Args[1:]); err != nil {
 		return err

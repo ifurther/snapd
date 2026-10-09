@@ -33,6 +33,7 @@ import (
 	"github.com/snapcore/snapd/asserts/assertstest"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/overlord"
+	"github.com/snapcore/snapd/overlord/confdbstate"
 	"github.com/snapcore/snapd/overlord/configstate"
 	"github.com/snapcore/snapd/overlord/configstate/config"
 	"github.com/snapcore/snapd/overlord/configstate/configcore"
@@ -64,6 +65,7 @@ func (s *configureHandlerSuite) SetUpTest(c *C) {
 	s.BaseTest.SetUpTest(c)
 	dirs.SetRootDir(c.MkDir())
 	s.AddCleanup(func() { dirs.SetRootDir("/") })
+	hookstate.IsConfdbHookname = confdbstate.IsConfdbHookname
 
 	s.state = state.New(nil)
 	s.state.Lock()
@@ -101,7 +103,7 @@ type: os
 func (s *configureHandlerSuite) TestBeforeInitializesTransaction(c *C) {
 	// Initialize context
 	s.context.Lock()
-	s.context.Set("patch", map[string]interface{}{
+	s.context.Set("patch", map[string]any{
 		"foo": "bar",
 	})
 	s.context.Unlock()
@@ -117,8 +119,8 @@ func (s *configureHandlerSuite) TestBeforeInitializesTransaction(c *C) {
 	c.Check(value, Equals, "bar")
 }
 
-func makeModel(override map[string]interface{}) *asserts.Model {
-	model := map[string]interface{}{
+func makeModel(override map[string]any) *asserts.Model {
+	model := map[string]any{
 		"type":         "model",
 		"authority-id": "brand",
 		"series":       "16",
@@ -165,7 +167,7 @@ volumes:
 		SnapType: "gadget",
 	})
 
-	r = snapstatetest.MockDeviceModel(makeModel(map[string]interface{}{
+	r = snapstatetest.MockDeviceModel(makeModel(map[string]any{
 		"gadget": "canonical-pc",
 	}))
 	defer r()
@@ -239,7 +241,7 @@ volumes:
 		SnapType: "gadget",
 	})
 
-	r = snapstatetest.MockDeviceModel(makeModel(map[string]interface{}{
+	r = snapstatetest.MockDeviceModel(makeModel(map[string]any{
 		"gadget": "canonical-pc",
 	}))
 	defer r()
@@ -370,7 +372,7 @@ volumes:
 		SnapType: "gadget",
 	})
 
-	r = snapstatetest.MockDeviceModel(makeModel(map[string]interface{}{
+	r = snapstatetest.MockDeviceModel(makeModel(map[string]any{
 		"gadget": "canonical-pc",
 	}))
 	defer r()
@@ -460,7 +462,7 @@ func (s *configcoreHandlerSuite) SetUpTest(c *C) {
 	c.Assert(err, IsNil)
 	s.o.AddManager(s.o.TaskRunner())
 
-	r = snapstatetest.MockDeviceModel(makeModel(map[string]interface{}{
+	r = snapstatetest.MockDeviceModel(makeModel(map[string]any{
 		"gadget": "canonical-pc",
 	}))
 	s.AddCleanup(r)

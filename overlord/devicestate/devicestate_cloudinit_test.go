@@ -15,6 +15,7 @@ import (
 	"github.com/snapcore/snapd/overlord/auth"
 	"github.com/snapcore/snapd/overlord/devicestate"
 	"github.com/snapcore/snapd/overlord/devicestate/devicestatetest"
+	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/release"
 	"github.com/snapcore/snapd/sysconfig"
 	"github.com/snapcore/snapd/testutil"
@@ -41,6 +42,10 @@ func (s *cloudInitBaseSuite) SetUpTest(c *C) {
 
 	r := release.MockOnClassic(false)
 	defer r()
+
+	s.AddCleanup(devicestate.MockFdestateAttemptAutoRepairIfNeeded(func(st *state.State, lockoutResetErr error, runPostInstallChecks bool) error {
+		return nil
+	}))
 
 	st := s.o.State()
 	st.Lock()
@@ -73,19 +78,19 @@ func (s *cloudInitUC20Suite) SetUpTest(c *C) {
 	s.state.Lock()
 	defer s.state.Unlock()
 
-	s.makeModelAssertionInState(c, "canonical", "pc20-model", map[string]interface{}{
+	s.makeModelAssertionInState(c, "canonical", "pc20-model", map[string]any{
 		"display-name": "UC20 pc model",
 		"architecture": "amd64",
 		"base":         "core20",
 		"grade":        "signed",
-		"snaps": []interface{}{
-			map[string]interface{}{
+		"snaps": []any{
+			map[string]any{
 				"name":            "pc-kernel",
 				"id":              "pckernelidididididididididididid",
 				"type":            "kernel",
 				"default-channel": "20",
 			},
-			map[string]interface{}{
+			map[string]any{
 				"name":            "pc",
 				"id":              "pcididididididididididididididid",
 				"type":            "gadget",
@@ -220,7 +225,7 @@ func (s *cloudInitSuite) SetUpTest(c *C) {
 	s.state.Lock()
 	defer s.state.Unlock()
 
-	s.makeModelAssertionInState(c, "canonical", "pc-model", map[string]interface{}{
+	s.makeModelAssertionInState(c, "canonical", "pc-model", map[string]any{
 		"architecture": "amd64",
 		"kernel":       "pc-kernel",
 		"gadget":       "pc",
@@ -253,10 +258,11 @@ func (s *cloudInitSuite) TestClassicCloudInitDoesNothing(c *C) {
 	c.Assert(err, IsNil)
 }
 
-func (s *cloudInitSuite) TestCloudInitEnsureBeforeSeededDoesNothing(c *C) {
+func (s *cloudInitSuite) TestDeviceManagerEnsureDoesNotRestrictCloudInitBeforeSeeded(c *C) {
 	st := s.o.State()
 	st.Lock()
 	st.Set("seeded", false)
+	st.NewChange("seed", "Initialize system state")
 	st.Unlock()
 
 	r := devicestate.MockCloudInitStatus(func() (sysconfig.CloudInitState, error) {
@@ -271,7 +277,7 @@ func (s *cloudInitSuite) TestCloudInitEnsureBeforeSeededDoesNothing(c *C) {
 	})
 	defer r()
 
-	err := devicestate.EnsureCloudInitRestricted(s.mgr)
+	err := s.mgr.Ensure()
 	c.Assert(err, IsNil)
 }
 
@@ -837,7 +843,7 @@ fi`)
 	c.Assert(restrictCalls, Equals, 1)
 
 	// and a new message about being disabled permanently
-	c.Assert(strings.TrimSpace(s.logbuf.String()), Matches, `.*System initialized, cloud-init reported to be in error state after 3 minutes, disabled permanently.*`)
+	c.Assert(strings.TrimSpace(s.logbuf.String()), Matches, `(?s).*System initialized, cloud-init reported to be in error state after 3 minutes, disabled permanently.*`)
 }
 
 func (s *cloudInitSuite) TestCloudInitTakingTooLongDisables(c *C) {
@@ -932,7 +938,7 @@ fi`)
 	c.Assert(restrictCalls, Equals, 1)
 
 	// now a message after we timeout waiting for the transition
-	c.Assert(strings.TrimSpace(s.logbuf.String()), Matches, `.*System initialized, cloud-init failed to transition to done or error state after 5 minutes, disabled permanently.*`)
+	c.Assert(strings.TrimSpace(s.logbuf.String()), Matches, `(?s).*System initialized, cloud-init failed to transition to done or error state after 5 minutes, disabled permanently.*`)
 }
 
 func (s *cloudInitSuite) TestCloudInitTakingTooLongDisablesFasterEnsures(c *C) {
@@ -1031,7 +1037,7 @@ fi`)
 	c.Assert(restrictCalls, Equals, 1)
 
 	// now a message after we timeout waiting for the transition
-	c.Assert(strings.TrimSpace(s.logbuf.String()), Matches, `.*System initialized, cloud-init failed to transition to done or error state after 5 minutes, disabled permanently.*`)
+	c.Assert(strings.TrimSpace(s.logbuf.String()), Matches, `(?s).*System initialized, cloud-init failed to transition to done or error state after 5 minutes, disabled permanently.*`)
 }
 
 func (s *cloudInitSuite) TestCloudInitErrorOnceAllowsFixing(c *C) {
@@ -1135,7 +1141,7 @@ fi`, cloudInitScriptStateFile))
 	c.Assert(restrictCalls, Equals, 1)
 
 	// we now have a message about restricting
-	c.Assert(strings.TrimSpace(s.logbuf.String()), Matches, `.*System initialized, cloud-init reported to be done, set datasource_list to \[ NoCloud \] and disabled auto-import by filesystem label`)
+	c.Assert(strings.TrimSpace(s.logbuf.String()), Matches, `.*System initialized, cloud-init reported to be done, set datasource_list to \[ NoCloud \] and disabled auto-import by filesystem label.*`)
 }
 func (s *cloudInitSuite) TestCloudInitHappyNotFound(c *C) {
 	// pretend that cloud-init was not found on PATH
@@ -1161,5 +1167,5 @@ func (s *cloudInitSuite) TestCloudInitHappyNotFound(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(statusCalls, Equals, 1)
 	c.Assert(restrictCalls, Equals, 1)
-	c.Assert(strings.TrimSpace(s.logbuf.String()), Matches, `.*System initialized, cloud-init not found, disabled permanently`)
+	c.Assert(strings.TrimSpace(s.logbuf.String()), Matches, `.*System initialized, cloud-init not found, disabled permanently.*`)
 }

@@ -137,9 +137,12 @@ type ConnectCandidate struct {
 
 	Model *asserts.Model
 	Store *asserts.Store
+
+	// Are compatibility labels enabled?
+	CompatEnabled bool
 }
 
-func nestedGet(which string, attrs interfaces.Attrer, path string) (interface{}, error) {
+func nestedGet(which string, attrs interfaces.Attrer, path string) (any, error) {
 	val, ok := attrs.Lookup(path)
 	if !ok {
 		return nil, fmt.Errorf("%s attribute %q not found", which, path)
@@ -147,12 +150,16 @@ func nestedGet(which string, attrs interfaces.Attrer, path string) (interface{},
 	return val, nil
 }
 
-func (connc *ConnectCandidate) PlugAttr(arg string) (interface{}, error) {
+func (connc *ConnectCandidate) PlugAttr(arg string) (any, error) {
 	return nestedGet("plug", connc.Plug, arg)
 }
 
-func (connc *ConnectCandidate) SlotAttr(arg string) (interface{}, error) {
+func (connc *ConnectCandidate) SlotAttr(arg string) (any, error) {
 	return nestedGet("slot", connc.Slot, arg)
+}
+
+func (connc ConnectCandidate) CompatLabelsEnabled() bool {
+	return connc.CompatEnabled
 }
 
 func (connc *ConnectCandidate) plugSnapID() string {
@@ -169,14 +176,14 @@ func (connc *ConnectCandidate) slotSnapID() string {
 	return "" // never a valid snap-id
 }
 
-func (connc *ConnectCandidate) plugPublisherID() string {
+func (connc *ConnectCandidate) PlugPublisherID() string {
 	if connc.PlugSnapDeclaration != nil {
 		return connc.PlugSnapDeclaration.PublisherID()
 	}
 	return "" // never a valid publisher-id
 }
 
-func (connc *ConnectCandidate) slotPublisherID() string {
+func (connc *ConnectCandidate) SlotPublisherID() string {
 	if connc.SlotSnapDeclaration != nil {
 		return connc.SlotSnapDeclaration.PublisherID()
 	}

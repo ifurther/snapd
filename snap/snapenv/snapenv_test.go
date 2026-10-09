@@ -22,18 +22,19 @@ package snapenv
 import (
 	"fmt"
 	"os"
-	"os/user"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	. "gopkg.in/check.v1"
 
 	"github.com/snapcore/snapd/arch"
 	"github.com/snapcore/snapd/dirs"
-	"github.com/snapcore/snapd/features"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/osutil/sys"
+	"github.com/snapcore/snapd/osutil/user"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/testutil"
 )
 
@@ -61,6 +62,69 @@ var mockSnapInfo = &snap.Info{
 		Revision: snap.R(17),
 	},
 }
+
+var mockSnapInfoWithComponents = &snap.Info{
+	SuggestedName: "foo",
+	Version:       "1.0",
+	SideInfo: snap.SideInfo{
+		Revision: snap.R(17),
+	},
+	Components: map[string]*snap.Component{
+		"comp1": {
+			Name: "comp1",
+			Type: "standard",
+		},
+	},
+}
+
+var mockSnapInfoWithDesktopFile = func() *snap.Info {
+	mi := *mockSnapInfo
+	mi.Plugs = map[string]*snap.PlugInfo{
+		"desktop": {
+			Snap:      &mi,
+			Interface: "desktop",
+			Name:      "desktop",
+			Attrs: map[string]any{
+				"desktop-file-ids": []any{"io.snapcraft.foo.bar.desktop"},
+			},
+		},
+	}
+	return &mi
+}()
+var mockAppInfo = &snap.AppInfo{
+	Snap:     mockSnapInfo,
+	Name:     "bar",
+	CommonID: "io.snapcraft.foo.bar",
+	BusName:  "io.snapcraft.foo.bar.bus",
+}
+var mockAppInfoWithDesktopFile = func() *snap.AppInfo {
+	mai := *mockAppInfo
+	mai.Snap = mockSnapInfoWithDesktopFile
+	return &mai
+}()
+var mockAppInfoMinimal = &snap.AppInfo{
+	Snap: mockSnapInfo,
+	Name: "bar",
+}
+var mockComponentInfo = &snap.ComponentInfo{
+	Component: naming.ComponentRef{
+		SnapName:      "foo",
+		ComponentName: "comp",
+	},
+	CompVersion: "1.1",
+	ComponentSideInfo: snap.ComponentSideInfo{
+		Revision: snap.R(5),
+	},
+}
+var mockComponentInfoNoVersion = &snap.ComponentInfo{
+	Component: naming.ComponentRef{
+		SnapName:      "foo",
+		ComponentName: "comp",
+	},
+	ComponentSideInfo: snap.ComponentSideInfo{
+		Revision: snap.R(5),
+	},
+}
 var mockClassicSnapInfo = &snap.Info{
 	SuggestedName: "foo",
 	Version:       "1.0",
@@ -73,6 +137,10 @@ var mockClassicSnapInfo = &snap.Info{
 func (s *HTestSuite) SetUpTest(c *C) {
 	s.BaseTest.SetUpTest(c)
 	s.BaseTest.AddCleanup(snap.MockSanitizePlugsSlots(func(snapInfo *snap.Info) {}))
+
+	defaultDesktopFilesDir := dirs.SnapDesktopFilesDir
+	dirs.SnapDesktopFilesDir = c.MkDir()
+	s.BaseTest.AddCleanup(func() { dirs.SnapDesktopFilesDir = defaultDesktopFilesDir })
 }
 
 func (s *HTestSuite) TearDownTest(c *C) {
@@ -91,11 +159,111 @@ func (ts *HTestSuite) TestBasic(c *C) {
 		"SNAP_VERSION":       "1.0",
 		"SNAP_REVISION":      "17",
 		"SNAP_ARCH":          arch.DpkgArchitecture(),
-		"SNAP_LIBRARY_PATH":  "/var/lib/snapd/lib/gl:/var/lib/snapd/lib/gl32:/var/lib/snapd/void",
-		"SNAP_REEXEC":        "",
+		"SNAP_LIBRARY_PATH":  "/var/lib/snapd/lib/gl:/var/lib/snapd/lib/gl32",
+		"SNAP_REEXEC":        os.Getenv("SNAP_REEXEC"),
 		"SNAP_UID":           fmt.Sprint(sys.Getuid()),
 		"SNAP_EUID":          fmt.Sprint(sys.Geteuid()),
 	})
+
+	envWithComps := basicEnv(mockSnapInfoWithComponents)
+	c.Assert(envWithComps, DeepEquals, osutil.Environment{
+		"SNAP":               fmt.Sprintf("%s/foo/17", dirs.CoreSnapMountDir),
+		"SNAP_COMMON":        "/var/snap/foo/common",
+		"SNAP_COMPONENTS":    fmt.Sprintf("%s/foo/components/17", dirs.CoreSnapMountDir),
+		"SNAP_DATA":          "/var/snap/foo/17",
+		"SNAP_NAME":          "foo",
+		"SNAP_INSTANCE_NAME": "foo",
+		"SNAP_INSTANCE_KEY":  "",
+		"SNAP_VERSION":       "1.0",
+		"SNAP_REVISION":      "17",
+		"SNAP_ARCH":          arch.DpkgArchitecture(),
+		"SNAP_LIBRARY_PATH":  "/var/lib/snapd/lib/gl:/var/lib/snapd/lib/gl32",
+		"SNAP_REEXEC":        os.Getenv("SNAP_REEXEC"),
+		"SNAP_UID":           fmt.Sprint(sys.Getuid()),
+		"SNAP_EUID":          fmt.Sprint(sys.Geteuid()),
+	})
+}
+
+func (ts *HTestSuite) TestBasicWithSources(c *C) {
+	defer dirs.SetRootDir(dirs.GlobalRootDir)
+	dirs.SetRootDir(c.MkDir())
+
+	// Write some sources files
+	eglDirs := []string{"/snap/kernel/33/egllibs1", "/snap/kernel/33/egllibs2", "/snap/kernel/33/duplicate"}
+	vulkanDirs := []string{"/snap/kernel/33/vulkanlibs1", "/snap/kernel/33/vulkanlibs2", "/snap/kernel/33/duplicate"}
+	exportDir := filepath.Join(dirs.GlobalRootDir, "var/lib/snapd/export")
+	c.Assert(os.MkdirAll(exportDir, os.ModePerm), IsNil)
+	c.Assert(os.WriteFile(filepath.Join(exportDir, "system_mykernel_eglslot_egl-driver-libs.library-source"),
+		[]byte(strings.Join(eglDirs, "\n")+"\n"), 0644), Equals, nil)
+	c.Assert(os.WriteFile(filepath.Join(exportDir, "system_mykernel_vulkanslot_vulkan-driver-libs.library-source"),
+		[]byte(strings.Join(vulkanDirs, "\n")+"\n"), 0644), Equals, nil)
+	// This one will be ignored
+	c.Assert(os.WriteFile(filepath.Join(exportDir, "system_mykernel_otherslot_foo-interface.library-source"),
+		[]byte("/snap/kernel/33/foolibs1\n"), 0644), Equals, nil)
+	var exportedPaths []string
+	for _, d := range []string{"kernel/33/egllibs1", "kernel/33/egllibs2",
+		"kernel/33/duplicate", "kernel/33/vulkanlibs1", "kernel/33/vulkanlibs2"} {
+		exportedPaths = append(exportedPaths, filepath.Join(
+			dirs.GlobalRootDir, "var/lib/snapd/lib/system/gpu", d))
+	}
+
+	env := basicEnv(mockSnapInfo)
+	c.Assert(env, DeepEquals, osutil.Environment{
+		"SNAP":               fmt.Sprintf("%s/foo/17", dirs.CoreSnapMountDir),
+		"SNAP_COMMON":        filepath.Join(dirs.GlobalRootDir, "var/snap/foo/common"),
+		"SNAP_DATA":          filepath.Join(dirs.GlobalRootDir, "var/snap/foo/17"),
+		"SNAP_NAME":          "foo",
+		"SNAP_INSTANCE_NAME": "foo",
+		"SNAP_INSTANCE_KEY":  "",
+		"SNAP_VERSION":       "1.0",
+		"SNAP_REVISION":      "17",
+		"SNAP_ARCH":          arch.DpkgArchitecture(),
+		"SNAP_LIBRARY_PATH":  strings.Join(exportedPaths, ":"),
+		"SNAP_REEXEC":        os.Getenv("SNAP_REEXEC"),
+		"SNAP_UID":           fmt.Sprint(sys.Getuid()),
+		"SNAP_EUID":          fmt.Sprint(sys.Geteuid()),
+	})
+}
+
+func (ts *HTestSuite) TestAppEnvironment(c *C) {
+	env := appEnv(mockSnapInfo, mockAppInfo)
+	c.Assert(env, DeepEquals, osutil.Environment{
+		"SNAP_APP_NAME":      "bar",
+		"SNAP_APP_COMMON_ID": "io.snapcraft.foo.bar",
+		"SNAP_APP_BUS_NAME":  "io.snapcraft.foo.bar.bus",
+	})
+}
+
+func (ts *HTestSuite) testAppDesktopFileEnvironment(c *C, appInfo *snap.AppInfo, desktopFileName string) {
+	desktopFilePath := filepath.Join(dirs.SnapDesktopFilesDir, desktopFileName)
+	desktopFile := fmt.Sprintf(`[Desktop Entry]
+Exec=%s
+X-SnapInstanceName=%s
+X-SnapAppName=%s
+`, appInfo.Command, appInfo.Snap.InstanceName(), appInfo.Name)
+	c.Assert(os.WriteFile(desktopFilePath, []byte(desktopFile), 0644), IsNil)
+
+	c.Assert(appInfo.DesktopFile(), Equals, desktopFilePath)
+
+	env := appEnv(appInfo.Snap, appInfo)
+	c.Assert(env, DeepEquals, osutil.Environment{
+		"SNAP_APP_NAME":         appInfo.Name,
+		"SNAP_APP_COMMON_ID":    appInfo.CommonID,
+		"SNAP_APP_BUS_NAME":     appInfo.BusName,
+		"SNAP_APP_DESKTOP_FILE": appInfo.DesktopFile(),
+	})
+}
+
+func (ts *HTestSuite) TestAppWithFallbackDesktopFileIDEnvironment(c *C) {
+	ts.testAppDesktopFileEnvironment(c, mockAppInfo, "foo_bar.desktop")
+}
+
+func (ts *HTestSuite) TestAppWithDesktopFileIDEnvironment(c *C) {
+	ts.testAppDesktopFileEnvironment(c, mockAppInfoWithDesktopFile, "io.snapcraft.foo.bar.desktop")
+}
+
+func (ts *HTestSuite) TestAppWithDesktopFileIDUsingFallbackDesktopFileEnvironment(c *C) {
+	ts.testAppDesktopFileEnvironment(c, mockAppInfoWithDesktopFile, "foo_bar.desktop")
 }
 
 func (ts *HTestSuite) TestSaveDataEnvironmentNotPresent(c *C) {
@@ -111,11 +279,11 @@ func (ts *HTestSuite) TestSaveDataEnvironmentNotPresent(c *C) {
 func (ts *HTestSuite) TestSaveDataEnvironmentPresent(c *C) {
 	dirs.SetRootDir(c.MkDir())
 	ts.AddCleanup(func() { dirs.SetRootDir("") })
-	c.Assert(os.MkdirAll(snap.CommonDataSaveDir(mockSnapInfo.InstanceName()), 0755), IsNil)
+	c.Assert(os.MkdirAll(snap.CommonDataSaveDir(mockSnapInfo.InstanceName().String()), 0755), IsNil)
 
 	// The snap environment should now include SNAP_SAVE_DATA with the above path.
 	env := basicEnv(mockSnapInfo)
-	c.Assert(env["SNAP_SAVE_DATA"], Equals, snap.CommonDataSaveDir(mockSnapInfo.InstanceName()))
+	c.Assert(env["SNAP_SAVE_DATA"], Equals, snap.CommonDataSaveDir(mockSnapInfo.InstanceName().String()))
 }
 
 func (ts *HTestSuite) TestUser(c *C) {
@@ -130,26 +298,7 @@ func (ts *HTestSuite) TestUser(c *C) {
 }
 
 func (ts *HTestSuite) TestUserForClassicConfinement(c *C) {
-	dirs.SetRootDir(c.MkDir())
-	defer dirs.SetRootDir("/")
-	c.Assert(os.MkdirAll(dirs.FeaturesDir, 0755), IsNil)
-
-	// With the classic-preserves-xdg-runtime-dir feature disabled the snap
-	// per-user environment contains an override for XDG_RUNTIME_DIR.
 	env := userEnv(mockClassicSnapInfo, "/root", nil)
-	c.Assert(env, DeepEquals, osutil.Environment{
-		// NOTE: Both HOME and XDG_RUNTIME_DIR are not defined here.
-		"SNAP_USER_COMMON": "/root/snap/foo/common",
-		"SNAP_USER_DATA":   "/root/snap/foo/17",
-		"XDG_RUNTIME_DIR":  fmt.Sprintf(dirs.GlobalRootDir+"/run/user/%d/snap.foo", sys.Geteuid()),
-		"SNAP_REAL_HOME":   "/root",
-	})
-
-	// With the classic-preserves-xdg-runtime-dir feature enabled the snap
-	// per-user environment contains no overrides for XDG_RUNTIME_DIR.
-	f := features.ClassicPreservesXdgRuntimeDir
-	c.Assert(os.WriteFile(f.ControlFile(), nil, 0644), IsNil)
-	env = userEnv(mockClassicSnapInfo, "/root", nil)
 	c.Assert(env, DeepEquals, osutil.Environment{
 		// NOTE: Both HOME and XDG_RUNTIME_DIR are not defined here.
 		"SNAP_USER_COMMON": "/root/snap/foo/common",
@@ -174,7 +323,7 @@ func (s *HTestSuite) TestSnapRunSnapExecEnv(c *C) {
 			os.Setenv("HOME", "")
 		}
 
-		env := snapEnv(info, nil)
+		env := snapEnv(info, mockAppInfo, nil, nil)
 		c.Assert(env, DeepEquals, osutil.Environment{
 			"SNAP":               fmt.Sprintf("%s/snapname/42", dirs.CoreSnapMountDir),
 			"SNAP_COMMON":        "/var/snap/snapname/common",
@@ -185,8 +334,8 @@ func (s *HTestSuite) TestSnapRunSnapExecEnv(c *C) {
 			"SNAP_VERSION":       "1.0",
 			"SNAP_REVISION":      "42",
 			"SNAP_ARCH":          arch.DpkgArchitecture(),
-			"SNAP_LIBRARY_PATH":  "/var/lib/snapd/lib/gl:/var/lib/snapd/lib/gl32:/var/lib/snapd/void",
-			"SNAP_REEXEC":        "",
+			"SNAP_LIBRARY_PATH":  "/var/lib/snapd/lib/gl:/var/lib/snapd/lib/gl32",
+			"SNAP_REEXEC":        os.Getenv("SNAP_REEXEC"),
 			"SNAP_USER_COMMON":   fmt.Sprintf("%s/snap/snapname/common", usr.HomeDir),
 			"SNAP_USER_DATA":     fmt.Sprintf("%s/snap/snapname/42", usr.HomeDir),
 			"HOME":               fmt.Sprintf("%s/snap/snapname/42", usr.HomeDir),
@@ -194,6 +343,9 @@ func (s *HTestSuite) TestSnapRunSnapExecEnv(c *C) {
 			"SNAP_REAL_HOME":     usr.HomeDir,
 			"SNAP_UID":           fmt.Sprint(sys.Getuid()),
 			"SNAP_EUID":          fmt.Sprint(sys.Geteuid()),
+			"SNAP_APP_COMMON_ID": "io.snapcraft.foo.bar",
+			"SNAP_APP_BUS_NAME":  "io.snapcraft.foo.bar.bus",
+			"SNAP_APP_NAME":      "bar",
 		})
 	}
 }
@@ -217,7 +369,7 @@ func (s *HTestSuite) TestParallelInstallSnapRunSnapExecEnv(c *C) {
 			os.Setenv("HOME", "")
 		}
 
-		env := snapEnv(info, nil)
+		env := snapEnv(info, mockAppInfoMinimal, nil, nil)
 		c.Check(env, DeepEquals, osutil.Environment{
 			// Those are mapped to snap-specific directories by
 			// mount namespace setup
@@ -230,8 +382,8 @@ func (s *HTestSuite) TestParallelInstallSnapRunSnapExecEnv(c *C) {
 			"SNAP_VERSION":       "1.0",
 			"SNAP_REVISION":      "42",
 			"SNAP_ARCH":          arch.DpkgArchitecture(),
-			"SNAP_LIBRARY_PATH":  "/var/lib/snapd/lib/gl:/var/lib/snapd/lib/gl32:/var/lib/snapd/void",
-			"SNAP_REEXEC":        "",
+			"SNAP_LIBRARY_PATH":  "/var/lib/snapd/lib/gl:/var/lib/snapd/lib/gl32",
+			"SNAP_REEXEC":        os.Getenv("SNAP_REEXEC"),
 			// User's data directories are not mapped to
 			// snap-specific ones
 			"SNAP_USER_COMMON": fmt.Sprintf("%s/snap/snapname_foo/common", usr.HomeDir),
@@ -241,6 +393,7 @@ func (s *HTestSuite) TestParallelInstallSnapRunSnapExecEnv(c *C) {
 			"SNAP_REAL_HOME":   usr.HomeDir,
 			"SNAP_UID":         fmt.Sprint(sys.Getuid()),
 			"SNAP_EUID":        fmt.Sprint(sys.Geteuid()),
+			"SNAP_APP_NAME":    "bar",
 		})
 	}
 }
@@ -260,28 +413,10 @@ func (ts *HTestSuite) TestParallelInstallUser(c *C) {
 }
 
 func (ts *HTestSuite) TestParallelInstallUserForClassicConfinement(c *C) {
-	dirs.SetRootDir(c.MkDir())
-	defer dirs.SetRootDir("/")
-	c.Assert(os.MkdirAll(dirs.FeaturesDir, 0755), IsNil)
-
 	info := *mockClassicSnapInfo
 	info.InstanceKey = "bar"
 
-	// With the classic-preserves-xdg-runtime-dir feature disabled the snap
-	// per-user environment contains an override for XDG_RUNTIME_DIR.
 	env := userEnv(&info, "/root", nil)
-	c.Assert(env, DeepEquals, osutil.Environment{
-		"SNAP_USER_COMMON": "/root/snap/foo_bar/common",
-		"SNAP_USER_DATA":   "/root/snap/foo_bar/17",
-		"XDG_RUNTIME_DIR":  fmt.Sprintf(dirs.GlobalRootDir+"/run/user/%d/snap.foo_bar", sys.Geteuid()),
-		"SNAP_REAL_HOME":   "/root",
-	})
-
-	// With the classic-preserves-xdg-runtime-dir feature enabled the snap
-	// per-user environment contains no overrides for XDG_RUNTIME_DIR.
-	f := features.ClassicPreservesXdgRuntimeDir
-	c.Assert(os.WriteFile(f.ControlFile(), nil, 0644), IsNil)
-	env = userEnv(&info, "/root", nil)
 	c.Assert(env, DeepEquals, osutil.Environment{
 		// NOTE, Both HOME and XDG_RUNTIME_DIR are not defined here.
 		"SNAP_USER_COMMON": "/root/snap/foo_bar/common",
@@ -293,11 +428,14 @@ func (ts *HTestSuite) TestParallelInstallUserForClassicConfinement(c *C) {
 func (s *HTestSuite) TestExtendEnvForRunForNonClassic(c *C) {
 	env := osutil.Environment{"TMPDIR": "/var/tmp"}
 
-	ExtendEnvForRun(env, mockSnapInfo, nil)
+	ExtendEnvForRun(env, mockSnapInfo, mockAppInfo, nil, nil)
 
 	c.Assert(env["SNAP_NAME"], Equals, "foo")
 	c.Assert(env["SNAP_COMMON"], Equals, "/var/snap/foo/common")
 	c.Assert(env["SNAP_DATA"], Equals, "/var/snap/foo/17")
+	c.Assert(env["SNAP_APP_NAME"], Equals, "bar")
+	c.Assert(env["SNAP_APP_COMMON_ID"], Equals, "io.snapcraft.foo.bar")
+	c.Assert(env["SNAP_APP_BUS_NAME"], Equals, "io.snapcraft.foo.bar.bus")
 
 	c.Assert(env["TMPDIR"], Equals, "/var/tmp")
 }
@@ -305,13 +443,46 @@ func (s *HTestSuite) TestExtendEnvForRunForNonClassic(c *C) {
 func (s *HTestSuite) TestExtendEnvForRunForClassic(c *C) {
 	env := osutil.Environment{"TMPDIR": "/var/tmp"}
 
-	ExtendEnvForRun(env, mockClassicSnapInfo, nil)
+	ExtendEnvForRun(env, mockClassicSnapInfo, mockAppInfoMinimal, nil, nil)
 
+	c.Assert(env["SNAP_NAME"], Equals, "foo")
+	c.Assert(env["SNAP_COMMON"], Equals, "/var/snap/foo/common")
+	c.Assert(env["SNAP_DATA"], Equals, "/var/snap/foo/17")
+	c.Assert(env["SNAP_APP_NAME"], Equals, "bar")
+	c.Assert(func() bool { _, ok := env["SNAP_APP_COMMON_ID"]; return ok }(), Equals, false)
+	c.Assert(func() bool { _, ok := env["SNAP_APP_BUS_NAME"]; return ok }(), Equals, false)
+
+	c.Assert(env["TMPDIR"], Equals, "/var/tmp")
+}
+
+func checkEnvWithComp(c *C, env osutil.Environment, compVersion string) {
 	c.Assert(env["SNAP_NAME"], Equals, "foo")
 	c.Assert(env["SNAP_COMMON"], Equals, "/var/snap/foo/common")
 	c.Assert(env["SNAP_DATA"], Equals, "/var/snap/foo/17")
 
 	c.Assert(env["TMPDIR"], Equals, "/var/tmp")
+
+	c.Assert(env["SNAP_COMPONENT"], Equals, filepath.Join(dirs.CoreSnapMountDir, "foo/components/mnt/comp/5"))
+	c.Assert(env["SNAP_COMPONENT_REVISION"], Equals, "5")
+	c.Assert(env["SNAP_COMPONENT_VERSION"], Equals, compVersion)
+	c.Assert(env["SNAP_COMPONENT_NAME"], Equals, "foo+comp")
+}
+
+func (s *HTestSuite) TestExtendEnvForRunWithComponent(c *C) {
+	env := osutil.Environment{"TMPDIR": "/var/tmp"}
+
+	ExtendEnvForRun(env, mockSnapInfo, nil, mockComponentInfo, nil)
+	compVersion := "1.1"
+	checkEnvWithComp(c, env, compVersion)
+}
+
+func (s *HTestSuite) TestExtendEnvForRunWithComponentNoVersion(c *C) {
+	env := osutil.Environment{"TMPDIR": "/var/tmp"}
+
+	ExtendEnvForRun(env, mockSnapInfo, nil, mockComponentInfoNoVersion, nil)
+	// Same as snap in this case
+	compVersion := "1.0"
+	checkEnvWithComp(c, env, compVersion)
 }
 
 func (s *HTestSuite) TestHiddenDirEnv(c *C) {
@@ -333,7 +504,7 @@ func (s *HTestSuite) TestHiddenDirEnv(c *C) {
 		{dir: dirs.HiddenSnapDataHomeDir, opts: &dirs.SnapDirOptions{HiddenSnapDataDir: true}},
 		{dir: dirs.HiddenSnapDataHomeDir, opts: &dirs.SnapDirOptions{HiddenSnapDataDir: true, MigratedToExposedHome: true}}} {
 		env := osutil.Environment{}
-		ExtendEnvForRun(env, mockSnapInfo, t.opts)
+		ExtendEnvForRun(env, mockSnapInfo, mockAppInfo, nil, t.opts)
 
 		c.Check(env["SNAP_USER_COMMON"], Equals, filepath.Join(testDir, t.dir, mockSnapInfo.SuggestedName, "common"))
 		c.Check(env["SNAP_USER_DATA"], DeepEquals, filepath.Join(testDir, t.dir, mockSnapInfo.SuggestedName, mockSnapInfo.Revision.String()))

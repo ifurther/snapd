@@ -25,7 +25,7 @@ import (
 	"fmt"
 	"sync/atomic"
 
-	"github.com/godbus/dbus"
+	"github.com/godbus/dbus/v5"
 )
 
 // testDBusClientName is the unique name of the connected client.
@@ -119,7 +119,7 @@ func (s *testDBusStream) decodeRequest(req []byte) {
 				dbus.FieldReplySerial: dbus.MakeVariant(msgIn.Serial()),
 				dbus.FieldSignature:   dbus.MakeVariant(dbus.SignatureOf("")),
 			},
-			Body: []interface{}{":test"},
+			Body: []any{":test"},
 		})
 		s.sendMsg(&dbus.Message{
 			Type: dbus.TypeSignal,
@@ -131,7 +131,7 @@ func (s *testDBusStream) decodeRequest(req []byte) {
 				dbus.FieldSender:      dbus.MakeVariant("org.freedesktop.DBus"),
 				dbus.FieldSignature:   dbus.MakeVariant(dbus.SignatureOf("")),
 			},
-			Body: []interface{}{testDBusClientName},
+			Body: []any{testDBusClientName},
 		})
 	default:
 		msgOutList, err := s.handler(msgIn, s.n-1)

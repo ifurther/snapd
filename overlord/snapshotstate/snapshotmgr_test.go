@@ -23,6 +23,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -34,6 +35,7 @@ import (
 	"github.com/snapcore/snapd/client"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/logger"
+	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/overlord"
 	"github.com/snapcore/snapd/overlord/snapshotstate"
 	"github.com/snapcore/snapd/overlord/snapshotstate/backend"
@@ -99,9 +101,9 @@ func (snapshotSuite) TestEnsureForgetsSnapshots(c *check.C) {
 	st.Lock()
 	defer st.Unlock()
 
-	st.Set("snapshots", map[uint64]interface{}{
-		1: map[string]interface{}{"expiry-time": "2001-03-11T11:24:00Z"},
-		2: map[string]interface{}{"expiry-time": "2037-02-12T12:50:00Z"},
+	st.Set("snapshots", map[uint64]any{
+		1: map[string]any{"expiry-time": "2001-03-11T11:24:00Z"},
+		2: map[string]any{"expiry-time": "2037-02-12T12:50:00Z"},
 	})
 
 	st.Unlock()
@@ -109,10 +111,10 @@ func (snapshotSuite) TestEnsureForgetsSnapshots(c *check.C) {
 	st.Lock()
 
 	// verify expired snapshots were removed
-	var expirations map[uint64]interface{}
+	var expirations map[uint64]any
 	c.Assert(st.Get("snapshots", &expirations), check.IsNil)
-	c.Check(expirations, check.DeepEquals, map[uint64]interface{}{
-		2: map[string]interface{}{"expiry-time": "2037-02-12T12:50:00Z"}})
+	c.Check(expirations, check.DeepEquals, map[uint64]any{
+		2: map[string]any{"expiry-time": "2037-02-12T12:50:00Z"}})
 	c.Check(removedSnapshot, check.Matches, ".*/foo.zip")
 }
 
@@ -144,8 +146,8 @@ func (snapshotSuite) TestEnsureForgetsSnapshotsRunsRegularly(c *check.C) {
 	storeExpiredSnapshot := func() {
 		st.Lock()
 		// we need at least one snapshot set in the state for forgetExpiredSnapshots to do any work
-		st.Set("snapshots", map[uint64]interface{}{
-			1: map[string]interface{}{"expiry-time": "2001-03-11T11:24:00Z"},
+		st.Set("snapshots", map[uint64]any{
+			1: map[string]any{"expiry-time": "2001-03-11T11:24:00Z"},
 		})
 		st.Unlock()
 	}
@@ -187,8 +189,8 @@ func (snapshotSuite) testEnsureForgetSnapshotsConflict(c *check.C, snapshotOp st
 	st.Lock()
 	defer st.Unlock()
 
-	st.Set("snapshots", map[uint64]interface{}{
-		1: map[string]interface{}{"expiry-time": "2001-03-11T11:24:00Z"},
+	st.Set("snapshots", map[uint64]any{
+		1: map[string]any{"expiry-time": "2001-03-11T11:24:00Z"},
 	})
 
 	var tsk *state.Task
@@ -208,10 +210,10 @@ func (snapshotSuite) testEnsureForgetSnapshotsConflict(c *check.C, snapshotOp st
 	c.Assert(mgr.Ensure(), check.IsNil)
 	st.Lock()
 
-	var expirations map[uint64]interface{}
+	var expirations map[uint64]any
 	c.Assert(st.Get("snapshots", &expirations), check.IsNil)
-	c.Check(expirations, check.DeepEquals, map[uint64]interface{}{
-		1: map[string]interface{}{"expiry-time": "2001-03-11T11:24:00Z"},
+	c.Check(expirations, check.DeepEquals, map[uint64]any{
+		1: map[string]any{"expiry-time": "2001-03-11T11:24:00Z"},
 	})
 	c.Check(removeCalled, check.Equals, 0)
 
@@ -279,13 +281,14 @@ func (snapshotSuite) TestDoSave(c *check.C) {
 		buf := json.RawMessage(`{"hello": "there"}`)
 		return &buf, nil
 	})()
+	defer osutil.MockMountInfo("")()
 
 	expectedOptions := &snap.SnapshotOptions{}
-	defer snapshotstate.MockBackendSave(func(_ context.Context, id uint64, si *snap.Info, cfg map[string]interface{}, usernames []string,
+	defer snapshotstate.MockBackendSave(func(_ context.Context, id uint64, si *snap.Info, cfg map[string]any, usernames []string,
 		options *snap.SnapshotOptions, _ *dirs.SnapDirOptions) (*client.Snapshot, error) {
 		c.Check(id, check.Equals, uint64(42))
 		c.Check(si, check.DeepEquals, &snapInfo)
-		c.Check(cfg, check.DeepEquals, map[string]interface{}{"hello": "there"})
+		c.Check(cfg, check.DeepEquals, map[string]any{"hello": "there"})
 		c.Check(usernames, check.DeepEquals, []string{"a-user", "b-user"})
 		c.Check(options, check.DeepEquals, expectedOptions)
 		return nil, nil
@@ -306,7 +309,7 @@ func (snapshotSuite) TestDoSave(c *check.C) {
 		st := state.New(nil)
 		st.Lock()
 		task := st.NewTask("save-snapshot", "...")
-		task.Set("snapshot-setup", map[string]interface{}{
+		task.Set("snapshot-setup", map[string]any{
 			"set-id":  42,
 			"snap":    "a-snap",
 			"users":   []string{"a-user", "b-user"},
@@ -317,6 +320,462 @@ func (snapshotSuite) TestDoSave(c *check.C) {
 		err := snapshotstate.DoSave(task, &tomb.Tomb{})
 		c.Assert(err, check.IsNil)
 	}
+}
+
+func (snapshotSuite) TestMapMountPointsInDataDirsToExcludes(c *check.C) {
+	snapInfo := snap.Info{
+		SideInfo: snap.SideInfo{
+			RealName: "a-snap",
+			Revision: snap.R(3),
+		},
+	}
+	snapDataDir := snapInfo.DataDir()
+	snapCommonDir := snapInfo.CommonDataDir()
+
+	homeBase := dirs.SnapHomeDirs()[0]
+	user1HomeDir := filepath.Join(homeBase, "user1")
+	user1SnapDataDir := snapInfo.UserDataDir(user1HomeDir, nil)
+	user1SnapCommonDir := snapInfo.UserCommonDataDir(user1HomeDir, nil)
+
+	dirOpts := &dirs.SnapDirOptions{HiddenSnapDataDir: true}
+	user1SnapDataDirHidden := snapInfo.UserDataDir(user1HomeDir, dirOpts)
+	user1SnapCommonDirHidden := snapInfo.UserCommonDataDir(user1HomeDir, dirOpts)
+
+	user2HomeDir := filepath.Join(homeBase, "user2")
+	user2SnapDataDir := snapInfo.UserDataDir(user2HomeDir, nil)
+
+	tests := []struct {
+		comment     string
+		opts        *dirs.SnapDirOptions
+		users       []string
+		mountPoints []string
+		expected    []string
+	}{
+		{
+			comment:     "nil mount points",
+			mountPoints: nil,
+			expected:    nil,
+		},
+		{
+			comment:     "empty mount points",
+			mountPoints: []string{},
+			expected:    nil,
+		},
+		{
+			comment:     "SNAP_DATA subdir",
+			mountPoints: []string{snapDataDir + "/mymount"},
+			expected:    []string{"$SNAP_DATA/mymount"},
+		},
+		{
+			comment:     "SNAP_COMMON subdir",
+			mountPoints: []string{snapCommonDir + "/media"},
+			expected:    []string{"$SNAP_COMMON/media"},
+		},
+		{
+			comment:     "exact SNAP_DATA dir",
+			mountPoints: []string{snapDataDir},
+			expected:    []string{"$SNAP_DATA"},
+		},
+		{
+			comment:     "exact SNAP_COMMON dir",
+			mountPoints: []string{snapCommonDir},
+			expected:    []string{"$SNAP_COMMON"},
+		},
+		{
+			comment:     "SNAP_DATA with trailing slash",
+			mountPoints: []string{snapDataDir + "/"},
+			expected:    []string{"$SNAP_DATA"},
+		},
+		{
+			comment:     "SNAP_DATA and SNAP_COMMON",
+			mountPoints: []string{snapDataDir + "/mymount", snapCommonDir + "/media"},
+			expected:    []string{"$SNAP_DATA/mymount", "$SNAP_COMMON/media"},
+		},
+		{
+			comment:     "outside snap dirs",
+			mountPoints: []string{"/media/external"},
+			expected:    nil,
+		},
+		{
+			comment:     "SNAP_USER_DATA subdir",
+			mountPoints: []string{user1SnapDataDir + "/cache"},
+			expected:    []string{"$SNAP_USER_DATA/cache"},
+		},
+		{
+			comment:     "SNAP_USER_COMMON subdir",
+			mountPoints: []string{user1SnapCommonDir + "/db"},
+			expected:    []string{"$SNAP_USER_COMMON/db"},
+		},
+		{
+			comment:     "exact SNAP_USER_DATA dir",
+			mountPoints: []string{user1SnapDataDir},
+			expected:    []string{"$SNAP_USER_DATA"},
+		},
+		{
+			comment:     "exact SNAP_USER_COMMON dir",
+			mountPoints: []string{user1SnapCommonDir},
+			expected:    []string{"$SNAP_USER_COMMON"},
+		},
+		{
+			comment:     "SNAP_USER_DATA with trailing slash",
+			mountPoints: []string{user1SnapDataDir + "/"},
+			expected:    []string{"$SNAP_USER_DATA"},
+		},
+		{
+			comment:     "different user SNAP_USER_DATA",
+			mountPoints: []string{user2SnapDataDir + "/logs"},
+			expected:    []string{"$SNAP_USER_DATA/logs"},
+		},
+		{
+			comment:     "hidden SNAP_USER_DATA subdir",
+			opts:        dirOpts,
+			mountPoints: []string{user1SnapDataDirHidden + "/cache"},
+			expected:    []string{"$SNAP_USER_DATA/cache"},
+		},
+		{
+			comment:     "hidden SNAP_USER_COMMON subdir",
+			opts:        dirOpts,
+			mountPoints: []string{user1SnapCommonDirHidden + "/db"},
+			expected:    []string{"$SNAP_USER_COMMON/db"},
+		},
+		{
+			comment:     "non-revision, non-common user path",
+			mountPoints: []string{filepath.Join(filepath.Dir(user1SnapDataDir), "extra")},
+			expected:    nil,
+		},
+		{
+			comment:     "user not in users list",
+			users:       []string{"user2"},
+			mountPoints: []string{user1SnapDataDir + "/cache"},
+			expected:    nil,
+		},
+		{
+			comment:     "user in users list",
+			users:       []string{"user1"},
+			mountPoints: []string{user1SnapDataDir + "/cache"},
+			expected:    []string{"$SNAP_USER_DATA/cache"},
+		},
+		{
+			comment:     "multiple users",
+			users:       []string{"user1", "user2"},
+			mountPoints: []string{user1SnapDataDir + "/cache", user2SnapDataDir + "/logs"},
+			expected:    []string{"$SNAP_USER_DATA/cache", "$SNAP_USER_DATA/logs"},
+		},
+		{
+			comment: "all four",
+			mountPoints: []string{
+				snapDataDir + "/d0",
+				snapCommonDir + "/c0",
+				user1SnapDataDir + "/d1",
+				user1SnapCommonDir + "/c1",
+			},
+			expected: []string{"$SNAP_DATA/d0", "$SNAP_COMMON/c0", "$SNAP_USER_DATA/d1", "$SNAP_USER_COMMON/c1"},
+		},
+	}
+
+	defer snapshotstate.MockBackendMapSnapDataDirToSnapVar(func(si *snap.Info, opts *dirs.SnapDirOptions, names []string) (map[string]string, error) {
+		mappings := map[string]string{
+			si.DataDir():       "$SNAP_DATA",
+			si.CommonDataDir(): "$SNAP_COMMON",
+		}
+		usernames := names
+		if len(usernames) == 0 {
+			usernames = []string{"user1", "user2"}
+		}
+		for _, n := range usernames {
+			home := filepath.Join(homeBase, n)
+			mappings[si.UserDataDir(home, opts)] = "$SNAP_USER_DATA"
+			mappings[si.UserCommonDataDir(home, opts)] = "$SNAP_USER_COMMON"
+		}
+		return mappings, nil
+	})()
+
+	for _, t := range tests {
+		entries := make([]*osutil.MountInfoEntry, len(t.mountPoints))
+		for i, mp := range t.mountPoints {
+			entries[i] = &osutil.MountInfoEntry{MountDir: mp}
+		}
+		result, err := snapshotstate.MapMountPointsInDataDirsToExcludes(&snapInfo, t.opts, t.users, entries)
+		c.Assert(err, check.IsNil, check.Commentf(t.comment))
+		c.Check(result, check.DeepEquals, t.expected, check.Commentf(t.comment))
+	}
+}
+
+func (snapshotSuite) TestDoSaveMountExcludes(c *check.C) {
+	snapInfo := snap.Info{
+		SideInfo: snap.SideInfo{
+			RealName: "a-snap",
+			Revision: snap.R(3),
+		},
+	}
+	defer snapshotstate.MockSnapstateCurrentInfo(func(_ *state.State, snapname string) (*snap.Info, error) {
+		c.Check(snapname, check.Equals, "a-snap")
+		return &snapInfo, nil
+	})()
+	defer snapshotstate.MockConfigGetSnapConfig(func(*state.State, string) (*json.RawMessage, error) {
+		return nil, nil
+	})()
+
+	dirOpts := &dirs.SnapDirOptions{HiddenSnapDataDir: true}
+	defer snapshotstate.MockGetSnapDirOptions(func(*state.State, string) (*dirs.SnapDirOptions, error) {
+		return dirOpts, nil
+	})()
+
+	homeBase := dirs.SnapHomeDirs()[0]
+	user1HomeDir := filepath.Join(homeBase, "user1")
+	user2HomeDir := filepath.Join(homeBase, "user2")
+
+	snapDataDir := snapInfo.DataDir()
+	snapCommonDir := snapInfo.CommonDataDir()
+	user1SnapDataDir := snapInfo.UserDataDir(user1HomeDir, dirOpts)
+	user1SnapCommonDir := snapInfo.UserCommonDataDir(user1HomeDir, dirOpts)
+	user2SnapDataDir := snapInfo.UserDataDir(user2HomeDir, dirOpts)
+
+	mp := []string{
+		snapDataDir + "/mymount",
+		"/outside/snap/dirs",
+		snapCommonDir + "/media",
+		user1SnapDataDir + "/cache",
+		user1SnapCommonDir + "/db",
+		user2SnapDataDir + "/logs",
+	}
+	mountInfoContent := fmt.Sprintf(
+		"36 1 8:1 / %s rw - ext4 /dev/sda1 rw\n"+
+			"37 1 8:2 / %s rw - ext4 /dev/sda2 rw\n"+
+			"38 1 8:3 / %s rw - tmpfs tmpfs rw\n"+
+			"39 1 8:4 / %s rw - ext4 /dev/sda3 rw\n"+
+			"40 1 8:5 / %s rw - tmpfs tmpfs rw\n"+
+			"41 1 8:6 / %s rw - ext4 /dev/sda4 rw\n",
+		mp[0], mp[1], mp[2], mp[3], mp[4], mp[5])
+	defer osutil.MockMountInfo(mountInfoContent)()
+
+	defer snapshotstate.MockBackendMapSnapDataDirToSnapVar(func(si *snap.Info, opts *dirs.SnapDirOptions, usernames []string) (map[string]string, error) {
+		c.Assert(usernames, check.DeepEquals, []string{"user1"})
+		c.Assert(opts, check.DeepEquals, dirOpts)
+		mappings := map[string]string{
+			si.DataDir():                             "$SNAP_DATA",
+			si.CommonDataDir():                       "$SNAP_COMMON",
+			si.UserDataDir(user1HomeDir, opts):       "$SNAP_USER_DATA",
+			si.UserCommonDataDir(user1HomeDir, opts): "$SNAP_USER_COMMON",
+		}
+		return mappings, nil
+	})()
+
+	var gotOptions *snap.SnapshotOptions
+	defer snapshotstate.MockBackendSave(func(_ context.Context, _ uint64, _ *snap.Info, _ map[string]any, _ []string,
+		opts *snap.SnapshotOptions, _ *dirs.SnapDirOptions) (*client.Snapshot, error) {
+		gotOptions = opts
+		return nil, nil
+	})()
+
+	st := state.New(nil)
+	st.Lock()
+	task := st.NewTask("save-snapshot", "...")
+	task.Set("snapshot-setup", map[string]any{
+		"set-id": 1,
+		"snap":   "a-snap",
+		"users":  []string{"user1"},
+	})
+	st.Unlock()
+
+	err := snapshotstate.DoSave(task, &tomb.Tomb{})
+	c.Assert(err, check.IsNil)
+	c.Assert(gotOptions, check.NotNil)
+	// user2's mount point is present in the mount info but should not be present
+	// in the excludes as only "user1" was listed in the snapshot-setup users.
+	c.Check(gotOptions.Exclude, check.DeepEquals, []string{
+		"$SNAP_DATA/mymount",
+		"$SNAP_COMMON/media",
+		"$SNAP_USER_DATA/cache",
+		"$SNAP_USER_COMMON/db",
+	})
+}
+
+func (snapshotSuite) TestDoSaveMountExcludesPreservesSetupOptions(c *check.C) {
+	snapInfo := snap.Info{
+		SideInfo: snap.SideInfo{
+			RealName: "a-snap",
+			Revision: snap.R(3),
+		},
+	}
+	defer snapshotstate.MockSnapstateCurrentInfo(func(_ *state.State, snapname string) (*snap.Info, error) {
+		c.Check(snapname, check.Equals, "a-snap")
+		return &snapInfo, nil
+	})()
+	defer snapshotstate.MockConfigGetSnapConfig(func(*state.State, string) (*json.RawMessage, error) {
+		return nil, nil
+	})()
+
+	snapCommonDir := snapInfo.CommonDataDir()
+	mountInfoContent := fmt.Sprintf("36 1 8:1 / %s rw - ext4 /dev/sda1 rw\n", snapCommonDir+"/media")
+	defer osutil.MockMountInfo(mountInfoContent)()
+	defer snapshotstate.MockBackendMapSnapDataDirToSnapVar(func(si *snap.Info, opts *dirs.SnapDirOptions, _ []string) (map[string]string, error) {
+		return map[string]string{
+			si.DataDir():       "$SNAP_DATA",
+			si.CommonDataDir(): "$SNAP_COMMON",
+		}, nil
+	})()
+
+	var gotOptions *snap.SnapshotOptions
+	defer snapshotstate.MockBackendSave(func(_ context.Context, _ uint64, _ *snap.Info, _ map[string]any, _ []string,
+		opts *snap.SnapshotOptions, _ *dirs.SnapDirOptions) (*client.Snapshot, error) {
+		gotOptions = opts
+		return nil, nil
+	})()
+
+	st := state.New(nil)
+	st.Lock()
+	task := st.NewTask("save-snapshot", "...")
+	task.Set("snapshot-setup", map[string]any{
+		"set-id":  1,
+		"snap":    "a-snap",
+		"options": &snap.SnapshotOptions{Exclude: []string{"$SNAP_DATA/logs"}},
+	})
+	st.Unlock()
+
+	err := snapshotstate.DoSave(task, &tomb.Tomb{})
+	c.Assert(err, check.IsNil)
+	c.Assert(gotOptions, check.NotNil)
+	// Both setup-specified and mount excludes are present
+	c.Check(gotOptions.Exclude, check.DeepEquals, []string{"$SNAP_DATA/logs", "$SNAP_COMMON/media"})
+}
+
+func (snapshotSuite) TestDoSaveMountExcludesLoadMountInfoError(c *check.C) {
+	snapInfo := snap.Info{
+		SideInfo: snap.SideInfo{
+			RealName: "a-snap",
+			Revision: snap.R(3),
+		},
+	}
+	defer snapshotstate.MockSnapstateCurrentInfo(func(_ *state.State, snapname string) (*snap.Info, error) {
+		c.Check(snapname, check.Equals, "a-snap")
+		return &snapInfo, nil
+	})()
+	defer snapshotstate.MockConfigGetSnapConfig(func(*state.State, string) (*json.RawMessage, error) {
+		return nil, nil
+	})()
+	// Inject a mountinfo line with less fields; the parser requires at least 10.
+	defer osutil.MockMountInfo("col1 col2 col3\n")()
+
+	setupOptions := &snap.SnapshotOptions{Exclude: []string{"$SNAP_DATA/logs"}}
+	var gotOptions *snap.SnapshotOptions
+	defer snapshotstate.MockBackendSave(func(_ context.Context, _ uint64, _ *snap.Info, _ map[string]any, _ []string,
+		opts *snap.SnapshotOptions, _ *dirs.SnapDirOptions) (*client.Snapshot, error) {
+		gotOptions = opts
+		return nil, nil
+	})()
+
+	logbuf, restore := logger.MockLogger()
+	defer restore()
+
+	st := state.New(nil)
+	st.Lock()
+	task := st.NewTask("save-snapshot", "...")
+	task.Set("snapshot-setup", map[string]any{
+		"set-id":  1,
+		"snap":    "a-snap",
+		"options": setupOptions,
+	})
+	st.Unlock()
+
+	err := snapshotstate.DoSave(task, &tomb.Tomb{})
+	c.Assert(err, check.IsNil)
+	// Original setup options passed through unchanged despite error
+	c.Check(gotOptions, check.DeepEquals, setupOptions)
+	// Verify error was logged
+	c.Check(logbuf.String(), check.Matches, "(?s).*cannot exclude mount points.* incorrect number of fields, expected at least 10 but found 3.*")
+}
+
+func (snapshotSuite) TestDoSaveNoMounts(c *check.C) {
+	snapInfo := snap.Info{
+		SideInfo: snap.SideInfo{
+			RealName: "a-snap",
+			Revision: snap.R(3),
+		},
+	}
+	defer snapshotstate.MockSnapstateCurrentInfo(func(_ *state.State, snapname string) (*snap.Info, error) {
+		c.Check(snapname, check.Equals, "a-snap")
+		return &snapInfo, nil
+	})()
+	defer snapshotstate.MockConfigGetSnapConfig(func(*state.State, string) (*json.RawMessage, error) {
+		return nil, nil
+	})()
+	defer osutil.MockMountInfo("")()
+
+	setupOptions := &snap.SnapshotOptions{Exclude: []string{"$SNAP_DATA/cache"}}
+	var gotOptions *snap.SnapshotOptions
+	defer snapshotstate.MockBackendSave(func(_ context.Context, _ uint64, _ *snap.Info, _ map[string]any, _ []string,
+		opts *snap.SnapshotOptions, _ *dirs.SnapDirOptions) (*client.Snapshot, error) {
+		gotOptions = opts
+		return nil, nil
+	})()
+
+	st := state.New(nil)
+	st.Lock()
+	task := st.NewTask("save-snapshot", "...")
+	task.Set("snapshot-setup", map[string]any{
+		"set-id":  1,
+		"snap":    "a-snap",
+		"options": setupOptions,
+	})
+	st.Unlock()
+
+	err := snapshotstate.DoSave(task, &tomb.Tomb{})
+	c.Assert(err, check.IsNil)
+	// Options unchanged when there are no mounts
+	c.Check(gotOptions, check.DeepEquals, setupOptions)
+}
+
+func (snapshotSuite) TestDoSaveMountExcludesMapDirToVarError(c *check.C) {
+	snapInfo := snap.Info{
+		SideInfo: snap.SideInfo{
+			RealName: "a-snap",
+			Revision: snap.R(3),
+		},
+	}
+	defer snapshotstate.MockSnapstateCurrentInfo(func(_ *state.State, snapname string) (*snap.Info, error) {
+		c.Check(snapname, check.Equals, "a-snap")
+		return &snapInfo, nil
+	})()
+	defer snapshotstate.MockConfigGetSnapConfig(func(*state.State, string) (*json.RawMessage, error) {
+		return nil, nil
+	})()
+
+	snapCommonDir := snapInfo.CommonDataDir()
+	mountInfoContent := fmt.Sprintf("36 1 8:1 / %s rw - ext4 /dev/sda1 rw\n", snapCommonDir+"/media")
+	defer osutil.MockMountInfo(mountInfoContent)()
+
+	defer snapshotstate.MockBackendMapSnapDataDirToSnapVar(func(_ *snap.Info, _ *dirs.SnapDirOptions, _ []string) (map[string]string, error) {
+		return nil, fmt.Errorf("mock MapSnapDataDirToSnapVar error")
+	})()
+
+	setupOptions := &snap.SnapshotOptions{Exclude: []string{"$SNAP_DATA/logs"}}
+	var gotOptions *snap.SnapshotOptions
+	defer snapshotstate.MockBackendSave(func(_ context.Context, _ uint64, _ *snap.Info, _ map[string]any, _ []string,
+		opts *snap.SnapshotOptions, _ *dirs.SnapDirOptions) (*client.Snapshot, error) {
+		gotOptions = opts
+		return nil, nil
+	})()
+
+	logbuf, restore := logger.MockLogger()
+	defer restore()
+
+	st := state.New(nil)
+	st.Lock()
+	task := st.NewTask("save-snapshot", "...")
+	task.Set("snapshot-setup", map[string]any{
+		"set-id":  1,
+		"snap":    "a-snap",
+		"options": setupOptions,
+	})
+	st.Unlock()
+
+	err := snapshotstate.DoSave(task, &tomb.Tomb{})
+	c.Assert(err, check.IsNil)
+	// Original setup options passed through unchanged despite error
+	c.Check(gotOptions, check.DeepEquals, setupOptions)
+	// Verify error was logged
+	c.Check(logbuf.String(), check.Matches, "(?s).*cannot exclude mount points.* mock MapSnapDataDirToSnapVar error.*")
 }
 
 func (snapshotSuite) TestDoSaveGetsSnapDirOpts(c *check.C) {
@@ -336,9 +795,10 @@ func (snapshotSuite) TestDoSaveGetsSnapDirOpts(c *check.C) {
 		c.Check(snapname, check.Equals, "a-snap")
 		return &snapInfo, nil
 	})()
+	defer osutil.MockMountInfo("")()
 
 	var checkOpts bool
-	defer snapshotstate.MockBackendSave(func(_ context.Context, id uint64, si *snap.Info, cfg map[string]interface{}, usernames []string, _ *snap.SnapshotOptions, opts *dirs.SnapDirOptions) (*client.Snapshot, error) {
+	defer snapshotstate.MockBackendSave(func(_ context.Context, id uint64, si *snap.Info, cfg map[string]any, usernames []string, _ *snap.SnapshotOptions, opts *dirs.SnapDirOptions) (*client.Snapshot, error) {
 		c.Check(opts.HiddenSnapDataDir, check.Equals, true)
 		checkOpts = true
 		return nil, nil
@@ -347,7 +807,7 @@ func (snapshotSuite) TestDoSaveGetsSnapDirOpts(c *check.C) {
 	st := state.New(nil)
 	st.Lock()
 	task := st.NewTask("save-snapshot", "...")
-	task.Set("snapshot-setup", map[string]interface{}{
+	task.Set("snapshot-setup", map[string]any{
 		"snap": "a-snap",
 	})
 	st.Unlock()
@@ -362,14 +822,14 @@ func (snapshotSuite) TestDoSaveFailsWithNoSnap(c *check.C) {
 		return nil, errors.New("bzzt")
 	})()
 	defer snapshotstate.MockConfigGetSnapConfig(func(*state.State, string) (*json.RawMessage, error) { return nil, nil })()
-	defer snapshotstate.MockBackendSave(func(_ context.Context, id uint64, si *snap.Info, cfg map[string]interface{}, usernames []string, _ *snap.SnapshotOptions, options *dirs.SnapDirOptions) (*client.Snapshot, error) {
+	defer snapshotstate.MockBackendSave(func(_ context.Context, id uint64, si *snap.Info, cfg map[string]any, usernames []string, _ *snap.SnapshotOptions, options *dirs.SnapDirOptions) (*client.Snapshot, error) {
 		return nil, nil
 	})()
 
 	st := state.New(nil)
 	st.Lock()
 	task := st.NewTask("save-snapshot", "...")
-	task.Set("snapshot-setup", map[string]interface{}{
+	task.Set("snapshot-setup", map[string]any{
 		"set-id": 42,
 		"snap":   "a-snap",
 		"users":  []string{"a-user", "b-user"},
@@ -389,7 +849,7 @@ func (snapshotSuite) TestDoSaveFailsWithNoSnapshot(c *check.C) {
 	}
 	defer snapshotstate.MockSnapstateCurrentInfo(func(*state.State, string) (*snap.Info, error) { return &snapInfo, nil })()
 	defer snapshotstate.MockConfigGetSnapConfig(func(*state.State, string) (*json.RawMessage, error) { return nil, nil })()
-	defer snapshotstate.MockBackendSave(func(_ context.Context, id uint64, si *snap.Info, cfg map[string]interface{}, usernames []string, _ *snap.SnapshotOptions, options *dirs.SnapDirOptions) (*client.Snapshot, error) {
+	defer snapshotstate.MockBackendSave(func(_ context.Context, id uint64, si *snap.Info, cfg map[string]any, usernames []string, _ *snap.SnapshotOptions, options *dirs.SnapDirOptions) (*client.Snapshot, error) {
 		return nil, nil
 	})()
 
@@ -413,14 +873,15 @@ func (snapshotSuite) TestDoSaveFailsBackendError(c *check.C) {
 	}
 	defer snapshotstate.MockSnapstateCurrentInfo(func(*state.State, string) (*snap.Info, error) { return &snapInfo, nil })()
 	defer snapshotstate.MockConfigGetSnapConfig(func(*state.State, string) (*json.RawMessage, error) { return nil, nil })()
-	defer snapshotstate.MockBackendSave(func(_ context.Context, id uint64, si *snap.Info, cfg map[string]interface{}, usernames []string, _ *snap.SnapshotOptions, options *dirs.SnapDirOptions) (*client.Snapshot, error) {
+	defer osutil.MockMountInfo("")()
+	defer snapshotstate.MockBackendSave(func(_ context.Context, id uint64, si *snap.Info, cfg map[string]any, usernames []string, _ *snap.SnapshotOptions, options *dirs.SnapDirOptions) (*client.Snapshot, error) {
 		return nil, errors.New("bzzt")
 	})()
 
 	st := state.New(nil)
 	st.Lock()
 	task := st.NewTask("save-snapshot", "...")
-	task.Set("snapshot-setup", map[string]interface{}{
+	task.Set("snapshot-setup", map[string]any{
 		"set-id": 42,
 		"snap":   "a-snap",
 		"users":  []string{"a-user", "b-user"},
@@ -442,14 +903,14 @@ func (snapshotSuite) TestDoSaveFailsConfigError(c *check.C) {
 	defer snapshotstate.MockConfigGetSnapConfig(func(*state.State, string) (*json.RawMessage, error) {
 		return nil, errors.New("bzzt")
 	})()
-	defer snapshotstate.MockBackendSave(func(_ context.Context, id uint64, si *snap.Info, cfg map[string]interface{}, usernames []string, _ *snap.SnapshotOptions, options *dirs.SnapDirOptions) (*client.Snapshot, error) {
+	defer snapshotstate.MockBackendSave(func(_ context.Context, id uint64, si *snap.Info, cfg map[string]any, usernames []string, _ *snap.SnapshotOptions, options *dirs.SnapDirOptions) (*client.Snapshot, error) {
 		return nil, nil
 	})()
 
 	st := state.New(nil)
 	st.Lock()
 	task := st.NewTask("save-snapshot", "...")
-	task.Set("snapshot-setup", map[string]interface{}{
+	task.Set("snapshot-setup", map[string]any{
 		"set-id": 42,
 		"snap":   "a-snap",
 		"users":  []string{"a-user", "b-user"},
@@ -473,14 +934,14 @@ func (snapshotSuite) TestDoSaveFailsBadConfig(c *check.C) {
 		buf := json.RawMessage(`"hello-there"`)
 		return &buf, nil
 	})()
-	defer snapshotstate.MockBackendSave(func(_ context.Context, id uint64, si *snap.Info, cfg map[string]interface{}, usernames []string, _ *snap.SnapshotOptions, options *dirs.SnapDirOptions) (*client.Snapshot, error) {
+	defer snapshotstate.MockBackendSave(func(_ context.Context, id uint64, si *snap.Info, cfg map[string]any, usernames []string, _ *snap.SnapshotOptions, options *dirs.SnapDirOptions) (*client.Snapshot, error) {
 		return nil, nil
 	})()
 
 	st := state.New(nil)
 	st.Lock()
 	task := st.NewTask("save-snapshot", "...")
-	task.Set("snapshot-setup", map[string]interface{}{
+	task.Set("snapshot-setup", map[string]any{
 		"set-id": 42,
 		"snap":   "a-snap",
 		"users":  []string{"a-user", "b-user"},
@@ -506,8 +967,9 @@ func (snapshotSuite) TestDoSaveFailureRemovesStateEntry(c *check.C) {
 	defer snapshotstate.MockConfigGetSnapConfig(func(_ *state.State, snapname string) (*json.RawMessage, error) {
 		return nil, nil
 	})()
-	defer snapshotstate.MockBackendSave(func(_ context.Context, id uint64, si *snap.Info, cfg map[string]interface{}, usernames []string, _ *snap.SnapshotOptions, options *dirs.SnapDirOptions) (*client.Snapshot, error) {
-		var expirations map[uint64]interface{}
+	defer osutil.MockMountInfo("")()
+	defer snapshotstate.MockBackendSave(func(_ context.Context, id uint64, si *snap.Info, cfg map[string]any, usernames []string, _ *snap.SnapshotOptions, options *dirs.SnapDirOptions) (*client.Snapshot, error) {
+		var expirations map[uint64]any
 		st.Lock()
 		defer st.Unlock()
 		// verify that prepareSave stored expiration in the state
@@ -520,7 +982,7 @@ func (snapshotSuite) TestDoSaveFailureRemovesStateEntry(c *check.C) {
 	st.Lock()
 
 	task := st.NewTask("save-snapshot", "...")
-	task.Set("snapshot-setup", map[string]interface{}{
+	task.Set("snapshot-setup", map[string]any{
 		"set-id": 42,
 		"snap":   "a-snap",
 		"auto":   true,
@@ -533,7 +995,7 @@ func (snapshotSuite) TestDoSaveFailureRemovesStateEntry(c *check.C) {
 	defer st.Unlock()
 
 	// verify that after backend.Save failure expiration was removed from the state
-	var expirations map[uint64]interface{}
+	var expirations map[uint64]any
 	c.Assert(st.Get("snapshots", &expirations), check.IsNil)
 	c.Check(expirations, check.HasLen, 0)
 }
@@ -550,7 +1012,7 @@ func (rs *readerSuite) SetUpTest(c *check.C) {
 	st := state.New(nil)
 	st.Lock()
 	rs.task = st.NewTask("restore-snapshot", "...")
-	rs.task.Set("snapshot-setup", map[string]interface{}{
+	rs.task.Set("snapshot-setup", map[string]any{
 		// interestingly restore doesn't use the set-id
 		"snap":     "a-snap",
 		"filename": "/some/1_file.zip",
@@ -612,7 +1074,7 @@ func (rs *readerSuite) TestDoRestore(c *check.C) {
 		c.Check(setID, check.Equals, uint64(0))
 		c.Check(filename, check.Equals, "/some/1_file.zip")
 		return &backend.Reader{
-			Snapshot: client.Snapshot{Conf: map[string]interface{}{"hello": "there"}},
+			Snapshot: client.Snapshot{Conf: map[string]any{"hello": "there"}},
 		}, nil
 	})()
 	defer snapshotstate.MockBackendRestore(func(_ *backend.Reader, _ context.Context, _ snap.Revision, users []string, _ backend.Logf, options *dirs.SnapDirOptions) (*backend.RestoreState, error) {
@@ -633,10 +1095,10 @@ func (rs *readerSuite) TestDoRestore(c *check.C) {
 
 	st := rs.task.State()
 	st.Lock()
-	var v map[string]interface{}
+	var v map[string]any
 	rs.task.Get("restore-state", &v)
 	st.Unlock()
-	c.Check(v, check.DeepEquals, map[string]interface{}{"config": map[string]interface{}{"old": "conf"}})
+	c.Check(v, check.DeepEquals, map[string]any{"config": map[string]any{"old": "conf"}})
 }
 
 func (rs *readerSuite) TestDoRestoreNoConfig(c *check.C) {
@@ -676,9 +1138,9 @@ func (rs *readerSuite) TestDoRestoreNoConfig(c *check.C) {
 
 	st.Lock()
 	defer st.Unlock()
-	var v map[string]interface{}
+	var v map[string]any
 	rs.task.Get("restore-state", &v)
-	c.Check(v, check.DeepEquals, map[string]interface{}{"config": map[string]interface{}{"foo": "bar"}})
+	c.Check(v, check.DeepEquals, map[string]any{"config": map[string]any{"foo": "bar"}})
 }
 
 func (rs *readerSuite) TestDoRestoreFailsNoTaskSnapshot(c *check.C) {
@@ -730,7 +1192,7 @@ func (rs *readerSuite) TestDoRestoreFailsUnserialisableSnapshotConfigError(c *ch
 	defer snapshotstate.MockBackendOpen(func(string, uint64) (*backend.Reader, error) {
 		rs.calls = append(rs.calls, "open")
 		return &backend.Reader{
-			Snapshot: client.Snapshot{Conf: map[string]interface{}{"hello": func() {}}},
+			Snapshot: client.Snapshot{Conf: map[string]any{"hello": func() {}}},
 		}, nil
 	})()
 
@@ -770,7 +1232,7 @@ func (rs *readerSuite) TestUndoRestore(c *check.C) {
 
 	st := rs.task.State()
 	st.Lock()
-	v := map[string]interface{}{"config": map[string]interface{}{"foo": "bar"}}
+	v := map[string]any{"config": map[string]any{"foo": "bar"}}
 	rs.task.Set("restore-state", &v)
 	st.Unlock()
 
@@ -788,7 +1250,7 @@ func (rs *readerSuite) TestUndoRestoreNoConfig(c *check.C) {
 
 	st := rs.task.State()
 	st.Lock()
-	var v map[string]interface{}
+	var v map[string]any
 	rs.task.Set("restore-state", &v)
 	st.Unlock()
 
@@ -800,7 +1262,7 @@ func (rs *readerSuite) TestUndoRestoreNoConfig(c *check.C) {
 func (rs *readerSuite) TestCleanupRestore(c *check.C) {
 	st := rs.task.State()
 	st.Lock()
-	var v map[string]interface{}
+	var v map[string]any
 	rs.task.Set("restore-state", &v)
 	st.Unlock()
 
@@ -824,7 +1286,7 @@ func (rs *readerSuite) TestDoCheck(c *check.C) {
 		// set id 0 tells backend.Open to use set id from the filename
 		c.Check(setID, check.Equals, uint64(0))
 		return &backend.Reader{
-			Snapshot: client.Snapshot{Conf: map[string]interface{}{"hello": "there"}},
+			Snapshot: client.Snapshot{Conf: map[string]any{"hello": "there"}},
 		}, nil
 	})()
 	defer snapshotstate.MockBackendCheck(func(_ *backend.Reader, _ context.Context, users []string) error {
@@ -859,17 +1321,17 @@ func (rs *readerSuite) TestDoForgetRemovesAutomaticSnapshotExpiry(c *check.C) {
 	defer st.Unlock()
 
 	task := st.NewTask("forget-snapshot", "...")
-	task.Set("snapshot-setup", map[string]interface{}{
+	task.Set("snapshot-setup", map[string]any{
 		"set-id":   1,
 		"filename": "a-file",
 		"snap":     "a-snap",
 	})
 
-	st.Set("snapshots", map[uint64]interface{}{
-		1: map[string]interface{}{
+	st.Set("snapshots", map[uint64]any{
+		1: map[string]any{
 			"expiry-time": "2001-03-11T11:24:00Z",
 		},
-		2: map[string]interface{}{
+		2: map[string]any{
 			"expiry-time": "2037-02-12T12:50:00Z",
 		},
 	})
@@ -878,17 +1340,17 @@ func (rs *readerSuite) TestDoForgetRemovesAutomaticSnapshotExpiry(c *check.C) {
 	c.Assert(snapshotstate.DoForget(task, &tomb.Tomb{}), check.IsNil)
 
 	st.Lock()
-	var expirations map[uint64]interface{}
+	var expirations map[uint64]any
 	c.Assert(st.Get("snapshots", &expirations), check.IsNil)
-	c.Check(expirations, check.DeepEquals, map[uint64]interface{}{
-		2: map[string]interface{}{
+	c.Check(expirations, check.DeepEquals, map[uint64]any{
+		2: map[string]any{
 			"expiry-time": "2037-02-12T12:50:00Z",
 		}})
 }
 
-func (snapshotSuite) TestManagerRunCleanupAbandondedImportsAtStartup(c *check.C) {
+func (snapshotSuite) TestManagerRunCleanupAbandonedImportsAtStartup(c *check.C) {
 	n := 0
-	restore := snapshotstate.MockBackenCleanupAbandondedImports(func() (int, error) {
+	restore := snapshotstate.MockBackendCleanupAbandonedImports(func() (int, error) {
 		n++
 		return 0, nil
 	})
@@ -905,12 +1367,12 @@ func (snapshotSuite) TestManagerRunCleanupAbandondedImportsAtStartup(c *check.C)
 	c.Check(n, check.Equals, 1)
 }
 
-func (snapshotSuite) TestManagerRunCleanupAbandondedImportsAtStartupErrorLogged(c *check.C) {
+func (snapshotSuite) TestManagerRunCleanupAbandonedImportsAtStartupErrorLogged(c *check.C) {
 	logbuf, restore := logger.MockLogger()
 	defer restore()
 
 	n := 0
-	restore = snapshotstate.MockBackenCleanupAbandondedImports(func() (int, error) {
+	restore = snapshotstate.MockBackendCleanupAbandonedImports(func() (int, error) {
 		n++
 		return 0, errors.New("some error")
 	})

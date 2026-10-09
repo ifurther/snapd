@@ -430,7 +430,7 @@ type modeenvValueUnmarshaller interface {
 
 // marshalModeenvEntryTo marshals to out what as value for an entry
 // with the given key. If what is empty this is a no-op.
-func marshalModeenvEntryTo(out io.Writer, key string, what interface{}) error {
+func marshalModeenvEntryTo(out io.Writer, key string, what any) error {
 	var asString string
 	switch v := what.(type) {
 	case string:
@@ -473,7 +473,7 @@ func marshalModeenvEntryTo(out io.Writer, key string, what interface{}) error {
 // unmarshalModeenvValueFromCfg unmarshals the value of the entry with
 // the given key to dest. If there's no such entry dest might be left
 // empty.
-func unmarshalModeenvValueFromCfg(cfg *goconfigparser.ConfigParser, key string, dest interface{}) error {
+func unmarshalModeenvValueFromCfg(cfg *goconfigparser.ConfigParser, key string, dest any) error {
 	if dest == nil {
 		return fmt.Errorf("internal error: cannot unmarshal to nil")
 	}
@@ -580,4 +580,32 @@ func (s *bootCommandLines) UnmarshalJSON(data []byte) error {
 	}
 	*s = bootCommandLines(asList)
 	return nil
+}
+
+// MaybeReadModeenv uses ReadModeenv() with the default root directory, but
+// ignores ENOENT errors and returns a nil, but no error.
+func MaybeReadModeenv() (*Modeenv, error) {
+	modeenv, err := ReadModeenv("")
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("cannot read modeenv: %v", err)
+	}
+	return modeenv, nil
+}
+
+// SystemMode returns the current mode of the system and a flag indicating
+// whether the mode is explicitly set through modeenv. When the mode is not set
+// epxlicitly through modeenv, caller provided fallback is returned.
+func SystemMode(fallback string) (mode string, explicit bool, err error) {
+	modeenv, err := MaybeReadModeenv()
+	if err != nil {
+		return "", false, err
+	}
+
+	if modeenv != nil {
+		// we have the modeenv, making the system mode explicit
+		return modeenv.Mode, true, nil
+	}
+
+	// lacking the modeenv, system is implicitly in "run" mode
+	return fallback, false, nil
 }

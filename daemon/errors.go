@@ -24,11 +24,15 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/snapcore/snapd/arch"
 	"github.com/snapcore/snapd/client"
+	"github.com/snapcore/snapd/interfaces"
+	"github.com/snapcore/snapd/overlord/fdestate"
 	"github.com/snapcore/snapd/overlord/servicestate"
 	"github.com/snapcore/snapd/overlord/snapstate"
+	"github.com/snapcore/snapd/seclog"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/store"
 )
@@ -42,6 +46,15 @@ type apiError struct {
 	// Kind is the error kind. See client/errors.go
 	Kind  client.ErrorKind
 	Value errorValue
+}
+
+// seclogReason returns a [seclog.Reason] derived from the API error fields.
+func (ae *apiError) seclogReason() seclog.Reason {
+	return seclog.Reason{
+		Code:    ae.Status,
+		Kind:    string(ae.Kind),
+		Message: ae.Message,
+	}
 }
 
 func (ae *apiError) Error() string {
@@ -73,7 +86,7 @@ func (ae *apiError) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // check it implements StructuredResponse
 var _ StructuredResponse = (*apiError)(nil)
 
-type errorValue interface{}
+type errorValue any
 
 type errorResult struct {
 	Message string `json:"message"` // note no omitempty
@@ -84,11 +97,11 @@ type errorResult struct {
 
 // errorResponder is a callable that produces an error Response.
 // e.g., InternalError("something broke: %v", err), etc.
-type errorResponder func(string, ...interface{}) *apiError
+type errorResponder func(string, ...any) *apiError
 
 // makeErrorResponder builds an errorResponder from the given error status.
 func makeErrorResponder(status int) errorResponder {
-	return func(format string, v ...interface{}) *apiError {
+	return func(format string, v ...any) *apiError {
 		var msg string
 		if len(v) == 0 {
 			msg = format
@@ -151,29 +164,39 @@ func SnapNotInstalled(snapName string, err error) *apiError {
 	}
 }
 
+// SnapNotInstalled is an error responder used when an operation is
+// requested on a snap that is not in the system but expected to be.
+func MissingSnapResourcePair(csi *snap.ComponentSideInfo, snapRev snap.Revision) *apiError {
+	return &apiError{
+		Status:  400,
+		Message: fmt.Sprintf("cannot find resource pair connecting component revision %q with snap revision %q for %q", csi.Revision, snapRev, csi.Component),
+		Kind:    client.ErrorKindMissingSnapResourcePair,
+	}
+}
+
 // SnapRevisionNotAvailable is an error responder used when an
 // operation is requested for which no revivision can be found
 // in the given context (e.g. request an install from a stable
 // channel when this channel is empty).
 func SnapRevisionNotAvailable(snapName string, rnaErr *store.RevisionNotAvailableError) *apiError {
-	var value interface{} = snapName
+	var value any = snapName
 	kind := client.ErrorKindSnapRevisionNotAvailable
 	msg := rnaErr.Error()
 	if len(rnaErr.Releases) != 0 && rnaErr.Channel != "" {
 		thisArch := arch.DpkgArchitecture()
-		values := map[string]interface{}{
+		values := map[string]any{
 			"snap-name":    snapName,
 			"action":       rnaErr.Action,
 			"channel":      rnaErr.Channel,
 			"architecture": thisArch,
 		}
 		archOK := false
-		releases := make([]map[string]interface{}, 0, len(rnaErr.Releases))
+		releases := make([]map[string]any, 0, len(rnaErr.Releases))
 		for _, c := range rnaErr.Releases {
 			if c.Architecture == thisArch {
 				archOK = true
 			}
-			releases = append(releases, map[string]interface{}{
+			releases = append(releases, map[string]any{
 				"architecture": c.Architecture,
 				"channel":      c.Name,
 			})
@@ -200,10 +223,30 @@ func SnapRevisionNotAvailable(snapName string, rnaErr *store.RevisionNotAvailabl
 	}
 }
 
+// AlreadyInstalled is an error responder used when an install command
+// attempts to installed snaps/components that are already installed.
+func AlreadyInstalled(aie *snap.AlreadyInstalledError) *apiError {
+	value := map[string]any{}
+	if len(aie.Snaps) > 0 {
+		value["snaps"] = aie.Snaps
+	}
+
+	if len(aie.Components) > 0 {
+		value["components"] = aie.Components
+	}
+
+	return &apiError{
+		Status:  400,
+		Message: aie.Error(),
+		Kind:    client.ErrorKindSnapAlreadyInstalled,
+		Value:   value,
+	}
+}
+
 // SnapChangeConflict is an error responder used when an operation would
 // conflict with another ongoing change.
 func SnapChangeConflict(cce *snapstate.ChangeConflictError) *apiError {
-	value := map[string]interface{}{}
+	value := map[string]any{}
 	if cce.Snap != "" {
 		value["snap-name"] = cce.Snap
 	}
@@ -222,7 +265,7 @@ func SnapChangeConflict(cce *snapstate.ChangeConflictError) *apiError {
 // QuotaChangeConflict is an error responder used when an operation would
 // conflict with another ongoing change.
 func QuotaChangeConflict(qce *servicestate.QuotaChangeConflictError) *apiError {
-	value := map[string]interface{}{}
+	value := map[string]any{}
 	if qce.Quota != "" {
 		value["quota-name"] = qce.Quota
 	}
@@ -241,7 +284,7 @@ func QuotaChangeConflict(qce *servicestate.QuotaChangeConflictError) *apiError {
 // InsufficientSpace is an error responder used when an operation cannot
 // be performed due to low disk space.
 func InsufficientSpace(dserr *snapstate.InsufficientSpaceError) *apiError {
-	value := map[string]interface{}{}
+	value := map[string]any{}
 	if len(dserr.Snaps) > 0 {
 		value["snap-names"] = dserr.Snaps
 	}
@@ -256,9 +299,65 @@ func InsufficientSpace(dserr *snapstate.InsufficientSpaceError) *apiError {
 	}
 }
 
+func KeyslotsNotFound(err *fdestate.KeyslotRefsNotFoundError) *apiError {
+	return &apiError{
+		Status:  400,
+		Message: err.Error(),
+		Kind:    client.ErrorKindKeyslotsNotFound,
+		Value:   err.KeyslotRefs,
+	}
+}
+
+func KeyslotsAlreadyExist(err *fdestate.KeyslotsAlreadyExistsError) *apiError {
+	refs := make([]fdestate.KeyslotRef, len(err.Keyslots))
+	for i, keyslot := range err.Keyslots {
+		refs[i] = keyslot.Ref()
+	}
+	return &apiError{
+		Status:  400,
+		Message: err.Error(),
+		Kind:    client.ErrorKindKeyslotsAlreadyExists,
+		Value:   refs,
+	}
+}
+
+func InsufficientContainerCapacity(err *fdestate.InsufficientContainerCapacityError) *apiError {
+	return &apiError{
+		Status:  400,
+		Message: err.Error(),
+		Kind:    client.ErrorKindInsufficientContainerCapacity,
+		Value:   err.ContainerRoles,
+	}
+}
+
+func InvalidRecoveryKey(err *fdestate.InvalidRecoveryKeyError) *apiError {
+	return &apiError{
+		Status:  400,
+		Message: err.Error(),
+		Kind:    client.ErrorKindInvalidRecoveryKey,
+		Value: map[string]any{
+			"reason": err.Reason,
+		},
+	}
+}
+
+// FDEChangeAuthThrottled is an error responder used when a change-passphrase or
+// change-pin request is rejected because it is rate-limited to avoid tripping
+// the TPM Dictionary Attack lockout.
+func FDEChangeAuthThrottled(err *fdestate.DALockoutThrottledError) *apiError {
+	return &apiError{
+		Status:  429,
+		Message: err.Error(),
+		Kind:    client.ErrorKindFDEChangeAuthThrottled,
+		Value: map[string]any{
+			"retry-after": err.RetryAfter.Format(time.RFC3339),
+		},
+	}
+}
+
 // AppNotFound is an error responder used when an operation is
 // requested on a app that doesn't exist.
-func AppNotFound(format string, v ...interface{}) *apiError {
+func AppNotFound(format string, v ...any) *apiError {
 	return &apiError{
 		Status:  404,
 		Message: fmt.Sprintf(format, v...),
@@ -268,7 +367,7 @@ func AppNotFound(format string, v ...interface{}) *apiError {
 
 // AuthCancelled is an error responder used when a user cancelled
 // the auth process.
-func AuthCancelled(format string, v ...interface{}) *apiError {
+func AuthCancelled(format string, v ...any) *apiError {
 	return &apiError{
 		Status:  403,
 		Message: fmt.Sprintf(format, v...),
@@ -278,7 +377,7 @@ func AuthCancelled(format string, v ...interface{}) *apiError {
 
 // InterfacesUnchanged is an error responder used when an operation
 // that would normally change interfaces finds it has nothing to do
-func InterfacesUnchanged(format string, v ...interface{}) *apiError {
+func InterfacesUnchanged(format string, v ...any) *apiError {
 	return &apiError{
 		Status:  400,
 		Message: fmt.Sprintf(format, v...),
@@ -286,7 +385,7 @@ func InterfacesUnchanged(format string, v ...interface{}) *apiError {
 	}
 }
 
-func errToResponse(err error, snaps []string, fallback errorResponder, format string, v ...interface{}) *apiError {
+func errToResponse(err error, snaps []string, fallback errorResponder, format string, v ...any) *apiError {
 	var kind client.ErrorKind
 	var snapName string
 
@@ -306,6 +405,8 @@ func errToResponse(err error, snaps []string, fallback errorResponder, format st
 		kind = client.ErrorKindSnapNoUpdateAvailable
 	case store.ErrLocalSnap:
 		kind = client.ErrorKindSnapLocal
+	case interfaces.ErrSystemKeyMismatchVersionTooHigh:
+		kind = client.ErrorKindSystemKeyVersionUnsupported
 	default:
 		handled := true
 		switch err := err.(type) {
@@ -321,8 +422,7 @@ func errToResponse(err error, snaps []string, fallback errorResponder, format st
 				return InternalError("store.RevisionNotAvailable with %d snaps", len(snaps))
 			}
 		case *snap.AlreadyInstalledError:
-			kind = client.ErrorKindSnapAlreadyInstalled
-			snapName = err.Snap
+			return AlreadyInstalled(err)
 		case *snap.NotInstalledError:
 			kind = client.ErrorKindSnapNotInstalled
 			snapName = err.Snap
@@ -342,6 +442,16 @@ func errToResponse(err error, snaps []string, fallback errorResponder, format st
 			snapName = err.Snap
 		case *snapstate.InsufficientSpaceError:
 			return InsufficientSpace(err)
+		case *fdestate.KeyslotRefsNotFoundError:
+			return KeyslotsNotFound(err)
+		case *fdestate.KeyslotsAlreadyExistsError:
+			return KeyslotsAlreadyExist(err)
+		case *fdestate.InsufficientContainerCapacityError:
+			return InsufficientContainerCapacity(err)
+		case *fdestate.InvalidRecoveryKeyError:
+			return InvalidRecoveryKey(err)
+		case *fdestate.DALockoutThrottledError:
+			return FDEChangeAuthThrottled(err)
 		case net.Error:
 			if err.Timeout() {
 				kind = client.ErrorKindNetworkTimeout

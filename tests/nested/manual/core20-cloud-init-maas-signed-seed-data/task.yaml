@@ -5,7 +5,11 @@ details: |
   ubuntu-seed with grade signed. Check files have been copied depending on the variant
   and cloud-init is disabled after it is executed.
 
-systems: [ubuntu-2*]
+systems:
+  # core26 is not yet in grade that can work with a signed model
+  - ubuntu-20*
+  - ubuntu-22*
+  - ubuntu-24*
 
 environment:
   # three variants
@@ -47,16 +51,12 @@ environment:
   # a model with grade higher than dangerous when building the image
   NESTED_CORE_CHANNEL: ""
 
+skip:
+    - reason: This test needs test keys to be trusted
+      if: |
+        [ "$TRUST_TEST_KEYS" = "false" ]
+
 prepare: |
-  if [ "$TRUST_TEST_KEYS" = "false" ]; then
-      echo "This test needs test keys to be trusted"
-      exit
-  fi
-
-  snap install remarshal jq
-  tests.cleanup defer snap remove remarshal
-  tests.cleanup defer snap remove jq
-
   #shellcheck source=tests/lib/nested.sh
   . "$TESTSLIB/nested.sh"
 
@@ -145,11 +145,6 @@ prepare: |
   tests.nested create-vm core
 
 restore: |
-  if [ "$TRUST_TEST_KEYS" = "false" ]; then
-      echo "This test needs test keys to be trusted"
-      exit
-  fi
-
   systemctl stop fakedevicesvc
 
   "$TESTSTOOLS"/store-state teardown-fake-store "$NESTED_FAKESTORE_BLOB_DIR"
@@ -162,11 +157,6 @@ debug: |
   remote.exec "cloud-init status --long" || true
 
 execute: |
-  if [ "$TRUST_TEST_KEYS" = "false" ]; then
-      echo "This test needs test keys to be trusted"
-      exit
-  fi
-
   #shellcheck source=tests/lib/nested.sh
   . "$TESTSLIB/nested.sh"
 
@@ -280,9 +270,9 @@ execute: |
     remote.exec "cat /etc/cloud/cloud.cfg.d/99_snapd_datasource.cfg" > datasource_restrict.cfg
     # check that it has only MAAS
     #shellcheck disable=SC2002
-    cat datasource_restrict.cfg | yaml2json | jq -r '."datasource_list" | .[]' | MATCH MAAS
+    cat datasource_restrict.cfg | gojq --yaml-input -r '."datasource_list" | .[]' | MATCH MAAS
     #shellcheck disable=SC2002
-    test "$(cat datasource_restrict.cfg | yaml2json | jq -r '."datasource_list" | .[]' | wc -l)" = 1
+    test "$(cat datasource_restrict.cfg | gojq --yaml-input -r '."datasource_list" | .[]' | wc -l)" = 1
   fi
 
   # note that zzzz_snapd.cfg is not installed because cloud-init is in error and

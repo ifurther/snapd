@@ -7,6 +7,12 @@ details: |
 # we just need a single system to verify this
 systems: [ubuntu-22.04-64]
 
+skip:
+    - reason: Requires snapd .deb files built for testing
+      if: |
+        # "$GOHOME"/snapd_*.deb is used in the lxd container
+        [[ "$(find "$GOHOME" -name 'snapd_*.deb' | wc -l || echo 0)" -eq 0 ]]
+
 restore: |
     lxc delete --force my-ubuntu
     snap remove --purge lxd
@@ -18,9 +24,7 @@ execute: |
 
     echo "Install lxd"
     "$TESTSTOOLS"/lxd-state prepare-snap
-
-    VERSION_ID="$(. /etc/os-release && echo "$VERSION_ID" )"
-    lxd.lxc launch --quiet "ubuntu:$VERSION_ID" my-ubuntu
+    "$TESTSTOOLS"/lxd-state launch --name my-ubuntu
 
     if os.query is-pc-amd64 && lxd.lxc info my-ubuntu | grep "Architecture: i686"; then
         echo "LXD spawned 32bit userspace container on a 64bit host, WAT?"

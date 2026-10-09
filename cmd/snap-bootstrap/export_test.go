@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2016-2020 Canonical Ltd
+ * Copyright (C) 2016-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -20,6 +20,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -27,9 +28,9 @@ import (
 	"github.com/snapcore/snapd/boot"
 	"github.com/snapcore/snapd/gadget"
 	gadgetInstall "github.com/snapcore/snapd/gadget/install"
-	"github.com/snapcore/snapd/osutil/disks"
 	"github.com/snapcore/snapd/secboot"
 	"github.com/snapcore/snapd/seed"
+	"github.com/snapcore/snapd/snap/integrity"
 	"github.com/snapcore/snapd/testutil"
 	"github.com/snapcore/snapd/timings"
 )
@@ -39,18 +40,26 @@ var (
 
 	DoSystemdMount = doSystemdMountImpl
 
-	MountNonDataPartitionMatchingKernelDisk = mountNonDataPartitionMatchingKernelDisk
+	FindPartitionsOfBootDisk = findBootDisk
 
 	GetNonUEFISystemDisk = getNonUEFISystemDisk
+
+	GenerateMountsFromManifest = generateMountsFromManifest
+
+	ParseImageManifest = parseImageManifest
+
+	CreateOverlayDirs = createOverlayDirs
 )
 
+type OverlayFsOptions = overlayFsOptions
+type DmVerityOptions = dmVerityOptions
 type SystemdMountOptions = systemdMountOptions
 
-type RecoverDegradedState = recoverDegradedState
+type DiskUnlockState = diskUnlockState
 
 type PartitionState = partitionState
 
-func (r *RecoverDegradedState) Degraded(isEncrypted bool) bool {
+func (r *DiskUnlockState) Degraded(isEncrypted bool) bool {
 	m := recoverModeStateMachine{
 		isEncryptedDev: isEncrypted,
 		degradedState:  r,
@@ -121,7 +130,7 @@ func MockDefaultMarkerFile(p string) (restore func()) {
 	}
 }
 
-func MockSecbootUnlockVolumeUsingSealedKeyIfEncrypted(f func(disk disks.Disk, name string, sealedEncryptionKeyFile string, opts *secboot.UnlockVolumeUsingSealedKeyOptions) (secboot.UnlockResult, error)) (restore func()) {
+func MockSecbootUnlockVolumeUsingSealedKeyIfEncrypted(f func(activateContext secboot.ActivateContext, disk secboot.Disk, name string, sealedEncryptionKeyFiles []*secboot.LegacyKeyFile, opts *secboot.UnlockVolumeUsingSealedKeyOptions) (secboot.UnlockResult, error)) (restore func()) {
 	old := secbootUnlockVolumeUsingSealedKeyIfEncrypted
 	secbootUnlockVolumeUsingSealedKeyIfEncrypted = f
 	return func() {
@@ -129,11 +138,11 @@ func MockSecbootUnlockVolumeUsingSealedKeyIfEncrypted(f func(disk disks.Disk, na
 	}
 }
 
-func MockSecbootUnlockEncryptedVolumeUsingKey(f func(disk disks.Disk, name string, key []byte) (secboot.UnlockResult, error)) (restore func()) {
-	old := secbootUnlockEncryptedVolumeUsingKey
-	secbootUnlockEncryptedVolumeUsingKey = f
+func MockSecbootUnlockEncryptedVolumeUsingProtectorKey(f func(activateContext secboot.ActivateContext, disk secboot.Disk, name string, key []byte) (secboot.UnlockResult, error)) (restore func()) {
+	old := secbootUnlockEncryptedVolumeUsingProtectorKey
+	secbootUnlockEncryptedVolumeUsingProtectorKey = f
 	return func() {
-		secbootUnlockEncryptedVolumeUsingKey = old
+		secbootUnlockEncryptedVolumeUsingProtectorKey = old
 	}
 }
 
@@ -202,7 +211,7 @@ func MockWaitFile(f func(string, time.Duration, int) error) (restore func()) {
 
 var WaitFile = waitFile
 
-func MockGadgetInstallRun(f func(model gadget.Model, gadgetRoot, kernelRoot, bootDevice string, options gadgetInstall.Options, observer gadget.ContentObserver, perfTimings timings.Measurer) (*gadgetInstall.InstalledSystemSideData, error)) (restore func()) {
+func MockGadgetInstallRun(f func(model gadget.Model, gadgetRoot string, kernelSnapInfo *gadgetInstall.KernelSnapInfo, bootDevice string, options gadgetInstall.Options, observer gadget.ContentObserver, perfTimings timings.Measurer) (*gadgetInstall.InstalledSystemSideData, error)) (restore func()) {
 	old := gadgetInstallRun
 	gadgetInstallRun = f
 	return func() {
@@ -210,7 +219,7 @@ func MockGadgetInstallRun(f func(model gadget.Model, gadgetRoot, kernelRoot, boo
 	}
 }
 
-func MockMakeRunnableStandaloneSystem(f func(model *asserts.Model, bootWith *boot.BootableSet, sealer *boot.TrustedAssetsInstallObserver) error) (restore func()) {
+func MockMakeRunnableStandaloneSystem(f func(model *asserts.Model, bootWith *boot.BootableSet, bootAssets boot.BootAssets, encryption *boot.EncryptionSetup) error) (restore func()) {
 	old := bootMakeRunnableStandaloneSystem
 	bootMakeRunnableStandaloneSystem = f
 	return func() {
@@ -232,4 +241,36 @@ func MockEnsureNextBootToRunMode(f func(systemLabel string) error) (restore func
 	return func() {
 		bootEnsureNextBootToRunMode = old
 	}
+}
+
+func MockBuildInstallObserver(f func(model *asserts.Model, gadgetDir string, useEncryption bool) (observer gadget.ContentObserver, trustedObserver boot.TrustedAssetsInstallObserver, err error)) (restore func()) {
+	old := installBuildInstallObserver
+	installBuildInstallObserver = f
+	return func() {
+		installBuildInstallObserver = old
+	}
+}
+
+func MockOsGetenv(mock func(string) string) (restore func()) {
+	old := osGetenv
+	osGetenv = mock
+	return func() {
+		osGetenv = old
+	}
+}
+
+func MockLookupDmVerityDataAndCrossCheck(f func(snapPath string, params *integrity.IntegrityDataParams) (string, error)) (restore func()) {
+	old := lookupDmVerityDataAndCrossCheck
+	lookupDmVerityDataAndCrossCheck = f
+	return func() {
+		lookupDmVerityDataAndCrossCheck = old
+	}
+}
+
+func MockSecbootNewActivateContext(f func(ctx context.Context) (secboot.ActivateContext, error)) (restore func()) {
+	return testutil.Mock(&secbootNewActivateContext, f)
+}
+
+func MockOsutilDeviceMajorAndMinor(f func(devPath string) (uint32, uint32, error)) (restore func()) {
+	return testutil.Mock(&osutilDeviceMajorAndMinor, f)
 }

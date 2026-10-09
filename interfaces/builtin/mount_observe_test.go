@@ -26,7 +26,6 @@ import (
 	"github.com/snapcore/snapd/interfaces/apparmor"
 	"github.com/snapcore/snapd/interfaces/builtin"
 	"github.com/snapcore/snapd/snap"
-	"github.com/snapcore/snapd/snap/snaptest"
 	"github.com/snapcore/snapd/testutil"
 )
 
@@ -50,15 +49,15 @@ apps:
   command: foo
   plugs: [mount-observe]
 `
-	s.slotInfo = &snap.SlotInfo{
-		Snap:      &snap.Info{SuggestedName: "core", SnapType: snap.TypeOS},
-		Name:      "mount-observe",
-		Interface: "mount-observe",
-	}
-	s.slot = interfaces.NewConnectedSlot(s.slotInfo, nil, nil)
-	snapInfo := snaptest.MockInfo(c, mockPlugSnapInfoYaml, nil)
-	s.plugInfo = snapInfo.Plugs["mount-observe"]
-	s.plug = interfaces.NewConnectedPlug(s.plugInfo, nil, nil)
+	const mockSlotSnapInfoYaml = `name: core
+version: 1.0
+type: os
+slots:
+ mount-observe:
+  interface: mount-observe
+`
+	s.slot, s.slotInfo = MockConnectedSlot(c, mockSlotSnapInfoYaml, nil, "mount-observe")
+	s.plug, s.plugInfo = MockConnectedPlug(c, mockPlugSnapInfoYaml, nil, "mount-observe")
 }
 
 func (s *MountObserveInterfaceSuite) TestName(c *C) {
@@ -75,7 +74,7 @@ func (s *MountObserveInterfaceSuite) TestSanitizePlug(c *C) {
 
 func (s *MountObserveInterfaceSuite) TestUsedSecuritySystems(c *C) {
 	// connected plugs have a non-nil security snippet for apparmor
-	apparmorSpec := apparmor.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	apparmorSpec := apparmor.NewSpecification(s.plug.AppSet())
 	err := apparmorSpec.AddConnectedPlug(s.iface, s.plug, s.slot)
 	c.Assert(err, IsNil)
 	c.Assert(apparmorSpec.SecurityTags(), DeepEquals, []string{"snap.other.app"})
@@ -84,4 +83,29 @@ func (s *MountObserveInterfaceSuite) TestUsedSecuritySystems(c *C) {
 
 func (s *MountObserveInterfaceSuite) TestInterfaces(c *C) {
 	c.Check(builtin.Interfaces(), testutil.DeepContains, s.iface)
+}
+
+func (s *MountObserveInterfaceSuite) TestPrioritizedSnippetMountInfo(c *C) {
+	spec := apparmor.NewSpecification(s.plug.AppSet())
+	spec.AddBasePrioritizedSnippet(`
+deny @{PROC}/self/mountinfo r,
+deny @{PROC}/@{pid}/mountinfo r,
+`, apparmor.MountInfoKey)
+
+	snippet := spec.SnippetForTag("snap.other.app")
+	// contains the denials but not the allows
+	c.Assert(snippet, testutil.Contains, "deny @{PROC}/@{pid}/mountinfo r,")
+	c.Assert(snippet, testutil.Contains, "deny @{PROC}/self/mountinfo r,")
+	c.Assert(snippet, Not(testutil.Contains), "owner @{PROC}/@{pid}/mountinfo r,")
+	c.Assert(snippet, Not(testutil.Contains), "owner @{PROC}/self/mountinfo r,")
+
+	err := spec.AddConnectedPlug(s.iface, s.plug, s.slot)
+	c.Assert(err, IsNil)
+
+	snippet = spec.SnippetForTag("snap.other.app")
+	// contains the allows but not the denials
+	c.Assert(snippet, testutil.Contains, "owner @{PROC}/@{pid}/mountinfo r,")
+	c.Assert(snippet, testutil.Contains, "owner @{PROC}/self/mountinfo r,")
+	c.Assert(snippet, Not(Matches), "(?s).*\ndeny [^\n]*/mountinfo [^\n]*.*")
+	c.Assert(snippet, Not(Matches), "(?s).*\ndeny [^\n]*/mountinfo [^\n]*.*")
 }

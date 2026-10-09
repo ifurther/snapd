@@ -26,15 +26,16 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os/user"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/snapcore/snapd/client/clientutil"
+	"github.com/snapcore/snapd/osutil/user"
 	"github.com/snapcore/snapd/overlord/auth"
 	"github.com/snapcore/snapd/overlord/servicestate"
 	"github.com/snapcore/snapd/overlord/state"
+	"github.com/snapcore/snapd/overlord/swfeats"
 	"github.com/snapcore/snapd/progress"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/strutil"
@@ -45,8 +46,9 @@ var (
 		Path:        "/v2/apps",
 		GET:         getAppsInfo,
 		POST:        postApps,
-		ReadAccess:  openAccess{},
-		WriteAccess: authenticatedAccess{Polkit: polkitActionManage},
+		Actions:     []string{"start", "stop", "restart"},
+		ReadAccess:  interfaceOpenAccess{Interfaces: []string{"ros-snapd-support"}},
+		WriteAccess: interfaceAuthenticatedAccess{Interfaces: []string{"ros-snapd-support"}, Polkit: polkitActionManage},
 	}
 
 	logsCmd = &Command{
@@ -55,6 +57,8 @@ var (
 		ReadAccess: authenticatedAccess{Polkit: polkitActionManage},
 	}
 )
+
+var serviceControlChangeKind = swfeats.RegisterChangeKind("service-control")
 
 var newStatusDecorator = func(ctx context.Context, isGlobal bool, uid string) clientutil.StatusDecorator {
 	if isGlobal {
@@ -100,6 +104,12 @@ func getAppsInfo(c *Command, r *http.Request, user *auth.UserState) Response {
 	u, err := systemUserFromRequest(r)
 	if err != nil {
 		return BadRequest("cannot retrieve services: %v", err)
+	}
+
+	// For the root user, default to global to preserve the normal
+	// behaviour and we make sure to match behaviour for snapctl.
+	if u.Uid == "0" {
+		global = true
 	}
 
 	sd := newStatusDecorator(r.Context(), global, u.Uid)
@@ -156,7 +166,7 @@ func appInfosFor(st *state.State, names []string, opts appInfoOptions) ([]*snap.
 	found := make(map[string]bool)
 	appInfos := make([]*snap.AppInfo, 0, len(requested))
 	for _, snp := range snaps {
-		snapName := snp.info.InstanceName()
+		instanceName := snp.info.InstanceName().String()
 		apps := make([]*snap.AppInfo, 0, len(snp.info.Apps))
 		for _, app := range snp.info.Apps {
 			if !opts.service || app.IsService() {
@@ -164,18 +174,18 @@ func appInfosFor(st *state.State, names []string, opts appInfoOptions) ([]*snap.
 			}
 		}
 
-		if len(apps) == 0 && requested[snapName] {
-			return nil, AppNotFound("snap %q has no %ss", snapName, opts)
+		if len(apps) == 0 && requested[instanceName] {
+			return nil, AppNotFound("snap %q has no %ss", instanceName, opts)
 		}
 
-		includeAll := len(requested) == 0 || requested[snapName]
+		includeAll := len(requested) == 0 || requested[instanceName]
 		if includeAll {
 			// want all services in a snap
-			found[snapName] = true
+			found[instanceName] = true
 		}
 
 		for _, app := range apps {
-			appName := snapName + "." + app.Name
+			appName := instanceName + "." + app.Name
 			if includeAll || requested[appName] {
 				appInfos = append(appInfos, app)
 				found[appName] = true
@@ -205,8 +215,8 @@ func appInfosFor(st *state.State, names []string, opts appInfoOptions) ([]*snap.
 //	snap.SplitSnapApp("foo") is ("foo", "foo"),
 //	splitAppName("foo") is ("foo", "").
 func splitAppName(s string) (snap, app string) {
-	if idx := strings.IndexByte(s, '.'); idx > -1 {
-		return s[:idx], s[idx+1:]
+	if before, after, ok := strings.Cut(s, "."); ok {
+		return before, after
 	}
 
 	return s, ""
@@ -221,6 +231,11 @@ func getLogs(c *Command, r *http.Request, user *auth.UserState) Response {
 			return BadRequest(`invalid value for n: %q: %v`, s, err)
 		}
 		n = int(m)
+		// The special value -1 represents "snap logs -n=all".
+		// The backend handles negative values as "all the log" by passing --no-tail to journalctl.
+		if n != -1 && n <= 0 {
+			return BadRequest(`invalid value for n: %v`, n)
+		}
 	}
 	follow := false
 	if s := query.Get("follow"); s != "" {
@@ -328,7 +343,7 @@ func postApps(c *Command, r *http.Request, user *auth.UserState) Response {
 	}
 	// names received in the request can be snap or snap.app, we need to
 	// extract the actual snap names before associating them with a change
-	chg := newChange(st, "service-control", "Running service command", tss, namesToSnapNames(inst))
+	chg := newChange(st, serviceControlChangeKind, "Running service command", tss, namesToSnapNames(inst))
 	st.EnsureBefore(0)
 	return AsyncResponse(nil, chg.ID())
 }

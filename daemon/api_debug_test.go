@@ -21,6 +21,7 @@ package daemon_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -58,7 +59,7 @@ func (s *postDebugSuite) TestPostDebugEnsureStateSoon(c *check.C) {
 	req, err := http.NewRequest("POST", "/v2/debug", buf)
 	c.Assert(err, check.IsNil)
 
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 	c.Check(rsp.Result, check.Equals, true)
 	c.Check(soon, check.Equals, 1)
 }
@@ -74,7 +75,7 @@ func (s *postDebugSuite) TestDebugConnectivityHappy(c *check.C) {
 	req, err := http.NewRequest("GET", "/v2/debug?aspect=connectivity", nil)
 	c.Assert(err, check.IsNil)
 
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 	c.Check(rsp.Result, check.DeepEquals, daemon.ConnectivityStatus{
 		Connectivity: true,
 		Unreachable:  []string(nil),
@@ -92,7 +93,7 @@ func (s *postDebugSuite) TestDebugConnectivityUnhappy(c *check.C) {
 	req, err := http.NewRequest("GET", "/v2/debug?aspect=connectivity", nil)
 	c.Assert(err, check.IsNil)
 
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 	c.Check(rsp.Result, check.DeepEquals, daemon.ConnectivityStatus{
 		Connectivity: false,
 		Unreachable:  []string{"bad.host.com"},
@@ -105,9 +106,9 @@ func (s *postDebugSuite) TestGetDebugBaseDeclaration(c *check.C) {
 	req, err := http.NewRequest("GET", "/v2/debug?aspect=base-declaration", nil)
 	c.Assert(err, check.IsNil)
 
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 
-	c.Check(rsp.Result.(map[string]interface{})["base-declaration"],
+	c.Check(rsp.Result.(map[string]any)["base-declaration"],
 		testutil.Contains, "type: base-declaration")
 }
 
@@ -120,7 +121,7 @@ func mockDurationThreshold() func() {
 	return restore
 }
 
-func (s *postDebugSuite) getDebugTimings(c *check.C, request string) []interface{} {
+func (s *postDebugSuite) getDebugTimings(c *check.C, request string) []any {
 	defer mockDurationThreshold()()
 
 	s.daemonWithOverlordMock()
@@ -166,10 +167,10 @@ func (s *postDebugSuite) getDebugTimings(c *check.C, request string) []interface
 
 	st.Unlock()
 
-	rsp := s.syncReq(c, req, nil)
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
 	data, err := json.Marshal(rsp.Result)
 	c.Assert(err, check.IsNil)
-	var dataJSON []interface{}
+	var dataJSON []any
 	json.Unmarshal(data, &dataJSON)
 
 	return dataJSON
@@ -179,7 +180,7 @@ func (s *postDebugSuite) TestGetDebugTimingsSingleChange(c *check.C) {
 	dataJSON := s.getDebugTimings(c, "/v2/debug?aspect=change-timings&change-id=1")
 
 	c.Check(dataJSON, check.HasLen, 1)
-	tmData := dataJSON[0].(map[string]interface{})
+	tmData := dataJSON[0].(map[string]any)
 	c.Check(tmData["change-id"], check.DeepEquals, "1")
 	c.Check(tmData["change-timings"], check.NotNil)
 }
@@ -188,7 +189,7 @@ func (s *postDebugSuite) TestGetDebugTimingsEnsureLatest(c *check.C) {
 	dataJSON := s.getDebugTimings(c, "/v2/debug?aspect=change-timings&ensure=foo&all=false")
 	c.Assert(dataJSON, check.HasLen, 1)
 
-	tmData := dataJSON[0].(map[string]interface{})
+	tmData := dataJSON[0].(map[string]any)
 	c.Check(tmData["change-id"], check.DeepEquals, "2")
 	c.Check(tmData["change-timings"], check.NotNil)
 	c.Check(tmData["total-duration"], check.NotNil)
@@ -198,12 +199,12 @@ func (s *postDebugSuite) TestGetDebugTimingsEnsureAll(c *check.C) {
 	dataJSON := s.getDebugTimings(c, "/v2/debug?aspect=change-timings&ensure=foo&all=true")
 
 	c.Assert(dataJSON, check.HasLen, 2)
-	tmData := dataJSON[0].(map[string]interface{})
+	tmData := dataJSON[0].(map[string]any)
 	c.Check(tmData["change-id"], check.DeepEquals, "1")
 	c.Check(tmData["change-timings"], check.NotNil)
 	c.Check(tmData["total-duration"], check.NotNil)
 
-	tmData = dataJSON[1].(map[string]interface{})
+	tmData = dataJSON[1].(map[string]any)
 	c.Check(tmData["change-id"], check.DeepEquals, "2")
 	c.Check(tmData["change-timings"], check.NotNil)
 	c.Check(tmData["total-duration"], check.NotNil)
@@ -214,12 +215,12 @@ func (s *postDebugSuite) TestGetDebugTimingsError(c *check.C) {
 
 	req, err := http.NewRequest("GET", "/v2/debug?aspect=change-timings&ensure=unknown", nil)
 	c.Assert(err, check.IsNil)
-	rsp := s.errorReq(c, req, nil)
+	rsp := s.errorReq(c, req, nil, actionIsExpected)
 	c.Check(rsp.Status, check.Equals, 400)
 
 	req, err = http.NewRequest("GET", "/v2/debug?aspect=change-timings&change-id=9999", nil)
 	c.Assert(err, check.IsNil)
-	rsp = s.errorReq(c, req, nil)
+	rsp = s.errorReq(c, req, nil, actionIsExpected)
 	c.Check(rsp.Status, check.Equals, 400)
 }
 
@@ -262,7 +263,7 @@ func (s *postDebugSuite) TestMigrateHome(c *check.C) {
 	req, err := http.NewRequest("POST", "/v2/debug", body)
 	c.Assert(err, check.IsNil)
 
-	rsp := s.req(c, req, nil)
+	rsp := s.req(c, req, nil, actionIsExpected)
 	c.Assert(rsp, check.FitsTypeOf, &daemon.RespJSON{})
 
 	rspJSON := rsp.(*daemon.RespJSON)
@@ -285,7 +286,7 @@ func (s *postDebugSuite) TestMigrateHomeNoSnaps(c *check.C) {
 	req, err := http.NewRequest("POST", "/v2/debug", body)
 	c.Assert(err, check.IsNil)
 
-	rsp := s.req(c, req, nil)
+	rsp := s.req(c, req, nil, actionIsExpected)
 	c.Assert(rsp, check.FitsTypeOf, &daemon.APIError{})
 	apiErr := rsp.(*daemon.APIError)
 
@@ -306,7 +307,7 @@ func (s *postDebugSuite) TestMigrateHomeNotInstalled(c *check.C) {
 	req, err := http.NewRequest("POST", "/v2/debug", body)
 	c.Assert(err, check.IsNil)
 
-	rsp := s.req(c, req, nil)
+	rsp := s.req(c, req, nil, actionIsExpected)
 	c.Assert(rsp, check.FitsTypeOf, &daemon.APIError{})
 	apiErr := rsp.(*daemon.APIError)
 
@@ -329,10 +330,82 @@ func (s *postDebugSuite) TestMigrateHomeInternalError(c *check.C) {
 	req, err := http.NewRequest("POST", "/v2/debug", body)
 	c.Assert(err, check.IsNil)
 
-	rsp := s.req(c, req, nil)
+	rsp := s.req(c, req, nil, actionIsExpected)
 	c.Assert(rsp, check.FitsTypeOf, &daemon.APIError{})
 	apiErr := rsp.(*daemon.APIError)
 
 	c.Check(apiErr.Status, check.Equals, 500)
 	c.Check(apiErr.Message, check.Equals, `boom`)
+}
+
+func (s *postDebugSuite) TestRefreshAppAwarenessHappy(c *check.C) {
+	d := s.daemonWithOverlordMock()
+
+	st := d.Overlord().State()
+	st.Lock()
+	st.Cache("monitored-snaps", map[string]context.CancelFunc{
+		"snap-a": nil,
+	})
+	candidates := map[string]*daemon.RefreshCandidate{
+		"snap-a": {
+			Version:   "0.1",
+			Channel:   "edge",
+			SideInfo:  &snap.SideInfo{Revision: snap.R(14)},
+			Monitored: true,
+		},
+	}
+	st.Set("refresh-candidates", &candidates)
+	st.Unlock()
+
+	restore := daemon.MockCgroupPidsOfSnap(func(instanceName string) (map[string][]int, error) {
+		return map[string][]int{
+			"snap.snap-a.app": {101, 102, 103},
+		}, nil
+	})
+	defer restore()
+
+	req, err := http.NewRequest("GET", "/v2/debug?aspect=raa", nil)
+	c.Assert(err, check.IsNil)
+
+	rsp := s.syncReq(c, req, nil, actionIsExpected)
+	c.Check(rsp.Result, check.DeepEquals, &daemon.RAAInfo{
+		MonitoredSnaps: map[string]daemon.MonitoredSnapInfo{
+			"snap-a": {
+				Pids: map[string][]int{
+					"snap.snap-a.app": {101, 102, 103},
+				},
+			},
+		},
+		RefreshCandidates: map[string]daemon.RefreshCandidateInfo{
+			"snap-a": {
+				Version:   "0.1",
+				Channel:   "edge",
+				Revision:  snap.R(14),
+				Monitored: true,
+			},
+		},
+	})
+}
+
+func (s *postDebugSuite) TestRefreshAppAwarenessUnhappy(c *check.C) {
+	d := s.daemonWithOverlordMock()
+
+	st := d.Overlord().State()
+	st.Lock()
+	st.Cache("monitored-snaps", map[string]context.CancelFunc{
+		"snap-a": nil,
+	})
+	st.Unlock()
+
+	restore := daemon.MockCgroupPidsOfSnap(func(instanceName string) (map[string][]int, error) {
+		return nil, errors.New("boom!")
+	})
+	defer restore()
+
+	req, err := http.NewRequest("GET", "/v2/debug?aspect=raa", nil)
+	c.Assert(err, check.IsNil)
+
+	rsp := s.errorReq(c, req, nil, actionIsExpected)
+	c.Check(rsp.Status, check.Equals, 500)
+	c.Check(rsp.Message, check.Equals, "boom!")
 }

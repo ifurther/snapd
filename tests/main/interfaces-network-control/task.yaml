@@ -3,19 +3,19 @@ summary: Ensure that the network-control interface works.
 details: |
     The network-control interface allows a snap to configure networking.
 
-    A snap which defines the network-control plug must be shown in the interfaces list.
-    The plug must not be autoconnected on install and, as usual, must be able to be
-    reconnected.
+    A snap which defines the network-control plug must be shown in the
+    interfaces list. The plug must not be auto-connected on install and, as
+    usual, must be able to be reconnected.
 
-    A snap declaring a plug on this interface must be able to modify the network configuration
-    and ask for its status, the test sets up a network service, gets information about it (read
-    capability) and creates an arp entry (write capability).
+    A snap declaring a plug on this interface must be able to modify the network
+    configuration and ask for its status, the test sets up a network service,
+    gets information about it (read capability) and creates an arp entry (write
+    capability).
 
 # ubuntu-14.04: systemd-run not supported
-# ubuntu-18.04-32: network-control-consumer snap not available on i386
 # ubuntu-core-16-32: cannot install snap base "core20"
 # ubuntu-core-18-32: cannot install snap base "core20"
-systems: [-fedora-*, -opensuse-*, -ubuntu-14.04*, -ubuntu-18.04-32, -ubuntu-core-16-32, -ubuntu-core-18-32]
+systems: [-fedora-*, -opensuse-*, -ubuntu-14.04*, -ubuntu-core-16-32, -ubuntu-core-18-32]
 
 environment:
     PORT: 8081
@@ -85,6 +85,13 @@ execute: |
     echo "A network namespace can be created"
     network-control-consumer.cmd ip netns add test-ns
     ip netns list | MATCH test-ns
+    echo "Listed"
+    network-control-consumer.cmd ip netns list | MATCH test-ns
+    echo "And removed"
+    network-control-consumer.cmd ip netns delete test-ns
+
+    # re-add to continue with the test
+    network-control-consumer.cmd ip netns add test-ns
 
     echo "And a veth interface can be added to the namespace"
 

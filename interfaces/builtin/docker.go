@@ -23,8 +23,15 @@ const dockerSummary = `allows access to Docker socket`
 
 const dockerBaseDeclarationSlots = `
   docker:
-    allow-installation: false
-    deny-connection: true
+    allow-installation:
+      slot-snap-type:
+        - app
+        - core
+    deny-installation:
+      slot-snap-type:
+        - app
+    deny-connection:
+      on-classic: false
     deny-auto-connection: true
 `
 
@@ -48,8 +55,12 @@ func init() {
 	registerIface(&commonInterface{
 		name:                  "docker",
 		summary:               dockerSummary,
+		implicitOnClassic:     true,
 		baseDeclarationSlots:  dockerBaseDeclarationSlots,
 		connectedPlugAppArmor: dockerConnectedPlugAppArmor,
 		connectedPlugSecComp:  dockerConnectedPlugSecComp,
+		// docker daemon owns the well-known /run/docker.sock; only one snap instance
+		// can hold it at a time.
+		parallelInstancesSlotErr: errParallelInstancesUniqueResourceOwner,
 	})
 }

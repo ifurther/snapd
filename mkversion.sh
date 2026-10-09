@@ -1,4 +1,24 @@
 #!/bin/sh
+# mkversion.sh - derive a version from git history / the Debian changelog and
+# generate the version files (snapdtool/version_generated.go, cmd/VERSION and
+# data/info) from it. The files themselves are written by
+# packaging/gen-version.sh, which this script execs once the version string
+# has been determined.
+#
+# This script is intended for development and git-based builds only, that is
+# the snapcraft flow, `go generate` and direct `./mkversion.sh` invocations on
+# a git checkout. It is NOT used for downstream distribution packaging of
+# release source tarballs: those are produced by packaging/pack-source, which
+# bakes the upstream version into the tarball via packaging/gen-version.sh, and
+# downstream packaging only sets DownstreamVersionSuffix via a linker flag (see
+# packaging/snapd.mk).
+#
+# usage: mkversion.sh [--output-only] [--ensure] [<version>]
+#   --output-only  print the derived version to stdout, write nothing
+#   --ensure       do nothing if snapdtool/version_generated.go already
+#                  exists (i.e. building from a release tarball produced by
+#                  packaging/pack-source); otherwise behave as usual. Used by
+#                  the CI test harness when building from a git checkout.
 set -e
 
 # debugging if anything fails is tricky as dh-golang eats up all output
@@ -11,25 +31,24 @@ set -e
 #echo "mkversion.sh run from: $0"
 #echo "pwd: $(pwd)"
 
-# we have two directories we need to care about:
-# - our toplevel pkg builddir which is where "mkversion.sh" is located
-#   and where "snap-confine" expects its cmd/VERSION file
-# - the GO_GENERATE_BUILDDIR which may be the toplevel pkg dir. but
-#   during "dpkg-buildpackage" it will become a different _build/ dir
-#   that dh-golang creates and that only contains a subset of the
-#   files of the toplevel buildir. 
+# PKG_BUILDDIR is the toplevel pkg builddir, i.e. where "mkversion.sh" is
+# located, where "snap-confine" expects its cmd/VERSION file, and where the
+# generated snapdtool/version_generated.go and data/info live.
 PKG_BUILDDIR=$(dirname "$0")
-GO_GENERATE_BUILDDIR="${GO_GENERATE_BUILDDIR:-$(pwd)}"
-
-# run from "go generate" adjust path
-if [ "$GOPACKAGE" = "snapdtool" ]; then
-    GO_GENERATE_BUILDDIR="$(pwd)/.."
-fi
 
 OUTPUT_ONLY=false
 if [ "$1" = "--output-only" ]; then
     OUTPUT_ONLY=true
     shift
+fi
+
+if [ "$1" = "--ensure" ]; then
+    shift
+    if [ -f "$PKG_BUILDDIR/snapdtool/version_generated.go" ]; then
+        # Building from a release tarball produced by packaging/pack-source,
+        # which already carries the version files.
+        exit 0
+    fi
 fi
 
 # If the version is passed in as an argument to mkversion.sh, let's use that.
@@ -43,16 +62,16 @@ DIRTY=false
 # tracked by git. The script can be invoked when building distro packages in
 # which case, the source tree could be a tarball, but the distro packaging files
 # can be in git, so try not to confuse the two.
-if command -v git >/dev/null && [ -d "$(dirname "$0")/.git" ] ; then
+if command -v git >/dev/null && [ -e "$(dirname "$0")/.git" ] ; then
     # don't include --dirty here as we independently track whether the tree is
     # dirty and append that last, including it here will make dirty trees 
     # directly on top of tags show up with version_from_git as 2.46-dirty which
     # will not match 2.46 from the changelog and then result in a final version
-    # like 2.46+git2.46.2.46 which is silly and unhelpful
+    # like 2.46+g2.46.2.46 which is silly and unhelpful
     # tracking the dirty independently like this will produce instead 2.46-dirty
-    # for a dirty tree on top of a tag, and 2.46+git83.g1671726-dirty for a 
+    # for a dirty tree on top of a tag, and 2.46+g83.1671726-dirty for a
     # commit not directly on top of a tag
-    version_from_git="$(git describe --always | sed -e 's/-/+git/;y/-/./' )"
+    version_from_git="$(git describe --always | sed -e  's/-/+/;y/-/./;s/\.g/g./;s/\([0-9]\+\)g/g\1/' )"
 
     # check if we are using a dirty tree
     if git describe --always --dirty | grep -q dirty; then
@@ -63,8 +82,16 @@ fi
 # at this point we maybe in _build/src/github etc where we have no
 # debian/changelog (dh-golang only exports the sources here)
 # switch to the real source dir for the changelog parsing
-if command -v dpkg-parsechangelog >/dev/null; then
-    version_from_changelog="$(cd "$PKG_BUILDDIR"; dpkg-parsechangelog --show-field Version)";
+: "${DPKG_PARSECHANGELOG=$(command -v dpkg-parsechangelog)}"
+if [ -n "$DPKG_PARSECHANGELOG" ]; then
+    changelog_file="packaging/ubuntu-16.04/changelog"
+    debian_path="$PKG_BUILDDIR/debian"
+    if [ -L "$debian_path" ] &&
+       debian_target=$(readlink "$debian_path") &&
+       [ "${debian_target%/}" != "packaging/ubuntu-16.04" ]; then
+        changelog_file="${debian_target%/}/changelog"
+    fi
+    version_from_changelog="$(cd "$PKG_BUILDDIR"; "$DPKG_PARSECHANGELOG" --file "$changelog_file" --show-field Version)";
 fi
 
 # select version based on priority
@@ -90,7 +117,7 @@ fi
 # and append the git revno and commit hash. A simpler approach would be
 # to git tag all pre/rc releases.
 if [ -z "$version_from_user" ] && [ "$version_from_git" != "" ] && \
-       [ -n "$version_from_changelog" ] && [ "$version_from_git" != "$version_from_changelog" ]; then
+       [ -n "$version_from_changelog" ] && [ "$version_from_git" != "${version_from_changelog%+fips}" ]; then
     # if the changelog version has "git" in it and we also have a git version
     # directly, that is a bad changelog version, so fail, otherwise the below
     # code will produce a duplicated git info
@@ -99,8 +126,8 @@ if [ -z "$version_from_user" ] && [ "$version_from_git" != "" ] && \
         exit 1
     else
         revno=$(git describe --always --abbrev=7|cut -d- -f2)
-        commit=$(git describe --always --abbrev=7|cut -d- -f3)
-        v="${version_from_changelog}+git${revno}.${commit}"
+        commit=$(git describe --always --abbrev=7|cut -d- -f3|sed -e 's/^g//')
+        v="${version_from_changelog}+g${revno}.${commit}"
         o="changelog+git"
     fi
 fi
@@ -117,30 +144,4 @@ fi
 
 echo "*** Setting version to '$v' from $o." >&2
 
-cat <<EOF > "$GO_GENERATE_BUILDDIR/snapdtool/version_generated.go"
-package snapdtool
-
-// generated by mkversion.sh; do not edit
-
-func init() {
-	Version = "$v"
-}
-EOF
-
-cat <<EOF > "$PKG_BUILDDIR/cmd/VERSION"
-$v
-EOF
-
-MOD=-mod=vendor
-if [ "$GO111MODULE" = "off" ] ; then
-    MOD=--
-elif [ ! -d "$GO_GENERATE_BUILDDIR/vendor/github.com"  ] ; then
-    MOD=--
-fi
-fmts=$(cd "$GO_GENERATE_BUILDDIR" ; go run $MOD ./asserts/info)
-
-cat <<EOF > "$PKG_BUILDDIR/data/info"
-VERSION=$v
-SNAPD_APPARMOR_REEXEC=1
-${fmts}
-EOF
+exec "$PKG_BUILDDIR/packaging/gen-version.sh" "$v" "$PKG_BUILDDIR"

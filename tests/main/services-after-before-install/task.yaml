@@ -1,5 +1,13 @@
 summary: Check that snap install respects after/before ordering of services
 
+details: |
+    Snap services of the same snap can be configured to follow an specific
+    order on how those are launched. 
+
+    This test install many times the test-snapd-after-before-service snap and verifies that
+    the services defined in it are started following the defined order by using the before
+    and after service options.
+
 # slow in autopkgtest (>3m)
 backends: [-autopkgtest]
 
@@ -42,7 +50,7 @@ execute: |
 
         echo "We can see all services running"
         for service in before-middle middle after-middle; do
-            systemctl status "$service_prefix.$service" | MATCH "running"
+            systemctl status "$service_prefix.$service" | MATCH ' \(running\) '
         done
 
         inactive_leave="$(get_prop "InactiveExitTimestampMonotonic" "$service_prefix.before-middle")"

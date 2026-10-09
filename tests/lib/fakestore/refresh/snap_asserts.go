@@ -28,6 +28,8 @@ import (
 
 	"github.com/snapcore/snapd/asserts"
 	"github.com/snapcore/snapd/asserts/systestkeys"
+	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/snapfile"
 )
 
 func snapNameFromPath(snapPath string) string {
@@ -36,7 +38,7 @@ func snapNameFromPath(snapPath string) string {
 
 // TODO: also support reading/copying form a store snap
 
-func NewSnapRevision(targetDir string, snap string, headers map[string]interface{}) (string, error) {
+func NewSnapRevision(targetDir string, snap string, headers map[string]any) (string, error) {
 	db, err := newAssertsDB(systestkeys.TestStorePrivKey)
 	if err != nil {
 		return "", err
@@ -46,7 +48,7 @@ func NewSnapRevision(targetDir string, snap string, headers map[string]interface
 		return "", err
 	}
 
-	fallbacks := map[string]interface{}{
+	fallbacks := map[string]any{
 		"developer-id":  "testrootorg",
 		"snap-id":       snapNameFromPath(snap) + "-id",
 		"snap-revision": "1",
@@ -68,13 +70,109 @@ func NewSnapRevision(targetDir string, snap string, headers map[string]interface
 	return writeAssert(a, targetDir)
 }
 
-func NewSnapDeclaration(targetDir string, snap string, headers map[string]interface{}) (string, error) {
+func NewSnapResourceRevision(targetDir string, compPath string, headers map[string]any) (string, error) {
+	db, err := newAssertsDB(systestkeys.TestStorePrivKey)
+	if err != nil {
+		return "", err
+	}
+	digest, size, err := asserts.SnapFileSHA3_384(compPath)
+	if err != nil {
+		return "", err
+	}
+
+	container, err := snapfile.Open(compPath)
+	if err != nil {
+		return "", err
+	}
+
+	ci, err := snap.ReadComponentInfoFromContainer(container, nil, nil)
+	if err != nil {
+		return "", err
+	}
+
+	required := []string{"snap-id", "resource-revision"}
+	for _, r := range required {
+		if _, ok := headers[r]; !ok {
+			return "", fmt.Errorf("missing required header %q", r)
+		}
+	}
+
+	defaults := map[string]any{
+		"type":              "snap-resource-revision",
+		"authority-id":      "testrootorg",
+		"developer-id":      "testrootorg",
+		"resource-name":     ci.Component.ComponentName,
+		"timestamp":         time.Now().Format(time.RFC3339),
+		"resource-size":     fmt.Sprintf("%d", size),
+		"resource-sha3-384": digest,
+	}
+	for k, v := range defaults {
+		if _, ok := headers[k]; !ok {
+			headers[k] = v
+		}
+	}
+	headers["authority-id"] = "testrootorg"
+	headers["snap-sha3-384"] = digest
+	headers["snap-size"] = fmt.Sprintf("%d", size)
+	headers["timestamp"] = time.Now().Format(time.RFC3339)
+
+	a, err := db.Sign(asserts.SnapResourceRevisionType, headers, nil, systestkeys.TestStoreKeyID)
+	if err != nil {
+		return "", err
+	}
+	return writeAssert(a, targetDir)
+}
+
+func NewSnapResourcePair(targetDir string, compPath string, headers map[string]any) (string, error) {
 	db, err := newAssertsDB(systestkeys.TestStorePrivKey)
 	if err != nil {
 		return "", err
 	}
 
-	fallbacks := map[string]interface{}{
+	container, err := snapfile.Open(compPath)
+	if err != nil {
+		return "", err
+	}
+
+	ci, err := snap.ReadComponentInfoFromContainer(container, nil, nil)
+	if err != nil {
+		return "", err
+	}
+
+	required := []string{"snap-id", "resource-revision", "snap-revision"}
+	for _, r := range required {
+		if _, ok := headers[r]; !ok {
+			return "", fmt.Errorf("missing required header %q", r)
+		}
+	}
+
+	defaults := map[string]any{
+		"type":          "snap-resource-pair",
+		"authority-id":  "testrootorg",
+		"developer-id":  "testrootorg",
+		"resource-name": ci.Component.ComponentName,
+		"timestamp":     time.Now().Format(time.RFC3339),
+	}
+	for k, v := range defaults {
+		if _, ok := headers[k]; !ok {
+			headers[k] = v
+		}
+	}
+
+	a, err := db.Sign(asserts.SnapResourcePairType, headers, nil, systestkeys.TestStoreKeyID)
+	if err != nil {
+		return "", err
+	}
+	return writeAssert(a, targetDir)
+}
+
+func NewSnapDeclaration(targetDir string, snap string, headers map[string]any) (string, error) {
+	db, err := newAssertsDB(systestkeys.TestStorePrivKey)
+	if err != nil {
+		return "", err
+	}
+
+	fallbacks := map[string]any{
 		"snap-id":      snapNameFromPath(snap) + "-id",
 		"snap-name":    snapNameFromPath(snap),
 		"publisher-id": "testrootorg",
@@ -97,14 +195,14 @@ func NewSnapDeclaration(targetDir string, snap string, headers map[string]interf
 
 // NewRepair signs a repair assertion, including the specified script as the
 // body of the assertion.
-func NewRepair(targetDir string, scriptFilename string, headers map[string]interface{}) (string, error) {
+func NewRepair(targetDir string, scriptFilename string, headers map[string]any) (string, error) {
 	// use the separate root of trust for signing repair assertions
 	db, err := newAssertsDB(systestkeys.TestRepairRootPrivKey)
 	if err != nil {
 		return "", err
 	}
 
-	fallbacks := map[string]interface{}{
+	fallbacks := map[string]any{
 		"brand-id":  "testrootorg",
 		"repair-id": "1",
 		"summary":   "some test keys repair",
@@ -122,7 +220,7 @@ func NewRepair(targetDir string, scriptFilename string, headers map[string]inter
 
 	headers["authority-id"] = "testrootorg"
 	// note that series is a list for repair assertions
-	headers["series"] = []interface{}{"16"}
+	headers["series"] = []any{"16"}
 	headers["timestamp"] = time.Now().Format(time.RFC3339)
 
 	a, err := db.Sign(asserts.RepairType, headers, scriptBodyBytes, systestkeys.TestRepairKeyID)

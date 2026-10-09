@@ -186,7 +186,7 @@ func validateAddress(address string) error {
 		return fmt.Errorf("qualcomm-ipc-router %s attribute cannot be empty", qcipcAttrib)
 	}
 	// do not allow apparmor RE in the address
-	if err := apparmor.ValidateNoAppArmorRegexp(address); err != nil {
+	if err := apparmor_sandbox.ValidateNoAppArmorRegexp(address); err != nil {
 		return fmt.Errorf(`address is invalid: %v`, err)
 	}
 	return nil
@@ -214,7 +214,7 @@ func (iface *qualcomIPCRouterInterface) AppArmorConnectedPlug(spec *apparmor.Spe
 		}
 
 		old := "###SLOT_SECURITY_TAGS###"
-		slotLabel := spec.SnapAppSet().SlotLabelExpression(slot)
+		slotLabel := slot.LabelExpression()
 		snippet := strings.ReplaceAll(qipcrtrConnectedPlugAppArmor, old, slotLabel)
 		var err error
 		if snippet, err = fillSnippetSocketAddress(slot, snippet); err != nil {
@@ -231,7 +231,7 @@ func (iface *qualcomIPCRouterInterface) AppArmorConnectedSlot(spec *apparmor.Spe
 	}
 
 	old := "###PLUG_SECURITY_TAGS###"
-	new := spec.SnapAppSet().PlugLabelExpression(plug)
+	new := plug.LabelExpression()
 	snippet := strings.ReplaceAll(qipcrtrConnectedSlotAppArmor, old, new)
 	var err error
 	if snippet, err = fillSnippetSocketAddress(slot, snippet); err != nil {
@@ -293,7 +293,7 @@ func (iface *qualcomIPCRouterInterface) verifySupport(what string) error {
 
 func (iface *qualcomIPCRouterInterface) BeforePrepareSlot(slot *snap.SlotInfo) error {
 	if slot.Attrs == nil {
-		slot.Attrs = make(map[string]interface{})
+		slot.Attrs = make(map[string]any)
 	}
 	if isSlotInfoSystem(slot) {
 		return nil

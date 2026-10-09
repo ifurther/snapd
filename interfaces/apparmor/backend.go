@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2016-2020 Canonical Ltd
+ * Copyright (C) 2016-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -17,13 +17,13 @@
  *
  */
 
-// Package apparmor implements integration between snappy and
-// ubuntu-core-launcher around apparmor.
+// Package apparmor implements integration between snappy and snap-confine
+// around apparmor.
 //
 // Snappy creates apparmor profiles for each application (for each snap)
-// present in the system.  Upon each execution of ubuntu-core-launcher
-// application process is launched under the profile. Prior to that the profile
-// must be parsed, compiled and loaded into the kernel using the support tool
+// present in the system.  Upon each execution of snap-confine application
+// process is launched under the profile. Prior to that the profile must be
+// parsed, compiled and loaded into the kernel using the support tool
 // "apparmor_parser".
 //
 // Each apparmor profile contains a simple <header><content><footer> structure.
@@ -45,6 +45,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/snapcore/snapd/dirs"
@@ -54,6 +55,8 @@ import (
 	"github.com/snapcore/snapd/release"
 	apparmor_sandbox "github.com/snapcore/snapd/sandbox/apparmor"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
+	"github.com/snapcore/snapd/snapdenv"
 	"github.com/snapcore/snapd/strutil"
 	"github.com/snapcore/snapd/timings"
 )
@@ -68,7 +71,8 @@ var (
 
 	// make sure that apparmor profile fulfills the late discarding backend
 	// interface
-	_ interfaces.SecurityBackendDiscardingLate = (*Backend)(nil)
+	_ interfaces.SecurityBackendDiscardingLate  = (*Backend)(nil)
+	_ interfaces.ReinitializableSecurityBackend = (*Backend)(nil)
 )
 
 // Backend is responsible for maintaining apparmor profiles for snaps and parts of snapd.
@@ -94,6 +98,15 @@ func (b *Backend) Initialize(opts *interfaces.SecurityBackendOptions) error {
 		b.coreSnap = opts.CoreSnapInfo
 		b.snapdSnap = opts.SnapdSnapInfo
 	}
+
+	const reinitializing = false
+	if err := b.initializeSnapConfineProfiles(b.preseed, reinitializing); err != nil {
+		return fmt.Errorf("cannot initialize snap-confine profiles: %w", err)
+	}
+	return nil
+}
+
+func (b *Backend) initializeSnapConfineProfiles(preseed, reinitializing bool) error {
 	// NOTE: It would be nice if we could also generate the profile for
 	// snap-confine executing from the core snap, right here, and not have to
 	// do this in the Setup function below. I sadly don't think this is
@@ -104,22 +117,34 @@ func (b *Backend) Initialize(opts *interfaces.SecurityBackendOptions) error {
 	// fail early if this fails for whatever reason.
 	exe, err := os.Readlink(procSelfExe)
 	if err != nil {
-		return fmt.Errorf("cannot read %s: %s", procSelfExe, err)
+		return fmt.Errorf("cannot read %s: %w", procSelfExe, err)
 	}
 
-	if _, err := apparmor_sandbox.SetupSnapConfineSnippets(); err != nil {
+	// TODO:mismatch:optimization: regenerate a subset of snippets if needed?
+
+	// snippets are shared between all snap-confine profiles, those from
+	// snapd/core snap and the distro one
+	changed, err := apparmor_sandbox.SetupSnapConfineSnippets()
+	if err != nil {
 		return err
 	}
 
-	// If snapd is executing from the core snap the it means it has
-	// re-executed. In that case we are no longer using the copy of
-	// snap-confine from the host distribution but our own copy. We don't have
-	// to re-compile and load the updated profile as that is performed by
-	// setupSnapConfineReexec below.
-	if strings.HasPrefix(exe, dirs.SnapMountDir) {
+	if reinitializing && !changed {
+		logger.Noticef("snap-confine snippets not changed during reinit, not reloading profiles")
 		return nil
 	}
 
+	// If snapd is executing from the snapd or core snap the it means it has
+	// re-executed. In that case we are no longer using the copy of snap-confine
+	// from the host distribution but our own copy. We don't have to re-compile
+	// and load the updated profile as that will be done when preparing security
+	// profiles of the snapd/core snap.
+	if strings.HasPrefix(exe, dirs.SnapMountDir) {
+		logger.Notice("delegating reload of snap-confine profiles to system snap security profiles setup")
+		return nil
+	}
+
+	logger.Notice("reloading profiles for snap-confine")
 	// Reload the apparmor profile of snap-confine. This points to the main
 	// file in /etc/apparmor.d/ as that file contains include statements that
 	// load any of the files placed in /var/lib/snapd/apparmor/snap-confine/.
@@ -136,7 +161,7 @@ func (b *Backend) Initialize(opts *interfaces.SecurityBackendOptions) error {
 	}
 
 	aaFlags := apparmor_sandbox.SkipReadCache
-	if b.preseed {
+	if preseed {
 		aaFlags |= apparmor_sandbox.SkipKernelLoad
 	}
 
@@ -145,7 +170,17 @@ func (b *Backend) Initialize(opts *interfaces.SecurityBackendOptions) error {
 		// policy. Maybe we have caused the problem so it's better to let other
 		// things work.
 		apparmor_sandbox.RemoveSnapConfineSnippets()
-		return fmt.Errorf("cannot reload snap-confine apparmor profile: %v", err)
+		return fmt.Errorf("cannot reload snap-confine apparmor profile: %w", err)
+	}
+	return nil
+}
+
+// Reinitialize performs a limited reinitialization of the backend. Implements
+// interfaces.ReinitializableSecurityBackend.
+func (b *Backend) Reinitialize() error {
+	const reinitializing = true
+	if err := b.initializeSnapConfineProfiles(b.preseed, reinitializing); err != nil {
+		return fmt.Errorf("cannot initialize snap-confine profiles: %w", err)
 	}
 	return nil
 }
@@ -239,8 +274,8 @@ func snapConfineFromSnapProfile(info *snap.Info) (dir, glob string, content map[
 	return dirs.SnapAppArmorDir, patchedProfileGlob, content, nil
 }
 
-func snapConfineProfileName(snapName string, rev snap.Revision) string {
-	return fmt.Sprintf("snap-confine.%s.%s", snapName, rev)
+func snapConfineProfileName(instanceName naming.InstanceName, rev snap.Revision) string {
+	return fmt.Sprintf("snap-confine.%s.%s", instanceName, rev)
 }
 
 // setupSnapConfineReexec will setup apparmor profiles inside the host's
@@ -249,6 +284,8 @@ func snapConfineProfileName(snapName string, rev snap.Revision) string {
 //
 // Additionally it will cleanup stale apparmor profiles it created.
 func (b *Backend) setupSnapConfineReexec(info *snap.Info) error {
+	logger.Noticef("reloading profiles of snap-confine provided by the system snap")
+
 	if err := os.MkdirAll(apparmor_sandbox.SnapConfineAppArmorDir, 0755); err != nil {
 		return fmt.Errorf("cannot create snap-confine policy directory: %s", err)
 	}
@@ -292,7 +329,7 @@ func (b *Backend) setupSnapConfineReexec(info *snap.Info) error {
 		return fmt.Errorf("cannot reload snap-confine apparmor profile: %s", errReload)
 	}
 	if errRemoveCached != nil {
-		return fmt.Errorf("cannot remove cached snap-confine apparmor profile: %s", errReload)
+		return fmt.Errorf("cannot remove cached snap-confine apparmor profile: %s", errRemoveCached)
 	}
 	return nil
 }
@@ -308,8 +345,8 @@ func nsProfile(snapName string) string {
 // Currently the list is just a pair. The first glob describes profiles for all
 // apps and hooks while the second profile describes the snap-update-ns profile
 // for the whole snap.
-func profileGlobs(snapName string) []string {
-	return []string{interfaces.SecurityTagGlob(snapName), nsProfile(snapName)}
+func profileGlobs(instanceName naming.InstanceName) []string {
+	return append(interfaces.SecurityTagGlobs(instanceName), nsProfile(instanceName.String()))
 }
 
 // Determine if a profile filename is removable during core refresh/rollback.
@@ -343,28 +380,13 @@ type profilePathsResults struct {
 	removed   []string
 }
 
-func (b *Backend) prepareProfiles(appSet *interfaces.SnapAppSet, opts interfaces.ConfinementOptions, repo *interfaces.Repository) (prof *profilePathsResults, err error) {
-	snapName := appSet.InstanceName()
-	spec, err := repo.SnapSpecification(b.Name(), appSet)
-	if err != nil {
-		return nil, fmt.Errorf("cannot obtain apparmor specification for snap %q: %s", snapName, err)
-	}
-
+func (b *Backend) setupHostAppArmorForCoreAndSnapd(appSet *interfaces.SnapAppSet) error {
 	snapInfo := appSet.Info()
 
-	// Add snippets for parallel snap installation mapping
-	spec.(*Specification).AddOvername(snapInfo)
-
-	// Add snippets derived from the layout definition.
-	spec.(*Specification).AddLayout(snapInfo)
-
-	// Add additional mount layouts rules for the snap.
-	spec.(*Specification).AddExtraLayouts(snapInfo, opts.ExtraLayouts)
-
 	// core on classic is special
-	if snapName == "core" && release.OnClassic && apparmor_sandbox.ProbedLevel() != apparmor_sandbox.Unsupported {
+	if appSet.InstanceName() == naming.Core && release.OnClassic && apparmor_sandbox.ProbedLevel() != apparmor_sandbox.Unsupported {
 		if err := b.setupSnapConfineReexec(snapInfo); err != nil {
-			return nil, fmt.Errorf("cannot create host snap-confine apparmor configuration: %s", err)
+			return fmt.Errorf("cannot create host snap-confine apparmor configuration: %s", err)
 		}
 	}
 
@@ -373,7 +395,7 @@ func (b *Backend) prepareProfiles(appSet *interfaces.SnapAppSet, opts interfaces
 	// systems but /etc/apparmor.d is not writable on core18 systems
 	if snapInfo.Type() == snap.TypeSnapd && apparmor_sandbox.ProbedLevel() != apparmor_sandbox.Unsupported {
 		if err := b.setupSnapConfineReexec(snapInfo); err != nil {
-			return nil, fmt.Errorf("cannot create host snap-confine apparmor configuration: %s", err)
+			return fmt.Errorf("cannot create host snap-confine apparmor configuration: %s", err)
 		}
 	}
 
@@ -393,19 +415,52 @@ func (b *Backend) prepareProfiles(appSet *interfaces.SnapAppSet, opts interfaces
 			}
 		}
 	}
+	return nil
+}
+
+func (b *Backend) Prepare(appSet *interfaces.SnapAppSet) error {
+	// Perform any host-specific setup needed for core and snapd snaps.
+	return b.setupHostAppArmorForCoreAndSnapd(appSet)
+}
+
+func (b *Backend) prepareProfiles(appSet *interfaces.SnapAppSet, opts interfaces.ConfinementOptions, repo *interfaces.Repository) (prof *profilePathsResults, err error) {
+	instanceName := appSet.InstanceName()
+	spec, err := repo.SnapSpecification(b.Name(), appSet, opts)
+	if err != nil {
+		return nil, fmt.Errorf("cannot obtain apparmor specification for snap %q: %s", instanceName, err)
+	}
+
+	snapInfo := appSet.Info()
+
+	// Add snippets for parallel snap installation mapping
+	spec.(*Specification).AddOvername(snapInfo)
+
+	// Add snippets derived from the layout definition.
+	spec.(*Specification).AddLayout(appSet)
+
+	// Add additional mount layouts rules for the snap.
+	spec.(*Specification).AddExtraLayouts(snapInfo, opts.ExtraLayouts)
+
+	// Perform any host-specific setup needed for core and snapd snaps.
+	// TODO: Remove this once Prepare is being called.
+	if err := b.setupHostAppArmorForCoreAndSnapd(appSet); err != nil {
+		return nil, err
+	}
 
 	// Get the files that this snap should have
-	content := b.deriveContent(spec.(*Specification), snapInfo, opts)
+	content := b.deriveContent(spec.(*Specification), appSet, opts)
 
 	dir := dirs.SnapAppArmorDir
-	globs := profileGlobs(snapInfo.InstanceName())
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("cannot create directory for apparmor profiles %q: %s", dir, err)
 	}
+
+	globs := profileGlobs(snapInfo.InstanceName())
+
 	changed, removedPaths, errEnsure := osutil.EnsureDirStateGlobs(dir, globs, content)
 	// XXX: in the old code this error was reported late, after doing load/removeCached.
 	if errEnsure != nil {
-		return nil, fmt.Errorf("cannot synchronize security files for snap %q: %s", snapName, errEnsure)
+		return nil, fmt.Errorf("cannot synchronize security files for snap %q: %s", instanceName, errEnsure)
 	}
 
 	// Find the set of unchanged profiles.
@@ -439,7 +494,7 @@ func (b *Backend) prepareProfiles(appSet *interfaces.SnapAppSet, opts interfaces
 //
 // This method should be called after changing plug, slots, connections between
 // them or application present in the snap.
-func (b *Backend) Setup(appSet *interfaces.SnapAppSet, opts interfaces.ConfinementOptions, repo *interfaces.Repository, tm timings.Measurer) error {
+func (b *Backend) Setup(appSet *interfaces.SnapAppSet, opts interfaces.ConfinementOptions, sctx interfaces.SetupContext, repo *interfaces.Repository, tm timings.Measurer) error {
 	prof, err := b.prepareProfiles(appSet, opts, repo)
 	if err != nil {
 		return err
@@ -488,7 +543,7 @@ func (b *Backend) Setup(appSet *interfaces.SnapAppSet, opts interfaces.Confineme
 // collects and returns them all.
 //
 // This method is useful mainly for regenerating profiles.
-func (b *Backend) SetupMany(appSets []*interfaces.SnapAppSet, confinement func(snapName string) interfaces.ConfinementOptions, repo *interfaces.Repository, tm timings.Measurer) []error {
+func (b *Backend) SetupMany(appSets []*interfaces.SnapAppSet, confinement func(instanceName naming.InstanceName) interfaces.ConfinementOptions, sctx func(instanceName naming.InstanceName) interfaces.SetupContext, repo *interfaces.Repository, tm timings.Measurer) []error {
 	var allChangedPaths, allUnchangedPaths, allRemovedPaths []string
 	var fallback bool
 	for _, set := range appSets {
@@ -543,7 +598,7 @@ func (b *Backend) SetupMany(appSets []*interfaces.SnapAppSet, confinement func(s
 		for _, set := range appSets {
 			instanceName := set.InstanceName()
 			opts := confinement(instanceName)
-			if err := b.Setup(set, opts, repo, tm); err != nil {
+			if err := b.Setup(set, opts, sctx(instanceName), repo, tm); err != nil {
 				errors = append(errors, fmt.Errorf("cannot setup profiles for snap %q: %s", instanceName, err))
 			}
 		}
@@ -574,27 +629,27 @@ func RemoveAllSnapAppArmorProfiles() error {
 }
 
 // Remove removes the apparmor profiles of a given snap from disk and the cache.
-func (b *Backend) Remove(snapName string) error {
+func (b *Backend) Remove(instanceName naming.InstanceName) error {
 	dir := dirs.SnapAppArmorDir
-	globs := profileGlobs(snapName)
+	globs := profileGlobs(instanceName)
 	cache := apparmor_sandbox.CacheDir
 	_, removed, errEnsure := osutil.EnsureDirStateGlobs(dir, globs, nil)
 	// always try to remove affected profiles from the cache
 	errRemoveCached := removeCachedProfiles(removed, cache)
 	if errEnsure != nil {
-		return fmt.Errorf("cannot synchronize security files for snap %q: %s", snapName, errEnsure)
+		return fmt.Errorf("cannot synchronize security files for snap %q: %s", instanceName, errEnsure)
 	}
 	return errRemoveCached
 }
 
-func (b *Backend) RemoveLate(snapName string, rev snap.Revision, typ snap.Type) error {
-	logger.Debugf("remove late for snap %v (%s) type %v", snapName, rev, typ)
+func (b *Backend) RemoveLate(instanceName naming.InstanceName, rev snap.Revision, typ snap.Type) error {
+	logger.Debugf("remove late for snap %v (%s) type %v", instanceName, rev, typ)
 	if typ != snap.TypeSnapd {
 		// late remove is relevant only for snap confine profiles
 		return nil
 	}
 
-	globs := []string{snapConfineProfileName(snapName, rev)}
+	globs := []string{snapConfineProfileName(instanceName, rev)}
 	_, removed, errEnsure := osutil.EnsureDirStateGlobs(dirs.SnapAppArmorDir, globs, nil)
 	// XXX: we should also try and unload the profile from the kernel
 	// instead of just removing it from the cache but currently it is not
@@ -602,7 +657,7 @@ func (b *Backend) RemoveLate(snapName string, rev snap.Revision, typ snap.Type) 
 	// it is not safe to unload the profile
 	errRemoveCached := removeCachedProfiles(removed, apparmor_sandbox.CacheDir)
 	if errEnsure != nil {
-		return fmt.Errorf("cannot remove security profiles for snap %q (%s): %s", snapName, rev, errEnsure)
+		return fmt.Errorf("cannot remove security profiles for snap %q (%s): %s", instanceName, rev, errEnsure)
 	}
 	return errRemoveCached
 }
@@ -612,27 +667,73 @@ var (
 	coreRuntimePattern = regexp.MustCompile("^core([0-9][0-9])?$")
 )
 
-func (b *Backend) deriveContent(spec *Specification, snapInfo *snap.Info, opts interfaces.ConfinementOptions) (content map[string]osutil.FileState) {
-	content = make(map[string]osutil.FileState, len(snapInfo.Apps)+len(snapInfo.Hooks)+1)
+// joinRules concatenates apparmor rule snippets with a newline separator.
+func joinRules(parts ...string) string {
+	return strings.Join(parts, "\n")
+}
 
-	// Add profile for each app.
-	for _, appInfo := range snapInfo.Apps {
-		securityTag := appInfo.SecurityTag()
-		b.addContent(securityTag, snapInfo, appInfo.Name, opts, spec.SnippetForTag(securityTag), content, spec)
+// isCustomBase reports whether base names a snap outside the core* family.
+// An empty base is the implicit "core" base, so it returns false.
+func isCustomBase(base string) bool {
+	return base != "" && !coreRuntimePattern.MatchString(base)
+}
+
+// baseRuntimeExtraRules returns additional apparmor rules for perl/python
+// runtimes for all core and non-core bases, including the pycache deny
+// snippet unless suppressPycacheDeny is set.
+var baseRuntimeExtraRules = func(base string, suppressPycacheDeny bool) string {
+	pycacheDeny := pycacheDenySnippet
+	if suppressPycacheDeny {
+		pycacheDeny = ""
 	}
-	// Add profile for each hook.
-	for _, hookInfo := range snapInfo.Hooks {
-		securityTag := hookInfo.SecurityTag()
-		b.addContent(securityTag, snapInfo, "hook."+hookInfo.Name, opts, spec.SnippetForTag(securityTag), content, spec)
+	pythonRules := joinRules(defaultPythonTemplateRules, pycacheDeny)
+	if isCustomBase(base) {
+		return joinRules(defaultPerlTemplateRules, pythonRules)
+	}
+	// For base "" (implicit core) or "core" (explicit), TrimPrefix yields ""
+	// so coreVer=0 and Atoi error intentionally ignored. Any other value here
+	// matches ^core[0-9][0-9]$ so TrimPrefix yields two digits and Atoi succeeds.
+	coreVer, _ := strconv.Atoi(strings.TrimPrefix(base, "core"))
+	if coreVer >= 26 {
+		return ""
+	} else if coreVer == 24 {
+		return joinRules(pythonRules, defaultCoreRuntimePythonTemplateRules)
+	}
+	return joinRules(
+		defaultPerlTemplateRules,
+		defaultCoreRuntimePerlTemplateRules,
+		pythonRules,
+		defaultCoreRuntimePythonTemplateRules,
+	)
+}
+
+func (b *Backend) deriveContent(spec *Specification, appSet *interfaces.SnapAppSet, opts interfaces.ConfinementOptions) (content map[string]osutil.FileState) {
+	runnables := appSet.Runnables()
+	content = make(map[string]osutil.FileState, len(runnables))
+	snapInfo := appSet.Info()
+
+	// add base snippets to the spec, unless it's a strict snap in devmode or a
+	// classic snap without a jail. These will be present in the final profile
+	// if no interface overrides them with a more specific snippet of the same
+	// key
+	if (!opts.Classic && !opts.DevMode) || opts.JailMode {
+		for key, snippet := range basePrioritizedSnippets {
+			// TODO: pass confinement flags down if snippets need to be
+			// added conditionally
+			spec.AddBasePrioritizedSnippet(snippet, key)
+		}
 	}
 
-	// TODO: something with component hooks will need to happen here
+	// Add profile for apps and hooks.
+	for _, r := range runnables {
+		b.addContent(r.SecurityTag, snapInfo, r.CommandName, opts, spec.SnippetForTag(r.SecurityTag), content, spec)
+	}
 
 	// Add profile for snap-update-ns if we have any apps or hooks.
 	// If we have neither then we don't have any need to create an executing environment.
 	// This applies to, for example, kernel snaps or gadget snaps (unless they have hooks).
 	if len(content) > 0 {
-		snippets := strings.Join(spec.UpdateNS(), "\n")
+		snippets := joinRules(spec.UpdateNS()...)
 		addUpdateNSProfile(snapInfo, snippets, content)
 	}
 
@@ -649,23 +750,38 @@ func addUpdateNSProfile(snapInfo *snap.Info, snippets string, content map[string
 	policy := templatePattern.ReplaceAllStringFunc(updateNSTemplate, func(placeholder string) string {
 		switch placeholder {
 		case "###SNAP_INSTANCE_NAME###":
-			return snapInfo.InstanceName()
+			return snapInfo.InstanceName().String()
 		case "###SNIPPETS###":
 			if overlayRoot, _ := isRootWritableOverlay(); overlayRoot != "" {
 				snippets += strings.Replace(apparmor_sandbox.OverlayRootSnippet, "###UPPERDIR###", overlayRoot, -1)
 			}
 			return snippets
+		case "###INCLUDE_SYSTEM_TUNABLES_HOME_D_WITH_VENDORED_APPARMOR###":
+			// XXX: refactor this so that we don't have to duplicate this part.
+			// TODO: rewrite this whole mess with go templates.
+			features, _ := parserFeatures()
+			if strutil.ListContains(features, "snapd-internal") {
+				return `#include if exists "/etc/apparmor.d/tunables/home.d"`
+			}
+			return ""
+		default:
+			if snapdenv.Testing() || osutil.IsTestBinary() {
+				panic(fmt.Sprintf("cannot expand snippet for pattern %q", placeholder))
+			}
 		}
 		return ""
 	})
 
 	// Ensure that the snap-update-ns profile is on disk.
-	profileName := nsProfile(snapInfo.InstanceName())
+	profileName := nsProfile(snapInfo.InstanceName().String())
 	content[profileName] = &osutil.MemoryFileState{
 		Content: []byte(policy),
 		Mode:    0644,
 	}
 }
+
+// Allow optional trailing ' ' after "###PROMPT###"
+var promptReplacer = regexp.MustCompile("###PROMPT### ?")
 
 func (b *Backend) addContent(securityTag string, snapInfo *snap.Info, cmdName string, opts interfaces.ConfinementOptions, snippetForTag string, content map[string]osutil.FileState, spec *Specification) {
 	// If base is specified and it doesn't match the core snaps (not
@@ -673,7 +789,7 @@ func (b *Backend) addContent(securityTag string, snapInfo *snap.Info, cmdName st
 	// case, the 'core' snap is used for the runtime), use the base
 	// apparmor template, otherwise use the default template.
 	var policy string
-	if snapInfo.Base != "" && !coreRuntimePattern.MatchString(snapInfo.Base) {
+	if isCustomBase(snapInfo.Base) {
 		policy = defaultOtherBaseTemplate
 	} else {
 		policy = defaultCoreRuntimeTemplate
@@ -688,6 +804,17 @@ func (b *Backend) addContent(securityTag string, snapInfo *snap.Info, cmdName st
 	}
 	policy = templatePattern.ReplaceAllStringFunc(policy, func(placeholder string) string {
 		switch placeholder {
+		case "###BASE_RUNTIME_EXTRA###":
+			return baseRuntimeExtraRules(snapInfo.Base, spec.SuppressPycacheDeny())
+		case "###KERNEL_MODULES_AND_FIRMWARE###":
+			if opts.KernelSnap != "" {
+				return fmt.Sprintf(`
+  # Allow access to kernel modules and firmware from the kernel snap
+  /snap/%[1]s/*/{modules,firmware}/{,**} r,
+  /snap/%[1]s/components/mnt/*/*/{modules,firmware}/{,**} r,
+  /var/snap/%[1]s/*/{modules,firmware}/{,**} r,`, opts.KernelSnap)
+			}
+			return ""
 		case "###DEVMODE_SNAP_CONFINE###":
 			if !opts.DevMode {
 				// nothing to add if we are not in devmode
@@ -797,7 +924,7 @@ func (b *Backend) addContent(securityTag string, snapInfo *snap.Info, cmdName st
 				snapdSnapConfineSnippet = fmt.Sprintf("/snap/snapd/*/usr/lib/snapd/snap-confine Pxr -> %s,\n", snapdProfileTarget())
 			}
 
-			nonBaseCoreTransitionSnippet := coreSnapConfineSnippet + "\n" + snapdSnapConfineSnippet
+			nonBaseCoreTransitionSnippet := joinRules(coreSnapConfineSnippet, snapdSnapConfineSnippet)
 
 			// include both rules for the core snap and the snapd snap since
 			// we can't know which one will be used at runtime (for example
@@ -811,6 +938,10 @@ func (b *Backend) addContent(securityTag string, snapInfo *snap.Info, cmdName st
   # to the actual snap-confine profile
   /usr/bin/snap ixr,
   /snap/{snapd,core}/*/usr/bin/snap ixr,
+  # allow executing snapd binary through a symlink. snapd implements the actual
+  # usr/bin/snap functionality
+  /usr/lib{,exec}/snapd/snapd ixr,
+  /snap/{snapd,core}/*/usr/lib/snapd/snapd ixr,
 
   # allow transitioning to snap-confine to support executing strict snaps from
   # inside devmode confined snaps
@@ -883,11 +1014,6 @@ func (b *Backend) addContent(securityTag string, snapInfo *snap.Info, cmdName st
 			} else {
 				return ""
 			}
-		case "###PYCACHEDENY###":
-			if spec.SuppressPycacheDeny() {
-				return ""
-			}
-			return pycacheDenySnippet
 		case "###CHANGEPROFILE_RULE###":
 			features, _ := parserFeatures()
 			if strutil.ListContains(features, "unsafe") {
@@ -900,7 +1026,7 @@ func (b *Backend) addContent(securityTag string, snapInfo *snap.Info, cmdName st
 				// Add a special internal snippet for snaps using classic confinement
 				// and jailmode together. This snippet provides access to the core snap
 				// so that the dynamic linker and shared libraries can be used.
-				tagSnippets = classicJailmodeSnippet + "\n" + snippetForTag
+				tagSnippets = joinRules(classicJailmodeSnippet, snippetForTag)
 			} else if ignoreSnippets {
 				// When classic confinement template is in effect we are
 				// ignoring all apparmor snippets as they may conflict with the
@@ -949,6 +1075,13 @@ func (b *Backend) addContent(securityTag string, snapInfo *snap.Info, cmdName st
 				}
 				tagSnippets = strings.Replace(tagSnippets, "###HOME_IX###", repl, -1)
 
+				// Use prompt prefix if prompting is supported and enabled
+				repl = ""
+				if spec.UsePromptPrefix() {
+					repl = "prompt "
+				}
+				tagSnippets = promptReplacer.ReplaceAllLiteralString(tagSnippets, repl)
+
 				// Conditionally add privilege dropping policy
 				if len(snapInfo.SystemUsernames) > 0 {
 					tagSnippets += privDropAndChownRules
@@ -956,6 +1089,12 @@ func (b *Backend) addContent(securityTag string, snapInfo *snap.Info, cmdName st
 			}
 
 			return tagSnippets
+		default:
+			if snapdenv.Testing() || osutil.IsTestBinary() {
+				panic(fmt.Sprintf("cannot expand snippet for pattern %q", placeholder))
+			} else {
+				logger.Noticef("WARNING: cannto expand snippet for pattern %q", placeholder)
+			}
 		}
 		return ""
 	})
@@ -967,8 +1106,11 @@ func (b *Backend) addContent(securityTag string, snapInfo *snap.Info, cmdName st
 }
 
 // NewSpecification returns a new, empty apparmor specification.
-func (b *Backend) NewSpecification(appSet *interfaces.SnapAppSet) interfaces.Specification {
-	return &Specification{appSet: appSet}
+func (b *Backend) NewSpecification(appSet *interfaces.SnapAppSet, opts interfaces.ConfinementOptions) interfaces.Specification {
+	return &Specification{
+		appSet:          appSet,
+		usePromptPrefix: opts.AppArmorPrompting,
+	}
 }
 
 // SandboxFeatures returns the list of apparmor features supported by the kernel.

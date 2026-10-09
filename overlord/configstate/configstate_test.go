@@ -37,6 +37,7 @@ import (
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/snapstate/snapstatetest"
 	"github.com/snapcore/snapd/overlord/state"
+	"github.com/snapcore/snapd/overlord/swfeats/swfeatstest"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/sysconfig"
 	"github.com/snapcore/snapd/testutil"
@@ -58,7 +59,7 @@ func (s *tasksetsSuite) SetUpTest(c *C) {
 }
 
 var configureTests = []struct {
-	patch       map[string]interface{}
+	patch       map[string]any
 	optional    bool
 	ignoreError bool
 	useDefaults bool
@@ -67,11 +68,11 @@ var configureTests = []struct {
 	optional:    true,
 	ignoreError: false,
 }, {
-	patch:       map[string]interface{}{},
+	patch:       map[string]any{},
 	optional:    true,
 	ignoreError: false,
 }, {
-	patch:       map[string]interface{}{"foo": "bar"},
+	patch:       map[string]any{"foo": "bar"},
 	optional:    false,
 	ignoreError: false,
 }, {
@@ -136,11 +137,11 @@ func (s *tasksetsSuite) TestConfigureInstalled(c *C) {
 
 		context, err := hookstate.NewContext(task, task.State(), &hooksup, nil, "")
 		c.Check(err, IsNil)
-		c.Check(context.InstanceName(), Equals, "test-snap")
+		c.Check(context.InstanceName().String(), Equals, "test-snap")
 		c.Check(context.SnapRevision(), Equals, snap.Revision{})
 		c.Check(context.HookName(), Equals, "configure")
 
-		var patch map[string]interface{}
+		var patch map[string]any
 		var useDefaults bool
 		context.Lock()
 		context.Get("use-defaults", &useDefaults)
@@ -174,13 +175,13 @@ func (s *tasksetsSuite) TestConfigureInstalledConflict(c *C) {
 	chg := s.state.NewChange("other-change", "...")
 	chg.AddAll(ts)
 
-	patch := map[string]interface{}{"foo": "bar"}
+	patch := map[string]any{"foo": "bar"}
 	_, err = configstate.ConfigureInstalled(s.state, "test-snap", patch, 0)
 	c.Check(err, ErrorMatches, `snap "test-snap" has "other-change" change in progress`)
 }
 
 func (s *tasksetsSuite) TestConfigureNotInstalled(c *C) {
-	patch := map[string]interface{}{"foo": "bar"}
+	patch := map[string]any{"foo": "bar"}
 	s.state.Lock()
 	defer s.state.Unlock()
 
@@ -193,7 +194,7 @@ func (s *tasksetsSuite) TestConfigureNotInstalled(c *C) {
 }
 
 func (s *tasksetsSuite) TestConfigureInstalledDenyBases(c *C) {
-	patch := map[string]interface{}{"foo": "bar"}
+	patch := map[string]any{"foo": "bar"}
 	s.state.Lock()
 	defer s.state.Unlock()
 	snapstate.Set(s.state, "test-base", &snapstate.SnapState{
@@ -210,7 +211,7 @@ func (s *tasksetsSuite) TestConfigureInstalledDenyBases(c *C) {
 }
 
 func (s *tasksetsSuite) TestConfigureInstalledDenySnapd(c *C) {
-	patch := map[string]interface{}{"foo": "bar"}
+	patch := map[string]any{"foo": "bar"}
 	s.state.Lock()
 	defer s.state.Unlock()
 	snapstate.Set(s.state, "snapd", &snapstate.SnapState{
@@ -264,11 +265,11 @@ func (s *tasksetsSuite) TestDefaultConfigure(c *C) {
 
 	context, err := hookstate.NewContext(task, task.State(), &hooksup, nil, "")
 	c.Check(err, IsNil)
-	c.Check(context.InstanceName(), Equals, "test-snap")
+	c.Check(context.InstanceName().String(), Equals, "test-snap")
 	c.Check(context.SnapRevision(), Equals, snap.Revision{})
 	c.Check(context.HookName(), Equals, "default-configure")
 
-	var patch map[string]interface{}
+	var patch map[string]any
 	var useDefaults bool
 	context.Lock()
 	context.Get("use-defaults", &useDefaults)
@@ -324,6 +325,53 @@ func (s *configcoreHijackSuite) TestConfigMngrInitHomeDirs(c *C) {
 	c.Check(dirs.SnapHomeDirs(), DeepEquals, snapHomeDirs)
 }
 
+func (s *configcoreHijackSuite) TestConfigMngrInitPrunesGraduatedExperimentalFeatures(c *C) {
+	s.o = overlord.Mock()
+	s.state = s.o.State()
+	hookMgr, err := hookstate.Manager(s.state, s.o.TaskRunner())
+	c.Assert(err, IsNil)
+
+	s.state.Lock()
+	t := config.NewTransaction(s.state)
+	feature := features.Graduated()[0]
+	c.Assert(t.Set("core", "experimental."+feature, true), IsNil)
+	t.Commit()
+	s.state.Unlock()
+
+	c.Assert(configstate.Init(s.state, hookMgr), IsNil)
+
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	t = config.NewTransaction(s.state)
+	var value any
+	err = t.Get("core", "experimental."+feature, &value)
+	c.Check(config.IsNoOption(err), Equals, true)
+}
+
+func (s *configcoreHijackSuite) TestConfigMngrInitMigratesDiskSpaceReservation(c *C) {
+	s.o = overlord.Mock()
+	s.state = s.o.State()
+	hookMgr, err := hookstate.Manager(s.state, s.o.TaskRunner())
+	c.Assert(err, IsNil)
+
+	s.state.Lock()
+	t := config.NewTransaction(s.state)
+	c.Assert(t.Set("core", "experimental.check-disk-space-install", true), IsNil)
+	t.Commit()
+	s.state.Unlock()
+
+	c.Assert(configstate.Init(s.state, hookMgr), IsNil)
+
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	t = config.NewTransaction(s.state)
+	var reservation uint64
+	c.Assert(t.Get("core", "disk-reservation.size", &reservation), IsNil)
+	c.Check(reservation, Equals, uint64(5*1024*1024))
+}
+
 type witnessManager struct {
 	state     *state.State
 	committed bool
@@ -345,7 +393,7 @@ func (s *configcoreHijackSuite) TestHijack(c *C) {
 	s.state.Lock()
 	defer s.state.Unlock()
 
-	ts := configstate.Configure(s.state, "core", map[string]interface{}{
+	ts := configstate.Configure(s.state, "core", map[string]any{
 		"witness": true,
 	}, 0)
 	c.Assert(len(ts.Tasks()), Equals, 1)
@@ -510,14 +558,14 @@ func (s *earlyConfigSuite) TestEarlyConfigFromGadget(c *C) {
 	ok, err = features.Flag(tr, features.UserDaemons)
 	c.Assert(err, IsNil)
 	c.Check(ok, Equals, true)
-	var serviceCfg map[string]interface{}
+	var serviceCfg map[string]any
 	err = tr.Get("core", "services", &serviceCfg)
 	// nothing of this was set
 	c.Assert(config.IsNoOption(err), Equals, true)
 }
 
 func (s *earlyConfigSuite) TestEarlyConfigFromGadgetErr(c *C) {
-	defer configstate.MockConfigcoreEarly(func(sysconfig.Device, configcore.RunTransaction, map[string]interface{}) error {
+	defer configstate.MockConfigcoreEarly(func(sysconfig.Device, configcore.RunTransaction, map[string]any) error {
 		return fmt.Errorf("boom")
 	})()
 
@@ -533,7 +581,7 @@ func (s *earlyConfigSuite) TestEarlyConfigFromGadgetErr(c *C) {
 }
 
 func (s *earlyConfigSuite) TestEarlyConfigNoHookTask(c *C) {
-	defer configstate.MockConfigcoreEarly(func(dev sysconfig.Device, cfg configcore.RunTransaction, vals map[string]interface{}) error {
+	defer configstate.MockConfigcoreEarly(func(dev sysconfig.Device, cfg configcore.RunTransaction, vals map[string]any) error {
 		c.Assert(cfg.Task(), IsNil)
 		return nil
 	})()
@@ -575,4 +623,8 @@ func (s *earlyConfigSuite) TestEarlyConfigNoGadget(c *C) {
 	sysCfg, err := config.GetSnapConfig(s.state, "core")
 	c.Assert(err, IsNil)
 	c.Check(sysCfg, IsNil)
+}
+
+func (s *earlyConfigSuite) TestEnsureLoopLogging(c *C) {
+	swfeatstest.CheckEnsureLoopLogging("configmgr.go", c, false)
 }

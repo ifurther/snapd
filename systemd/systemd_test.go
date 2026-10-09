@@ -790,6 +790,8 @@ func (s *SystemdTestSuite) TestVersion(c *C) {
 	s.outs = [][]byte{
 		[]byte("systemd 223\n+PAM\n"),
 		[]byte("systemd 245 (245.4-4ubuntu3)\n+PAM +AUDIT +SELINUX +IMA\n"),
+		[]byte("systemd 255~rc3\n+PAM"),
+		[]byte("systemd 256~rc3-foo\n+PAM"),
 		// error cases
 		[]byte("foo 223\n+PAM\n"),
 		[]byte(""),
@@ -804,6 +806,14 @@ func (s *SystemdTestSuite) TestVersion(c *C) {
 	c.Assert(err, IsNil)
 	c.Check(v, Equals, 245)
 
+	v, err = Version()
+	c.Assert(err, IsNil)
+	c.Check(v, Equals, 255)
+
+	v, err = Version()
+	c.Assert(err, IsNil)
+	c.Check(v, Equals, 256)
+
 	_, err = Version()
 	c.Assert(err, ErrorMatches, `cannot parse systemd version: expected "systemd", got "foo"`)
 
@@ -814,6 +824,8 @@ func (s *SystemdTestSuite) TestVersion(c *C) {
 	c.Assert(err, ErrorMatches, `cannot convert systemd version to number: abc`)
 
 	c.Check(s.argses, DeepEquals, [][]string{
+		{"--version"},
+		{"--version"},
 		{"--version"},
 		{"--version"},
 		{"--version"},
@@ -955,7 +967,7 @@ func (s *SystemdTestSuite) TestLogs(c *C) {
 }
 
 // mustJSONMarshal panic's if the value cannot be marshaled
-func mustJSONMarshal(v interface{}) *json.RawMessage {
+func mustJSONMarshal(v any) *json.RawMessage {
 	b, err := json.Marshal(v)
 	if err != nil {
 		panic(fmt.Sprintf("couldn't marshal json in test fixture: %v", err))
@@ -1159,7 +1171,20 @@ func (s *SystemdTestSuite) TestAddMountUnit(c *C) {
 	mockSnapPath := filepath.Join(c.MkDir(), "/var/lib/snappy/snaps/foo_1.0.snap")
 	makeMockFile(c, mockSnapPath)
 
-	mountUnitName, err := NewUnderRoot(rootDir, SystemMode, nil).EnsureMountUnitFile("Mount unit for foo, revision 42", mockSnapPath, "/snap/snapname/123", "squashfs", systemd.EnsureMountUnitFlags{})
+	mountOptions := &systemd.MountUnitOptions{
+		Lifetime:                 systemd.Persistent,
+		Description:              "Mount unit for foo, revision 42",
+		What:                     mockSnapPath,
+		Where:                    "/snap/snapname/123",
+		PreventRestartIfModified: true,
+	}
+
+	sysd := NewUnderRoot(rootDir, SystemMode, nil)
+
+	err := sysd.ConfigureMountUnitOptions(mountOptions, "squashfs", false)
+	c.Assert(err, IsNil)
+
+	mountUnitName, err := sysd.EnsureMountUnitFile(mountOptions)
 	c.Assert(err, IsNil)
 	defer os.Remove(mountUnitName)
 
@@ -1186,6 +1211,145 @@ WantedBy=multi-user.target
 		{"--root", rootDir, "enable", "snap-snapname-123.mount"},
 		{"restart", "snap-snapname-123.mount"},
 	})
+}
+
+func (s *SystemdTestSuite) TestConfigureMountUnitOptions(c *C) {
+	sysd := NewUnderRoot(dirs.GlobalRootDir, SystemMode, nil)
+
+	restore := MockSquashFsType(func() (string, []string) { return "squashfs.foo", []string{"foo", "bar", "baz"} })
+	defer restore()
+
+	mockSnapPath := filepath.Join(c.MkDir(), "/var/lib/snappy/snaps/foo_1.0.snap")
+	makeMockFile(c, mockSnapPath)
+
+	mockWhatDir := c.MkDir()
+
+	type testcase struct {
+		testOpts, expectedOpts systemd.MountUnitOptions
+
+		fstype             string
+		startBeforeDrivers bool
+	}
+
+	for _, tc := range []testcase{
+		{
+			testOpts: systemd.MountUnitOptions{
+				Lifetime:                 systemd.Persistent,
+				Description:              "Mount unit for foo, revision 42",
+				What:                     mockSnapPath,
+				Where:                    "/snap/snapname/123",
+				PreventRestartIfModified: true,
+				EnsureStartIfUnchanged:   true,
+				Origin:                   "origin",
+				RootDir:                  "/root/dir",
+			},
+			fstype:             "ext4",
+			startBeforeDrivers: false,
+			expectedOpts: systemd.MountUnitOptions{
+				Lifetime:                 systemd.Persistent,
+				Description:              "Mount unit for foo, revision 42",
+				What:                     mockSnapPath,
+				Where:                    "/snap/snapname/123",
+				PreventRestartIfModified: true,
+				EnsureStartIfUnchanged:   true,
+				Origin:                   "origin",
+				RootDir:                  "/root/dir",
+				MountUnitType:            RegularMountUnit,
+				// overridden by fstype="ext4"
+				Fstype:  "ext4",
+				Options: []string{"nodev"},
+			},
+		},
+		{
+			testOpts: systemd.MountUnitOptions{
+				Lifetime:                 systemd.Persistent,
+				Description:              "Mount unit for foo, revision 42",
+				What:                     mockWhatDir,
+				Where:                    "/snap/snapname/123",
+				PreventRestartIfModified: true,
+				EnsureStartIfUnchanged:   true,
+				Origin:                   "origin",
+				RootDir:                  "/root/dir",
+			},
+			fstype:             "ext4",
+			startBeforeDrivers: false,
+			expectedOpts: systemd.MountUnitOptions{
+				Lifetime:                 systemd.Persistent,
+				Description:              "Mount unit for foo, revision 42",
+				What:                     mockWhatDir,
+				Where:                    "/snap/snapname/123",
+				PreventRestartIfModified: true,
+				EnsureStartIfUnchanged:   true,
+				Origin:                   "origin",
+				RootDir:                  "/root/dir",
+				MountUnitType:            RegularMountUnit,
+				// overridden by fstype="ext4"
+				Fstype:  "none", // because "What" is a directory
+				Options: []string{"nodev", "bind"},
+			},
+		},
+		{
+			testOpts: systemd.MountUnitOptions{
+				Lifetime:                 systemd.Persistent,
+				Description:              "Mount unit for foo, revision 42",
+				What:                     mockSnapPath,
+				Where:                    "/snap/snapname/123",
+				PreventRestartIfModified: true,
+				EnsureStartIfUnchanged:   true,
+				Origin:                   "origin",
+				RootDir:                  "/root/dir",
+				MountUnitType:            RegularMountUnit,
+			},
+			fstype:             "squashfs",
+			startBeforeDrivers: true,
+			expectedOpts: systemd.MountUnitOptions{
+				Lifetime:                 systemd.Persistent,
+				Description:              "Mount unit for foo, revision 42",
+				What:                     mockSnapPath,
+				Where:                    "/snap/snapname/123",
+				PreventRestartIfModified: true,
+				EnsureStartIfUnchanged:   true,
+				Origin:                   "origin",
+				RootDir:                  "/root/dir",
+				// overridden by fstype="squashfs"
+				Fstype:  "squashfs.foo",
+				Options: []string{"nodev", "foo", "bar", "baz"},
+				// overridden by startBeforeDrivers=true
+				MountUnitType: BeforeDriversLoadMountUnit,
+			},
+		},
+	} {
+		err := sysd.ConfigureMountUnitOptions(&tc.testOpts, tc.fstype, tc.startBeforeDrivers)
+		c.Assert(err, IsNil)
+		c.Check(tc.testOpts, DeepEquals, tc.expectedOpts)
+	}
+}
+
+func (s *SystemdTestSuite) TestConfigureMountUnitOptionsErrors(c *C) {
+	sysd := NewUnderRoot(dirs.GlobalRootDir, SystemMode, nil)
+
+	mountOptions := &systemd.MountUnitOptions{
+		// What is not set
+		What: "",
+	}
+	err := sysd.ConfigureMountUnitOptions(mountOptions, "squashfs", false)
+	c.Assert(err, ErrorMatches, `internal error: cannot configure mount unit options: "What" cannot be unset`)
+
+	mountOptions = &systemd.MountUnitOptions{
+		What: "/var/lib/snappy/snaps/foo_1.0.snap",
+		// Fstype is set
+		Fstype: "fs-type",
+	}
+	err = sysd.ConfigureMountUnitOptions(mountOptions, "squashfs", false)
+	c.Assert(err, ErrorMatches, `internal error: cannot configure mount unit options: "Fstype" cannot be set`)
+
+	mountOptions = &systemd.MountUnitOptions{
+		What: "/var/lib/snappy/snaps/foo_1.0.snap",
+		// Options are set
+		Options: []string{"opt1"},
+	}
+	err = sysd.ConfigureMountUnitOptions(mountOptions, "squashfs", false)
+	c.Assert(err, ErrorMatches, `internal error: cannot configure mount unit options: "Options" cannot be set`)
 }
 
 func (s *SystemdTestSuite) TestEnsureMountUnitUnchanged(c *C) {
@@ -1220,7 +1384,20 @@ WantedBy=multi-user.target
 	err = os.WriteFile(filepath.Join(dirs.SnapServicesDir, "snap-snapname-123.mount"), []byte(content), 0644)
 	c.Assert(err, IsNil)
 
-	mountUnitName, err := NewUnderRoot(rootDir, SystemMode, nil).EnsureMountUnitFile("Mount unit for foo, revision 42", mockSnapPath, "/snap/snapname/123", "squashfs", systemd.EnsureMountUnitFlags{})
+	mountOptions := &systemd.MountUnitOptions{
+		Lifetime:                 systemd.Persistent,
+		Description:              "Mount unit for foo, revision 42",
+		What:                     mockSnapPath,
+		Where:                    "/snap/snapname/123",
+		PreventRestartIfModified: true,
+	}
+
+	sysd := NewUnderRoot(rootDir, SystemMode, nil)
+
+	err = sysd.ConfigureMountUnitOptions(mountOptions, "squashfs", false)
+	c.Assert(err, IsNil)
+
+	mountUnitName, err := sysd.EnsureMountUnitFile(mountOptions)
 	c.Assert(err, IsNil)
 
 	// Should still be the same file
@@ -1247,15 +1424,16 @@ WantedBy=multi-user.target
 }
 
 func (s *SystemdTestSuite) TestEnsureMountUnitChanged(c *C) {
-	s.testEnsureMountUnitChanged(c, systemd.EnsureMountUnitFlags{})
+	const preventRestartIfModified = false
+	s.testEnsureMountUnitChanged(c, preventRestartIfModified)
 }
 
 func (s *SystemdTestSuite) TestEnsureMountUnitChangedIgnoreChanged(c *C) {
-	s.testEnsureMountUnitChanged(c,
-		systemd.EnsureMountUnitFlags{PreventRestartIfModified: true})
+	const preventRestartIfModified = true
+	s.testEnsureMountUnitChanged(c, preventRestartIfModified)
 }
 
-func (s *SystemdTestSuite) testEnsureMountUnitChanged(c *C, mountFlags systemd.EnsureMountUnitFlags) {
+func (s *SystemdTestSuite) testEnsureMountUnitChanged(c *C, preventRestartIfModified bool) {
 	rootDir := dirs.GlobalRootDir
 
 	restore := squashfs.MockNeedsFuse(false)
@@ -1288,7 +1466,20 @@ WantedBy=multi-user.target
 	err = os.WriteFile(filepath.Join(dirs.SnapServicesDir, "snap-snapname-123.mount"), []byte(content), 0644)
 	c.Assert(err, IsNil)
 
-	mountUnitName, err := NewUnderRoot(rootDir, SystemMode, nil).EnsureMountUnitFile("Mount unit for foo, revision 42", mockSnapPath, "/snap/snapname/123", "squashfs", mountFlags)
+	mountOptions := &systemd.MountUnitOptions{
+		Lifetime:                 systemd.Persistent,
+		Description:              "Mount unit for foo, revision 42",
+		What:                     mockSnapPath,
+		Where:                    "/snap/snapname/123",
+		PreventRestartIfModified: preventRestartIfModified,
+	}
+
+	sysd := NewUnderRoot(rootDir, SystemMode, nil)
+
+	err = sysd.ConfigureMountUnitOptions(mountOptions, "squashfs", false)
+	c.Assert(err, IsNil)
+
+	mountUnitName, err := sysd.EnsureMountUnitFile(mountOptions)
 	c.Assert(err, IsNil)
 
 	// Should still be the same file
@@ -1314,7 +1505,7 @@ WantedBy=multi-user.target
 	expectedCalls := [][]string{
 		{"daemon-reload"},
 		{"--root", rootDir, "enable", "snap-snapname-123.mount"}}
-	if !mountFlags.PreventRestartIfModified {
+	if !preventRestartIfModified {
 		expectedCalls = append(expectedCalls, []string{"restart", "snap-snapname-123.mount"})
 	}
 	c.Assert(s.argses, DeepEquals, expectedCalls)
@@ -1326,7 +1517,20 @@ func (s *SystemdTestSuite) TestAddMountUnitForDirs(c *C) {
 
 	// a directory instead of a file produces a different output
 	snapDir := c.MkDir()
-	mountUnitName, err := New(SystemMode, nil).EnsureMountUnitFile("Mount unit for foodir, revision x1", snapDir, "/snap/snapname/x1", "squashfs", systemd.EnsureMountUnitFlags{})
+	mountOptions := &systemd.MountUnitOptions{
+		Lifetime:                 systemd.Persistent,
+		Description:              "Mount unit for foodir, revision x1",
+		What:                     snapDir,
+		Where:                    "/snap/snapname/x1",
+		PreventRestartIfModified: true,
+	}
+
+	sysd := New(SystemMode, nil)
+
+	err := sysd.ConfigureMountUnitOptions(mountOptions, "squashfs", false)
+	c.Assert(err, IsNil)
+
+	mountUnitName, err := sysd.EnsureMountUnitFile(mountOptions)
 	c.Assert(err, IsNil)
 	defer os.Remove(mountUnitName)
 
@@ -1362,7 +1566,20 @@ func (s *SystemdTestSuite) TestAddMountUnitStartBeforeDriversLoad(c *C) {
 	mockSnapPath := filepath.Join(c.MkDir(), "/var/lib/snappy/snaps/foo_1.0.snap")
 	makeMockFile(c, mockSnapPath)
 
-	mountUnitName, err := New(SystemMode, nil).EnsureMountUnitFile("Mount unit for foo, revision x1", mockSnapPath, "/snap/snapname/x1", "squashfs", systemd.EnsureMountUnitFlags{StartBeforeDriversLoad: true})
+	mountOptions := &systemd.MountUnitOptions{
+		Lifetime:                 systemd.Persistent,
+		Description:              "Mount unit for foo, revision x1",
+		What:                     mockSnapPath,
+		Where:                    "/snap/snapname/x1",
+		PreventRestartIfModified: true,
+	}
+
+	sysd := New(SystemMode, nil)
+
+	err := sysd.ConfigureMountUnitOptions(mountOptions, "squashfs", true)
+	c.Assert(err, IsNil)
+
+	mountUnitName, err := sysd.EnsureMountUnitFile(mountOptions)
 	c.Assert(err, IsNil)
 	defer os.Remove(mountUnitName)
 
@@ -1372,6 +1589,7 @@ Description=Mount unit for foo, revision x1
 After=snapd.mounts-pre.target
 Before=snapd.mounts.target
 Before=systemd-udevd.service systemd-modules-load.service
+Before=usr-lib-modules.mount usr-lib-firmware.mount
 
 [Mount]
 What=%s
@@ -1410,7 +1628,7 @@ func (s *SystemdTestSuite) TestAddMountUnitTransient(c *C) {
 		Options:     []string{"remount,ro"},
 		Origin:      "bar",
 	}
-	mountUnitName, err := NewUnderRoot(rootDir, SystemMode, nil).EnsureMountUnitFileWithOptions(addMountUnitOptions)
+	mountUnitName, err := NewUnderRoot(rootDir, SystemMode, nil).EnsureMountUnitFile(addMountUnitOptions)
 	c.Assert(err, IsNil)
 	defer os.Remove(mountUnitName)
 
@@ -1440,6 +1658,51 @@ X-SnapdOrigin=bar
 	})
 }
 
+func (s *SystemdTestSuite) TestAddMountUnitInRootDir(c *C) {
+	rootDir := filepath.Join(dirs.GlobalRootDir, "rootfs")
+
+	restore := squashfs.MockNeedsFuse(false)
+	defer restore()
+
+	mockSnapPath := filepath.Join(c.MkDir(), "/var/lib/snappy/snaps/foo_1.0.snap")
+	makeMockFile(c, mockSnapPath)
+
+	addMountUnitOptions := &MountUnitOptions{
+		Lifetime:    Transient,
+		Description: "Mount unit for foo via bar",
+		What:        mockSnapPath,
+		Where:       "/snap/snapname/345",
+		Fstype:      "squashfs",
+		Options:     []string{"remount,ro"},
+		Origin:      "bar",
+		RootDir:     rootDir,
+	}
+	mountUnitName, modified, err := systemd.EnsureMountUnitFileContent(addMountUnitOptions)
+	c.Assert(err, IsNil)
+	c.Assert(modified, Equals, systemd.MountCreated)
+	defer os.Remove(mountUnitName)
+
+	c.Assert(filepath.Join(dirs.SnapRuntimeServicesDirUnder(rootDir), mountUnitName),
+		testutil.FileEquals, fmt.Sprintf(`
+[Unit]
+Description=Mount unit for foo via bar
+After=snapd.mounts-pre.target
+Before=snapd.mounts.target
+
+[Mount]
+What=%s
+Where=/snap/snapname/345
+Type=squashfs
+Options=remount,ro
+LazyUnmount=yes
+
+[Install]
+WantedBy=snapd.mounts.target
+WantedBy=multi-user.target
+X-SnapdOrigin=bar
+`[1:], mockSnapPath))
+}
+
 func (s *SystemdTestSuite) TestAddKernelModulesMountUnit(c *C) {
 	rootDir := dirs.GlobalRootDir
 
@@ -1459,7 +1722,7 @@ func (s *SystemdTestSuite) TestAddKernelModulesMountUnit(c *C) {
 		Options:       []string{"nodev,ro,x-gdu.hide,x-gvfs-hide"},
 		Origin:        "",
 	}
-	mountUnitName, err := NewUnderRoot(rootDir, SystemMode, nil).EnsureMountUnitFileWithOptions(addMountUnitOptions)
+	mountUnitName, err := NewUnderRoot(rootDir, SystemMode, nil).EnsureMountUnitFile(addMountUnitOptions)
 	c.Assert(err, IsNil)
 	defer os.Remove(mountUnitName)
 
@@ -1468,6 +1731,7 @@ Description=Mount unit for wifi kernel modules component
 After=snapd.mounts-pre.target
 Before=snapd.mounts.target
 Before=systemd-udevd.service systemd-modules-load.service
+Before=usr-lib-modules.mount usr-lib-firmware.mount
 
 [Mount]
 What=%s
@@ -1506,7 +1770,7 @@ func (s *SystemdTestSuite) TestAddKernelTreeMountUnit(c *C) {
 		Options:       []string{"bind"},
 		Origin:        "",
 	}
-	mountUnitName, err := NewUnderRoot(rootDir, SystemMode, nil).EnsureMountUnitFileWithOptions(addMountUnitOptions)
+	mountUnitName, err := NewUnderRoot(rootDir, SystemMode, nil).EnsureMountUnitFile(addMountUnitOptions)
 	c.Assert(err, IsNil)
 	defer os.Remove(mountUnitName)
 
@@ -1515,6 +1779,7 @@ Description=Mount unit for kernel modules in kernel tree
 After=snapd.mounts-pre.target
 Before=snapd.mounts.target
 Before=systemd-udevd.service systemd-modules-load.service
+Before=usr-lib-modules.mount usr-lib-firmware.mount
 
 [Mount]
 What=/run/mnt/kernel-modules/5.15.0-91-generic/mykmod/modules/5.15.0-91-generic
@@ -1549,7 +1814,20 @@ func (s *SystemdTestSuite) TestWriteSELinuxMountUnit(c *C) {
 	err = os.WriteFile(mockSnapPath, nil, 0644)
 	c.Assert(err, IsNil)
 
-	mountUnitName, err := New(SystemMode, nil).EnsureMountUnitFile("Mount unit for foo, revision 42", mockSnapPath, "/snap/snapname/123", "squashfs", systemd.EnsureMountUnitFlags{})
+	mountOptions := &systemd.MountUnitOptions{
+		Lifetime:                 systemd.Persistent,
+		Description:              "Mount unit for foo, revision 42",
+		What:                     mockSnapPath,
+		Where:                    "/snap/snapname/123",
+		PreventRestartIfModified: true,
+	}
+
+	sysd := New(SystemMode, nil)
+
+	err = sysd.ConfigureMountUnitOptions(mountOptions, "squashfs", false)
+	c.Assert(err, IsNil)
+
+	mountUnitName, err := sysd.EnsureMountUnitFile(mountOptions)
 	c.Assert(err, IsNil)
 	defer os.Remove(mountUnitName)
 
@@ -1594,7 +1872,20 @@ exit 0
 	err = os.WriteFile(mockSnapPath, nil, 0644)
 	c.Assert(err, IsNil)
 
-	mountUnitName, err := New(SystemMode, nil).EnsureMountUnitFile("Mount unit for foo, revision x1", mockSnapPath, "/snap/snapname/123", "squashfs", systemd.EnsureMountUnitFlags{})
+	mountOptions := &systemd.MountUnitOptions{
+		Lifetime:                 systemd.Persistent,
+		Description:              "Mount unit for foo, revision x1",
+		What:                     mockSnapPath,
+		Where:                    "/snap/snapname/123",
+		PreventRestartIfModified: true,
+	}
+
+	sysd := New(SystemMode, nil)
+
+	err = sysd.ConfigureMountUnitOptions(mountOptions, "squashfs", false)
+	c.Assert(err, IsNil)
+
+	mountUnitName, err := sysd.EnsureMountUnitFile(mountOptions)
 	c.Assert(err, IsNil)
 	defer os.Remove(mountUnitName)
 
@@ -1635,7 +1926,20 @@ exit 0
 	err = os.WriteFile(mockSnapPath, nil, 0644)
 	c.Assert(err, IsNil)
 
-	mountUnitName, err := New(SystemMode, nil).EnsureMountUnitFile("Mount unit for foo, revision x1", mockSnapPath, "/snap/snapname/123", "squashfs", systemd.EnsureMountUnitFlags{})
+	mountOptions := &systemd.MountUnitOptions{
+		Lifetime:                 systemd.Persistent,
+		Description:              "Mount unit for foo, revision x1",
+		What:                     mockSnapPath,
+		Where:                    "/snap/snapname/123",
+		PreventRestartIfModified: true,
+	}
+
+	sysd := New(SystemMode, nil)
+
+	err = sysd.ConfigureMountUnitOptions(mountOptions, "squashfs", false)
+	c.Assert(err, IsNil)
+
+	mountUnitName, err := sysd.EnsureMountUnitFile(mountOptions)
 	c.Assert(err, IsNil)
 	defer os.Remove(mountUnitName)
 
@@ -1784,6 +2088,58 @@ func (s *SystemdTestSuite) TestRemoveMountUnit(c *C) {
 	})
 }
 
+func (s *SystemdTestSuite) TestRemoveMountUnitWhenIsMountedButDeletedUnitFile(c *C) {
+	// When the unit file is missing but the directory is still mounted
+	// (e.g. a user manually deleted the unit file), RemoveMountUnitFile
+	// must still unmount the directory and return nil error
+	rootDir := dirs.GlobalRootDir
+	mountDir := rootDir + "/snap/foo/42"
+
+	restore := MockOsutilIsMounted(func(path string) (bool, error) {
+		c.Check(path, Equals, mountDir)
+		return true, nil
+	})
+	defer restore()
+
+	mockUmountCmd := testutil.MockCommand(c, "umount", "")
+	defer mockUmountCmd.Restore()
+
+	// No unit file on disk
+	err := NewUnderRoot(rootDir, SystemMode, nil).RemoveMountUnitFile(mountDir)
+	c.Assert(err, IsNil)
+
+	// umount was called
+	c.Check(mockUmountCmd.Calls(), HasLen, 1)
+	c.Check(mockUmountCmd.Calls()[0], DeepEquals, []string{"umount", "-d", "-l", mountDir})
+	// no systemctl calls: no unit file to disable or daemon-reload for
+	c.Check(s.argses, HasLen, 0)
+}
+
+func (s *SystemdTestSuite) TestRemoveMountUnitWhenIsNotMountedAndDeletedUnitFile(c *C) {
+	// When the unit file is missing and the directory is not mounted
+	// RemoveMountUnitFile must return nil error without calling umount
+	// or systemctl
+	rootDir := dirs.GlobalRootDir
+	mountDir := rootDir + "/snap/foo/42"
+
+	restore := MockOsutilIsMounted(func(path string) (bool, error) {
+		c.Check(path, Equals, mountDir)
+		return false, nil
+	})
+	defer restore()
+
+	mockUmountCmd := testutil.MockCommand(c, "umount", "")
+	defer mockUmountCmd.Restore()
+
+	// No unit file on disk
+	err := NewUnderRoot(rootDir, SystemMode, nil).RemoveMountUnitFile(mountDir)
+	c.Assert(err, IsNil)
+
+	// nothing to unmount or disable
+	c.Check(mockUmountCmd.Calls(), HasLen, 0)
+	c.Check(s.argses, HasLen, 0)
+}
+
 func (s *SystemdTestSuite) TestDaemonReloadMutex(c *C) {
 	s.testDaemonOpWithMutex(c, Systemd.DaemonReload)
 }
@@ -1815,7 +2171,18 @@ func (s *SystemdTestSuite) testDaemonOpWithMutex(c *C, testFunc func(Systemd) er
 	// daemon-reload. This will be serialized, if not this would
 	// panic because systemd.daemonReloadNoLock ensures the lock is
 	// taken when this happens.
-	_, err := sysd.EnsureMountUnitFile("42", mockSnapPath, "/snap/foo/42", "squashfs", systemd.EnsureMountUnitFlags{})
+	mountOptions := &systemd.MountUnitOptions{
+		Lifetime:                 systemd.Persistent,
+		Description:              "42",
+		What:                     mockSnapPath,
+		Where:                    "/snap/foo/42",
+		PreventRestartIfModified: true,
+	}
+
+	err := sysd.ConfigureMountUnitOptions(mountOptions, "squashfs", false)
+	c.Assert(err, IsNil)
+
+	_, err = sysd.EnsureMountUnitFile(mountOptions)
 	c.Assert(err, IsNil)
 	close(stopCh)
 	<-stoppedCh
@@ -1928,13 +2295,27 @@ func (s *SystemdTestSuite) TestPreseedModeAddMountUnit(c *C) {
 	restore := squashfs.MockNeedsFuse(false)
 	defer restore()
 
+	restore = osutil.MockMountInfo("")
+	defer restore()
+
 	mockMountCmd := testutil.MockCommand(c, "mount", "")
 	defer mockMountCmd.Restore()
 
 	mockSnapPath := filepath.Join(c.MkDir(), "/var/lib/snappy/snaps/foo_1.0.snap")
 	makeMockFile(c, mockSnapPath)
 
-	mountUnitName, err := sysd.EnsureMountUnitFile("Mount unit for foo, revision 42", mockSnapPath, "/snap/snapname/123", "squashfs", systemd.EnsureMountUnitFlags{})
+	mountOptions := &systemd.MountUnitOptions{
+		Lifetime:                 systemd.Persistent,
+		Description:              "Mount unit for foo, revision 42",
+		What:                     mockSnapPath,
+		Where:                    "/snap/snapname/123",
+		PreventRestartIfModified: true,
+	}
+
+	err := sysd.ConfigureMountUnitOptions(mountOptions, "squashfs", false)
+	c.Assert(err, IsNil)
+
+	mountUnitName, err := sysd.EnsureMountUnitFile(mountOptions)
 	c.Assert(err, IsNil)
 	defer os.Remove(mountUnitName)
 
@@ -1948,6 +2329,9 @@ func (s *SystemdTestSuite) TestPreseedModeAddMountUnitUnchanged(c *C) {
 	sysd := NewEmulationMode(dirs.GlobalRootDir)
 
 	restore := squashfs.MockNeedsFuse(false)
+	defer restore()
+
+	restore = osutil.MockMountInfo("")
 	defer restore()
 
 	mockMountCmd := testutil.MockCommand(c, "mount", "")
@@ -1978,7 +2362,18 @@ WantedBy=multi-user.target
 	err = os.WriteFile(filepath.Join(dirs.SnapServicesDir, "snap-snapname-123.mount"), []byte(content), 0644)
 	c.Assert(err, IsNil)
 
-	_, err = sysd.EnsureMountUnitFile("Mount unit for foo, revision 42", mockSnapPath, "/snap/snapname/123", "squashfs", systemd.EnsureMountUnitFlags{})
+	mountOptions := &systemd.MountUnitOptions{
+		Lifetime:                 systemd.Persistent,
+		Description:              "Mount unit for foo, revision 42",
+		What:                     mockSnapPath,
+		Where:                    "/snap/snapname/123",
+		PreventRestartIfModified: true,
+	}
+
+	err = sysd.ConfigureMountUnitOptions(mountOptions, "squashfs", false)
+	c.Assert(err, IsNil)
+
+	_, err = sysd.EnsureMountUnitFile(mountOptions)
 	c.Assert(err, IsNil)
 
 	// systemd was not called
@@ -1987,10 +2382,14 @@ WantedBy=multi-user.target
 	c.Check(mockMountCmd.Calls(), HasLen, 0)
 }
 
-func (s *SystemdTestSuite) TestPreseedModeAddMountUniModified(c *C) {
+func (s *SystemdTestSuite) TestPreseedModeAddMountUnitModifiedAlreadyMounted(c *C) {
 	sysd := NewEmulationMode(dirs.GlobalRootDir)
 
 	restore := squashfs.MockNeedsFuse(false)
+	defer restore()
+
+	mountInfoContent := `24 0 8:18 / /snap/snapname/123 rw,relatime shared:1 - squashfs /dev/loop1 rw,errors=remount-ro,data=ordered`
+	restore = osutil.MockMountInfo(mountInfoContent)
 	defer restore()
 
 	mockMountCmd := testutil.MockCommand(c, "mount", "")
@@ -2022,12 +2421,85 @@ WantedBy=multi-user.target
 	err = os.WriteFile(filepath.Join(dirs.SnapServicesDir, "snap-snapname-123.mount"), []byte(content), 0644)
 	c.Assert(err, IsNil)
 
-	mountUnitName, err := sysd.EnsureMountUnitFile("Mount unit for foo, revision 42", mockSnapPath, "/snap/snapname/123", "squashfs", systemd.EnsureMountUnitFlags{})
+	mountOptions := &systemd.MountUnitOptions{
+		Lifetime:                 systemd.Persistent,
+		Description:              "Mount unit for foo, revision 42",
+		What:                     mockSnapPath,
+		Where:                    "/snap/snapname/123",
+		PreventRestartIfModified: true,
+	}
+
+	err = sysd.ConfigureMountUnitOptions(mountOptions, "squashfs", false)
+	c.Assert(err, IsNil)
+
+	mountUnitName, err := sysd.EnsureMountUnitFile(mountOptions)
 	c.Assert(err, IsNil)
 
 	c.Check(s.argses, DeepEquals, [][]string{{"--root", dirs.GlobalRootDir, "enable", "snap-snapname-123.mount"}})
 	// mount was called with remount option
-	c.Check(mockMountCmd.Calls()[0], DeepEquals, []string{"mount", "-t", "squashfs", mockSnapPath, "/snap/snapname/123", "-o", "nodev,ro,x-gdu.hide,x-gvfs-hide,remount"})
+	c.Check(mockMountCmd.Calls()[0], DeepEquals, []string{
+		"mount", "-t", "squashfs", mockSnapPath, "/snap/snapname/123", "-o", "nodev,ro,x-gdu.hide,x-gvfs-hide,remount",
+	})
+	c.Check(filepath.Join(dirs.SnapServicesDir, mountUnitName), testutil.FileEquals, fmt.Sprintf(unitTemplate[1:], mockSnapPath, "squashfs", "nodev,ro,x-gdu.hide,x-gvfs-hide"))
+}
+
+func (s *SystemdTestSuite) TestPreseedModeAddMountUnitModifiedButNotMounted(c *C) {
+	sysd := NewEmulationMode(dirs.GlobalRootDir)
+
+	restore := squashfs.MockNeedsFuse(false)
+	defer restore()
+
+	restore = osutil.MockMountInfo("")
+	defer restore()
+
+	mockMountCmd := testutil.MockCommand(c, "mount", "")
+	defer mockMountCmd.Restore()
+
+	mockSnapPath := filepath.Join(c.MkDir(), "/var/lib/snappy/snaps/foo_1.0.snap")
+	makeMockFile(c, mockSnapPath)
+
+	err := os.MkdirAll(dirs.SnapServicesDir, 0755)
+	c.Assert(err, IsNil)
+	// Note the "anotheroption"
+	content := fmt.Sprintf(`
+[Unit]
+Description=Mount unit for foo, revision 42
+After=snapd.mounts-pre.target
+Before=snapd.mounts.target
+
+[Mount]
+What=%s
+Where=/snap/snapname/123
+Type=squashfs
+Options=nodev,ro,x-gdu.hide,x-gvfs-hide,anotheroption
+LazyUnmount=yes
+
+[Install]
+WantedBy=snapd.mounts.target
+WantedBy=multi-user.target
+`[1:], mockSnapPath)
+	err = os.WriteFile(filepath.Join(dirs.SnapServicesDir, "snap-snapname-123.mount"), []byte(content), 0644)
+	c.Assert(err, IsNil)
+
+	mountOptions := &systemd.MountUnitOptions{
+		Lifetime:                 systemd.Persistent,
+		Description:              "Mount unit for foo, revision 42",
+		What:                     mockSnapPath,
+		Where:                    "/snap/snapname/123",
+		PreventRestartIfModified: true,
+	}
+
+	err = sysd.ConfigureMountUnitOptions(mountOptions, "squashfs", false)
+	c.Assert(err, IsNil)
+
+	mountUnitName, err := sysd.EnsureMountUnitFile(mountOptions)
+	c.Assert(err, IsNil)
+
+	c.Check(s.argses, DeepEquals, [][]string{{"--root", dirs.GlobalRootDir, "enable", "snap-snapname-123.mount"}})
+	// no remount option in mount command
+	c.Check(mockMountCmd.Calls()[0], DeepEquals, []string{
+		"mount", "-t", "squashfs", mockSnapPath, "/snap/snapname/123", "-o", "nodev,ro,x-gdu.hide,x-gvfs-hide",
+	})
 	c.Check(filepath.Join(dirs.SnapServicesDir, mountUnitName), testutil.FileEquals, fmt.Sprintf(unitTemplate[1:], mockSnapPath, "squashfs", "nodev,ro,x-gdu.hide,x-gvfs-hide"))
 }
 
@@ -2037,13 +2509,27 @@ func (s *SystemdTestSuite) TestPreseedModeAddMountUnitWithFuse(c *C) {
 	restore := MockSquashFsType(func() (string, []string) { return "fuse.squashfuse", []string{"a,b,c"} })
 	defer restore()
 
+	restore = osutil.MockMountInfo("")
+	defer restore()
+
 	mockMountCmd := testutil.MockCommand(c, "mount", "")
 	defer mockMountCmd.Restore()
 
 	mockSnapPath := filepath.Join(c.MkDir(), "/var/lib/snappy/snaps/foo_1.0.snap")
 	makeMockFile(c, mockSnapPath)
 
-	mountUnitName, err := sysd.EnsureMountUnitFile("Mount unit for foo, revision 42", mockSnapPath, "/snap/snapname/123", "squashfs", systemd.EnsureMountUnitFlags{})
+	mountOptions := &systemd.MountUnitOptions{
+		Lifetime:                 systemd.Persistent,
+		Description:              "Mount unit for foo, revision 42",
+		What:                     mockSnapPath,
+		Where:                    "/snap/snapname/123",
+		PreventRestartIfModified: true,
+	}
+
+	err := sysd.ConfigureMountUnitOptions(mountOptions, "squashfs", false)
+	c.Assert(err, IsNil)
+
+	mountUnitName, err := sysd.EnsureMountUnitFile(mountOptions)
 	c.Assert(err, IsNil)
 	defer os.Remove(mountUnitName)
 
@@ -2055,6 +2541,9 @@ func (s *SystemdTestSuite) TestPreseedModeAddMountUnitWithOptions(c *C) {
 	sysd := NewEmulationMode(dirs.GlobalRootDir)
 
 	restore := MockSquashFsType(func() (string, []string) { return "fuse.squashfuse", []string{"a,b,c"} })
+	defer restore()
+
+	restore = osutil.MockMountInfo("")
 	defer restore()
 
 	mockMountCmd := testutil.MockCommand(c, "mount", "")
@@ -2072,7 +2561,7 @@ func (s *SystemdTestSuite) TestPreseedModeAddMountUnitWithOptions(c *C) {
 		Fstype:        "squashfs",
 		Options:       []string{"nodev,ro,x-gdu.hide,x-gvfs-hide"},
 	}
-	mountUnitName, err := sysd.EnsureMountUnitFileWithOptions(mountUnitOptions)
+	mountUnitName, err := sysd.EnsureMountUnitFile(mountUnitOptions)
 
 	c.Assert(err, IsNil)
 	defer os.Remove(mountUnitName)
@@ -2086,6 +2575,7 @@ Description=Early mount unit for kernel snap
 After=snapd.mounts-pre.target
 Before=snapd.mounts.target
 Before=systemd-udevd.service systemd-modules-load.service
+Before=usr-lib-modules.mount usr-lib-firmware.mount
 
 [Mount]
 What=%s
@@ -2100,10 +2590,72 @@ WantedBy=multi-user.target
 `, mockSnapPath))
 }
 
+func (s *SystemdTestSuite) TestAddMountUnitWithOptionsEnsureStart(c *C) {
+	rootDir := dirs.GlobalRootDir
+
+	restore := squashfs.MockNeedsFuse(false)
+	defer restore()
+
+	what := "/dev/sda1"
+	where := "/var/snaps/mysnap/common/mnt"
+	unitContent := fmt.Sprintf(`
+[Unit]
+Description=Mount unit
+After=snapd.mounts-pre.target
+Before=snapd.mounts.target
+
+[Mount]
+What=%s
+Where=%s
+Type=ext4
+Options=remount,ro
+LazyUnmount=yes
+
+[Install]
+WantedBy=snapd.mounts.target
+WantedBy=multi-user.target
+X-SnapdOrigin=mount-control
+`[1:], what, where)
+
+	addMountUnitOptions := &MountUnitOptions{
+		Lifetime:               Transient,
+		Description:            "Mount unit",
+		What:                   what,
+		Where:                  where,
+		Fstype:                 "ext4",
+		Options:                []string{"remount,ro"},
+		Origin:                 "mount-control",
+		EnsureStartIfUnchanged: true,
+	}
+	sysd := NewUnderRoot(rootDir, SystemMode, nil)
+	mountUnitName, err := sysd.EnsureMountUnitFile(addMountUnitOptions)
+	c.Assert(err, IsNil)
+
+	mountUnit := "var-snaps-mysnap-common-mnt.mount"
+	c.Assert(filepath.Join(dirs.SnapRuntimeServicesDir, mountUnitName),
+		testutil.FileEquals, unitContent)
+	c.Assert(s.argses, DeepEquals, [][]string{
+		{"daemon-reload"},
+		{"--root", rootDir, "enable", mountUnit},
+		{"restart", mountUnit},
+	})
+	s.argses = nil
+
+	// The unit is ensured to have started even if unchanged
+	mountUnitName, err = sysd.EnsureMountUnitFile(addMountUnitOptions)
+	c.Assert(err, IsNil)
+	c.Assert(filepath.Join(dirs.SnapRuntimeServicesDir, mountUnitName),
+		testutil.FileEquals, unitContent)
+	c.Assert(s.argses, DeepEquals, [][]string{{"start", "--no-block", mountUnit}})
+}
+
 func (s *SystemdTestSuite) TestPreseedModeMountError(c *C) {
 	sysd := NewEmulationMode(dirs.GlobalRootDir)
 
 	restore := squashfs.MockNeedsFuse(false)
+	defer restore()
+
+	restore = osutil.MockMountInfo("")
 	defer restore()
 
 	mockMountCmd := testutil.MockCommand(c, "mount", `echo "some failure"; exit 1`)
@@ -2112,7 +2664,18 @@ func (s *SystemdTestSuite) TestPreseedModeMountError(c *C) {
 	mockSnapPath := filepath.Join(c.MkDir(), "/var/lib/snappy/snaps/foo_1.0.snap")
 	makeMockFile(c, mockSnapPath)
 
-	_, err := sysd.EnsureMountUnitFile("42", mockSnapPath, "/snap/snapname/123", "squashfs", systemd.EnsureMountUnitFlags{})
+	mountOptions := &systemd.MountUnitOptions{
+		Lifetime:                 systemd.Persistent,
+		Description:              "42",
+		What:                     mockSnapPath,
+		Where:                    "/snap/snapname/123",
+		PreventRestartIfModified: true,
+	}
+
+	err := sysd.ConfigureMountUnitOptions(mountOptions, "squashfs", false)
+	c.Assert(err, IsNil)
+
+	_, err = sysd.EnsureMountUnitFile(mountOptions)
 	c.Assert(err, ErrorMatches, `cannot mount .*/var/lib/snappy/snaps/foo_1.0.snap \(squashfs\) at /snap/snapname/123 in preseed mode: exit status 1; some failure\n`)
 }
 
@@ -2123,6 +2686,9 @@ func (s *SystemdTestSuite) TestPreseedModeRemoveMountUnit(c *C) {
 		c.Check(path, Equals, mountDir)
 		return true, nil
 	})
+	defer restore()
+
+	restore = osutil.MockMountInfo("")
 	defer restore()
 
 	mockUmountCmd := testutil.MockCommand(c, "umount", "")
@@ -2170,6 +2736,56 @@ func (s *SystemdTestSuite) TestPreseedModeRemoveMountUnitUnmounted(c *C) {
 	c.Check(mockUmountCmd.Calls(), HasLen, 0)
 }
 
+func (s *SystemdTestSuite) TestPreseedModeRemoveMountUnitMountedButNoUnitFile(c *C) {
+	// When the unit file is missing but the directory is still mounted,
+	// emulation-mode RemoveMountUnitFile must still unmount and return nil
+	// error.
+	mountDir := dirs.GlobalRootDir + "/snap/foo/42"
+
+	restore := MockOsutilIsMounted(func(path string) (bool, error) {
+		c.Check(path, Equals, mountDir)
+		return true, nil
+	})
+	defer restore()
+
+	mockUmountCmd := testutil.MockCommand(c, "umount", "")
+	defer mockUmountCmd.Restore()
+
+	// No unit file on disk
+	sysd := NewEmulationMode(dirs.GlobalRootDir)
+	c.Assert(sysd.RemoveMountUnitFile(mountDir), IsNil)
+
+	// umount was called
+	c.Check(mockUmountCmd.Calls(), HasLen, 1)
+	c.Check(mockUmountCmd.Calls()[0], DeepEquals, []string{"umount", "-d", "-l", mountDir})
+	// no systemctl calls: no unit file to disable
+	c.Check(s.argses, HasLen, 0)
+}
+
+func (s *SystemdTestSuite) TestPreseedModeRemoveMountUnitUnmountedAndNoUnitFile(c *C) {
+	// When the unit file is missing and the directory is not mounted
+	// RemoveMountUnitFile must return nil error without calling umount
+	// or systemctl
+	mountDir := dirs.GlobalRootDir + "/snap/foo/42"
+
+	restore := MockOsutilIsMounted(func(path string) (bool, error) {
+		c.Check(path, Equals, mountDir)
+		return false, nil
+	})
+	defer restore()
+
+	mockUmountCmd := testutil.MockCommand(c, "umount", "")
+	defer mockUmountCmd.Restore()
+
+	// No unit file on disk
+	sysd := NewEmulationMode(dirs.GlobalRootDir)
+	c.Assert(sysd.RemoveMountUnitFile(mountDir), IsNil)
+
+	// nothing to unmount or disable
+	c.Check(mockUmountCmd.Calls(), HasLen, 0)
+	c.Check(s.argses, HasLen, 0)
+}
+
 func (s *SystemdTestSuite) TestPreseedModeBindmountNotSupported(c *C) {
 	sysd := NewEmulationMode(dirs.GlobalRootDir)
 
@@ -2178,7 +2794,18 @@ func (s *SystemdTestSuite) TestPreseedModeBindmountNotSupported(c *C) {
 
 	mockSnapPath := c.MkDir()
 
-	_, err := sysd.EnsureMountUnitFile("42", mockSnapPath, "/snap/snapname/123", "", systemd.EnsureMountUnitFlags{})
+	mountOptions := &systemd.MountUnitOptions{
+		Lifetime:                 systemd.Persistent,
+		Description:              "42",
+		What:                     mockSnapPath,
+		Where:                    "/snap/snapname/123",
+		PreventRestartIfModified: true,
+	}
+
+	err := sysd.ConfigureMountUnitOptions(mountOptions, "squashfs", false)
+	c.Assert(err, IsNil)
+
+	_, err = sysd.EnsureMountUnitFile(mountOptions)
 	c.Assert(err, ErrorMatches, `bind-mounted directory is not supported in emulation mode`)
 }
 
@@ -2217,18 +2844,18 @@ func (s *SystemdTestSuite) TestUnmaskInEmulationMode(c *C) {
 		{"--root", "/path", "unmask", "foo"}})
 }
 
-func (s *SystemdTestSuite) TestListMountUnitsEmpty(c *C) {
+func (s *SystemdTestSuite) TestListMountUnitsLoadedEmpty(c *C) {
 	s.outs = [][]byte{
 		[]byte("\n"),
 	}
 
 	sysd := New(SystemMode, nil)
-	units, err := sysd.ListMountUnits("some-snap", "")
+	units, err := sysd.ListMountUnits("some-snap", "", LoadedMountUnits)
 	c.Check(units, HasLen, 0)
 	c.Check(err, IsNil)
 }
 
-func (s *SystemdTestSuite) TestListMountUnitsMalformed(c *C) {
+func (s *SystemdTestSuite) TestListMountUnitsLoadedMalformed(c *C) {
 	s.outs = [][]byte{
 		[]byte(`Description=Mount unit for some-snap, revision x1
 Where=/somewhere/here
@@ -2238,12 +2865,12 @@ HereIsOneLineWithoutAnEqualSign
 	}
 
 	sysd := New(SystemMode, nil)
-	units, err := sysd.ListMountUnits("some-snap", "")
+	units, err := sysd.ListMountUnits("some-snap", "", LoadedMountUnits)
 	c.Check(units, HasLen, 0)
 	c.Check(err, ErrorMatches, "cannot parse systemctl output:.*")
 }
 
-func (s *SystemdTestSuite) TestListMountUnitsHappy(c *C) {
+func (s *SystemdTestSuite) TestListMountUnitsLoadedHappy(c *C) {
 	tmpDir, err := os.MkdirTemp("/tmp", "snapd-systemd-test-list-mounts-*")
 	c.Assert(err, IsNil)
 	defer os.RemoveAll(tmpDir)
@@ -2252,7 +2879,7 @@ func (s *SystemdTestSuite) TestListMountUnitsHappy(c *C) {
 	createFakeUnit := func(fileName, snapName, where, origin string) error {
 		path := filepath.Join(tmpDir, fileName)
 		if len(systemctlOutput) > 0 {
-			systemctlOutput += "\n\n"
+			systemctlOutput += "\n"
 		}
 		systemctlOutput += fmt.Sprintf(`Description=Mount unit for %s, revision x1
 Where=%s
@@ -2288,15 +2915,223 @@ X-SnapdOrigin=%s
 	sysd := New(SystemMode, nil)
 
 	// First, get all mount units for some-snap, without filter on the origin module
-	units, err := sysd.ListMountUnits("some-snap", "")
+	units, err := sysd.ListMountUnits("some-snap", "", LoadedMountUnits)
 	c.Check(units, DeepEquals, []string{"/somepath/somedir", "/somewhere/there"})
 	c.Check(err, IsNil)
 
 	// Now repeat the same, filtering on the origin module
 	s.i = 0 // this resets the systemctl output iterator back to the beginning
-	units, err = sysd.ListMountUnits("some-snap", "module3")
+	units, err = sysd.ListMountUnits("some-snap", "module3", LoadedMountUnits)
 	c.Check(units, DeepEquals, []string{"/somewhere/there"})
 	c.Check(err, IsNil)
+}
+
+func (s *SystemdTestSuite) TestListMountUnitsInstalledEmpty(c *C) {
+	// When list-unit-files returns no mount units, ListMountUnits must return
+	// nil without issuing a second systemctl call.
+	s.outs = [][]byte{
+		[]byte("\n"),
+	}
+
+	sysd := New(SystemMode, nil)
+	units, err := sysd.ListMountUnits("some-snap", "", InstalledMountUnits)
+	c.Check(units, IsNil)
+	c.Check(err, IsNil)
+
+	// Only one systemctl call (list-unit-files); no 'show' call.
+	c.Assert(s.argses, HasLen, 1)
+	c.Check(s.argses[0], DeepEquals, []string{"list-unit-files", "--no-legend", "*.mount"})
+}
+
+func (s *SystemdTestSuite) TestListMountUnitsInstalledWhitespaceOnly(c *C) {
+	// When list-unit-files returns only whitespace (non-empty but no real
+	// unit names), ListMountUnits must return nil without issuing a second
+	// systemctl call.
+	s.outs = [][]byte{
+		[]byte("   \n"),
+	}
+
+	sysd := New(SystemMode, nil)
+	units, err := sysd.ListMountUnits("some-snap", "", InstalledMountUnits)
+	c.Check(units, IsNil)
+	c.Check(err, IsNil)
+
+	// Only one systemctl call (list-unit-files); no 'show' call.
+	c.Assert(s.argses, HasLen, 1)
+	c.Check(s.argses[0], DeepEquals, []string{"list-unit-files", "--no-legend", "*.mount"})
+}
+
+func (s *SystemdTestSuite) TestListMountUnitsInstalledHappy(c *C) {
+	tmpDir, err := os.MkdirTemp("/tmp", "snapd-systemd-test-list-mounts-all-*")
+	c.Assert(err, IsNil)
+	defer os.RemoveAll(tmpDir)
+
+	// "-.mount" is a generated root mount returned by list-unit-files
+	showOutput := "Description=Root Mount\nWhere=/\nFragmentPath=/run/systemd/generator/-.mount\n"
+	createFakeUnit := func(fileName, snapName, where, origin string) error {
+		path := filepath.Join(tmpDir, fileName)
+		if len(showOutput) > 0 {
+			showOutput += "\n"
+		}
+		showOutput += fmt.Sprintf(`Description=Mount unit for %s, revision x1
+Where=%s
+FragmentPath=%s
+`, snapName, where, path)
+		contents := fmt.Sprintf(`[Unit]
+Description=Mount unit for %s, revision x1
+
+[Mount]
+What=/does/not/matter
+Where=%s
+Type=doesntmatter
+Options=do,not,matter,either
+
+[Install]
+WantedBy=doesntmatter.target
+X-SnapdOrigin=%s
+`, snapName, where, origin)
+		return os.WriteFile(path, []byte(contents), 0644)
+	}
+
+	err = createFakeUnit("somepath-somedir.mount", "some-snap", "/somepath/somedir", "module1")
+	c.Assert(err, IsNil)
+	err = createFakeUnit("somewhere-there.mount", "some-snap", "/somewhere/there", "module3")
+	c.Assert(err, IsNil)
+	err = createFakeUnit("somewhere-other.mount", "some-other-snap", "/somewhere/other", "module2")
+	c.Assert(err, IsNil)
+
+	listOut := "-.mount  static   -\nsomepath-somedir.mount  enabled  enabled\nsomewhere-there.mount  enabled  -\nsomewhere-other.mount  static   disabled\n"
+
+	s.outs = [][]byte{
+		[]byte(listOut),    // first call: list-unit-files
+		[]byte(showOutput), // second call: show with explicit unit names
+	}
+
+	sysd := New(SystemMode, nil)
+	units, err := sysd.ListMountUnits("some-snap", "", InstalledMountUnits)
+	c.Check(units, DeepEquals, []string{"/somepath/somedir", "/somewhere/there"})
+	c.Check(err, IsNil)
+
+	// Verify the two systemctl calls
+	c.Assert(s.argses, HasLen, 2)
+	c.Check(s.argses[0], DeepEquals, []string{"list-unit-files", "--no-legend", "*.mount"})
+	c.Check(s.argses[1], DeepEquals, []string{
+		"show", "--property=Description,Where,FragmentPath", "--",
+		"-.mount", "somepath-somedir.mount", "somewhere-there.mount", "somewhere-other.mount",
+	})
+
+	// Repeat with origin filter
+	s.i = 0
+	units, err = sysd.ListMountUnits("some-snap", "module3", InstalledMountUnits)
+	c.Check(units, DeepEquals, []string{"/somewhere/there"})
+	c.Check(err, IsNil)
+}
+
+func (s *SystemdTestSuite) TestListMountUnitsInstalledListUnitFilesMalformed(c *C) {
+	// A blank line embedded in list-unit-files output is skipped rather
+	// than causing a panic
+	s.outs = [][]byte{
+		[]byte("foo.mount  enabled  -\n\nbar.mount  static   disabled\n"),
+		{}, // show returns empty
+	}
+
+	sysd := New(SystemMode, nil)
+	units, err := sysd.ListMountUnits("some-snap", "", InstalledMountUnits)
+	c.Check(units, HasLen, 0)
+	c.Check(err, IsNil)
+
+	// The blank line is skipped; only the two valid unit names reach show.
+	c.Assert(s.argses, HasLen, 2)
+	c.Check(s.argses[0], DeepEquals, []string{"list-unit-files", "--no-legend", "*.mount"})
+	c.Check(s.argses[1], DeepEquals, []string{
+		"show", "--property=Description,Where,FragmentPath", "--",
+		"foo.mount", "bar.mount",
+	})
+}
+
+func (s *SystemdTestSuite) TestListMountUnitsInstalledListUnitFilesError(c *C) {
+	s.errors = []error{fmt.Errorf("list-unit-files failed")}
+
+	sysd := New(SystemMode, nil)
+	units, err := sysd.ListMountUnits("some-snap", "", InstalledMountUnits)
+	c.Check(units, IsNil)
+	c.Check(err, ErrorMatches, ".*list-unit-files failed.*")
+
+	// Only the first systemctl call should have been made
+	c.Assert(s.argses, HasLen, 1)
+	c.Check(s.argses[0], DeepEquals, []string{"list-unit-files", "--no-legend", "*.mount"})
+}
+
+func (s *SystemdTestSuite) TestListMountUnitsInstalledChunkBoundary(c *C) {
+	// Reduce the chunk size to 2 so that 3 units span two "show" calls
+	restore := MockMaxUnitsPerShow(2)
+	defer restore()
+
+	tmpDir, err := os.MkdirTemp("/tmp", "snapd-systemd-test-list-mounts-chunk-*")
+	c.Assert(err, IsNil)
+	defer os.RemoveAll(tmpDir)
+
+	// chunk 1 contains units 1 and 2, chunk 2 contains unit 3
+	createFakeUnit := func(fileName, where string) (string, error) {
+		path := filepath.Join(tmpDir, fileName)
+		showBlock := fmt.Sprintf(`Description=Mount unit for some-snap, revision x1
+Where=%s
+FragmentPath=%s
+`, where, path)
+		contents := fmt.Sprintf(`[Unit]
+Description=Mount unit for some-snap, revision x1
+
+[Mount]
+What=/does/not/matter
+Where=%s
+Type=doesntmatter
+Options=do,not,matter,either
+
+[Install]
+WantedBy=doesntmatter.target
+X-SnapdOrigin=snapstate
+`, where)
+		return showBlock, os.WriteFile(path, []byte(contents), 0644)
+	}
+
+	show1, err := createFakeUnit("snap-foo-1.mount", "/snap/foo/1")
+	c.Assert(err, IsNil)
+	show2, err := createFakeUnit("snap-foo-2.mount", "/snap/foo/2")
+	c.Assert(err, IsNil)
+	show3, err := createFakeUnit("snap-foo-3.mount", "/snap/foo/3")
+	c.Assert(err, IsNil)
+
+	showChunk1 := show1 + "\n" + show2
+	showChunk2 := show3
+
+	listOut := "snap-foo-1.mount  enabled  -\nsnap-foo-2.mount  enabled  -\nsnap-foo-3.mount  enabled  -\n"
+
+	s.outs = [][]byte{
+		[]byte(listOut),    // list-unit-files
+		[]byte(showChunk1), // show chunk 1 (units 1 and 2)
+		[]byte(showChunk2), // show chunk 2 (unit 3)
+	}
+
+	sysd := New(SystemMode, nil)
+	units, err := sysd.ListMountUnits("some-snap", "", InstalledMountUnits)
+	c.Check(err, IsNil)
+	c.Check(units, DeepEquals, []string{"/snap/foo/1", "/snap/foo/2", "/snap/foo/3"})
+
+	// Verify three systemctl calls: list-unit-files + two show calls
+	c.Assert(s.argses, HasLen, 3)
+	c.Check(s.argses[0], DeepEquals, []string{"list-unit-files", "--no-legend", "*.mount"})
+	c.Check(s.argses[1], DeepEquals, []string{"show", "--property=Description,Where,FragmentPath", "--", "snap-foo-1.mount", "snap-foo-2.mount"})
+	c.Check(s.argses[2], DeepEquals, []string{"show", "--property=Description,Where,FragmentPath", "--", "snap-foo-3.mount"})
+}
+
+func (s *SystemdTestSuite) TestListMountUnitsUnknownFilter(c *C) {
+	sysd := New(SystemMode, nil)
+	units, err := sysd.ListMountUnits("some-snap", "", MountUnitFilter(99))
+	c.Check(units, IsNil)
+	c.Check(err, ErrorMatches, `internal error: unknown MountUnitFilter value 99`)
+
+	// No systemctl calls should have been made
+	c.Check(s.argses, HasLen, 0)
 }
 
 func (s *SystemdTestSuite) TestMountHappy(c *C) {
@@ -2607,6 +3442,19 @@ func (s *systemdErrorSuite) TestEnsureMountUnitFileEnsureFileStateErr(c *C) {
 	err := os.MkdirAll(filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap-snapname-123.mount"), 0755)
 	c.Assert(err, IsNil)
 
-	_, err = New(SystemMode, nil).EnsureMountUnitFile("42", mockSnapPath, "/snap/snapname/123", "squashfs", systemd.EnsureMountUnitFlags{})
+	mountOptions := &systemd.MountUnitOptions{
+		Lifetime:                 systemd.Persistent,
+		Description:              "42",
+		What:                     mockSnapPath,
+		Where:                    "/snap/snapname/123",
+		PreventRestartIfModified: true,
+	}
+
+	sysd := New(SystemMode, nil)
+
+	err = sysd.ConfigureMountUnitOptions(mountOptions, "squashfs", false)
+	c.Assert(err, IsNil)
+
+	_, err = sysd.EnsureMountUnitFile(mountOptions)
 	c.Assert(err, ErrorMatches, fmt.Sprintf("internal error: only regular files are supported, got %q instead", os.ModeDir))
 }

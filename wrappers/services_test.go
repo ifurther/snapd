@@ -23,7 +23,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/user"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -34,11 +33,13 @@ import (
 	. "gopkg.in/check.v1"
 
 	"github.com/snapcore/snapd/dirs"
+	"github.com/snapcore/snapd/dirs/dirstest"
 	"github.com/snapcore/snapd/gadget/quantity"
 
 	// imported to ensure actual interfaces are defined (in production this is guaranteed by ifacestate)
 	_ "github.com/snapcore/snapd/interfaces/builtin"
 	"github.com/snapcore/snapd/osutil"
+	"github.com/snapcore/snapd/osutil/user"
 	"github.com/snapcore/snapd/progress"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/snap/quota"
@@ -72,6 +73,7 @@ func (s *servicesTestSuite) SetUpTest(c *C) {
 	s.DBusTest.SetUpTest(c)
 	s.tempdir = c.MkDir()
 	s.sysdLog = nil
+	dirstest.MustMockCanonicalSnapMountDir(s.tempdir)
 	dirs.SetRootDir(s.tempdir)
 
 	s.systemctlRestorer = systemd.MockSystemctl(func(cmd ...string) ([]byte, error) {
@@ -124,8 +126,8 @@ func (s *servicesTestSuite) TestAddSnapServicesAndRemove(c *C) {
 
 	s.sysdLog = nil
 
-	flags := &wrappers.StartServicesFlags{Enable: true}
-	err = wrappers.StartServices(info.Services(), nil, flags, progress.Null, s.perfTimings)
+	opts := &wrappers.StartServicesOptions{Enable: true}
+	err = wrappers.StartServices(info.Services(), nil, opts, progress.Null, s.perfTimings)
 	c.Assert(err, IsNil)
 	c.Check(s.sysdLog, DeepEquals, [][]string{
 		{"--no-reload", "enable", filepath.Base(svcFile)},
@@ -133,7 +135,7 @@ func (s *servicesTestSuite) TestAddSnapServicesAndRemove(c *C) {
 		{"start", filepath.Base(svcFile)},
 	})
 
-	dir := filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount")
+	dir := dirs.StripRootDir(filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount"))
 	c.Assert(svcFile, testutil.FileEquals, fmt.Sprintf(`[Unit]
 # Auto-generated, DO NOT EDIT
 Description=Service for snap application hello-snap.svc1
@@ -147,21 +149,20 @@ EnvironmentFile=-/etc/environment
 ExecStart=/usr/bin/snap run hello-snap.svc1
 SyslogIdentifier=hello-snap.svc1
 Restart=on-failure
-WorkingDirectory=%[2]s/var/snap/hello-snap/12
+WorkingDirectory=/var/snap/hello-snap/12
 ExecStop=/usr/bin/snap run --command=stop hello-snap.svc1
 ExecStopPost=/usr/bin/snap run --command=post-stop hello-snap.svc1
-TimeoutStopSec=30
+TimeoutStopSec=30s
 Type=forking
 
 [Install]
 WantedBy=multi-user.target
 `,
 		systemd.EscapeUnitNamePath(dir),
-		dirs.GlobalRootDir,
 	))
 
 	s.sysdLog = nil
-	err = wrappers.StopServices(info.Services(), nil, "", progress.Null, s.perfTimings)
+	err = wrappers.StopServices(info.Services(), nil, nil, "", progress.Null, s.perfTimings)
 	c.Assert(err, IsNil)
 	c.Assert(s.sysdLog, HasLen, 2)
 	c.Check(s.sysdLog, DeepEquals, [][]string{
@@ -201,7 +202,7 @@ func (s *servicesTestSuite) TestEnsureSnapServicesAdds(c *C) {
 		"hello-snap:svc1:service:svc1": true,
 	})
 
-	dir := filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount")
+	dir := dirs.StripRootDir(filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount"))
 	c.Assert(svcFile, testutil.FileEquals, fmt.Sprintf(`[Unit]
 # Auto-generated, DO NOT EDIT
 Description=Service for snap application hello-snap.svc1
@@ -215,17 +216,16 @@ EnvironmentFile=-/etc/environment
 ExecStart=/usr/bin/snap run hello-snap.svc1
 SyslogIdentifier=hello-snap.svc1
 Restart=on-failure
-WorkingDirectory=%[2]s/var/snap/hello-snap/12
+WorkingDirectory=/var/snap/hello-snap/12
 ExecStop=/usr/bin/snap run --command=stop hello-snap.svc1
 ExecStopPost=/usr/bin/snap run --command=post-stop hello-snap.svc1
-TimeoutStopSec=30
+TimeoutStopSec=30s
 Type=forking
 
 [Install]
 WantedBy=multi-user.target
 `,
 		systemd.EscapeUnitNamePath(dir),
-		dirs.GlobalRootDir,
 	))
 }
 
@@ -248,7 +248,7 @@ func (s *servicesTestSuite) TestEnsureSnapServicesWithQuotas(c *C) {
 		info: {QuotaGroup: grp},
 	}
 
-	dir := filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount")
+	dir := dirs.StripRootDir(filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount"))
 	svcContent := fmt.Sprintf(`[Unit]
 # Auto-generated, DO NOT EDIT
 Description=Service for snap application hello-snap.svc1
@@ -262,10 +262,10 @@ EnvironmentFile=-/etc/environment
 ExecStart=/usr/bin/snap run hello-snap.svc1
 SyslogIdentifier=hello-snap.svc1
 Restart=on-failure
-WorkingDirectory=%[2]s/var/snap/hello-snap/12
+WorkingDirectory=/var/snap/hello-snap/12
 ExecStop=/usr/bin/snap run --command=stop hello-snap.svc1
 ExecStopPost=/usr/bin/snap run --command=post-stop hello-snap.svc1
-TimeoutStopSec=30
+TimeoutStopSec=30s
 Type=forking
 Slice=snap.foogroup.slice
 
@@ -273,7 +273,6 @@ Slice=snap.foogroup.slice
 WantedBy=multi-user.target
 `,
 		systemd.EscapeUnitNamePath(dir),
-		dirs.GlobalRootDir,
 	)
 
 	sliceTempl := `[Unit]
@@ -351,7 +350,7 @@ func (s *servicesTestSuite) TestEnsureSnapServicesWithZeroCpuCountQuotas(c *C) {
 		info: {QuotaGroup: grp},
 	}
 
-	dir := filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount")
+	dir := dirs.StripRootDir(filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount"))
 	svcContent := fmt.Sprintf(`[Unit]
 # Auto-generated, DO NOT EDIT
 Description=Service for snap application hello-snap.svc1
@@ -365,10 +364,10 @@ EnvironmentFile=-/etc/environment
 ExecStart=/usr/bin/snap run hello-snap.svc1
 SyslogIdentifier=hello-snap.svc1
 Restart=on-failure
-WorkingDirectory=%[2]s/var/snap/hello-snap/12
+WorkingDirectory=/var/snap/hello-snap/12
 ExecStop=/usr/bin/snap run --command=stop hello-snap.svc1
 ExecStopPost=/usr/bin/snap run --command=post-stop hello-snap.svc1
-TimeoutStopSec=30
+TimeoutStopSec=30s
 Type=forking
 Slice=snap.foogroup.slice
 
@@ -376,7 +375,6 @@ Slice=snap.foogroup.slice
 WantedBy=multi-user.target
 `,
 		systemd.EscapeUnitNamePath(dir),
-		dirs.GlobalRootDir,
 	)
 
 	sliceTempl := `[Unit]
@@ -450,7 +448,7 @@ func (s *servicesTestSuite) TestEnsureSnapServicesWithZeroCpuCountAndCpuSetQuota
 		info: {QuotaGroup: grp},
 	}
 
-	dir := filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount")
+	dir := dirs.StripRootDir(filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount"))
 	svcContent := fmt.Sprintf(`[Unit]
 # Auto-generated, DO NOT EDIT
 Description=Service for snap application hello-snap.svc1
@@ -464,10 +462,10 @@ EnvironmentFile=-/etc/environment
 ExecStart=/usr/bin/snap run hello-snap.svc1
 SyslogIdentifier=hello-snap.svc1
 Restart=on-failure
-WorkingDirectory=%[2]s/var/snap/hello-snap/12
+WorkingDirectory=/var/snap/hello-snap/12
 ExecStop=/usr/bin/snap run --command=stop hello-snap.svc1
 ExecStopPost=/usr/bin/snap run --command=post-stop hello-snap.svc1
-TimeoutStopSec=30
+TimeoutStopSec=30s
 Type=forking
 Slice=snap.foogroup.slice
 
@@ -475,7 +473,6 @@ Slice=snap.foogroup.slice
 WantedBy=multi-user.target
 `,
 		systemd.EscapeUnitNamePath(dir),
-		dirs.GlobalRootDir,
 	)
 
 	sliceTempl := `[Unit]
@@ -542,33 +539,32 @@ func (s *servicesTestSuite) TestEnsureSnapServicesWithJournalNamespaceOnly(c *C)
 		info: {QuotaGroup: grp},
 	}
 
-	dir := filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount")
+	dir := dirs.StripRootDir(filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount"))
 	svcContent := fmt.Sprintf(`[Unit]
 # Auto-generated, DO NOT EDIT
 Description=Service for snap application hello-snap.svc1
-Requires=%[1]s
+Requires=systemd-journald@snap-foogroup.socket %[1]s
 Wants=network.target
-After=%[1]s network.target snapd.apparmor.service
+After=%[1]s network.target systemd-journald@snap-foogroup.socket snapd.apparmor.service
 X-Snappy=yes
 
 [Service]
 EnvironmentFile=-/etc/environment
+Environment=SNAPD_LOG_NAMESPACE=snap-foogroup
 ExecStart=/usr/bin/snap run hello-snap.svc1
 SyslogIdentifier=hello-snap.svc1
 Restart=on-failure
-WorkingDirectory=%[2]s/var/snap/hello-snap/12
+WorkingDirectory=/var/snap/hello-snap/12
 ExecStop=/usr/bin/snap run --command=stop hello-snap.svc1
 ExecStopPost=/usr/bin/snap run --command=post-stop hello-snap.svc1
-TimeoutStopSec=30
+TimeoutStopSec=30s
 Type=forking
 Slice=snap.foogroup.slice
-LogNamespace=snap-foogroup
 
 [Install]
 WantedBy=multi-user.target
 `,
 		systemd.EscapeUnitNamePath(dir),
-		dirs.GlobalRootDir,
 	)
 	jconfTempl := `# Journald configuration for snap quota group %s
 [Journal]
@@ -657,33 +653,32 @@ func (s *servicesTestSuite) TestEnsureSnapServicesWithJournalQuotas(c *C) {
 		info: {QuotaGroup: grp},
 	}
 
-	dir := filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount")
+	dir := dirs.StripRootDir(filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount"))
 	svcContent := fmt.Sprintf(`[Unit]
 # Auto-generated, DO NOT EDIT
 Description=Service for snap application hello-snap.svc1
-Requires=%[1]s
+Requires=systemd-journald@snap-foogroup.socket %[1]s
 Wants=network.target
-After=%[1]s network.target snapd.apparmor.service
+After=%[1]s network.target systemd-journald@snap-foogroup.socket snapd.apparmor.service
 X-Snappy=yes
 
 [Service]
 EnvironmentFile=-/etc/environment
+Environment=SNAPD_LOG_NAMESPACE=snap-foogroup
 ExecStart=/usr/bin/snap run hello-snap.svc1
 SyslogIdentifier=hello-snap.svc1
 Restart=on-failure
-WorkingDirectory=%[2]s/var/snap/hello-snap/12
+WorkingDirectory=/var/snap/hello-snap/12
 ExecStop=/usr/bin/snap run --command=stop hello-snap.svc1
 ExecStopPost=/usr/bin/snap run --command=post-stop hello-snap.svc1
-TimeoutStopSec=30
+TimeoutStopSec=30s
 Type=forking
 Slice=snap.foogroup.slice
-LogNamespace=snap-foogroup
 
 [Install]
 WantedBy=multi-user.target
 `,
 		systemd.EscapeUnitNamePath(dir),
-		dirs.GlobalRootDir,
 	)
 	jconfTempl := `# Journald configuration for snap quota group %s
 [Journal]
@@ -775,33 +770,32 @@ func (s *servicesTestSuite) TestEnsureSnapServicesWithJournalQuotaRateAsZero(c *
 		info: {QuotaGroup: grp},
 	}
 
-	dir := filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount")
+	dir := dirs.StripRootDir(filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount"))
 	svcContent := fmt.Sprintf(`[Unit]
 # Auto-generated, DO NOT EDIT
 Description=Service for snap application hello-snap.svc1
-Requires=%[1]s
+Requires=systemd-journald@snap-foogroup.socket %[1]s
 Wants=network.target
-After=%[1]s network.target snapd.apparmor.service
+After=%[1]s network.target systemd-journald@snap-foogroup.socket snapd.apparmor.service
 X-Snappy=yes
 
 [Service]
 EnvironmentFile=-/etc/environment
+Environment=SNAPD_LOG_NAMESPACE=snap-foogroup
 ExecStart=/usr/bin/snap run hello-snap.svc1
 SyslogIdentifier=hello-snap.svc1
 Restart=on-failure
-WorkingDirectory=%[2]s/var/snap/hello-snap/12
+WorkingDirectory=/var/snap/hello-snap/12
 ExecStop=/usr/bin/snap run --command=stop hello-snap.svc1
 ExecStopPost=/usr/bin/snap run --command=post-stop hello-snap.svc1
-TimeoutStopSec=30
+TimeoutStopSec=30s
 Type=forking
 Slice=snap.foogroup.slice
-LogNamespace=snap-foogroup
 
 [Install]
 WantedBy=multi-user.target
 `,
 		systemd.EscapeUnitNamePath(dir),
-		dirs.GlobalRootDir,
 	)
 	jconfTempl := `# Journald configuration for snap quota group %s
 [Journal]
@@ -921,57 +915,55 @@ func (s *servicesTestSuite) TestEnsureSnapServicesWithSnapServices(c *C) {
 		info: {QuotaGroup: grp},
 	}
 
-	dir := filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount")
+	dir := dirs.StripRootDir(filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount"))
 	svc1Content := fmt.Sprintf(`[Unit]
 # Auto-generated, DO NOT EDIT
 Description=Service for snap application hello-snap.svc1
-Requires=%[1]s
+Requires=systemd-journald@snap-my-root.socket %[1]s
 Wants=network.target
-After=%[1]s network.target snapd.apparmor.service
+After=%[1]s network.target systemd-journald@snap-my-root.socket snapd.apparmor.service
 X-Snappy=yes
 
 [Service]
 EnvironmentFile=-/etc/environment
+Environment=SNAPD_LOG_NAMESPACE=snap-my-root
 ExecStart=/usr/bin/snap run hello-snap.svc1
 SyslogIdentifier=hello-snap.svc1
 Restart=on-failure
-WorkingDirectory=%[2]s/var/snap/hello-snap/12
-TimeoutStopSec=30
+WorkingDirectory=/var/snap/hello-snap/12
+TimeoutStopSec=30s
 Type=simple
-Slice=snap.%[3]s.slice
-LogNamespace=snap-my-root
+Slice=snap.%[2]s.slice
 
 [Install]
 WantedBy=multi-user.target
 `,
 		systemd.EscapeUnitNamePath(dir),
-		dirs.GlobalRootDir,
 		systemd.EscapeUnitNamePath("my-root"),
 	)
 	svc2Content := fmt.Sprintf(`[Unit]
 # Auto-generated, DO NOT EDIT
 Description=Service for snap application hello-snap.svc2
-Requires=%[1]s
+Requires=systemd-journald@snap-my-root.socket %[1]s
 Wants=network.target
-After=%[1]s network.target snapd.apparmor.service
+After=%[1]s network.target systemd-journald@snap-my-root.socket snapd.apparmor.service
 X-Snappy=yes
 
 [Service]
 EnvironmentFile=-/etc/environment
+Environment=SNAPD_LOG_NAMESPACE=snap-my-root
 ExecStart=/usr/bin/snap run hello-snap.svc2
 SyslogIdentifier=hello-snap.svc2
 Restart=on-failure
-WorkingDirectory=%[2]s/var/snap/hello-snap/12
-TimeoutStopSec=30
+WorkingDirectory=/var/snap/hello-snap/12
+TimeoutStopSec=30s
 Type=simple
-Slice=snap.%[3]s.slice
-LogNamespace=snap-my-root
+Slice=snap.%[2]s.slice
 
 [Install]
 WantedBy=multi-user.target
 `,
 		systemd.EscapeUnitNamePath(dir),
-		dirs.GlobalRootDir,
 		systemd.EscapeUnitNamePath("my-root")+"-"+systemd.EscapeUnitNamePath("my-sub"),
 	)
 	jSvcContent := `[Service]
@@ -1115,31 +1107,30 @@ func (s *servicesTestSuite) TestEnsureSnapServicesWithIncludeServices(c *C) {
 		info: {QuotaGroup: grp},
 	}
 
-	dir := filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount")
+	dir := dirs.StripRootDir(filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount"))
 	svc2Content := fmt.Sprintf(`[Unit]
 # Auto-generated, DO NOT EDIT
 Description=Service for snap application hello-snap.svc2
-Requires=%[1]s
+Requires=systemd-journald@snap-my-root.socket %[1]s
 Wants=network.target
-After=%[1]s network.target snapd.apparmor.service
+After=%[1]s network.target systemd-journald@snap-my-root.socket snapd.apparmor.service
 X-Snappy=yes
 
 [Service]
 EnvironmentFile=-/etc/environment
+Environment=SNAPD_LOG_NAMESPACE=snap-my-root
 ExecStart=/usr/bin/snap run hello-snap.svc2
 SyslogIdentifier=hello-snap.svc2
 Restart=on-failure
-WorkingDirectory=%[2]s/var/snap/hello-snap/12
-TimeoutStopSec=30
+WorkingDirectory=/var/snap/hello-snap/12
+TimeoutStopSec=30s
 Type=simple
-Slice=snap.%[3]s.slice
-LogNamespace=snap-my-root
+Slice=snap.%[2]s.slice
 
 [Install]
 WantedBy=multi-user.target
 `,
 		systemd.EscapeUnitNamePath(dir),
-		dirs.GlobalRootDir,
 		systemd.EscapeUnitNamePath("my-root")+"-"+systemd.EscapeUnitNamePath("my-sub"),
 	)
 	jSvcContent := `[Service]
@@ -1261,7 +1252,7 @@ func expChangeObserver(c *C, exp []changesObservation) (restore func(), obs wrap
 	f := func(app *snap.AppInfo, grp *quota.Group, unitType, name, old, new string) {
 		snapName := ""
 		if app != nil {
-			snapName = app.Snap.SnapName()
+			snapName = app.Snap.SnapName().String()
 		}
 		changesObserved = append(changesObserved, changesObservation{
 			snapName: snapName,
@@ -1331,7 +1322,7 @@ TasksAccounting=true
 `
 	sliceFile := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.foogroup.slice")
 
-	dir := filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount")
+	dir := dirs.StripRootDir(filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount"))
 	svcContent := fmt.Sprintf(`[Unit]
 # Auto-generated, DO NOT EDIT
 Description=Service for snap application hello-snap.svc1
@@ -1345,10 +1336,10 @@ EnvironmentFile=-/etc/environment
 ExecStart=/usr/bin/snap run hello-snap.svc1
 SyslogIdentifier=hello-snap.svc1
 Restart=on-failure
-WorkingDirectory=%[2]s/var/snap/hello-snap/12
+WorkingDirectory=/var/snap/hello-snap/12
 ExecStop=/usr/bin/snap run --command=stop hello-snap.svc1
 ExecStopPost=/usr/bin/snap run --command=post-stop hello-snap.svc1
-TimeoutStopSec=30
+TimeoutStopSec=30s
 Type=forking
 Slice=snap.foogroup.slice
 
@@ -1356,7 +1347,6 @@ Slice=snap.foogroup.slice
 WantedBy=multi-user.target
 `,
 		systemd.EscapeUnitNamePath(dir),
-		dirs.GlobalRootDir,
 	)
 
 	err := os.MkdirAll(filepath.Dir(sliceFile), 0755)
@@ -1433,7 +1423,7 @@ TasksMax=%[3]d
 `
 	sliceFile := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.foogroup.slice")
 
-	dir := filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount")
+	dir := dirs.StripRootDir(filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount"))
 	svcContent := fmt.Sprintf(`[Unit]
 # Auto-generated, DO NOT EDIT
 Description=Service for snap application hello-snap.svc1
@@ -1447,10 +1437,10 @@ EnvironmentFile=-/etc/environment
 ExecStart=/usr/bin/snap run hello-snap.svc1
 SyslogIdentifier=hello-snap.svc1
 Restart=on-failure
-WorkingDirectory=%[2]s/var/snap/hello-snap/12
+WorkingDirectory=/var/snap/hello-snap/12
 ExecStop=/usr/bin/snap run --command=stop hello-snap.svc1
 ExecStopPost=/usr/bin/snap run --command=post-stop hello-snap.svc1
-TimeoutStopSec=30
+TimeoutStopSec=30s
 Type=forking
 Slice=snap.foogroup.slice
 
@@ -1458,7 +1448,6 @@ Slice=snap.foogroup.slice
 WantedBy=multi-user.target
 `,
 		systemd.EscapeUnitNamePath(dir),
-		dirs.GlobalRootDir,
 	)
 
 	err := os.MkdirAll(filepath.Dir(sliceFile), 0755)
@@ -1625,31 +1614,29 @@ EnvironmentFile=-/etc/environment
 ExecStart=/usr/bin/snap run %[1]s.svc1
 SyslogIdentifier=%[1]s.svc1
 Restart=on-failure
-WorkingDirectory=%[3]s/var/snap/%[1]s/12
+WorkingDirectory=/var/snap/%[1]s/12
 ExecStop=/usr/bin/snap run --command=stop %[1]s.svc1
 ExecStopPost=/usr/bin/snap run --command=post-stop %[1]s.svc1
-TimeoutStopSec=30
+TimeoutStopSec=30s
 Type=forking
-Slice=%[4]s
+Slice=%[3]s
 
 [Install]
 WantedBy=multi-user.target
 `
 
-	dir1 := filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount")
-	dir2 := filepath.Join(dirs.SnapMountDir, "hello-other-snap", "12.mount")
+	dir1 := dirs.StripRootDir(filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount"))
+	dir2 := dirs.StripRootDir(filepath.Join(dirs.SnapMountDir, "hello-other-snap", "12.mount"))
 
 	helloSnapContent := fmt.Sprintf(svcTemplate,
 		"hello-snap",
 		systemd.EscapeUnitNamePath(dir1),
-		dirs.GlobalRootDir,
 		"snap.foogroup.slice",
 	)
 
 	helloOtherSnapContent := fmt.Sprintf(svcTemplate,
 		"hello-other-snap",
 		systemd.EscapeUnitNamePath(dir2),
-		dirs.GlobalRootDir,
 		"snap.foogroup-subgroup.slice",
 	)
 
@@ -1746,23 +1733,22 @@ EnvironmentFile=-/etc/environment
 ExecStart=/usr/bin/snap run %[1]s.svc1
 SyslogIdentifier=%[1]s.svc1
 Restart=on-failure
-WorkingDirectory=%[3]s/var/snap/%[1]s/12
+WorkingDirectory=/var/snap/%[1]s/12
 ExecStop=/usr/bin/snap run --command=stop %[1]s.svc1
 ExecStopPost=/usr/bin/snap run --command=post-stop %[1]s.svc1
-TimeoutStopSec=30
+TimeoutStopSec=30s
 Type=forking
-Slice=%[4]s
+Slice=%[3]s
 
 [Install]
 WantedBy=multi-user.target
 `
 
-	dir1 := filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount")
+	dir1 := dirs.StripRootDir(filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount"))
 
 	c.Assert(svcFile1, testutil.FileEquals, fmt.Sprintf(svcTemplate,
 		"hello-snap",
 		systemd.EscapeUnitNamePath(dir1),
-		dirs.GlobalRootDir,
 		"snap.foogroup-subgroup.slice",
 	))
 
@@ -1794,6 +1780,10 @@ TasksAccounting=true
 }
 
 func (s *servicesTestSuite) TestEnsureSnapServiceEnsureError(c *C) {
+	if os.Geteuid() == 0 {
+		c.Skip("this test cannot run as root (root bypasses directory write permissions)")
+	}
+
 	info := snaptest.MockSnap(c, packageHello, &snap.SideInfo{Revision: snap.R(12)})
 	svcFileDir := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system")
 
@@ -1846,7 +1836,7 @@ func (s *servicesTestSuite) TestEnsureSnapServicesPreseedingHappy(c *C) {
 		"hello-snap:svc1:service:svc1": true,
 	})
 
-	dir := filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount")
+	dir := dirs.StripRootDir(filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount"))
 	c.Assert(svcFile, testutil.FileEquals, fmt.Sprintf(`[Unit]
 # Auto-generated, DO NOT EDIT
 Description=Service for snap application hello-snap.svc1
@@ -1860,17 +1850,16 @@ EnvironmentFile=-/etc/environment
 ExecStart=/usr/bin/snap run hello-snap.svc1
 SyslogIdentifier=hello-snap.svc1
 Restart=on-failure
-WorkingDirectory=%[2]s/var/snap/hello-snap/12
+WorkingDirectory=/var/snap/hello-snap/12
 ExecStop=/usr/bin/snap run --command=stop hello-snap.svc1
 ExecStopPost=/usr/bin/snap run --command=post-stop hello-snap.svc1
-TimeoutStopSec=30
+TimeoutStopSec=30s
 Type=forking
 
 [Install]
 WantedBy=multi-user.target
 `,
 		systemd.EscapeUnitNamePath(dir),
-		dirs.GlobalRootDir,
 	))
 }
 
@@ -1940,30 +1929,28 @@ EnvironmentFile=-/etc/environment
 ExecStart=/usr/bin/snap run %[1]s.svc1
 SyslogIdentifier=%[1]s.svc1
 Restart=on-failure
-WorkingDirectory=%[3]s/var/snap/%[1]s/12
+WorkingDirectory=/var/snap/%[1]s/12
 ExecStop=/usr/bin/snap run --command=stop %[1]s.svc1
 ExecStopPost=/usr/bin/snap run --command=post-stop %[1]s.svc1
-TimeoutStopSec=30
+TimeoutStopSec=30s
 Type=forking
-%[4]s
+%[3]s
 [Install]
 WantedBy=multi-user.target
 `
 
-	dir1 := filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount")
-	dir2 := filepath.Join(dirs.SnapMountDir, "hello-other-snap", "12.mount")
+	dir1 := dirs.StripRootDir(filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount"))
+	dir2 := dirs.StripRootDir(filepath.Join(dirs.SnapMountDir, "hello-other-snap", "12.mount"))
 
 	c.Assert(svcFile1, testutil.FileEquals, fmt.Sprintf(template,
 		"hello-snap",
 		systemd.EscapeUnitNamePath(dir1),
-		dirs.GlobalRootDir,
 		"OOMScoreAdjust=-899\n", // VitalityRank in effect
 	))
 
 	c.Assert(svcFile2, testutil.FileEquals, fmt.Sprintf(template,
 		"hello-other-snap",
 		systemd.EscapeUnitNamePath(dir2),
-		dirs.GlobalRootDir,
 		"", // no VitalityRank in effect
 	))
 }
@@ -1979,7 +1966,7 @@ func (s *servicesTestSuite) TestEnsureSnapServicesCallback(c *C) {
 	svc1File := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.hello-snap.svc1.service")
 	svc2File := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.hello-snap.svc2.service")
 
-	dir := filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount")
+	dir := dirs.StripRootDir(filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount"))
 	template := `[Unit]
 # Auto-generated, DO NOT EDIT
 Description=Service for snap application hello-snap.%[1]s
@@ -1993,19 +1980,18 @@ EnvironmentFile=-/etc/environment
 ExecStart=/usr/bin/snap run hello-snap.%[1]s
 SyslogIdentifier=hello-snap.%[1]s
 Restart=on-failure
-WorkingDirectory=%[3]s/var/snap/hello-snap/12
+WorkingDirectory=/var/snap/hello-snap/12
 ExecStop=/usr/bin/snap run --command=stop hello-snap.%[1]s
 ExecStopPost=/usr/bin/snap run --command=post-stop hello-snap.%[1]s
-TimeoutStopSec=30
+TimeoutStopSec=30s
 Type=forking
-%[4]s
+%[3]s
 [Install]
 WantedBy=multi-user.target
 `
 	svc1Content := fmt.Sprintf(template,
 		"svc1",
 		systemd.EscapeUnitNamePath(dir),
-		dirs.GlobalRootDir,
 		"",
 	)
 
@@ -2034,7 +2020,6 @@ WantedBy=multi-user.target
 	svc2New := fmt.Sprintf(template,
 		"svc2",
 		systemd.EscapeUnitNamePath(dir),
-		dirs.GlobalRootDir,
 		"OOMScoreAdjust=-899\n",
 	)
 	c.Assert(svc2File, testutil.FileEquals, svc2New)
@@ -2043,7 +2028,6 @@ WantedBy=multi-user.target
 	svc1New := fmt.Sprintf(template,
 		"svc1",
 		systemd.EscapeUnitNamePath(dir),
-		dirs.GlobalRootDir,
 		"OOMScoreAdjust=-899\n",
 	)
 	c.Assert(svc1File, testutil.FileEquals, svc1New)
@@ -2072,7 +2056,7 @@ func (s *servicesTestSuite) TestEnsureSnapServicesAddsNewSvc(c *C) {
 	svc1File := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.hello-snap.svc1.service")
 	svc2File := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.hello-snap.svc2.service")
 
-	dir := filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount")
+	dir := dirs.StripRootDir(filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount"))
 	template := `[Unit]
 # Auto-generated, DO NOT EDIT
 Description=Service for snap application hello-snap.%[1]s
@@ -2086,19 +2070,18 @@ EnvironmentFile=-/etc/environment
 ExecStart=/usr/bin/snap run hello-snap.%[1]s
 SyslogIdentifier=hello-snap.%[1]s
 Restart=on-failure
-WorkingDirectory=%[3]s/var/snap/hello-snap/12
+WorkingDirectory=/var/snap/hello-snap/12
 ExecStop=/usr/bin/snap run --command=stop hello-snap.%[1]s
 ExecStopPost=/usr/bin/snap run --command=post-stop hello-snap.%[1]s
-TimeoutStopSec=30
+TimeoutStopSec=30s
 Type=forking
-%[4]s
+%[3]s
 [Install]
 WantedBy=multi-user.target
 `
 	svc1Content := fmt.Sprintf(template,
 		"svc1",
 		systemd.EscapeUnitNamePath(dir),
-		dirs.GlobalRootDir,
 		"",
 	)
 
@@ -2125,7 +2108,6 @@ WantedBy=multi-user.target
 	c.Assert(svc2File, testutil.FileEquals, fmt.Sprintf(template,
 		"svc2",
 		systemd.EscapeUnitNamePath(dir),
-		dirs.GlobalRootDir,
 		"",
 	))
 
@@ -2133,7 +2115,6 @@ WantedBy=multi-user.target
 	c.Assert(svc1File, testutil.FileEquals, fmt.Sprintf(template,
 		"svc1",
 		systemd.EscapeUnitNamePath(dir),
-		dirs.GlobalRootDir,
 		"",
 	))
 }
@@ -2144,7 +2125,7 @@ func (s *servicesTestSuite) TestEnsureSnapServicesNoChangeNoop(c *C) {
 	// pretend we already have a unit file setup
 	svcFile := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.hello-snap.svc1.service")
 
-	dir := filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount")
+	dir := dirs.StripRootDir(filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount"))
 	template := `[Unit]
 # Auto-generated, DO NOT EDIT
 Description=Service for snap application hello-snap.svc1
@@ -2158,10 +2139,10 @@ EnvironmentFile=-/etc/environment
 ExecStart=/usr/bin/snap run hello-snap.svc1
 SyslogIdentifier=hello-snap.svc1
 Restart=on-failure
-WorkingDirectory=%[2]s/var/snap/hello-snap/12
+WorkingDirectory=/var/snap/hello-snap/12
 ExecStop=/usr/bin/snap run --command=stop hello-snap.svc1
 ExecStopPost=/usr/bin/snap run --command=post-stop hello-snap.svc1
-TimeoutStopSec=30
+TimeoutStopSec=30s
 Type=forking
 %s
 [Install]
@@ -2169,7 +2150,6 @@ WantedBy=multi-user.target
 `
 	origContent := fmt.Sprintf(template,
 		systemd.EscapeUnitNamePath(dir),
-		dirs.GlobalRootDir,
 		"",
 	)
 
@@ -2212,7 +2192,7 @@ func (s *servicesTestSuite) TestEnsureSnapServicesChanges(c *C) {
 	// pretend we already have a unit file with no VitalityRank options set
 	svcFile := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.hello-snap.svc1.service")
 
-	dir := filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount")
+	dir := dirs.StripRootDir(filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount"))
 	template := `[Unit]
 # Auto-generated, DO NOT EDIT
 Description=Service for snap application hello-snap.svc1
@@ -2226,10 +2206,10 @@ EnvironmentFile=-/etc/environment
 ExecStart=/usr/bin/snap run hello-snap.svc1
 SyslogIdentifier=hello-snap.svc1
 Restart=on-failure
-WorkingDirectory=%[2]s/var/snap/hello-snap/12
+WorkingDirectory=/var/snap/hello-snap/12
 ExecStop=/usr/bin/snap run --command=stop hello-snap.svc1
 ExecStopPost=/usr/bin/snap run --command=post-stop hello-snap.svc1
-TimeoutStopSec=30
+TimeoutStopSec=30s
 Type=forking
 %s
 [Install]
@@ -2237,7 +2217,6 @@ WantedBy=multi-user.target
 `
 	origContent := fmt.Sprintf(template,
 		systemd.EscapeUnitNamePath(dir),
-		dirs.GlobalRootDir,
 		"",
 	)
 
@@ -2265,7 +2244,6 @@ WantedBy=multi-user.target
 	// now the file has been modified to have OOMScoreAdjust set for it
 	c.Assert(svcFile, testutil.FileEquals, fmt.Sprintf(template,
 		systemd.EscapeUnitNamePath(dir),
-		dirs.GlobalRootDir,
 		"OOMScoreAdjust=-899\n",
 	))
 }
@@ -2276,7 +2254,7 @@ func (s *servicesTestSuite) TestEnsureSnapServicesRollsback(c *C) {
 	svcFile := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.hello-snap.svc1.service")
 
 	// pretend we already have a unit file with no VitalityRank options set
-	dir := filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount")
+	dir := dirs.StripRootDir(filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount"))
 	template := `[Unit]
 # Auto-generated, DO NOT EDIT
 Description=Service for snap application hello-snap.svc1
@@ -2290,10 +2268,10 @@ EnvironmentFile=-/etc/environment
 ExecStart=/usr/bin/snap run hello-snap.svc1
 SyslogIdentifier=hello-snap.svc1
 Restart=on-failure
-WorkingDirectory=%[2]s/var/snap/hello-snap/12
+WorkingDirectory=/var/snap/hello-snap/12
 ExecStop=/usr/bin/snap run --command=stop hello-snap.svc1
 ExecStopPost=/usr/bin/snap run --command=post-stop hello-snap.svc1
-TimeoutStopSec=30
+TimeoutStopSec=30s
 Type=forking
 %s
 [Install]
@@ -2301,7 +2279,6 @@ WantedBy=multi-user.target
 `
 	origContent := fmt.Sprintf(template,
 		systemd.EscapeUnitNamePath(dir),
-		dirs.GlobalRootDir,
 		"",
 	)
 
@@ -2321,7 +2298,6 @@ WantedBy=multi-user.target
 			// for it
 			c.Assert(svcFile, testutil.FileEquals, fmt.Sprintf(template,
 				systemd.EscapeUnitNamePath(dir),
-				dirs.GlobalRootDir,
 				"OOMScoreAdjust=-899\n",
 			))
 
@@ -2360,7 +2336,7 @@ func (s *servicesTestSuite) TestEnsureSnapServicesRemovesNewAddOnRollback(c *C) 
 	svcFile := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.hello-snap.svc1.service")
 
 	// pretend we already have a unit file with no VitalityRank options set
-	dir := filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount")
+	dir := dirs.StripRootDir(filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount"))
 	template := `[Unit]
 # Auto-generated, DO NOT EDIT
 Description=Service for snap application hello-snap.svc1
@@ -2374,10 +2350,10 @@ EnvironmentFile=-/etc/environment
 ExecStart=/usr/bin/snap run hello-snap.svc1
 SyslogIdentifier=hello-snap.svc1
 Restart=on-failure
-WorkingDirectory=%[2]s/var/snap/hello-snap/12
+WorkingDirectory=/var/snap/hello-snap/12
 ExecStop=/usr/bin/snap run --command=stop hello-snap.svc1
 ExecStopPost=/usr/bin/snap run --command=post-stop hello-snap.svc1
-TimeoutStopSec=30
+TimeoutStopSec=30s
 Type=forking
 %s
 [Install]
@@ -2394,7 +2370,6 @@ WantedBy=multi-user.target
 			// daemon reload
 			c.Assert(svcFile, testutil.FileEquals, fmt.Sprintf(template,
 				systemd.EscapeUnitNamePath(dir),
-				dirs.GlobalRootDir,
 				"",
 			))
 
@@ -2438,7 +2413,7 @@ func (s *servicesTestSuite) TestEnsureSnapServicesOnlyRemovesNewAddOnRollback(c 
 	svc2File := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.hello-snap.svc2.service")
 
 	// pretend we already have a unit file with no VitalityRank options set
-	dir := filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount")
+	dir := dirs.StripRootDir(filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount"))
 	template := `[Unit]
 # Auto-generated, DO NOT EDIT
 Description=Service for snap application hello-snap.%[1]s
@@ -2452,12 +2427,12 @@ EnvironmentFile=-/etc/environment
 ExecStart=/usr/bin/snap run hello-snap.%[1]s
 SyslogIdentifier=hello-snap.%[1]s
 Restart=on-failure
-WorkingDirectory=%[3]s/var/snap/hello-snap/12
+WorkingDirectory=/var/snap/hello-snap/12
 ExecStop=/usr/bin/snap run --command=stop hello-snap.%[1]s
 ExecStopPost=/usr/bin/snap run --command=post-stop hello-snap.%[1]s
-TimeoutStopSec=30
+TimeoutStopSec=30s
 Type=forking
-%[4]s
+%[3]s
 [Install]
 WantedBy=multi-user.target
 `
@@ -2465,13 +2440,11 @@ WantedBy=multi-user.target
 	svc1Content := fmt.Sprintf(template,
 		"svc1",
 		systemd.EscapeUnitNamePath(dir),
-		dirs.GlobalRootDir,
 		"",
 	)
 	svc2Content := fmt.Sprintf(template,
 		"svc2",
 		systemd.EscapeUnitNamePath(dir),
-		dirs.GlobalRootDir,
 		"",
 	)
 
@@ -2568,7 +2541,7 @@ func (s *servicesTestSuite) TestEnsureSnapServicesSubunits(c *C) {
 	})
 }
 
-func (s *servicesTestSuite) TestAddSnapServicesWithInterfaceSnippets(c *C) {
+func (s *servicesTestSuite) TestAddSnapServicesWithInterfaceServiceSnippets(c *C) {
 	tt := []struct {
 		comment     string
 		plugSnippet string
@@ -2664,7 +2637,7 @@ plugs:
 			{"daemon-reload"},
 		}, comment)
 
-		dir := filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount")
+		dir := dirs.StripRootDir(filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount"))
 		c.Assert(svcFile, testutil.FileEquals, fmt.Sprintf(`[Unit]
 # Auto-generated, DO NOT EDIT
 Description=Service for snap application hello-snap.svc1
@@ -2678,8 +2651,8 @@ EnvironmentFile=-/etc/environment
 ExecStart=/usr/bin/snap run hello-snap.svc1
 SyslogIdentifier=hello-snap.svc1
 Restart=on-failure
-WorkingDirectory=%[2]s/var/snap/hello-snap/12
-TimeoutStopSec=30
+WorkingDirectory=/var/snap/hello-snap/12
+TimeoutStopSec=30s
 Type=simple
 Delegate=true
 
@@ -2687,11 +2660,10 @@ Delegate=true
 WantedBy=multi-user.target
 `,
 			systemd.EscapeUnitNamePath(dir),
-			dirs.GlobalRootDir,
 		), comment)
 
 		s.sysdLog = nil
-		err = wrappers.StopServices(info.Services(), nil, "", progress.Null, s.perfTimings)
+		err = wrappers.StopServices(info.Services(), nil, nil, "", progress.Null, s.perfTimings)
 		c.Assert(err, IsNil, comment)
 		c.Assert(s.sysdLog, HasLen, 2, comment)
 		c.Check(s.sysdLog, DeepEquals, [][]string{
@@ -2713,6 +2685,72 @@ WantedBy=multi-user.target
 	}
 }
 
+func (s *servicesTestSuite) TestAddSnapServicesWithGpioChardevInterfaceUnitSnippets(c *C) {
+	const snapYaml = packageHelloNoSrv + `
+ svc1:
+  daemon: simple
+  plugs:
+   - gpio-chardev
+plugs:
+ gpio-chardev:
+  source-chip: [chip0]
+  lines: 0-3
+`
+	info := snaptest.MockSnap(c, snapYaml, &snap.SideInfo{Revision: snap.R(12)})
+	svcFile := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.hello-snap.svc1.service")
+
+	err := s.addSnapServices(info, false)
+	c.Assert(err, IsNil)
+	c.Check(s.sysdLog, DeepEquals, [][]string{{"daemon-reload"}})
+
+	dir := dirs.StripRootDir(filepath.Join(dirs.SnapMountDir, "hello-snap", "12.mount"))
+	c.Assert(svcFile, testutil.FileEquals, fmt.Sprintf(`[Unit]
+# Auto-generated, DO NOT EDIT
+Description=Service for snap application hello-snap.svc1
+Requires=%[1]s
+Wants=network.target
+After=%[1]s network.target snapd.apparmor.service
+After=snapd.gpio-chardev-setup.target
+Wants=snapd.gpio-chardev-setup.target
+X-Snappy=yes
+
+[Service]
+EnvironmentFile=-/etc/environment
+ExecStart=/usr/bin/snap run hello-snap.svc1
+SyslogIdentifier=hello-snap.svc1
+Restart=on-failure
+WorkingDirectory=/var/snap/hello-snap/12
+TimeoutStopSec=30s
+Type=simple
+
+[Install]
+WantedBy=multi-user.target
+`,
+		systemd.EscapeUnitNamePath(dir),
+	))
+
+	s.sysdLog = nil
+	err = wrappers.StopServices(info.Services(), nil, nil, "", progress.Null, s.perfTimings)
+	c.Assert(err, IsNil)
+	c.Assert(s.sysdLog, HasLen, 2)
+	c.Check(s.sysdLog, DeepEquals, [][]string{
+		{"stop", filepath.Base(svcFile)},
+		{"show", "--property=ActiveState", "snap.hello-snap.svc1.service"},
+	})
+
+	s.sysdLog = nil
+	err = wrappers.RemoveSnapServices(info, progress.Null)
+	c.Assert(err, IsNil)
+	c.Check(osutil.FileExists(svcFile), Equals, false)
+	c.Assert(s.sysdLog, HasLen, 2)
+	c.Check(s.sysdLog, DeepEquals, [][]string{
+		{"--no-reload", "disable", filepath.Base(svcFile)},
+		{"daemon-reload"},
+	})
+
+	s.sysdLog = nil
+}
+
 func (s *servicesTestSuite) TestAddSnapServicesAndRemoveUserDaemons(c *C) {
 	info := snaptest.MockSnap(c, packageHelloNoSrv+`
  svc1:
@@ -2731,7 +2769,7 @@ func (s *servicesTestSuite) TestAddSnapServicesAndRemoveUserDaemons(c *C) {
 	c.Check(svcFile, testutil.FileMatches, "(?ms).*^"+regexp.QuoteMeta(expected)) // check.v1 adds ^ and $ around the regexp provided
 
 	s.sysdLog = nil
-	err = wrappers.StopServices(info.Services(), nil, "", progress.Null, s.perfTimings)
+	err = wrappers.StopServices(info.Services(), nil, nil, "", progress.Null, s.perfTimings)
 	c.Assert(err, IsNil)
 	c.Assert(s.sysdLog, HasLen, 2)
 	c.Check(s.sysdLog, DeepEquals, [][]string{
@@ -2751,7 +2789,7 @@ func (s *servicesTestSuite) TestAddSnapServicesAndRemoveUserDaemons(c *C) {
 }
 
 var snapdYaml = `name: snapd
-version: 1.0
+version: 2.62
 type: snapd
 `
 
@@ -2771,7 +2809,7 @@ func (s *servicesTestSuite) TestRemoveSnapWithSocketsRemovesSocketsService(c *C)
 	err := s.addSnapServices(info, false)
 	c.Assert(err, IsNil)
 
-	err = wrappers.StopServices(info.Services(), nil, "", &progress.Null, s.perfTimings)
+	err = wrappers.StopServices(info.Services(), nil, nil, "", &progress.Null, s.perfTimings)
 	c.Assert(err, IsNil)
 
 	err = wrappers.RemoveSnapServices(info, &progress.Null)
@@ -2816,7 +2854,7 @@ apps:
 
 	svcFName := "snap.wat.wat.service"
 
-	err = wrappers.StopServices(info.Services(), nil, "", progress.Null, s.perfTimings)
+	err = wrappers.StopServices(info.Services(), nil, nil, "", progress.Null, s.perfTimings)
 	c.Assert(err, ErrorMatches, "mock systemctl error")
 
 	c.Check(sysdLog, DeepEquals, [][]string{
@@ -2824,7 +2862,7 @@ apps:
 	})
 }
 
-func (s *servicesTestSuite) TestRemoveSnapPackageUserDaemonStopFailure(c *C) {
+func (s *servicesTestSuite) testRemoveSnapPackageUserDaemonStopFailure(c *C, reason snap.ServiceStopReason) {
 	var sysdLog [][]string
 	r := systemd.MockSystemctl(func(cmd ...string) ([]byte, error) {
 		// filter out the "systemctl --user show" that
@@ -2856,11 +2894,24 @@ apps:
 
 	svcFName := "snap.wat.wat.service"
 
-	err = wrappers.StopServices(info.Services(), nil, "", progress.Null, s.perfTimings)
-	c.Check(err, ErrorMatches, "some user services failed to stop")
+	opts := &wrappers.StopServicesOptions{}
+	err = wrappers.StopServices(info.Services(), nil, opts, reason, progress.Null, s.perfTimings)
+	if reason != snap.StopReasonRemove {
+		c.Check(err, ErrorMatches, "some user services failed to stop")
+	} else {
+		c.Check(err, IsNil)
+	}
 	c.Check(sysdLog, DeepEquals, [][]string{
 		{"--user", "stop", svcFName},
 	})
+}
+
+func (s *servicesTestSuite) TestRemoveSnapPackageUserDaemonStopFailureManual(c *C) {
+	s.testRemoveSnapPackageUserDaemonStopFailure(c, snap.StopReasonRemove)
+}
+
+func (s *servicesTestSuite) TestRemoveSnapPackageUserDaemonStopFailureNoError(c *C) {
+	s.testRemoveSnapPackageUserDaemonStopFailure(c, "")
 }
 
 func (s *servicesTestSuite) TestQueryDisabledServices(c *C) {
@@ -2894,7 +2945,9 @@ func (s *servicesTestSuite) TestQueryDisabledServices(c *C) {
 	c.Assert(err, IsNil)
 
 	// ensure svc1 was reported as disabled
-	c.Assert(disabledSvcs, DeepEquals, []string{"svc1"})
+	c.Assert(disabledSvcs, DeepEquals, &wrappers.DisabledServices{
+		SystemServices: []string{"svc1"},
+	})
 
 	// the calls could be out of order in the list, since iterating over a map
 	// is non-deterministic, so manually check each call
@@ -2956,7 +3009,9 @@ func (s *servicesTestSuite) TestQueryDisabledServicesActivatedServices(c *C) {
 	c.Assert(err, IsNil)
 
 	// ensure svc1 were reported as disabled
-	c.Assert(disabledSvcs, DeepEquals, []string{"svc1"})
+	c.Assert(disabledSvcs, DeepEquals, &wrappers.DisabledServices{
+		SystemServices: []string{"svc1"},
+	})
 
 	// the calls could be out of order in the list, since iterating over a map
 	// is non-deterministic, so manually check each call
@@ -2973,6 +3028,161 @@ func (s *servicesTestSuite) TestQueryDisabledServicesActivatedServices(c *C) {
 	}
 }
 
+func (s *servicesTestSuite) TestQueryDisabledServicesMixedServices(c *C) {
+	info := snaptest.MockSnap(c, packageHelloNoSrv+`
+ svc1:
+  daemon: simple
+  command: bin/hello
+ svc2:
+  daemon: simple
+  command: bin/hello
+ svc3:
+  daemon: simple
+  command: bin/hello
+  daemon-scope: user
+ svc4:
+  daemon: simple
+  command: bin/hello
+  daemon-scope: user
+
+`, &snap.SideInfo{Revision: snap.R(12)})
+	err := s.addSnapServices(info, false)
+	c.Assert(err, IsNil)
+
+	s.systemctlRestorer()
+	// This will mock the following:
+	// svc 1 will be reported as disabled
+	// svc 2 will be reported as enabled
+	s.systemctlRestorer = systemd.MockSystemctl(func(cmd ...string) ([]byte, error) {
+		s.sysdLog = append(s.sysdLog, cmd)
+		if cmd[0] == "--user" {
+			cmd = cmd[1:]
+		}
+		return systemdtest.HandleMockAllUnitsActiveOutput(cmd, map[string]systemdtest.ServiceState{
+			"snap.hello-snap.svc1.service": {
+				ActiveState:   "inactive",
+				UnitFileState: "disabled",
+			},
+			"snap.hello-snap.svc2.service": {
+				ActiveState:   "inactive",
+				UnitFileState: "enabled",
+			},
+			"snap.hello-snap.svc3.service": {
+				ActiveState:   "inactive",
+				UnitFileState: "enabled",
+			},
+			"snap.hello-snap.svc4.service": {
+				ActiveState:   "inactive",
+				UnitFileState: "disabled",
+			},
+		}), nil
+	})
+
+	disabledSvcs, err := wrappers.QueryDisabledServices(info, progress.Null)
+	c.Assert(err, IsNil)
+
+	// ensure svc1+svc4 was reported as disabled
+	uid := os.Getuid()
+	c.Assert(disabledSvcs, DeepEquals, &wrappers.DisabledServices{
+		SystemServices: []string{"svc1"},
+		UserServices: map[int][]string{
+			uid: {"svc4"},
+		},
+	})
+
+	// the calls could be out of order in the list, since iterating over a map
+	// is non-deterministic, so manually check each call
+	c.Assert(s.sysdLog, HasLen, 5)
+	for _, call := range s.sysdLog {
+		if call[0] == "--user" {
+			call = call[1:]
+		}
+		switch call[0] {
+		case "show":
+			switch call[2] {
+			case "snap.hello-snap.svc1.service", "snap.hello-snap.svc2.service":
+				// both are in one call, i.e two services
+				c.Assert(call, HasLen, 4)
+			case "snap.hello-snap.svc3.service", "snap.hello-snap.svc4.service":
+				// both will be in separate calls, i.e one service
+				c.Assert(call, HasLen, 3)
+			default:
+				c.Errorf("unknown service for systemctl call: %s", call[2])
+			}
+		case "daemon-reload":
+		default:
+			c.Errorf("unknown systemctl call: %s", call[1])
+		}
+	}
+}
+
+func (s *servicesTestSuite) TestQueryDisabledServicesUserServices(c *C) {
+	info := snaptest.MockSnap(c, packageHelloNoSrv+`
+ svc1:
+  daemon: simple
+  command: bin/hello
+  daemon-scope: user
+ svc2:
+  daemon: simple
+  command: bin/hello
+  daemon-scope: user
+
+`, &snap.SideInfo{Revision: snap.R(12)})
+	err := s.addSnapServices(info, false)
+	c.Assert(err, IsNil)
+
+	s.systemctlRestorer()
+	// This will mock the following:
+	// svc 1 will be reported as disabled
+	// svc 2 will be reported as enabled
+	s.systemctlRestorer = systemd.MockSystemctl(func(cmd ...string) ([]byte, error) {
+		s.sysdLog = append(s.sysdLog, cmd)
+		if cmd[0] != "--user" {
+			return nil, fmt.Errorf("expected --user argument")
+		}
+		return systemdtest.HandleMockAllUnitsActiveOutput(cmd[1:], map[string]systemdtest.ServiceState{
+			"snap.hello-snap.svc1.service": {
+				ActiveState:   "inactive",
+				UnitFileState: "disabled",
+			},
+			"snap.hello-snap.svc2.service": {
+				ActiveState:   "inactive",
+				UnitFileState: "enabled",
+			},
+		}), nil
+	})
+
+	disabledSvcs, err := wrappers.QueryDisabledServices(info, progress.Null)
+	c.Assert(err, IsNil)
+
+	// ensure svc1 was reported as disabled
+	uid := os.Getuid()
+	c.Assert(disabledSvcs, DeepEquals, &wrappers.DisabledServices{
+		UserServices: map[int][]string{
+			uid: {"svc1"},
+		},
+	})
+
+	// the calls could be out of order in the list, since iterating over a map
+	// is non-deterministic, so manually check each call
+	c.Assert(s.sysdLog, HasLen, 3)
+	for _, call := range s.sysdLog {
+		c.Assert(call[0], Equals, "--user")
+		switch call[1] {
+		case "show":
+			switch call[3] {
+			case "snap.hello-snap.svc1.service", "snap.hello-snap.svc2.service":
+				c.Assert(call, HasLen, 4)
+			default:
+				c.Errorf("unknown service for systemctl call: %s", call[3])
+			}
+		case "daemon-reload":
+		default:
+			c.Errorf("unknown systemctl call: %s", call[1])
+		}
+	}
+}
+
 func (s *servicesTestSuite) TestAddSnapServicesWithDisabledServices(c *C) {
 	info := snaptest.MockSnap(c, packageHello+`
  svc2:
@@ -2981,7 +3191,9 @@ func (s *servicesTestSuite) TestAddSnapServicesWithDisabledServices(c *C) {
 `, &snap.SideInfo{Revision: snap.R(12)})
 
 	// svc1 will be disabled
-	disabledSvcs := []string{"svc1"}
+	disabledSvcs := &wrappers.DisabledServices{
+		SystemServices: []string{"svc1"},
+	}
 
 	err := s.addSnapServices(info, false)
 	c.Assert(err, IsNil)
@@ -2992,8 +3204,8 @@ func (s *servicesTestSuite) TestAddSnapServicesWithDisabledServices(c *C) {
 
 	s.sysdLog = nil
 
-	flags := &wrappers.StartServicesFlags{Enable: true}
-	err = wrappers.StartServices(info.Services(), disabledSvcs, flags, progress.Null, s.perfTimings)
+	opts := &wrappers.StartServicesOptions{Enable: true}
+	err = wrappers.StartServices(info.Services(), disabledSvcs, opts, progress.Null, s.perfTimings)
 	c.Assert(err, IsNil)
 
 	// only svc2 should be enabled
@@ -3063,7 +3275,7 @@ func (s *servicesTestSuite) TestStopServicesWithSockets(c *C) {
 	sysServices = nil
 	userServices = nil
 
-	err = wrappers.StopServices(info.Services(), nil, "", &progress.Null, s.perfTimings)
+	err = wrappers.StopServices(info.Services(), nil, nil, "", &progress.Null, s.perfTimings)
 	c.Assert(err, IsNil)
 
 	sort.Strings(sysServices)
@@ -3111,29 +3323,39 @@ func (s *servicesTestSuite) TestStopStartServicesWithSocketsDisableAndEnable(c *
 
 	// Verify the expected behaviour of StopServices when activations are in play. We expect it stop all services,
 	// including activations, and then disable all the services.
-	err = wrappers.StopServices(sorted, &wrappers.StopServicesFlags{Disable: true}, "", &progress.Null, s.perfTimings)
+	opts := &wrappers.StopServicesOptions{Disable: true}
+	err = wrappers.StopServices(sorted, nil, opts, "", &progress.Null, s.perfTimings)
 	c.Assert(err, IsNil)
 	c.Check(s.sysdLog, DeepEquals, [][]string{
 		{"daemon-reload"},
 		{"--user", "daemon-reload"},
-		{"stop", "snap.hello-snap.svc1.sock1.socket", "snap.hello-snap.svc1.sock2.socket", "snap.hello-snap.svc1.service"},
-		{"show", "--property=ActiveState", "snap.hello-snap.svc1.sock1.socket"},
-		{"show", "--property=ActiveState", "snap.hello-snap.svc1.sock2.socket"},
-		{"show", "--property=ActiveState", "snap.hello-snap.svc1.service"},
+		// Expect that we are stopping the user services
 		{"--user", "stop", "snap.hello-snap.svc2.sock1.socket"},
 		{"--user", "show", "--property=ActiveState", "snap.hello-snap.svc2.sock1.socket"},
 		{"--user", "stop", "snap.hello-snap.svc2.sock2.socket"},
 		{"--user", "show", "--property=ActiveState", "snap.hello-snap.svc2.sock2.socket"},
 		{"--user", "stop", "snap.hello-snap.svc2.service"},
 		{"--user", "show", "--property=ActiveState", "snap.hello-snap.svc2.service"},
-		{"--no-reload", "disable", "snap.hello-snap.svc1.sock1.socket", "snap.hello-snap.svc1.sock2.socket", "snap.hello-snap.svc1.service", "snap.hello-snap.svc2.sock1.socket", "snap.hello-snap.svc2.sock2.socket", "snap.hello-snap.svc2.service"},
+		// Expect that we are disabling the user services afterwards
+		{"--user", "--no-reload", "disable", "snap.hello-snap.svc2.sock1.socket", "snap.hello-snap.svc2.sock2.socket", "snap.hello-snap.svc2.service"},
+		{"--user", "daemon-reload"},
+		// Expect that we then stop the system services
+		{"stop", "snap.hello-snap.svc1.sock1.socket"},
+		{"show", "--property=ActiveState", "snap.hello-snap.svc1.sock1.socket"},
+		{"stop", "snap.hello-snap.svc1.sock2.socket"},
+		{"show", "--property=ActiveState", "snap.hello-snap.svc1.sock2.socket"},
+		{"stop", "snap.hello-snap.svc1.service"},
+		{"show", "--property=ActiveState", "snap.hello-snap.svc1.service"},
+		// And then disable them :-)
+		{"--no-reload", "disable", "snap.hello-snap.svc1.sock1.socket", "snap.hello-snap.svc1.sock2.socket", "snap.hello-snap.svc1.service"},
 		{"daemon-reload"},
+		{"--user", "--global", "--no-reload", "disable", "snap.hello-snap.svc2.sock1.socket", "snap.hello-snap.svc2.sock2.socket", "snap.hello-snap.svc2.service"},
 	})
 
 	// For activated services, we expect StartServices to only affect the activation mechanisms
 	// when starting/enabling.
 	s.sysdLog = nil
-	err = wrappers.StartServices(sorted, nil, &wrappers.StartServicesFlags{Enable: true}, &progress.Null, s.perfTimings)
+	err = wrappers.StartServices(sorted, nil, &wrappers.StartServicesOptions{Enable: true}, &progress.Null, s.perfTimings)
 	c.Assert(err, IsNil)
 	c.Check(s.sysdLog, DeepEquals, [][]string{
 		{"--no-reload", "enable", "snap.hello-snap.svc1.sock1.socket", "snap.hello-snap.svc1.sock2.socket"},
@@ -3141,6 +3363,8 @@ func (s *servicesTestSuite) TestStopStartServicesWithSocketsDisableAndEnable(c *
 		{"--user", "--global", "--no-reload", "enable", "snap.hello-snap.svc2.sock1.socket", "snap.hello-snap.svc2.sock2.socket"},
 		{"start", "snap.hello-snap.svc1.sock1.socket"},
 		{"start", "snap.hello-snap.svc1.sock2.socket"},
+		{"--user", "--no-reload", "enable", "snap.hello-snap.svc2.sock1.socket", "snap.hello-snap.svc2.sock2.socket"},
+		{"--user", "daemon-reload"},
 		{"--user", "start", "snap.hello-snap.svc2.sock1.socket"},
 		{"--user", "start", "snap.hello-snap.svc2.sock2.socket"},
 	})
@@ -3163,7 +3387,7 @@ func (s *servicesTestSuite) TestStartServicesWithServiceScope(c *C) {
 		return sorted[i].Name < sorted[j].Name
 	})
 
-	err = wrappers.StartServices(sorted, nil, &wrappers.StartServicesFlags{ScopeOptions: wrappers.ScopeOptions{Scope: wrappers.ServiceScopeUser}}, &progress.Null, s.perfTimings)
+	err = wrappers.StartServices(sorted, nil, &wrappers.StartServicesOptions{ScopeOptions: wrappers.ScopeOptions{Scope: wrappers.ServiceScopeUser}}, &progress.Null, s.perfTimings)
 	c.Assert(err, IsNil)
 	c.Check(s.sysdLog, DeepEquals, [][]string{
 		{"daemon-reload"},
@@ -3174,7 +3398,7 @@ func (s *servicesTestSuite) TestStartServicesWithServiceScope(c *C) {
 	// Reset the sysd log
 	s.sysdLog = nil
 
-	err = wrappers.StartServices(sorted, nil, &wrappers.StartServicesFlags{ScopeOptions: wrappers.ScopeOptions{Scope: wrappers.ServiceScopeSystem}}, &progress.Null, s.perfTimings)
+	err = wrappers.StartServices(sorted, nil, &wrappers.StartServicesOptions{ScopeOptions: wrappers.ScopeOptions{Scope: wrappers.ServiceScopeSystem}}, &progress.Null, s.perfTimings)
 	c.Assert(err, IsNil)
 	c.Check(s.sysdLog, DeepEquals, [][]string{
 		{"start", "snap.hello-snap.svc1.service"},
@@ -3198,7 +3422,8 @@ func (s *servicesTestSuite) TestStopServicesWithServiceScope(c *C) {
 		return sorted[i].Name < sorted[j].Name
 	})
 
-	err = wrappers.StopServices(sorted, &wrappers.StopServicesFlags{ScopeOptions: wrappers.ScopeOptions{Scope: wrappers.ServiceScopeUser}}, "", &progress.Null, s.perfTimings)
+	opts := &wrappers.StopServicesOptions{ScopeOptions: wrappers.ScopeOptions{Scope: wrappers.ServiceScopeUser}}
+	err = wrappers.StopServices(sorted, nil, opts, "", &progress.Null, s.perfTimings)
 	c.Assert(err, IsNil)
 	c.Check(s.sysdLog, DeepEquals, [][]string{
 		{"daemon-reload"},
@@ -3210,7 +3435,8 @@ func (s *servicesTestSuite) TestStopServicesWithServiceScope(c *C) {
 	// Reset the sysd log
 	s.sysdLog = nil
 
-	err = wrappers.StopServices(sorted, &wrappers.StopServicesFlags{ScopeOptions: wrappers.ScopeOptions{Scope: wrappers.ServiceScopeSystem}}, "", &progress.Null, s.perfTimings)
+	opts.ScopeOptions.Scope = wrappers.ServiceScopeSystem
+	err = wrappers.StopServices(sorted, nil, opts, "", &progress.Null, s.perfTimings)
 	c.Assert(err, IsNil)
 	c.Check(s.sysdLog, DeepEquals, [][]string{
 		{"stop", "snap.hello-snap.svc1.service"},
@@ -3242,10 +3468,14 @@ func (s *servicesTestSuite) TestStartServicesWithDisabledActivatedService(c *C) 
 		return sorted[i].Name < sorted[j].Name
 	})
 
+	disabledSvcs := &wrappers.DisabledServices{
+		SystemServices: []string{"svc1"},
+	}
+
 	// When providing disabledServices (i.e during install), we want to make sure that
 	// the list of disabled services is honored, including their activation units.
 	s.sysdLog = nil
-	err = wrappers.StartServices(sorted, []string{"svc1"}, &wrappers.StartServicesFlags{Enable: true}, &progress.Null, s.perfTimings)
+	err = wrappers.StartServices(sorted, disabledSvcs, &wrappers.StartServicesOptions{Enable: true}, &progress.Null, s.perfTimings)
 	c.Assert(err, IsNil)
 	c.Check(s.sysdLog, DeepEquals, [][]string{
 		// Expect only calls related to svc2
@@ -3255,11 +3485,61 @@ func (s *servicesTestSuite) TestStartServicesWithDisabledActivatedService(c *C) 
 	})
 }
 
+func (s *servicesTestSuite) TestStartServicesWithDisabledUserServiceTriggersNoGlobalEnable(c *C) {
+	info := snaptest.MockSnap(c, packageHelloNoSrv+`
+ svc1:
+  daemon: simple
+  command: bin/hello
+  daemon-scope: user
+ svc2:
+  daemon: simple
+  command: bin/hello
+  daemon-scope: user
+`, &snap.SideInfo{Revision: snap.R(12)})
+
+	err := s.addSnapServices(info, false)
+	c.Assert(err, IsNil)
+
+	sorted := info.Services()
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Name < sorted[j].Name
+	})
+
+	// Providing a disabled map for one of the users will indicate that
+	// the service was pre-existing, meaning that it should not receive
+	// a global enable (i.e this has already occurred). Otherwise did
+	// would override the current enable-status of the services for all
+	// users
+	uid := os.Getuid()
+	disabledSvcs := &wrappers.DisabledServices{
+		// this will do nothing, svc1 is not a system service
+		SystemServices: []string{"svc1"},
+		UserServices: map[int][]string{
+			uid: {"svc2"},
+		},
+	}
+
+	s.sysdLog = nil
+	err = wrappers.StartServices(sorted, disabledSvcs, &wrappers.StartServicesOptions{Enable: true}, &progress.Null, s.perfTimings)
+	c.Assert(err, IsNil)
+	c.Check(s.sysdLog, DeepEquals, [][]string{
+		// Meaning we should only see the global enable for svc1 (since that is new)
+		{"--user", "--global", "--no-reload", "enable", "snap.hello-snap.svc1.service"},
+
+		// And only see attempts at starting and enabling svc1
+		{"--user", "--no-reload", "enable", "snap.hello-snap.svc1.service"},
+		{"--user", "daemon-reload"},
+		{"--user", "start", "snap.hello-snap.svc1.service"},
+	})
+}
+
 func (s *servicesTestSuite) TestStartServicesStopsServicesIncludingActivation(c *C) {
 	s.systemctlRestorer()
 	s.systemctlRestorer = systemd.MockSystemctl(func(cmd ...string) ([]byte, error) {
 		s.sysdLog = append(s.sysdLog, cmd)
-		if len(cmd) == 2 && cmd[0] == "start" && cmd[1] == "snap.hello-snap.svc1.sock1.socket" {
+		// Inject an error into the last socket of the last service so we can see the full
+		// 'undo' logic chain
+		if len(cmd) == 3 && cmd[1] == "start" && cmd[2] == "snap.hello-snap.svc2.sock2.socket" {
 			return []byte("no"), fmt.Errorf("mock error")
 		}
 		return []byte("ActiveState=inactive\n"), nil
@@ -3295,7 +3575,7 @@ func (s *servicesTestSuite) TestStartServicesStopsServicesIncludingActivation(c 
 		return sorted[i].Name < sorted[j].Name
 	})
 
-	err = wrappers.StartServices(sorted, nil, &wrappers.StartServicesFlags{Enable: true}, &progress.Null, s.perfTimings)
+	err = wrappers.StartServices(sorted, nil, &wrappers.StartServicesOptions{Enable: true}, &progress.Null, s.perfTimings)
 	c.Check(err, NotNil)
 	c.Check(s.sysdLog, DeepEquals, [][]string{
 		// Enable phase for the service activation units, we have one set of system daemon and one set of user daemon
@@ -3305,19 +3585,24 @@ func (s *servicesTestSuite) TestStartServicesStopsServicesIncludingActivation(c 
 		{"daemon-reload"},
 		{"--user", "--global", "--no-reload", "enable", "snap.hello-snap.svc2.sock1.socket", "snap.hello-snap.svc2.sock2.socket"},
 
-		// Start phase for service activation units, we have rigged the game by making sure this stage fails,
-		// so only one of the services will attempt to start
+		// Start phase for system service activation units
 		{"start", "snap.hello-snap.svc1.sock1.socket"},
+		{"start", "snap.hello-snap.svc1.sock2.socket"},
 
-		// Stop phase, where we attempt to stop the activation units and the primary services
-		// We first attempt to stop the user services, then the system services
+		// Start phase for user service activation units, we have rigged the system here to
+		// fail on this step, so we can test undo logic.
+		{"--user", "--no-reload", "enable", "snap.hello-snap.svc2.sock1.socket", "snap.hello-snap.svc2.sock2.socket"},
+		{"--user", "daemon-reload"},
+		{"--user", "start", "snap.hello-snap.svc2.sock1.socket"},
+		{"--user", "start", "snap.hello-snap.svc2.sock2.socket"},
+
+		// It failed, we attempt to stop all started user services again
 		{"--user", "stop", "snap.hello-snap.svc2.sock1.socket"},
 		{"--user", "show", "--property=ActiveState", "snap.hello-snap.svc2.sock1.socket"},
-		{"--user", "stop", "snap.hello-snap.svc2.sock2.socket"},
-		{"--user", "show", "--property=ActiveState", "snap.hello-snap.svc2.sock2.socket"},
-		{"--user", "stop", "snap.hello-snap.svc2.service"},
-		{"--user", "show", "--property=ActiveState", "snap.hello-snap.svc2.service"},
+		{"--user", "--no-reload", "disable", "snap.hello-snap.svc2.sock1.socket", "snap.hello-snap.svc2.sock2.socket"},
+		{"--user", "daemon-reload"},
 
+		// Stop system services again
 		{"stop", "snap.hello-snap.svc1.sock1.socket", "snap.hello-snap.svc1.sock2.socket", "snap.hello-snap.svc1.service"},
 		{"show", "--property=ActiveState", "snap.hello-snap.svc1.sock1.socket"},
 		{"show", "--property=ActiveState", "snap.hello-snap.svc1.sock2.socket"},
@@ -3334,8 +3619,8 @@ func (s *servicesTestSuite) TestStartServices(c *C) {
 	info := snaptest.MockSnap(c, packageHello, &snap.SideInfo{Revision: snap.R(12)})
 	svcFile := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.hello-snap.svc1.service")
 
-	flags := &wrappers.StartServicesFlags{Enable: true}
-	err := wrappers.StartServices(info.Services(), nil, flags, &progress.Null, s.perfTimings)
+	opts := &wrappers.StartServicesOptions{Enable: true}
+	err := wrappers.StartServices(info.Services(), nil, opts, &progress.Null, s.perfTimings)
 	c.Assert(err, IsNil)
 
 	c.Check(s.sysdLog, DeepEquals, [][]string{
@@ -3349,8 +3634,8 @@ func (s *servicesTestSuite) TestStartServicesNoEnable(c *C) {
 	info := snaptest.MockSnap(c, packageHello, &snap.SideInfo{Revision: snap.R(12)})
 	svcFile := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.hello-snap.svc1.service")
 
-	flags := &wrappers.StartServicesFlags{Enable: false}
-	err := wrappers.StartServices(info.Services(), nil, flags, &progress.Null, s.perfTimings)
+	opts := &wrappers.StartServicesOptions{Enable: false}
+	err := wrappers.StartServices(info.Services(), nil, opts, &progress.Null, s.perfTimings)
 	c.Assert(err, IsNil)
 
 	c.Check(s.sysdLog, DeepEquals, [][]string{
@@ -3366,12 +3651,14 @@ func (s *servicesTestSuite) TestStartServicesUserDaemons(c *C) {
 `, &snap.SideInfo{Revision: snap.R(12)})
 	svcFile := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/user/snap.hello-snap.svc1.service")
 
-	flags := &wrappers.StartServicesFlags{Enable: true}
-	err := wrappers.StartServices(info.Services(), nil, flags, &progress.Null, s.perfTimings)
+	opts := &wrappers.StartServicesOptions{Enable: true}
+	err := wrappers.StartServices(info.Services(), nil, opts, &progress.Null, s.perfTimings)
 	c.Assert(err, IsNil)
 
 	c.Assert(s.sysdLog, DeepEquals, [][]string{
 		{"--user", "--global", "--no-reload", "enable", filepath.Base(svcFile)},
+		{"--user", "--no-reload", "enable", filepath.Base(svcFile)},
+		{"--user", "daemon-reload"},
 		{"--user", "start", filepath.Base(svcFile)},
 	})
 }
@@ -3380,8 +3667,8 @@ func (s *servicesTestSuite) TestStartServicesEnabledConditional(c *C) {
 	info := snaptest.MockSnap(c, packageHello, &snap.SideInfo{Revision: snap.R(12)})
 	svcFile := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.hello-snap.svc1.service")
 
-	flags := &wrappers.StartServicesFlags{}
-	c.Check(wrappers.StartServices(info.Services(), nil, flags, progress.Null, s.perfTimings), IsNil)
+	opts := &wrappers.StartServicesOptions{}
+	c.Check(wrappers.StartServices(info.Services(), nil, opts, progress.Null, s.perfTimings), IsNil)
 	c.Check(s.sysdLog, DeepEquals, [][]string{{"start", filepath.Base(svcFile)}})
 }
 
@@ -3394,8 +3681,11 @@ func (s *servicesTestSuite) TestNoStartDisabledServices(c *C) {
   daemon: simple
 `, &snap.SideInfo{Revision: snap.R(12)})
 
-	flags := &wrappers.StartServicesFlags{Enable: true}
-	err := wrappers.StartServices(info.Services(), []string{"svc1"}, flags, &progress.Null, s.perfTimings)
+	disabledSvcs := &wrappers.DisabledServices{
+		SystemServices: []string{"svc1"},
+	}
+	opts := &wrappers.StartServicesOptions{Enable: true}
+	err := wrappers.StartServices(info.Services(), disabledSvcs, opts, &progress.Null, s.perfTimings)
 	c.Assert(err, IsNil)
 	c.Assert(s.sysdLog, DeepEquals, [][]string{
 		{"--no-reload", "enable", svc2Name},
@@ -3481,8 +3771,8 @@ func (s *servicesTestSuite) TestMultiServicesFailEnableCleanup(c *C) {
 	svcFiles, _ = filepath.Glob(filepath.Join(dirs.SnapServicesDir, "snap.hello-snap.*.service"))
 	c.Check(svcFiles, HasLen, 2)
 
-	flags := &wrappers.StartServicesFlags{Enable: true}
-	err = wrappers.StartServices(info.Services(), nil, flags, progress.Null, s.perfTimings)
+	opts := &wrappers.StartServicesOptions{Enable: true}
+	err = wrappers.StartServices(info.Services(), nil, opts, progress.Null, s.perfTimings)
 	c.Assert(err, ErrorMatches, "failed")
 
 	c.Check(sysdLog, DeepEquals, [][]string{
@@ -3762,8 +4052,8 @@ func (s *servicesTestSuite) TestStartSnapMultiServicesFailStartCleanup(c *C) {
 		svcs[0], svcs[1] = svcs[1], svcs[0]
 	}
 
-	flags := &wrappers.StartServicesFlags{Enable: true}
-	err := wrappers.StartServices(svcs, nil, flags, &progress.Null, s.perfTimings)
+	opts := &wrappers.StartServicesOptions{Enable: true}
+	err := wrappers.StartServices(svcs, nil, opts, &progress.Null, s.perfTimings)
 	c.Assert(err, ErrorMatches, "failed")
 	c.Assert(sysdLog, HasLen, 10, Commentf("len: %v calls: %v", len(sysdLog), sysdLog))
 	c.Check(sysdLog, DeepEquals, [][]string{
@@ -3819,8 +4109,8 @@ func (s *servicesTestSuite) TestStartSnapMultiServicesFailStartCleanupWithSocket
 	// ensure desired order
 	apps := []*snap.AppInfo{info.Apps["svc1"], info.Apps["svc2"], info.Apps["svc3"]}
 
-	flags := &wrappers.StartServicesFlags{Enable: true}
-	err := wrappers.StartServices(apps, nil, flags, &progress.Null, s.perfTimings)
+	opts := &wrappers.StartServicesOptions{Enable: true}
+	err := wrappers.StartServices(apps, nil, opts, &progress.Null, s.perfTimings)
 	c.Assert(err, ErrorMatches, "failed")
 	c.Logf("sysdlog: %v", sysdLog)
 	c.Assert(sysdLog, HasLen, 14, Commentf("len: %v calls: %v", len(sysdLog), sysdLog))
@@ -3884,8 +4174,8 @@ func (s *servicesTestSuite) TestStartSnapMultiServicesFailStartNoEnableNoDisable
 	apps := []*snap.AppInfo{info.Apps["svc1"], info.Apps["svc2"], info.Apps["svc3"]}
 
 	// no enable
-	flags := &wrappers.StartServicesFlags{Enable: false}
-	err := wrappers.StartServices(apps, nil, flags, &progress.Null, s.perfTimings)
+	opts := &wrappers.StartServicesOptions{Enable: false}
+	err := wrappers.StartServices(apps, nil, opts, &progress.Null, s.perfTimings)
 	c.Assert(err, ErrorMatches, "failed")
 	c.Logf("sysdlog: %v", sysdLog)
 	c.Assert(sysdLog, HasLen, 11, Commentf("len: %v calls: %v", len(sysdLog), sysdLog))
@@ -3937,22 +4227,22 @@ func (s *servicesTestSuite) TestStartSnapMultiUserServicesFailStartCleanup(c *C)
 	if svcs[0].Name == "svc2" {
 		svcs[0], svcs[1] = svcs[1], svcs[0]
 	}
-	flags := &wrappers.StartServicesFlags{Enable: true}
-	err := wrappers.StartServices(svcs, nil, flags, &progress.Null, s.perfTimings)
+	opts := &wrappers.StartServicesOptions{Enable: true}
+	err := wrappers.StartServices(svcs, nil, opts, &progress.Null, s.perfTimings)
 	c.Assert(err, ErrorMatches, "some user services failed to start")
 	c.Assert(sysdLog, HasLen, 10, Commentf("len: %v calls: %v", len(sysdLog), sysdLog))
 	c.Check(sysdLog, DeepEquals, [][]string{
 		{"--user", "--global", "--no-reload", "enable", svc1Name, svc2Name},
+		{"--user", "--no-reload", "enable", "snap.hello-snap.svc1.service", "snap.hello-snap.svc2.service"},
+		{"--user", "daemon-reload"},
 		{"--user", "start", svc1Name},
 		{"--user", "start", svc2Name}, // one of the services fails
 		// session agent attempts to stop the non-failed services
 		{"--user", "stop", svc1Name},
 		{"--user", "show", "--property=ActiveState", svc1Name},
-		// StartServices ensures everything is stopped
-		{"--user", "stop", svc2Name},
-		{"--user", "show", "--property=ActiveState", svc2Name},
-		{"--user", "stop", svc1Name},
-		{"--user", "show", "--property=ActiveState", svc1Name},
+		{"--user", "--no-reload", "disable", "snap.hello-snap.svc1.service", "snap.hello-snap.svc2.service"},
+		{"--user", "daemon-reload"},
+		// and we disable previously enabled user-services
 		{"--user", "--global", "--no-reload", "disable", svc1Name, svc2Name},
 	}, Commentf("calls: %v", sysdLog))
 }
@@ -3988,8 +4278,8 @@ apps:
 	sorted, err := snap.SortServices(svcs)
 	c.Assert(err, IsNil)
 
-	flags := &wrappers.StartServicesFlags{Enable: true}
-	err = wrappers.StartServices(sorted, nil, flags, &progress.Null, s.perfTimings)
+	opts := &wrappers.StartServicesOptions{Enable: true}
+	err = wrappers.StartServices(sorted, nil, opts, &progress.Null, s.perfTimings)
 	c.Assert(err, IsNil)
 	c.Assert(sysdLog, HasLen, 5, Commentf("len: %v calls: %v", len(sysdLog), sysdLog))
 	c.Check(sysdLog, DeepEquals, [][]string{
@@ -4004,7 +4294,7 @@ apps:
 	sorted[1], sorted[0] = sorted[0], sorted[1]
 
 	// we should observe the calls done in the same order as services
-	err = wrappers.StartServices(sorted, nil, flags, &progress.Null, s.perfTimings)
+	err = wrappers.StartServices(sorted, nil, opts, &progress.Null, s.perfTimings)
 	c.Assert(err, IsNil)
 	c.Assert(sysdLog, HasLen, 10, Commentf("len: %v calls: %v", len(sysdLog), sysdLog))
 	c.Check(sysdLog[5:], DeepEquals, [][]string{
@@ -4101,7 +4391,7 @@ func (s *servicesTestSuite) TestServiceWatchdog(c *C) {
 
 	content, err := os.ReadFile(filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.hello-snap.svc2.service"))
 	c.Assert(err, IsNil)
-	c.Check(strings.Contains(string(content), "\nWatchdogSec=12\n"), Equals, true)
+	c.Check(strings.Contains(string(content), "\nWatchdogSec=12s\n"), Equals, true)
 
 	noWatchdog := []string{
 		filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.hello-snap.svc3.service"),
@@ -4128,14 +4418,12 @@ apps:
 
 	err := s.addSnapServices(info, false)
 	c.Assert(err, IsNil)
-	c.Check(s.sysdLog, DeepEquals, [][]string{
-		{"daemon-reload"},
-	})
+	c.Check(s.sysdLog, DeepEquals, [][]string{{"daemon-reload"}})
 	s.sysdLog = nil
 
 	apps := []*snap.AppInfo{info.Apps["survivor"]}
-	flags := &wrappers.StartServicesFlags{Enable: true}
-	err = wrappers.StartServices(apps, nil, flags, progress.Null, s.perfTimings)
+	opts := &wrappers.StartServicesOptions{Enable: true}
+	err = wrappers.StartServices(apps, nil, opts, progress.Null, s.perfTimings)
 	c.Assert(err, IsNil)
 
 	c.Check(s.sysdLog, DeepEquals, [][]string{
@@ -4144,19 +4432,39 @@ apps:
 		{"start", filepath.Base(survivorFile)},
 	})
 
-	s.sysdLog = nil
-	err = wrappers.StopServices(info.Services(), nil, snap.StopReasonRefresh, progress.Null, s.perfTimings)
-	c.Assert(err, IsNil)
-	c.Assert(s.sysdLog, HasLen, 0)
-
-	s.sysdLog = nil
-	err = wrappers.StopServices(info.Services(), nil, snap.StopReasonRemove, progress.Null, s.perfTimings)
-	c.Assert(err, IsNil)
-	c.Check(s.sysdLog, DeepEquals, [][]string{
+	stoppedSvc := [][]string{
 		{"stop", filepath.Base(survivorFile)},
 		{"show", "--property=ActiveState", "snap.survive-snap.survivor.service"},
-	})
+	}
+	type testcase struct {
+		reason      snap.ServiceStopReason
+		removedSvcs map[string]*snap.AppInfo
+		sysdLog     [][]string
+	}
 
+	tcs := []testcase{
+		{
+			reason: snap.StopReasonRefresh,
+		},
+		{
+			// stops endure service if not present in new snap revision
+			reason:      snap.StopReasonRefresh,
+			removedSvcs: apps[0].Snap.Apps,
+			sysdLog:     stoppedSvc,
+		},
+		{
+			// stops endure service if removing the snap
+			reason:  snap.StopReasonRemove,
+			sysdLog: stoppedSvc,
+		},
+	}
+
+	for _, tc := range tcs {
+		s.sysdLog = nil
+		err = wrappers.StopServices(info.Services(), tc.removedSvcs, nil, tc.reason, progress.Null, s.perfTimings)
+		c.Assert(err, IsNil)
+		c.Assert(s.sysdLog, DeepEquals, tc.sysdLog)
+	}
 }
 
 func (s *servicesTestSuite) TestStopServiceSigs(c *C) {
@@ -4203,8 +4511,8 @@ apps:
 		for _, a := range info.Apps {
 			apps = append(apps, a)
 		}
-		flags := &wrappers.StartServicesFlags{Enable: true}
-		err = wrappers.StartServices(apps, nil, flags, progress.Null, s.perfTimings)
+		opts := &wrappers.StartServicesOptions{Enable: true}
+		err = wrappers.StartServices(apps, nil, opts, progress.Null, s.perfTimings)
 		c.Assert(err, IsNil)
 		c.Check(s.sysdLog, DeepEquals, [][]string{
 			{"--no-reload", "enable", filepath.Base(survivorFile)},
@@ -4213,7 +4521,7 @@ apps:
 		})
 
 		s.sysdLog = nil
-		err = wrappers.StopServices(info.Services(), nil, snap.StopReasonRefresh, progress.Null, s.perfTimings)
+		err = wrappers.StopServices(info.Services(), nil, nil, snap.StopReasonRefresh, progress.Null, s.perfTimings)
 		c.Assert(err, IsNil)
 		c.Check(s.sysdLog, DeepEquals, [][]string{
 			{"stop", filepath.Base(survivorFile)},
@@ -4221,7 +4529,7 @@ apps:
 		}, Commentf("failure in %s", t.mode))
 
 		s.sysdLog = nil
-		err = wrappers.StopServices(info.Services(), nil, snap.StopReasonRemove, progress.Null, s.perfTimings)
+		err = wrappers.StopServices(info.Services(), nil, nil, snap.StopReasonRemove, progress.Null, s.perfTimings)
 		c.Assert(err, IsNil)
 		switch t.expectedWho {
 		case "all":
@@ -4239,6 +4547,149 @@ apps:
 		}
 	}
 
+}
+
+func (s *servicesTestSuite) TestStopServiceFailsButServiceIsStopped(c *C) {
+	fooUnitFile := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.basic-snap.foo.service")
+	gooUnitFile := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.basic-snap.goo.service")
+
+	// Override the systemctl handler so we can inject an error when attempting to stop
+	// foo service. We then make sure to report the foo service stopped, so the service
+	// code continues
+	var sysdLog [][]string
+	r := systemd.MockSystemctl(func(cmd ...string) ([]byte, error) {
+		sysdLog = append(sysdLog, cmd)
+		switch cmd[0] {
+		case "daemon-reload":
+			return nil, nil
+		case "stop":
+			switch cmd[1] {
+			case filepath.Base(fooUnitFile):
+				return nil, fmt.Errorf("failed")
+			default:
+				return nil, nil
+			}
+		case "show":
+			switch cmd[2] {
+			case filepath.Base(fooUnitFile):
+				if cmd[1] == "--property=ActiveState" {
+					return []byte("ActiveState=inactive\n"), nil
+				}
+				return systemdtest.HandleMockAllUnitsActiveOutput(cmd, map[string]systemdtest.ServiceState{
+					filepath.Base(fooUnitFile): {ActiveState: "inactive", UnitFileState: "enabled"},
+				}), nil
+			case filepath.Base(gooUnitFile):
+				return []byte("ActiveState=inactive\n"), nil
+			}
+		}
+		return nil, fmt.Errorf("unexpected command %v", cmd)
+	})
+	defer r()
+
+	const snapYaml = `name: basic-snap
+version: 1.0
+apps:
+ foo:
+  command: bin/hello
+  daemon: simple
+ goo:
+  command: bin/hello
+  daemon: simple
+`
+	info := snaptest.MockSnap(c, snapYaml, &snap.SideInfo{Revision: snap.R(1)})
+
+	err := s.addSnapServices(info, false)
+	c.Assert(err, IsNil)
+	c.Check(sysdLog, DeepEquals, [][]string{
+		{"daemon-reload"},
+	})
+
+	services := info.Services()
+	sort.Sort(snap.AppInfoBySnapApp(services))
+
+	sysdLog = nil
+	err = wrappers.StopServices(services, nil, nil, snap.StopReasonRemove, progress.Null, s.perfTimings)
+	c.Assert(err, IsNil)
+	c.Check(sysdLog, DeepEquals, [][]string{
+		{"stop", filepath.Base(fooUnitFile)},
+		{"show", "--property=ActiveState", filepath.Base(fooUnitFile)},
+		{"show", "--property=Id,ActiveState,UnitFileState,Type,Names,NeedDaemonReload", filepath.Base(fooUnitFile)},
+		{"stop", filepath.Base(gooUnitFile)},
+		{"show", "--property=ActiveState", filepath.Base(gooUnitFile)},
+	})
+}
+
+func (s *servicesTestSuite) TestStopServiceFailsAndServiceStillRunsSoMustFail(c *C) {
+	fooUnitFile := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.basic-snap.foo.service")
+	gooUnitFile := filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.basic-snap.goo.service")
+
+	// Override the systemctl handler so we can inject an error when attempting to stop
+	// foo service. We then make sure to report the foo service stopped, so the service
+	// code continues
+	var sysdLog [][]string
+	r := systemd.MockSystemctl(func(cmd ...string) ([]byte, error) {
+		sysdLog = append(sysdLog, cmd)
+		switch cmd[0] {
+		case "daemon-reload":
+			return nil, nil
+		case "stop":
+			switch cmd[1] {
+			case filepath.Base(fooUnitFile):
+				return nil, fmt.Errorf("really failed to stop service")
+			default:
+				return nil, nil
+			}
+		case "show":
+			switch cmd[2] {
+			case filepath.Base(fooUnitFile):
+				if cmd[1] == "--property=ActiveState" {
+					return []byte("ActiveState=active\n"), nil
+				}
+				return systemdtest.HandleMockAllUnitsActiveOutput(cmd, map[string]systemdtest.ServiceState{
+					filepath.Base(fooUnitFile): {ActiveState: "active", UnitFileState: "enabled"},
+				}), nil
+			case filepath.Base(gooUnitFile):
+				return []byte("ActiveState=inactive\n"), nil
+			}
+		}
+		return nil, fmt.Errorf("unexpected command %v", cmd)
+	})
+	defer r()
+
+	const snapYaml = `name: basic-snap
+version: 1.0
+apps:
+ foo:
+  command: bin/hello
+  daemon: simple
+ goo:
+  command: bin/hello
+  daemon: simple
+`
+	info := snaptest.MockSnap(c, snapYaml, &snap.SideInfo{Revision: snap.R(1)})
+
+	err := s.addSnapServices(info, false)
+	c.Assert(err, IsNil)
+	c.Check(sysdLog, DeepEquals, [][]string{
+		{"daemon-reload"},
+	})
+
+	services := info.Services()
+	sort.Sort(snap.AppInfoBySnapApp(services))
+
+	sysdLog = nil
+	err = wrappers.StopServices(services, nil, nil, snap.StopReasonRemove, progress.Null, s.perfTimings)
+	c.Assert(err, ErrorMatches, `really failed to stop service`)
+
+	// systemd.Stop may poll ActiveState more than once while the stop command
+	// completes. the important part is that StopServices checks the full
+	// service status before reporting that the failed stop is fatal.
+	c.Assert(len(sysdLog) >= 3, Equals, true)
+	c.Check(sysdLog[0], DeepEquals, []string{"stop", filepath.Base(fooUnitFile)})
+	for _, cmd := range sysdLog[1 : len(sysdLog)-1] {
+		c.Check(cmd, DeepEquals, []string{"show", "--property=ActiveState", filepath.Base(fooUnitFile)})
+	}
+	c.Check(sysdLog[len(sysdLog)-1], DeepEquals, []string{"show", "--property=Id,ActiveState,UnitFileState,Type,Names,NeedDaemonReload", filepath.Base(fooUnitFile)})
 }
 
 func (s *servicesTestSuite) TestStartSnapSocketEnableStart(c *C) {
@@ -4265,16 +4716,18 @@ func (s *servicesTestSuite) TestStartSnapSocketEnableStart(c *C) {
 
 	// fix the apps order to make the test stable
 	apps := []*snap.AppInfo{info.Apps["svc1"], info.Apps["svc2"], info.Apps["svc3"]}
-	flags := &wrappers.StartServicesFlags{Enable: true}
-	err := wrappers.StartServices(apps, nil, flags, &progress.Null, s.perfTimings)
+	opts := &wrappers.StartServicesOptions{Enable: true}
+	err := wrappers.StartServices(apps, nil, opts, &progress.Null, s.perfTimings)
 	c.Assert(err, IsNil)
-	c.Assert(s.sysdLog, HasLen, 6, Commentf("len: %v calls: %v", len(s.sysdLog), s.sysdLog))
+	c.Assert(s.sysdLog, HasLen, 8, Commentf("len: %v calls: %v", len(s.sysdLog), s.sysdLog))
 	c.Check(s.sysdLog, DeepEquals, [][]string{
 		{"--no-reload", "enable", svc2Sock, svc1Name},
 		{"daemon-reload"},
 		{"--user", "--global", "--no-reload", "enable", svc3Sock},
 		{"start", svc2Sock},
 		{"start", svc1Name},
+		{"--user", "--no-reload", "enable", svc3Sock},
+		{"--user", "daemon-reload"},
 		{"--user", "start", svc3Sock},
 	}, Commentf("calls: %v", s.sysdLog))
 }
@@ -4299,16 +4752,18 @@ func (s *servicesTestSuite) TestStartSnapTimerEnableStart(c *C) {
 
 	// fix the apps order to make the test stable
 	apps := []*snap.AppInfo{info.Apps["svc1"], info.Apps["svc2"], info.Apps["svc3"]}
-	flags := &wrappers.StartServicesFlags{Enable: true}
-	err := wrappers.StartServices(apps, nil, flags, &progress.Null, s.perfTimings)
+	opts := &wrappers.StartServicesOptions{Enable: true}
+	err := wrappers.StartServices(apps, nil, opts, &progress.Null, s.perfTimings)
 	c.Assert(err, IsNil)
-	c.Assert(s.sysdLog, HasLen, 6, Commentf("len: %v calls: %v", len(s.sysdLog), s.sysdLog))
+	c.Assert(s.sysdLog, HasLen, 8, Commentf("len: %v calls: %v", len(s.sysdLog), s.sysdLog))
 	c.Check(s.sysdLog, DeepEquals, [][]string{
 		{"--no-reload", "enable", svc2Timer, svc1Name},
 		{"daemon-reload"},
 		{"--user", "--global", "--no-reload", "enable", svc3Timer},
 		{"start", svc2Timer},
 		{"start", svc1Name},
+		{"--user", "--no-reload", "enable", svc3Timer},
+		{"--user", "daemon-reload"},
 		{"--user", "start", svc3Timer},
 	}, Commentf("calls: %v", s.sysdLog))
 }
@@ -4337,8 +4792,8 @@ func (s *servicesTestSuite) TestStartSnapTimerCleanup(c *C) {
 
 	// fix the apps order to make the test stable
 	apps := []*snap.AppInfo{info.Apps["svc1"], info.Apps["svc2"]}
-	flags := &wrappers.StartServicesFlags{Enable: true}
-	err := wrappers.StartServices(apps, nil, flags, &progress.Null, s.perfTimings)
+	opts := &wrappers.StartServicesOptions{Enable: true}
+	err := wrappers.StartServices(apps, nil, opts, &progress.Null, s.perfTimings)
 	c.Assert(err, ErrorMatches, "failed")
 	c.Assert(sysdLog, HasLen, 10, Commentf("len: %v calls: %v", len(sysdLog), sysdLog))
 	c.Check(sysdLog, DeepEquals, [][]string{
@@ -4372,7 +4827,7 @@ func (s *servicesTestSuite) TestAddRemoveSnapWithTimersAddsRemovesTimerFiles(c *
 	c.Check(osutil.FileExists(app.Timer.File()), Equals, true)
 	c.Check(osutil.FileExists(app.ServiceFile()), Equals, true)
 
-	err = wrappers.StopServices(info.Services(), nil, "", &progress.Null, s.perfTimings)
+	err = wrappers.StopServices(info.Services(), nil, nil, "", &progress.Null, s.perfTimings)
 	c.Assert(err, IsNil)
 
 	err = wrappers.RemoveSnapServices(info, &progress.Null)
@@ -4502,8 +4957,8 @@ apps:
 	s.sysdLog = nil
 
 	apps := []*snap.AppInfo{info.Apps["svc1"], info.Apps["svc2"], info.Apps["svc3"]}
-	flags := &wrappers.StartServicesFlags{Enable: true}
-	err = wrappers.StartServices(apps, nil, flags, progress.Null, s.perfTimings)
+	opts := &wrappers.StartServicesOptions{Enable: true}
+	err = wrappers.StartServices(apps, nil, opts, progress.Null, s.perfTimings)
 	c.Assert(err, IsNil)
 
 	c.Assert(s.sysdLog, HasLen, 5, Commentf("len: %v calls: %v", len(s.sysdLog), s.sysdLog))
@@ -4531,7 +4986,7 @@ func (s *servicesTestSuite) TestServiceRestartDelay(c *C) {
 
 	content, err := os.ReadFile(filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.hello-snap.svc2.service"))
 	c.Assert(err, IsNil)
-	c.Check(strings.Contains(string(content), "\nRestartSec=12\n"), Equals, true)
+	c.Check(strings.Contains(string(content), "\nRestartSec=12s\n"), Equals, true)
 
 	content, err = os.ReadFile(filepath.Join(dirs.GlobalRootDir, "/etc/systemd/system/snap.hello-snap.svc3.service"))
 	c.Assert(err, IsNil)
@@ -4572,16 +5027,16 @@ apps:
 	c.Assert(err, IsNil)
 
 	s.sysdLog = nil
-	flags := wrappers.RestartServicesFlags{Reload: true, AlsoEnabledNonActive: true}
-	c.Assert(wrappers.RestartServices(info.Services(), nil, &flags, progress.Null, s.perfTimings), IsNil)
+	opts := wrappers.RestartServicesOptions{Reload: true, AlsoEnabledNonActive: true}
+	c.Assert(wrappers.RestartServices(info.Services(), nil, &opts, progress.Null, s.perfTimings), IsNil)
 	c.Check(s.sysdLog, DeepEquals, [][]string{
 		{"show", "--property=Id,ActiveState,UnitFileState,Type,Names,NeedDaemonReload", srvFile},
 		{"reload-or-restart", srvFile},
 	})
 
 	s.sysdLog = nil
-	flags.Reload = false
-	c.Assert(wrappers.RestartServices(info.Services(), nil, &flags, progress.Null, s.perfTimings), IsNil)
+	opts.Reload = false
+	c.Assert(wrappers.RestartServices(info.Services(), nil, &opts, progress.Null, s.perfTimings), IsNil)
 	c.Check(s.sysdLog, DeepEquals, [][]string{
 		{"show", "--property=Id,ActiveState,UnitFileState,Type,Names,NeedDaemonReload", srvFile},
 		{"stop", srvFile},
@@ -4590,7 +5045,7 @@ apps:
 	})
 
 	s.sysdLog = nil
-	c.Assert(wrappers.RestartServices(info.Services(), nil, &wrappers.RestartServicesFlags{AlsoEnabledNonActive: true}, progress.Null, s.perfTimings), IsNil)
+	c.Assert(wrappers.RestartServices(info.Services(), nil, &wrappers.RestartServicesOptions{AlsoEnabledNonActive: true}, progress.Null, s.perfTimings), IsNil)
 	c.Check(s.sysdLog, DeepEquals, [][]string{
 		{"show", "--property=Id,ActiveState,UnitFileState,Type,Names,NeedDaemonReload", srvFile},
 		{"stop", srvFile},
@@ -4626,8 +5081,8 @@ apps:
 	c.Assert(err, IsNil)
 
 	s.sysdLog = nil
-	flags := wrappers.RestartServicesFlags{AlsoEnabledNonActive: true}
-	c.Assert(wrappers.RestartServices(info.Services(), nil, &flags, progress.Null, s.perfTimings), ErrorMatches, `oh noes`)
+	opts := wrappers.RestartServicesOptions{AlsoEnabledNonActive: true}
+	c.Assert(wrappers.RestartServices(info.Services(), nil, &opts, progress.Null, s.perfTimings), ErrorMatches, `oh noes`)
 	c.Check(s.sysdLog, DeepEquals, [][]string{
 		{"show", "--property=Id,ActiveState,UnitFileState,Type,Names,NeedDaemonReload", srvFile},
 		{"stop", srvFile},
@@ -4658,8 +5113,8 @@ apps:
 	err := s.addSnapServices(info, false)
 	c.Assert(err, IsNil)
 
-	flags := wrappers.RestartServicesFlags{ScopeOptions: wrappers.ScopeOptions{Scope: wrappers.ServiceScopeUser}}
-	c.Assert(wrappers.RestartServices(info.Services(), nil, &flags, progress.Null, s.perfTimings), IsNil)
+	opts := wrappers.RestartServicesOptions{ScopeOptions: wrappers.ScopeOptions{Scope: wrappers.ServiceScopeUser}}
+	c.Assert(wrappers.RestartServices(info.Services(), nil, &opts, progress.Null, s.perfTimings), IsNil)
 	c.Assert(err, IsNil)
 	c.Check(s.sysdLog, DeepEquals, [][]string{
 		// Only invocations from querying status
@@ -4699,16 +5154,16 @@ NeedDaemonReload=no
 	c.Assert(err, IsNil)
 
 	s.sysdLog = nil
-	flags := wrappers.RestartServicesFlags{Reload: true, AlsoEnabledNonActive: true}
-	c.Assert(wrappers.RestartServices(info.Services(), nil, &flags, progress.Null, s.perfTimings), IsNil)
+	opts := wrappers.RestartServicesOptions{Reload: true, AlsoEnabledNonActive: true}
+	c.Assert(wrappers.RestartServices(info.Services(), nil, &opts, progress.Null, s.perfTimings), IsNil)
 	c.Check(s.sysdLog, DeepEquals, [][]string{
 		{"--user", "show", "--property=Id,ActiveState,UnitFileState,Type,Names,NeedDaemonReload", srvFile},
 		{"--user", "reload-or-restart", srvFile},
 	})
 
 	s.sysdLog = nil
-	flags.Reload = false
-	c.Assert(wrappers.RestartServices(info.Services(), nil, &flags, progress.Null, s.perfTimings), IsNil)
+	opts.Reload = false
+	c.Assert(wrappers.RestartServices(info.Services(), nil, &opts, progress.Null, s.perfTimings), IsNil)
 	c.Check(s.sysdLog, DeepEquals, [][]string{
 		{"--user", "show", "--property=Id,ActiveState,UnitFileState,Type,Names,NeedDaemonReload", srvFile},
 		{"--user", "stop", srvFile},
@@ -4717,7 +5172,7 @@ NeedDaemonReload=no
 	})
 
 	s.sysdLog = nil
-	c.Assert(wrappers.RestartServices(info.Services(), nil, &wrappers.RestartServicesFlags{AlsoEnabledNonActive: true}, progress.Null, s.perfTimings), IsNil)
+	c.Assert(wrappers.RestartServices(info.Services(), nil, &wrappers.RestartServicesOptions{AlsoEnabledNonActive: true}, progress.Null, s.perfTimings), IsNil)
 	c.Check(s.sysdLog, DeepEquals, [][]string{
 		{"--user", "show", "--property=Id,ActiveState,UnitFileState,Type,Names,NeedDaemonReload", srvFile},
 		{"--user", "stop", srvFile},
@@ -4762,8 +5217,8 @@ NeedDaemonReload=no
 	err := s.addSnapServices(info, false)
 	c.Assert(err, IsNil)
 
-	flags := wrappers.RestartServicesFlags{Reload: true, AlsoEnabledNonActive: true}
-	err = wrappers.RestartServices(info.Services(), nil, &flags, progress.Null, s.perfTimings)
+	opts := wrappers.RestartServicesOptions{Reload: true, AlsoEnabledNonActive: true}
+	err = wrappers.RestartServices(info.Services(), nil, &opts, progress.Null, s.perfTimings)
 	c.Assert(err, ErrorMatches, `some user services failed to restart`)
 	c.Check(s.sysdLog, DeepEquals, [][]string{
 		{"--user", "daemon-reload"},
@@ -4802,8 +5257,8 @@ NeedDaemonReload=no
 	err := s.addSnapServices(info, false)
 	c.Assert(err, IsNil)
 
-	flags := wrappers.RestartServicesFlags{ScopeOptions: wrappers.ScopeOptions{Scope: wrappers.ServiceScopeSystem}}
-	c.Assert(wrappers.RestartServices(info.Services(), []string{srvFile}, &flags, progress.Null, s.perfTimings), IsNil)
+	opts := wrappers.RestartServicesOptions{ScopeOptions: wrappers.ScopeOptions{Scope: wrappers.ServiceScopeSystem}}
+	c.Assert(wrappers.RestartServices(info.Services(), []string{srvFile}, &opts, progress.Null, s.perfTimings), IsNil)
 	c.Check(s.sysdLog, DeepEquals, [][]string{
 		// Those comes from querying status of services
 		{"--user", "daemon-reload"},
@@ -4856,7 +5311,7 @@ apps:
 	s.sysdLog = nil
 	services := info.Services()
 	sort.Sort(snap.AppInfoBySnapApp(services))
-	c.Assert(wrappers.RestartServices(services, nil, &wrappers.RestartServicesFlags{AlsoEnabledNonActive: true}, progress.Null, s.perfTimings), IsNil)
+	c.Assert(wrappers.RestartServices(services, nil, &wrappers.RestartServicesOptions{AlsoEnabledNonActive: true}, progress.Null, s.perfTimings), IsNil)
 	c.Check(s.sysdLog, DeepEquals, [][]string{
 		{"show", "--property=Id,ActiveState,UnitFileState,Type,Names,NeedDaemonReload", srvFile1, srvFile2, srvFile3, srvFile4},
 		{"stop", srvFile1},
@@ -4873,7 +5328,7 @@ apps:
 	// Verify that explicitly mentioning a service causes it to restart,
 	// regardless of its state
 	s.sysdLog = nil
-	c.Assert(wrappers.RestartServices(services, []string{srvFile4}, &wrappers.RestartServicesFlags{AlsoEnabledNonActive: true}, progress.Null, s.perfTimings), IsNil)
+	c.Assert(wrappers.RestartServices(services, []string{srvFile4}, &wrappers.RestartServicesOptions{AlsoEnabledNonActive: true}, progress.Null, s.perfTimings), IsNil)
 	c.Check(s.sysdLog, DeepEquals, [][]string{
 		{"show", "--property=Id,ActiveState,UnitFileState,Type,Names,NeedDaemonReload", srvFile1, srvFile2, srvFile3, srvFile4},
 		{"stop", srvFile1},
@@ -4892,7 +5347,7 @@ apps:
 
 	// Check the restart only active service case
 	s.sysdLog = nil
-	c.Assert(wrappers.RestartServices(services, nil, &wrappers.RestartServicesFlags{AlsoEnabledNonActive: false}, progress.Null, s.perfTimings), IsNil)
+	c.Assert(wrappers.RestartServices(services, nil, &wrappers.RestartServicesOptions{AlsoEnabledNonActive: false}, progress.Null, s.perfTimings), IsNil)
 	c.Check(s.sysdLog, DeepEquals, [][]string{
 		{"show", "--property=Id,ActiveState,UnitFileState,Type,Names,NeedDaemonReload", srvFile1, srvFile2, srvFile3, srvFile4},
 		{"stop", srvFile1},
@@ -4901,6 +5356,288 @@ apps:
 		{"stop", srvFile3},
 		{"show", "--property=ActiveState", srvFile3},
 		{"start", srvFile3},
+	})
+}
+
+func (s *servicesTestSuite) TestRestartWithActivatedServicesInactive(c *C) {
+	const manyServicesYaml = `name: test-snap
+version: 1.0
+apps:
+  svc1:
+    command: bin/foo
+    daemon: simple
+  svc2:
+    daemon: simple
+    plugs: [network-bind]
+    sockets:
+      sock1:
+        listen-stream: $SNAP_DATA/sock1.socket
+        socket-mode: 0666
+      sock2:
+        listen-stream: $SNAP_COMMON/sock2.socket
+`
+	srvFile1 := "snap.test-snap.svc1.service"
+	srvFile2 := "snap.test-snap.svc2.service"
+	srvFile2Sock1 := "snap.test-snap.svc2.sock1.socket"
+	srvFile2Sock2 := "snap.test-snap.svc2.sock2.socket"
+
+	info := snaptest.MockSnap(c, manyServicesYaml, &snap.SideInfo{Revision: snap.R(1)})
+
+	r := systemd.MockSystemctl(func(cmd ...string) ([]byte, error) {
+		s.sysdLog = append(s.sysdLog, cmd)
+		states := map[string]systemdtest.ServiceState{
+			srvFile1:      {ActiveState: "active", UnitFileState: "enabled"},
+			srvFile2:      {ActiveState: "inactive", UnitFileState: "enabled"},
+			srvFile2Sock1: {ActiveState: "inactive", UnitFileState: "enabled"},
+			srvFile2Sock2: {ActiveState: "inactive", UnitFileState: "enabled"},
+		}
+		if out := systemdtest.HandleMockAllUnitsActiveOutput(cmd, states); out != nil {
+			return out, nil
+		}
+		return []byte("ActiveState=inactive\n"), nil
+	})
+	defer r()
+
+	err := s.addSnapServices(info, false)
+	c.Assert(err, IsNil)
+
+	// Restart without restarting things that were inactive to test this case,
+	// which should result in just svc1 restarting
+	s.sysdLog = nil
+	services := info.Services()
+	sort.Sort(snap.AppInfoBySnapApp(services))
+	c.Assert(wrappers.RestartServices(services, nil, nil, progress.Null, s.perfTimings), IsNil)
+	c.Check(s.sysdLog, DeepEquals, [][]string{
+		{"show", "--property=Id,ActiveState,UnitFileState,Type,Names,NeedDaemonReload", srvFile1, srvFile2},
+		{"show", "--property=Id,ActiveState,UnitFileState,Names", srvFile2Sock1, srvFile2Sock2},
+		{"stop", srvFile1},
+		{"show", "--property=ActiveState", srvFile1},
+		{"start", srvFile1},
+	})
+
+	// Restart but with restarting non-active. This restarts the activators for the
+	// activated service, but the inactive primary unit still stays stopped.
+	s.sysdLog = nil
+	c.Assert(wrappers.RestartServices(services, nil, &wrappers.RestartServicesOptions{AlsoEnabledNonActive: true}, progress.Null, s.perfTimings), IsNil)
+	c.Check(s.sysdLog, DeepEquals, [][]string{
+		{"show", "--property=Id,ActiveState,UnitFileState,Type,Names,NeedDaemonReload", srvFile1, srvFile2},
+		{"show", "--property=Id,ActiveState,UnitFileState,Names", srvFile2Sock1, srvFile2Sock2},
+		{"stop", srvFile1},
+		{"show", "--property=ActiveState", srvFile1},
+		{"start", srvFile1},
+		{"stop", srvFile2Sock1, srvFile2Sock2},
+		{"show", "--property=ActiveState", srvFile2Sock1},
+		{"show", "--property=ActiveState", srvFile2Sock2},
+		{"start", srvFile2Sock1, srvFile2Sock2},
+	})
+
+	// Restart but also reload. Reload skips activators, and idle activated
+	// services still keep their primary unit stopped. The only reload here is for
+	// svc1, which is the only primary unit reported active.
+	s.sysdLog = nil
+	c.Assert(wrappers.RestartServices(services, nil, &wrappers.RestartServicesOptions{Reload: true}, progress.Null, s.perfTimings), IsNil)
+	c.Check(s.sysdLog, DeepEquals, [][]string{
+		{"show", "--property=Id,ActiveState,UnitFileState,Type,Names,NeedDaemonReload", srvFile1, srvFile2},
+		{"show", "--property=Id,ActiveState,UnitFileState,Names", srvFile2Sock1, srvFile2Sock2},
+		{"reload-or-restart", srvFile1},
+	})
+}
+
+func (s *servicesTestSuite) TestRestartWithActivatedServicesActive(c *C) {
+	const manyServicesYaml = `name: test-snap
+version: 1.0
+apps:
+  svc1:
+    command: bin/foo
+    daemon: simple
+  svc2:
+    daemon: simple
+    plugs: [network-bind]
+    sockets:
+      sock1:
+        listen-stream: $SNAP_DATA/sock1.socket
+        socket-mode: 0666
+      sock2:
+        listen-stream: $SNAP_COMMON/sock2.socket
+`
+	srvFile1 := "snap.test-snap.svc1.service"
+	srvFile2 := "snap.test-snap.svc2.service"
+	srvFile2Sock1 := "snap.test-snap.svc2.sock1.socket"
+	srvFile2Sock2 := "snap.test-snap.svc2.sock2.socket"
+
+	info := snaptest.MockSnap(c, manyServicesYaml, &snap.SideInfo{Revision: snap.R(1)})
+
+	r := systemd.MockSystemctl(func(cmd ...string) ([]byte, error) {
+		s.sysdLog = append(s.sysdLog, cmd)
+		states := map[string]systemdtest.ServiceState{
+			srvFile1:      {ActiveState: "inactive", UnitFileState: "enabled"},
+			srvFile2:      {ActiveState: "inactive", UnitFileState: "enabled"},
+			srvFile2Sock1: {ActiveState: "active", UnitFileState: "enabled"},
+			srvFile2Sock2: {ActiveState: "active", UnitFileState: "enabled"},
+		}
+		if out := systemdtest.HandleMockAllUnitsActiveOutput(cmd, states); out != nil {
+			return out, nil
+		}
+		return []byte("ActiveState=inactive\n"), nil
+	})
+	defer r()
+
+	err := s.addSnapServices(info, false)
+	c.Assert(err, IsNil)
+
+	// Restart without restarting things that were inactive,
+	// which will result in activators only restarting
+	s.sysdLog = nil
+	services := info.Services()
+	sort.Sort(snap.AppInfoBySnapApp(services))
+	c.Assert(wrappers.RestartServices(services, nil, nil, progress.Null, s.perfTimings), IsNil)
+	c.Check(s.sysdLog, DeepEquals, [][]string{
+		{"show", "--property=Id,ActiveState,UnitFileState,Type,Names,NeedDaemonReload", srvFile1, srvFile2},
+		{"show", "--property=Id,ActiveState,UnitFileState,Names", srvFile2Sock1, srvFile2Sock2},
+		{"stop", srvFile2Sock1, srvFile2Sock2},
+		{"show", "--property=ActiveState", srvFile2Sock1},
+		{"show", "--property=ActiveState", srvFile2Sock2},
+		{"start", srvFile2Sock1, srvFile2Sock2},
+	})
+
+	// Restart but with restarting non-active. The non-activated service restarts,
+	// and the activated service only restarts its activators because the primary
+	// unit was reported inactive.
+	s.sysdLog = nil
+	c.Assert(wrappers.RestartServices(services, nil, &wrappers.RestartServicesOptions{AlsoEnabledNonActive: true}, progress.Null, s.perfTimings), IsNil)
+	c.Check(s.sysdLog, DeepEquals, [][]string{
+		{"show", "--property=Id,ActiveState,UnitFileState,Type,Names,NeedDaemonReload", srvFile1, srvFile2},
+		{"show", "--property=Id,ActiveState,UnitFileState,Names", srvFile2Sock1, srvFile2Sock2},
+		{"stop", srvFile1},
+		{"show", "--property=ActiveState", srvFile1},
+		{"start", srvFile1},
+		{"stop", srvFile2Sock1, srvFile2Sock2},
+		{"show", "--property=ActiveState", srvFile2Sock1},
+		{"show", "--property=ActiveState", srvFile2Sock2},
+		{"start", srvFile2Sock1, srvFile2Sock2},
+	})
+
+	// Restart but also reload. The primary units are reported inactive, so they
+	// must stay stopped.
+	s.sysdLog = nil
+	c.Assert(wrappers.RestartServices(services, nil, &wrappers.RestartServicesOptions{Reload: true}, progress.Null, s.perfTimings), IsNil)
+	c.Check(s.sysdLog, DeepEquals, [][]string{
+		{"show", "--property=Id,ActiveState,UnitFileState,Type,Names,NeedDaemonReload", srvFile1, srvFile2},
+		{"show", "--property=Id,ActiveState,UnitFileState,Names", srvFile2Sock1, srvFile2Sock2},
+	})
+}
+
+func (s *servicesTestSuite) TestRestartWithActivatedServicesActivePrimaryUnit(c *C) {
+	const manyServicesYaml = `name: test-snap
+version: 1.0
+apps:
+  svc1:
+    command: bin/foo
+    daemon: simple
+  svc2:
+    daemon: simple
+    plugs: [network-bind]
+    sockets:
+      sock1:
+        listen-stream: $SNAP_DATA/sock1.socket
+        socket-mode: 0666
+      sock2:
+        listen-stream: $SNAP_COMMON/sock2.socket
+`
+	srvFile1 := "snap.test-snap.svc1.service"
+	srvFile2 := "snap.test-snap.svc2.service"
+	srvFile2Sock1 := "snap.test-snap.svc2.sock1.socket"
+	srvFile2Sock2 := "snap.test-snap.svc2.sock2.socket"
+
+	info := snaptest.MockSnap(c, manyServicesYaml, &snap.SideInfo{Revision: snap.R(1)})
+
+	r := systemd.MockSystemctl(func(cmd ...string) ([]byte, error) {
+		s.sysdLog = append(s.sysdLog, cmd)
+		states := map[string]systemdtest.ServiceState{
+			srvFile1:      {ActiveState: "inactive", UnitFileState: "enabled"},
+			srvFile2:      {ActiveState: "active", UnitFileState: "enabled"},
+			srvFile2Sock1: {ActiveState: "active", UnitFileState: "enabled"},
+			srvFile2Sock2: {ActiveState: "active", UnitFileState: "enabled"},
+		}
+		if out := systemdtest.HandleMockAllUnitsActiveOutput(cmd, states); out != nil {
+			return out, nil
+		}
+		return []byte("ActiveState=inactive\n"), nil
+	})
+	defer r()
+
+	err := s.addSnapServices(info, false)
+	c.Assert(err, IsNil)
+
+	s.sysdLog = nil
+	services := info.Services()
+	sort.Sort(snap.AppInfoBySnapApp(services))
+	c.Assert(wrappers.RestartServices(services, nil, nil, progress.Null, s.perfTimings), IsNil)
+	c.Check(s.sysdLog, DeepEquals, [][]string{
+		{"show", "--property=Id,ActiveState,UnitFileState,Type,Names,NeedDaemonReload", srvFile1, srvFile2},
+		{"show", "--property=Id,ActiveState,UnitFileState,Names", srvFile2Sock1, srvFile2Sock2},
+		{"stop", srvFile2Sock1, srvFile2Sock2, srvFile2},
+		{"show", "--property=ActiveState", srvFile2Sock1},
+		{"show", "--property=ActiveState", srvFile2Sock2},
+		{"show", "--property=ActiveState", srvFile2},
+		{"start", srvFile2Sock1, srvFile2Sock2, srvFile2},
+	})
+
+	// Restart but also reload. Only the active primary unit should be
+	// reload-or-restarted.
+	s.sysdLog = nil
+	c.Assert(wrappers.RestartServices(services, nil, &wrappers.RestartServicesOptions{Reload: true}, progress.Null, s.perfTimings), IsNil)
+	c.Check(s.sysdLog, DeepEquals, [][]string{
+		{"show", "--property=Id,ActiveState,UnitFileState,Type,Names,NeedDaemonReload", srvFile1, srvFile2},
+		{"show", "--property=Id,ActiveState,UnitFileState,Names", srvFile2Sock1, srvFile2Sock2},
+		{"reload-or-restart", srvFile2},
+	})
+}
+
+func (s *servicesTestSuite) TestRestartWithActivatedServicesInactiveExplicitReload(c *C) {
+	const snapYaml = `name: test-snap
+version: 1.0
+apps:
+  svc1:
+    daemon: simple
+    plugs: [network-bind]
+    sockets:
+      sock1:
+        listen-stream: $SNAP_DATA/sock1.socket
+        socket-mode: 0666
+      sock2:
+        listen-stream: $SNAP_COMMON/sock2.socket
+`
+	srvFile1 := "snap.test-snap.svc1.service"
+	srvFile1Sock1 := "snap.test-snap.svc1.sock1.socket"
+	srvFile1Sock2 := "snap.test-snap.svc1.sock2.socket"
+
+	info := snaptest.MockSnap(c, snapYaml, &snap.SideInfo{Revision: snap.R(1)})
+
+	r := systemd.MockSystemctl(func(cmd ...string) ([]byte, error) {
+		s.sysdLog = append(s.sysdLog, cmd)
+		states := map[string]systemdtest.ServiceState{
+			srvFile1:      {ActiveState: "inactive", UnitFileState: "enabled"},
+			srvFile1Sock1: {ActiveState: "inactive", UnitFileState: "enabled"},
+			srvFile1Sock2: {ActiveState: "inactive", UnitFileState: "enabled"},
+		}
+		if out := systemdtest.HandleMockAllUnitsActiveOutput(cmd, states); out != nil {
+			return out, nil
+		}
+		return []byte("ActiveState=inactive\n"), nil
+	})
+	defer r()
+
+	err := s.addSnapServices(info, false)
+	c.Assert(err, IsNil)
+
+	s.sysdLog = nil
+	services := info.Services()
+	sort.Sort(snap.AppInfoBySnapApp(services))
+	c.Assert(wrappers.RestartServices(services, []string{srvFile1}, &wrappers.RestartServicesOptions{Reload: true}, progress.Null, s.perfTimings), IsNil)
+	c.Check(s.sysdLog, DeepEquals, [][]string{
+		{"show", "--property=Id,ActiveState,UnitFileState,Type,Names,NeedDaemonReload", srvFile1},
+		{"show", "--property=Id,ActiveState,UnitFileState,Names", srvFile1Sock1, srvFile1Sock2},
 	})
 }
 
@@ -4915,8 +5652,8 @@ func (s *servicesTestSuite) TestStopAndDisableServices(c *C) {
 	c.Assert(err, IsNil)
 
 	s.sysdLog = nil
-	flags := &wrappers.StopServicesFlags{Disable: true}
-	err = wrappers.StopServices(info.Services(), flags, "", progress.Null, s.perfTimings)
+	opts := &wrappers.StopServicesOptions{Disable: true}
+	err = wrappers.StopServices(info.Services(), nil, opts, "", progress.Null, s.perfTimings)
 	c.Assert(err, IsNil)
 	c.Check(s.sysdLog, DeepEquals, [][]string{
 		{"stop", svcFile},
@@ -4926,71 +5663,8 @@ func (s *servicesTestSuite) TestStopAndDisableServices(c *C) {
 	})
 }
 
-func (s *servicesTestSuite) TestUsersToUids(c *C) {
-	r := wrappers.MockUserLookup(func(username string) (*user.User, error) {
-		switch username {
-		case "test":
-			return &user.User{
-				Uid:      "1000",
-				Gid:      "1000",
-				Username: username,
-				Name:     "test-user",
-				HomeDir:  "~",
-			}, nil
-		case "root":
-			return &user.User{
-				Uid:      "0",
-				Gid:      "0",
-				Username: username,
-				Name:     "root",
-				HomeDir:  "/",
-			}, nil
-		default:
-			return nil, fmt.Errorf("unexpected username in test: %s", username)
-		}
-	})
-	defer r()
-
-	users, err := wrappers.UsersToUids([]string{"root", "test"})
-	c.Assert(err, IsNil)
-	c.Check(users, DeepEquals, map[int]string{
-		0:    "root",
-		1000: "test",
-	})
-}
-
-func (s *servicesTestSuite) TestUsersToUidsEmpty(c *C) {
-	users, err := wrappers.UsersToUids([]string{})
-	c.Assert(err, IsNil)
-	c.Check(users, DeepEquals, map[int]string{})
-}
-
-func (s *servicesTestSuite) TestUsersToUidsFails(c *C) {
-	r := wrappers.MockUserLookup(func(username string) (*user.User, error) {
-		c.Check(username, Equals, "test")
-		return nil, fmt.Errorf("oh no")
-	})
-	defer r()
-
-	_, err := wrappers.UsersToUids([]string{"test"})
-	c.Assert(err, ErrorMatches, `oh no`)
-}
-
-func (s *servicesTestSuite) TestUsersToUidsFailsInvalidUid(c *C) {
-	r := wrappers.MockUserLookup(func(username string) (*user.User, error) {
-		c.Check(username, Equals, "root")
-		return &user.User{
-			Uid: "hello",
-		}, nil
-	})
-	defer r()
-
-	_, err := wrappers.UsersToUids([]string{"root"})
-	c.Assert(err, ErrorMatches, `strconv.Atoi: parsing "hello": invalid syntax`)
-}
-
 func (s *servicesTestSuite) TestNewUserServiceClientNames(c *C) {
-	r := wrappers.MockUserLookup(func(username string) (*user.User, error) {
+	r := osutil.MockUserLookup(func(username string) (*user.User, error) {
 		switch username {
 		case "test":
 			return &user.User{
@@ -5020,7 +5694,7 @@ func (s *servicesTestSuite) TestNewUserServiceClientNames(c *C) {
 }
 
 func (s *servicesTestSuite) TestNewUserServiceClientNamesFails(c *C) {
-	r := wrappers.MockUserLookup(func(username string) (*user.User, error) {
+	r := osutil.MockUserLookup(func(username string) (*user.User, error) {
 		c.Check(username, Equals, "test")
 		return nil, fmt.Errorf("oh no")
 	})

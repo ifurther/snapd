@@ -28,50 +28,58 @@ import (
 	"github.com/snapcore/snapd/overlord/snapstate/backend"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/store"
 	"github.com/snapcore/snapd/testutil"
-	userclient "github.com/snapcore/snapd/usersession/client"
-	"github.com/snapcore/snapd/wrappers"
 )
 
 type (
 	ManagerBackend managerBackend
 
 	MinimalInstallInfo  = minimalInstallInfo
+	SnapUpdate          = update
 	InstallSnapInfo     = installSnapInfo
-	ByType              = byType
 	DirMigrationOptions = dirMigrationOptions
 	Migration           = migration
 
 	ReRefreshSetup = reRefreshSetup
 
 	TooSoonError = tooSoonError
+
+	Target = target
+
+	InstallContext = installContext
 )
 
+var ComponentSetupTask = componentSetupTask
+var RemoveComponentTasks = removeComponentTasks
+var DiskSpaceReservation = diskSpaceReservation
+
 const (
-	None         = none
-	Full         = full
-	Hidden       = hidden
-	Home         = home
-	RevertHidden = revertHidden
-	DisableHome  = disableHome
-	RevertFull   = revertFull
+	None                        = none
+	Full                        = full
+	Hidden                      = hidden
+	Home                        = home
+	RevertHidden                = revertHidden
+	DisableHome                 = disableHome
+	RevertFull                  = revertFull
+	DefaultDiskSpaceReservation = defaultDiskSpaceReservation
 )
 
 func SetSnapManagerBackend(s *SnapManager, b ManagerBackend) {
 	s.backend = b
 }
 
-func MockSnapReadInfo(mock func(name string, si *snap.SideInfo) (*snap.Info, error)) (restore func()) {
+func MockSnapReadInfo(mock func(name naming.InstanceName, si *snap.SideInfo) (*snap.Info, error)) (restore func()) {
 	old := snapReadInfo
 	snapReadInfo = mock
 	return func() { snapReadInfo = old }
 }
 
-func MockReadComponentInfo(mock func(compMntDir string, snapInfo *snap.Info) (*snap.ComponentInfo, error)) (restore func()) {
-	old := readComponentInfo
-	readComponentInfo = mock
-	return func() { readComponentInfo = old }
+func MockReadComponentInfo(mock func(compMntDir string, snapInfo *snap.Info, csi *snap.ComponentSideInfo) (*snap.ComponentInfo, error)) (restore func()) {
+	old := readComponentInfoAt
+	readComponentInfoAt = mock
+	return func() { readComponentInfoAt = old }
 }
 
 func MockMountPollInterval(intv time.Duration) (restore func()) {
@@ -114,7 +122,7 @@ var (
 	CanDisable             = canDisable
 	CachedStore            = cachedStore
 	DefaultRefreshSchedule = defaultRefreshScheduleStr
-	DoInstall              = doInstall
+	DoInstallOrPreDownload = doInstallOrPreDownload
 	UserFromUserID         = userFromUserID
 	ValidateFeatureFlags   = validateFeatureFlags
 	ResolveChannel         = resolveChannel
@@ -123,24 +131,17 @@ var (
 
 	HasOtherInstances = hasOtherInstances
 
-	SafetyMarginDiskSpace = safetyMarginDiskSpace
-
 	AffectedByRefresh = affectedByRefresh
 
-	GetDirMigrationOpts                  = getDirMigrationOpts
-	WriteSeqFile                         = writeSeqFile
-	TriggeredMigration                   = triggeredMigration
-	TaskSetsByTypeForEssentialSnaps      = taskSetsByTypeForEssentialSnaps
-	SetDefaultRestartBoundaries          = setDefaultRestartBoundaries
-	DeviceModelBootBase                  = deviceModelBootBase
-	SplitTaskSetByRebootEdges            = splitTaskSetByRebootEdges
-	ArrangeSnapToWaitForBaseIfPresent    = arrangeSnapToWaitForBaseIfPresent
-	ArrangeSnapTaskSetsLinkageAndRestart = arrangeSnapTaskSetsLinkageAndRestart
-	ReRefreshSummary                     = reRefreshSummary
-)
+	GetDirMigrationOpts             = getDirMigrationOpts
+	WriteSeqFile                    = writeSeqFile
+	TriggeredMigration              = triggeredMigration
+	TaskSetsByTypeForEssentialSnaps = taskSetsByTypeForEssentialSnaps
+	SetDefaultRestartBoundaries     = setDefaultRestartBoundaries
+	DeviceModelBootBase             = deviceModelBootBase
+	ReRefreshSummary                = reRefreshSummary
 
-const (
-	NoRestartBoundaries = noRestartBoundaries
+	MaybeFindTasksetForSnap = maybeFindTasksetForSnap
 )
 
 func PreviousSideInfo(snapst *SnapState) *snap.SideInfo {
@@ -148,7 +149,18 @@ func PreviousSideInfo(snapst *SnapState) *snap.SideInfo {
 }
 
 // helpers
-var InstallSize = installSize
+var (
+	InstallSize          = installSize
+	ResealingTaskBlocked = resealingTaskBlocked
+)
+
+func ResealingTaskKinds() []string {
+	kinds := make([]string, 0, len(resealingTaskKindCheckers))
+	for kind := range resealingTaskKindCheckers {
+		kinds = append(kinds, kind)
+	}
+	return kinds
+}
 
 // aliases v2
 var (
@@ -165,6 +177,11 @@ var (
 	CheckDBusServiceConflicts = checkDBusServiceConflicts
 )
 
+// desktop-file-ids
+var (
+	CheckDesktopFileIDsConflicts = checkDesktopFileIDsConflicts
+)
+
 // readme files
 var (
 	WriteSnapReadme = writeSnapReadme
@@ -177,13 +194,37 @@ var (
 	NewRefreshHints               = newRefreshHints
 	CanRefreshOnMeteredConnection = canRefreshOnMeteredConnection
 
-	NewCatalogRefresh            = newCatalogRefresh
-	CatalogRefreshDelayBase      = catalogRefreshDelayBase
-	CatalogRefreshDelayWithDelta = catalogRefreshDelayWithDelta
+	NewCatalogRefresh       = newCatalogRefresh
+	CatalogRefreshDelayBase = catalogRefreshDelayBase
 
 	SoftCheckNothingRunningForRefresh     = softCheckNothingRunningForRefresh
 	HardEnsureNothingRunningDuringRefresh = hardEnsureNothingRunningDuringRefresh
 )
+
+func (r *refreshHints) Ensure() error {
+	r.state.Lock()
+	deviceCtx, err := DeviceCtx(r.state, nil, nil)
+	r.state.Unlock()
+	if err != nil {
+		return err
+	}
+	return r.EnsureAfterSeed(deviceCtx)
+}
+
+func (r *catalogRefresh) Ensure() error {
+	r.state.Lock()
+	seeded, err := SystemSeeded(r.state)
+	if err != nil || !seeded {
+		r.state.Unlock()
+		return err
+	}
+	deviceCtx, err := DeviceCtx(r.state, nil, nil)
+	r.state.Unlock()
+	if err != nil {
+		return err
+	}
+	return r.EnsureAfterSeed(deviceCtx)
+}
 
 // cleanup
 var (
@@ -238,6 +279,16 @@ func NextCatalogRefresh(cr *catalogRefresh) time.Time {
 	return cr.nextCatalogRefresh
 }
 
+func WaitCatalogRefresh(cr *catalogRefresh) {
+	if cr.catalogC != nil {
+		<-cr.catalogC
+	}
+}
+
+func StopCatalogRefresh(m *SnapManager) {
+	m.catalogRefresh.Stop()
+}
+
 func MockRefreshRetryDelay(d time.Duration) func() {
 	origRefreshRetryDelay := refreshRetryDelay
 	refreshRetryDelay = d
@@ -270,19 +321,19 @@ func MockLocalInstallLastCleanup(t time.Time) (restore func()) {
 	}
 }
 
-func MockAsyncPendingRefreshNotification(fn func(context.Context, *userclient.PendingSnapRefreshInfo)) (restore func()) {
-	old := asyncPendingRefreshNotification
-	asyncPendingRefreshNotification = fn
-	return func() {
-		asyncPendingRefreshNotification = old
-	}
-}
-
 func MockHasActiveConnection(fn func(st *state.State, iface string) (bool, error)) (restore func()) {
 	old := HasActiveConnection
 	HasActiveConnection = fn
 	return func() {
 		HasActiveConnection = old
+	}
+}
+
+func MockOnRefreshInhibitionTimeout(fn func(chg *state.Change, snapName string) error) (restore func()) {
+	old := onRefreshInhibitionTimeout
+	onRefreshInhibitionTimeout = fn
+	return func() {
+		onRefreshInhibitionTimeout = old
 	}
 }
 
@@ -313,15 +364,7 @@ func MockReRefreshRetryTimeout(d time.Duration) (restore func()) {
 	}
 }
 
-// aux store info
-var (
-	AuxStoreInfoFilename = auxStoreInfoFilename
-	RetrieveAuxStoreInfo = retrieveAuxStoreInfo
-	KeepAuxStoreInfo     = keepAuxStoreInfo
-	DiscardAuxStoreInfo  = discardAuxStoreInfo
-)
-
-type AuxStoreInfo = auxStoreInfo
+type DisabledServices = disabledServices
 
 // link, misc handlers
 var (
@@ -344,12 +387,12 @@ func MockEnsuredDesktopFilesUpdated(m *SnapManager, ensured bool) (restore func(
 	}
 }
 
-func MockEnsuredDownloadsCleaned(m *SnapManager, ensured bool) (restore func()) {
-	old := m.ensuredDownloadsCleaned
-	m.ensuredDownloadsCleaned = ensured
-	return func() {
-		m.ensuredDownloadsCleaned = old
-	}
+func SetEnsuredDownloadsCleanedNext(m *SnapManager, next time.Time) {
+	m.ensuredDownloadsCleanedNext = next
+}
+
+func GetEnsuredDownloadsCleanedNext(m *SnapManager) time.Time {
+	return m.ensuredDownloadsCleanedNext
 }
 
 func MockPidsOfSnap(f func(instanceName string) (map[string][]int, error)) func() {
@@ -376,7 +419,7 @@ func MockInstallSize(f func(st *state.State, snaps []minimalInstallInfo, userID 
 	}
 }
 
-func MockGenerateSnapdWrappers(f func(snapInfo *snap.Info, opts *backend.GenerateSnapdWrappersOptions) (wrappers.SnapdRestart, error)) func() {
+func MockGenerateSnapdWrappers(f func(snapInfo *snap.Info, opts *backend.GenerateSnapdWrappersOptions) error) func() {
 	old := generateSnapdWrappers
 	generateSnapdWrappers = f
 	return func() {
@@ -390,11 +433,10 @@ var (
 
 // autorefresh
 var (
-	InhibitRefresh                       = inhibitRefresh
-	MaxInhibition                        = maxInhibition
-	MaxDuration                          = maxDuration
-	MaybeAddRefreshInhibitNotice         = maybeAddRefreshInhibitNotice
-	MaybeAsyncPendingRefreshNotification = maybeAsyncPendingRefreshNotification
+	InhibitRefresh               = inhibitRefresh
+	MaxDuration                  = maxDuration
+	MaxInhibitionDuration        = maxInhibitionDuration
+	MaybeAddRefreshInhibitNotice = maybeAddRefreshInhibitNotice
 )
 
 type RefreshCandidate = refreshCandidate
@@ -415,11 +457,17 @@ func MockRefreshAppsCheck(fn func(info *snap.Info) error) (restore func()) {
 	return func() { refreshAppsCheck = old }
 }
 
+func MockCheckSeedRefreshRemove(fn func(st *state.State, candidate SeedRefreshCandidate, dctx DeviceContext) error) (restore func()) {
+	r := testutil.Backup(&CheckSeedRefreshRemove)
+	CheckSeedRefreshRemove = fn
+	return r
+}
+
 func (m *autoRefresh) EnsureRefreshHoldAtLeast(d time.Duration) error {
 	return m.ensureRefreshHoldAtLeast(d)
 }
 
-func MockSecurityProfilesDiscardLate(fn func(snapName string, rev snap.Revision, typ snap.Type) error) (restore func()) {
+func MockSecurityProfilesDiscardLate(fn func(instanceName naming.InstanceName, rev snap.Revision, typ snap.Type) error) (restore func()) {
 	old := SecurityProfilesRemoveLate
 	SecurityProfilesRemoveLate = fn
 	return func() {
@@ -430,17 +478,19 @@ func MockSecurityProfilesDiscardLate(fn func(snapName string, rev snap.Revision,
 type HoldState = holdState
 
 var (
-	HoldDurationLeft           = holdDurationLeft
-	LastRefreshed              = lastRefreshed
-	PruneRefreshCandidates     = pruneRefreshCandidates
-	UpdateRefreshCandidates    = updateRefreshCandidates
-	ResetGatingForRefreshed    = resetGatingForRefreshed
-	PruneGating                = pruneGating
-	PruneSnapsHold             = pruneSnapsHold
-	CreateGateAutoRefreshHooks = createGateAutoRefreshHooks
-	AutoRefreshPhase1          = autoRefreshPhase1
-	RefreshRetain              = refreshRetain
-	RefreshCheck               = refreshAppsCheck
+	HoldDurationLeft                     = holdDurationLeft
+	LastRefreshed                        = lastRefreshed
+	PruneRefreshCandidates               = pruneRefreshCandidates
+	UpdateRefreshCandidates              = updateRefreshCandidates
+	ResetGatingForRefreshed              = resetGatingForRefreshed
+	PruneGating                          = pruneGating
+	PruneSnapsHold                       = pruneSnapsHold
+	CreateGateAutoRefreshHooks           = createGateAutoRefreshHooks
+	AutoRefreshPhase1                    = autoRefreshPhase1
+	RefreshRetain                        = refreshRetain
+	RefreshCheck                         = refreshAppsCheck
+	AffectsRunningHooks                  = affectsRunningHooks
+	ShouldScheduleUpdateCertDBForRefresh = shouldScheduleUpdateCertDBForRefresh
 
 	ExcludeFromRefreshAppAwareness = excludeFromRefreshAppAwareness
 )
@@ -558,4 +608,79 @@ func SetRestoredMonitoring(snapmgr *SnapManager, value bool) {
 
 func SetPreseed(snapmgr *SnapManager, value bool) {
 	snapmgr.preseed = value
+}
+
+func SetStoreCacheCleanNext(snapmgr *SnapManager, when time.Time) {
+	snapmgr.ensureStoreCacheCleanNext = when
+}
+
+func GetStoreCacheCleanNext(snapmgr *SnapManager) time.Time {
+	return snapmgr.ensureStoreCacheCleanNext
+}
+
+func SplitEssentialUpdates(deviceCtx DeviceContext, updates []SnapUpdate) (essential, nonEssential []SnapUpdate) {
+	return splitEssentialUpdates(deviceCtx, updates)
+}
+
+func MockAffectedSnapsByAttr(value map[string]AffectedSnapsFunc) (restore func()) {
+	old := affectedSnapsByAttr
+	affectedSnapsByAttr = value
+	return func() {
+		affectedSnapsByAttr = old
+	}
+}
+
+func MockAffectedSnapsByKind(value map[string]AffectedSnapsFunc) (restore func()) {
+	old := affectedSnapsByKind
+	affectedSnapsByKind = value
+	return func() {
+		affectedSnapsByKind = old
+	}
+}
+
+// CustomInstallGoal allows us to define custom implementations of installGoal
+// to be used in tests.
+type CustomInstallGoal struct {
+	ToInstall func(context.Context, *state.State, Options) ([]Target, error)
+}
+
+func (c *CustomInstallGoal) toInstall(ctx context.Context, st *state.State, opts Options) ([]Target, error) {
+	return c.ToInstall(ctx, st, opts)
+}
+
+func (sts *snapInstallTaskSet) TaskSet() *state.TaskSet {
+	return sts.ts
+}
+
+type SnapInstallTaskSet = snapInstallTaskSet
+
+func NewSnapInstallTaskSetForTest(
+	snapsup *SnapSetup,
+	ts *state.TaskSet,
+	prerequisites *state.Task,
+	beforeLocalSystemModificationsTasks []*state.Task,
+	prerequisitesSync *state.Task,
+	mountSnap *state.Task,
+	upToLinkSnapAndBeforeReboot, afterLinkSnapAndPostReboot []*state.Task,
+) SnapInstallTaskSet {
+	return SnapInstallTaskSet{
+		ts:                                  ts,
+		snapsup:                             snapsup,
+		prerequisites:                       prerequisites,
+		beforeLocalSystemModificationsTasks: beforeLocalSystemModificationsTasks,
+		prerequisitesSync:                   prerequisitesSync,
+		mountSnap:                           mountSnap,
+		upToLinkSnapAndBeforeReboot:         upToLinkSnapAndBeforeReboot,
+		afterLinkSnapAndPostReboot:          afterLinkSnapAndPostReboot,
+	}
+}
+
+var ArrangeRebootAndUpdateSeed = arrangeRebootAndUpdateSeed
+
+func MockProcessDelayedSecurityBackendEffects(f func(st *state.State, lanes []int, joinLane int) (ts *state.TaskSet)) (restore func()) {
+	return testutil.Mock(&ProcessDelayedSecurityBackendEffects, f)
+}
+
+func (s *catalogRefresh) GetCatalogRefreshDelayWithDelta() time.Duration {
+	return s.catalogRefreshDelayWithDelta
 }

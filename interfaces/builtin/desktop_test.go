@@ -105,7 +105,9 @@ func (s *DesktopInterfaceSuite) TestAppArmorSpec(c *C) {
 
 	// On an all-snaps system, the desktop interface grants access
 	// to system fonts.
-	spec := apparmor.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	appSet, err := interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec := apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.appSlot), IsNil)
 	c.Assert(spec.SecurityTags(), DeepEquals, []string{"snap.consumer.app"})
 	c.Check(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "# Description: Can access basic graphical desktop resources")
@@ -122,7 +124,9 @@ func (s *DesktopInterfaceSuite) TestAppArmorSpec(c *C) {
 	c.Check(updateNS, testutil.Contains, "  # Read-only access to /var/cache/fontconfig\n")
 
 	// There are permanent rules on the slot side
-	spec = apparmor.NewSpecification(interfaces.NewSnapAppSet(s.appSlotInfo.Snap))
+	appSet, err = interfaces.NewSnapAppSet(s.appSlotInfo.Snap, nil)
+	c.Assert(err, IsNil)
+	spec = apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddPermanentSlot(s.iface, s.appSlotInfo), IsNil)
 	c.Assert(spec.SecurityTags(), DeepEquals, []string{"snap.provider.app"})
 	c.Check(spec.SnippetForTag("snap.provider.app"), testutil.Contains, "# Description: Can provide various desktop services")
@@ -131,12 +135,16 @@ func (s *DesktopInterfaceSuite) TestAppArmorSpec(c *C) {
 	// On a classic system, additional permissions are granted
 	restore = release.MockOnClassic(true)
 	defer restore()
-	spec = apparmor.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	appSet, err = interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec = apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.coreSlot), IsNil)
 
 	c.Assert(spec.SecurityTags(), DeepEquals, []string{"snap.consumer.app"})
 	c.Check(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "# Description: Can access basic graphical desktop resources")
 	c.Check(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "/etc/gtk-3.0/settings.ini r,")
+	c.Check(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "owner @{HOME}/.config/gtk-3.0/{*.css,**/*.css} r,")
+	c.Check(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "owner @{HOME}/.config/gtk-4.0/{*.css,**/*.css} r,")
 	c.Check(spec.SnippetForTag("snap.consumer.app"), testutil.Contains, "# Allow access to xdg-desktop-portal and xdg-document-portal")
 
 	// check desktop interface uses correct label for Mutter when provided
@@ -151,10 +159,56 @@ func (s *DesktopInterfaceSuite) TestAppArmorSpec(c *C) {
 	c.Check(updateNS, testutil.Contains, "  # Read-only access to /var/cache/fontconfig\n")
 
 	// connected plug to core slot
-	spec = apparmor.NewSpecification(interfaces.NewSnapAppSet(s.coreSlotInfo.Snap))
+	appSet, err = interfaces.NewSnapAppSet(s.coreSlotInfo.Snap, nil)
+	c.Assert(err, IsNil)
+	spec = apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddPermanentSlot(s.iface, s.coreSlotInfo), IsNil)
 	c.Assert(spec.AddConnectedSlot(s.iface, s.plug, s.coreSlot), IsNil)
 	c.Assert(spec.SecurityTags(), HasLen, 0)
+}
+
+func (s *DesktopInterfaceSuite) TestChromiumStatusNotifierAppArmor(c *C) {
+	appSet, err := interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	plugSpec := apparmor.NewSpecification(appSet)
+	c.Assert(plugSpec.AddConnectedPlug(s.iface, s.plug, s.appSlot), IsNil)
+	plugSnippet := plugSpec.SnippetForTag("snap.consumer.app")
+
+	c.Check(plugSnippet, testutil.Contains, `member="{Request,Release}Name"`)
+	c.Check(plugSnippet, testutil.Contains, `name=org.freedesktop.StatusNotifierItem-[0-9]*-[0-9]*,`)
+	c.Check(plugSnippet, testutil.Contains, `interface=org.freedesktop.StatusNotifierItem
+    path=/{StatusNotifierItem{,/[0-9]*},org/chromium/StatusNotifierItem/[0-9]*}
+    member={Activate,ContextMenu,Scroll,SecondaryActivate}`)
+	c.Check(plugSnippet, testutil.Contains, `path=/{MenuBar,org/chromium/DbusMenu{,/[0-9]*}}`)
+	c.Check(plugSnippet, testutil.Contains, `interface=org.freedesktop.DBus.Properties
+    path=/{StatusNotifierItem{,/[0-9]*},org/chromium/StatusNotifierItem/[0-9]*}
+    member="Get{,All}"`)
+	c.Check(plugSnippet, testutil.Contains, `interface={org.kde.StatusNotifierItem,org.freedesktop.StatusNotifierItem}
+    path=/{StatusNotifierItem{,/[0-9]*},org/chromium/StatusNotifierItem/[0-9]*}
+    member="New{Icon,IconThemePath,ToolTip}"`)
+	c.Check(plugSnippet, testutil.Contains, `interface=org.freedesktop.DBus.Properties
+    path=/{StatusNotifierItem{,/[0-9]*},org/chromium/StatusNotifierItem/[0-9]*}
+    member=PropertiesChanged`)
+
+	appSet, err = interfaces.NewSnapAppSet(s.appSlot.Snap(), nil)
+	c.Assert(err, IsNil)
+	slotSpec := apparmor.NewSpecification(appSet)
+	c.Assert(slotSpec.AddConnectedSlot(s.iface, s.plug, s.appSlot), IsNil)
+	slotSnippet := slotSpec.SnippetForTag("snap.provider.app")
+
+	c.Check(slotSnippet, testutil.Contains, `interface=org.freedesktop.StatusNotifierItem
+    path=/{StatusNotifierItem{,/[0-9]*},org/chromium/StatusNotifierItem/[0-9]*}
+    member={Activate,ContextMenu,Scroll,SecondaryActivate}`)
+	c.Check(slotSnippet, testutil.Contains, `path=/{MenuBar,org/chromium/DbusMenu{,/[0-9]*}}`)
+	c.Check(slotSnippet, testutil.Contains, `interface=org.freedesktop.DBus.Properties
+    path=/{StatusNotifierItem{,/[0-9]*},org/chromium/StatusNotifierItem/[0-9]*}
+    member="Get{,All}"`)
+	c.Check(slotSnippet, testutil.Contains, `interface={org.kde.StatusNotifierItem,org.freedesktop.StatusNotifierItem}
+    path=/{StatusNotifierItem{,/[0-9]*},org/chromium/StatusNotifierItem/[0-9]*}
+    member="New{Icon,IconThemePath,ToolTip}"`)
+	c.Check(slotSnippet, testutil.Contains, `interface=org.freedesktop.DBus.Properties
+    path=/{StatusNotifierItem{,/[0-9]*},org/chromium/StatusNotifierItem/[0-9]*}
+    member=PropertiesChanged`)
 }
 
 func (s *DesktopInterfaceSuite) TestMountSpec(c *C) {
@@ -326,5 +380,69 @@ plugs:
 	} {
 		_, plugInfo := MockConnectedPlug(c, fmt.Sprintf(mockSnapYamlTemplate, value), nil, "desktop")
 		c.Check(interfaces.BeforePreparePlug(s.iface, plugInfo), ErrorMatches, "desktop plug requires bool with 'mount-host-font-cache'", Commentf(value))
+	}
+}
+
+func (s *DesktopInterfaceSuite) TestDesktopFileIDsValidation(c *C) {
+	const mockSnapYaml = `name: desktop-snap
+version: 1.0
+plugs:
+  desktop:
+    desktop-file-ids:
+      - org.example
+      - org.example.Foo
+      - org._example
+      - org.example-foo
+`
+	_, plugInfo := MockConnectedPlug(c, mockSnapYaml, nil, "desktop")
+	c.Check(interfaces.BeforePreparePlug(s.iface, plugInfo), IsNil)
+
+	const mockSnapYamlEmpty = `name: desktop-snap
+version: 1.0
+plugs:
+  desktop:
+`
+	_, plugInfo = MockConnectedPlug(c, mockSnapYamlEmpty, nil, "desktop")
+	c.Check(interfaces.BeforePreparePlug(s.iface, plugInfo), IsNil)
+}
+
+func (s *DesktopInterfaceSuite) TestDesktopFileIDsValidationTypeError(c *C) {
+	for _, tc := range []string{
+		"not-a-list-of-strings",
+		"1",
+		"true",
+		"[[string],1]",
+	} {
+		const mockSnapYaml = `name: desktop-snap
+version: 1.0
+plugs:
+  desktop:
+    desktop-file-ids: %s
+`
+		_, plugInfo := MockConnectedPlug(c, fmt.Sprintf(mockSnapYaml, tc), nil, "desktop")
+
+		err := interfaces.BeforePreparePlug(s.iface, plugInfo)
+		c.Check(err, ErrorMatches, "cannot add desktop plug: \"desktop-file-ids\" must be a list of strings", Commentf(tc))
+	}
+}
+
+func (s *DesktopInterfaceSuite) TestDesktopFileIDsValidationFormatError(c *C) {
+	// Invalid D-Bus names
+	for _, tc := range []string{
+		"[1starts-with-a-digit]",
+		"[ends-with-dot.]",
+		"[org.$pecial-char.Example]",
+		`[""]`,
+	} {
+		const mockSnapYaml = `name: desktop-snap
+version: 1.0
+plugs:
+  desktop:
+    desktop-file-ids: %s
+`
+		_, plugInfo := MockConnectedPlug(c, fmt.Sprintf(mockSnapYaml, tc), nil, "desktop")
+
+		err := interfaces.BeforePreparePlug(s.iface, plugInfo)
+		c.Check(err, ErrorMatches, "desktop-file-ids entry .* is not a valid D-Bus well-known name", Commentf(tc))
 	}
 }

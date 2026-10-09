@@ -18,6 +18,7 @@
 #include "bpf-support.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -39,16 +40,36 @@ static int sys_bpf(enum bpf_cmd cmd, union bpf_attr *attr, size_t size) {
 
 #define __ptr_as_u64(__x) ((uint64_t)(uintptr_t)__x)
 
-int bpf_create_map(enum bpf_map_type type, size_t key_size, size_t value_size, size_t max_entries) {
-    debug("create bpf map of type 0x%x, key size %zu, value size %zu, entries %zu", type, key_size, value_size,
-          max_entries);
+/* set_cloexec sets FD_CLOEXEC on fd. On failure the fd is closed and -1 is
+ * returned with errno preserved from fcntl. On success fd is returned. */
+static int set_cloexec(int fd) {
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+    return fd;
+}
+
+int bpf_create_map(enum bpf_map_type type, size_t key_size, size_t value_size, size_t max_entries,
+                   const char *map_name) {
+    debug("create bpf map of type 0x%x, key size %zu, value size %zu, entries %zu name '%s'", type, key_size,
+          value_size, max_entries, map_name != NULL ? map_name : "(none)");
     union bpf_attr attr;
     memset(&attr, 0, sizeof(attr));
     attr.map_type = type;
     attr.key_size = key_size;
     attr.value_size = value_size;
     attr.max_entries = max_entries;
-    return sys_bpf(BPF_MAP_CREATE, &attr, sizeof(attr));
+    if (map_name != NULL) {
+        strncpy(attr.map_name, map_name, sizeof(attr.map_name) - 1);
+    }
+    int fd = sys_bpf(BPF_MAP_CREATE, &attr, sizeof(attr));
+    if (fd < 0) {
+        return fd;
+    }
+    return set_cloexec(fd);
 }
 
 int bpf_update_map(int map_fd, const void *key, const void *value) {
@@ -80,31 +101,60 @@ int bpf_get_by_path(const char *path) {
     /* pointer must be converted to a u64 */
     attr.pathname = __ptr_as_u64(path);
 
-    return sys_bpf(BPF_OBJ_GET, &attr, sizeof(attr));
+    int fd = sys_bpf(BPF_OBJ_GET, &attr, sizeof(attr));
+    if (fd < 0) {
+        return fd;
+    }
+    return set_cloexec(fd);
 }
 
 int bpf_load_prog(enum bpf_prog_type type, const struct bpf_insn *insns, size_t insns_cnt, char *log_buf,
-                  size_t log_buf_size) {
+                  size_t log_buf_size, const char *prog_name) {
     if (type == BPF_PROG_TYPE_UNSPEC) {
         errno = EINVAL;
         return -1;
     }
-    debug("load program of type 0x%x, %zu instructions", type, insns_cnt);
+    debug("load program of type 0x%x, %zu instructions, name %s", type, insns_cnt,
+          prog_name != NULL ? prog_name : "(none)");
     union bpf_attr attr;
     memset(&attr, 0, sizeof(attr));
     attr.prog_type = type;
     attr.insns = __ptr_as_u64(insns);
     attr.insn_cnt = (uint64_t)insns_cnt;
     attr.license = __ptr_as_u64("GPL");
-    if (log_buf != NULL) {
+
+    if (prog_name != NULL) {
+        strncpy(attr.prog_name, prog_name, sizeof(attr.prog_name) - 1);
+    }
+
+    /* first attempt: load without requesting verifier */
+    int fd = sys_bpf(BPF_PROG_LOAD, &attr, sizeof(attr));
+    if (fd >= 0) {
+        return set_cloexec(fd);
+    }
+
+    /* retry with log buffer to capture verifier diagnostics. This applies a
+     * similar, but way simpler, retry mechanism as libbpf's bpf_prog_load(),
+     * see:
+     * https://github.com/libbpf/libbpf/blob/5ee8863eaf3e948dd602f4bdfd2c256ae3804616/src/bpf.c#L371-L382
+     */
+    if (log_buf != NULL && log_buf_size > 0) {
+        int saved_errno = errno;
+        log_buf[0] = '\0';
         attr.log_buf = __ptr_as_u64(log_buf);
         attr.log_size = log_buf_size;
         attr.log_level = 1;
+        /* note the log buffer may still be too small to hold the output, but
+         * since the initial loading failed there's not much we can do at this
+         * point. */
+        fd = sys_bpf(BPF_PROG_LOAD, &attr, sizeof(attr));
+        if (fd >= 0) {
+            return set_cloexec(fd);
+        }
+        errno = saved_errno;
     }
 
-    /* XXX: libbpf does a while loop checking for EAGAIN */
-    /* XXX: do we need to handle E2BIG? */
-    return sys_bpf(BPF_PROG_LOAD, &attr, sizeof(attr));
+    return -1;
 }
 
 int bpf_prog_attach(enum bpf_attach_type type, int cgroup_fd, int prog_fd) {
@@ -188,8 +238,11 @@ bool bpf_path_is_bpffs(const char *path) {
 void bpf_mount_bpffs(const char *path) {
     /* systemd and bpftool disagree as to the propagation mode of bpffs mounts,
      * so go with the default which is a shared propagation and matches the
-     * state of a freshly booted system */
-    int res = mount("bpf", path, "bpf", 0, "mode=0700");
+     * state of a freshly booted system.
+     * MS_NOSUID|MS_NODEV|MS_NOEXEC are included as a defense-in-depth measure:
+     * bpffs only contains BPF maps and programs, so no executables, device
+     * nodes, or setuid binaries should ever appear there. */
+    int res = mount("bpf", path, "bpf", MS_NOSUID | MS_NODEV | MS_NOEXEC, "mode=0700");
     if (res < 0) {
         die("cannot mount bpf filesystem under %s", path);
     }

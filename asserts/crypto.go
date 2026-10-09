@@ -96,24 +96,64 @@ type openpgpSigner interface {
 	sign(content []byte) (*packet.Signature, error)
 }
 
-func signContent(content []byte, privateKey PrivateKey) ([]byte, error) {
-	signer, ok := privateKey.(openpgpSigner)
-	if !ok {
-		panic(fmt.Errorf("not an internally supported PrivateKey: %T", privateKey))
-	}
-
-	sig, err := signer.sign(content)
+func signAndEncode(content []byte, privateKey PrivateKey) ([]byte, error) {
+	sig, err := RawSignWithKey(content, privateKey)
 	if err != nil {
 		return nil, err
 	}
 
-	buf := new(bytes.Buffer)
+	return encodeV1(sig), nil
+}
+
+// RawSignWithKey signs the given data with the provided [PrivateKey]. The
+// serialized signature returned.
+//
+// This is not intended to sign assertions. Rather, it might be used to
+// explicitly sign data with a device key.
+func RawSignWithKey(data []byte, pk PrivateKey) ([]byte, error) {
+	signer, ok := pk.(openpgpSigner)
+	if !ok {
+		return nil, fmt.Errorf("private key does not support signing: %T", pk)
+	}
+
+	sig, err := signer.sign(data)
+	if err != nil {
+		return nil, err
+	}
+
+	buf := bytes.NewBuffer(nil)
 	err = sig.Serialize(buf)
 	if err != nil {
 		return nil, err
 	}
 
-	return encodeV1(buf.Bytes()), nil
+	return buf.Bytes(), nil
+}
+
+// RawVerifyWithKey verifies that the given signature is valid for the provided
+// data using the specified [PublicKey].
+//
+// This is not intended to verify assertions. Rather, it might be used to verify
+// data signed with a device key.
+func RawVerifyWithKey(data []byte, signature []byte, pk PublicKey) error {
+	pkt, err := packet.Read(bytes.NewReader(signature))
+	if err != nil {
+		return fmt.Errorf("cannot decode signature: %w", err)
+	}
+
+	sig, ok := pkt.(*packet.Signature)
+	if !ok {
+		return fmt.Errorf("expected signature, got instead: %T", pkt)
+	}
+
+	verifier, ok := pk.(interface {
+		verify([]byte, *packet.Signature) error
+	})
+	if !ok {
+		return fmt.Errorf("public key does not support verification: %T", pk)
+	}
+
+	return verifier.verify(data, sig)
 }
 
 func decodeV1(b []byte, kind string) (packet.Packet, error) {
@@ -163,6 +203,9 @@ type PublicKey interface {
 	// verify verifies signature is valid for content using the key.
 	verify(content []byte, sig *packet.Signature) error
 
+	// cryptoPublicKey exposes the underlying crypto public key to internal package code.
+	cryptoPublicKey() crypto.PublicKey
+
 	keyEncoder
 }
 
@@ -179,6 +222,10 @@ func (opgPubKey *openpgpPubKey) verify(content []byte, sig *packet.Signature) er
 	h := sig.Hash.New()
 	h.Write(content)
 	return opgPubKey.pubKey.VerifySignature(h, sig)
+}
+
+func (opgPubKey *openpgpPubKey) cryptoPublicKey() crypto.PublicKey {
+	return opgPubKey.pubKey.PublicKey
 }
 
 func (opgPubKey openpgpPubKey) keyEncode(w io.Writer) error {
@@ -225,6 +272,15 @@ func DecodePublicKey(pubKey []byte) (PublicKey, error) {
 // EncodePublicKey serializes a public key, typically for embedding in an assertion.
 func EncodePublicKey(pubKey PublicKey) ([]byte, error) {
 	return encodeKey(pubKey, "public key")
+}
+
+func cryptoRSAPublicKey(pubKey PublicKey) (*rsa.PublicKey, error) {
+	cryptoPubKey := pubKey.cryptoPublicKey()
+	rsaPubKey, ok := cryptoPubKey.(*rsa.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("internal error: expected RSA public key, got instead: %T", cryptoPubKey)
+	}
+	return rsaPubKey, nil
 }
 
 // PrivateKey is a cryptographic private/public key pair.
@@ -313,7 +369,7 @@ type extPGPPrivateKey struct {
 	doSign     func(content []byte) (*packet.Signature, error)
 }
 
-func newExtPGPPrivateKey(exportedPubKeyStream io.Reader, from string, sign func(content []byte) (*packet.Signature, error)) (*extPGPPrivateKey, error) {
+func readOpenPGPRSAPublicKey(exportedPubKeyStream io.Reader) (PublicKey, string, error) {
 	var pubKey *packet.PublicKey
 
 	rd := packet.NewReader(exportedPubKeyStream)
@@ -323,37 +379,31 @@ func newExtPGPPrivateKey(exportedPubKeyStream io.Reader, from string, sign func(
 			break
 		}
 		if err != nil {
-			return nil, fmt.Errorf("cannot read exported public key: %v", err)
+			return nil, "", fmt.Errorf("cannot read exported public key: %v", err)
 		}
 		cand, ok := pkt.(*packet.PublicKey)
-		if ok {
-			if cand.IsSubkey {
-				continue
-			}
-			if pubKey != nil {
-				return nil, fmt.Errorf("cannot select exported public key, found many")
-			}
-			pubKey = cand
+		if !ok {
+			continue
 		}
+		if cand.IsSubkey {
+			continue
+		}
+		if pubKey != nil {
+			return nil, "", fmt.Errorf("cannot select exported public key, found many")
+		}
+		pubKey = cand
 	}
 
 	if pubKey == nil {
-		return nil, fmt.Errorf("cannot read exported public key, found none (broken export)")
-
+		return nil, "", fmt.Errorf("cannot read exported public key, found none (broken export)")
 	}
 
 	rsaPubKey, ok := pubKey.PublicKey.(*rsa.PublicKey)
 	if !ok {
-		return nil, fmt.Errorf("not a RSA key")
+		return nil, "", fmt.Errorf("not a RSA key")
 	}
 
-	return &extPGPPrivateKey{
-		pubKey:     RSAPublicKey(rsaPubKey),
-		from:       from,
-		externalID: fmt.Sprintf("%X", pubKey.Fingerprint),
-		bitLen:     rsaPubKey.N.BitLen(),
-		doSign:     sign,
-	}, nil
+	return RSAPublicKey(rsaPubKey), fmt.Sprintf("%X", pubKey.Fingerprint), nil
 }
 
 func (expk *extPGPPrivateKey) PublicKey() PublicKey {

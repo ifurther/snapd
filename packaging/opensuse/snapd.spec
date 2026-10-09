@@ -14,11 +14,18 @@
 
 # Please submit bugfixes or comments via http://bugs.opensuse.org/
 
+%define _missing_build_ids_terminate_build 1
+
 # takes an absolute path with slashes and turns it into an AppArmor profile path
 %define as_apparmor_path() %(echo "%1" | tr / . | cut -c2-)
 
 # Test keys: used for internal testing in snapd.
 %bcond_with testkeys
+
+%if 0%{?suse_version} >= 1600
+# Workaround recursively defined sle_version, see sbc#1238724.
+%undefine sle_version
+%endif
 
 # Enable apparmor on Tumbleweed and Leap 15.3+
 %if 0%{?suse_version} >= 1550 || 0%{?sle_version} >= 150300
@@ -27,15 +34,26 @@
 %bcond_with apparmor
 %endif
 
+# SELinux on openSUSE Leap 16+ and Tumbleweed
+%if 0%{?suse_version} >= 1600
+%bcond_without selinux
+%else
+%bcond_with selinux
+%endif
+
 # The list of systemd services we are expected to ship. Note that this does
 # not include services that are only required on core systems.
-%global systemd_services_list snapd.socket snapd.service snapd.seeded.service snapd.failure.service %{?with_apparmor:snapd.apparmor.service} snapd.mounts.target snapd.mounts-pre.target
+%global systemd_services_list snapd.socket snapd.service snapd.seeded.service %{?with_apparmor:snapd.apparmor.service} snapd.mounts.target snapd.mounts-pre.target
 %global systemd_user_services_list snapd.session-agent.socket
 
 # Alternate snap mount directory: not used by openSUSE.
 # If this spec file is integrated into Fedora then consider
 # adding global with_alt_snap_mount_dir 1 then.
 %global snap_mount_dir /snap
+%global alt_snap_mount_dir %{_localstatedir}/lib/snapd/snap
+%global with_alt_snap_mount_dir 1
+
+%global selinuxtype targeted
 
 # Compat macros
 %{!?make_build: %global make_build %{__make} %{?_smp_mflags}}
@@ -80,9 +98,24 @@
 %global with_multilib 1
 %endif
 
+%global with_go_unit_tests 1
+%ifnarch x86_64
+# disable Go unit tests on architectures other than x86_64. Those run on
+# virtualized systems with very little resources and often amplify races in
+# checks emplyed by unit tests themselves.
+%global with_go_unit_tests 0
+%endif
+
+%ifarch %arm
+# libsnap-confine-private/unit-tests fails on ARM under valgrind
+%bcond_with valgrind
+%else
+%bcond_without valgrind
+%endif
+
 
 Name:           snapd
-Version:        2.62
+Version:        2.78
 Release:        0
 Summary:        Tools enabling systems to work with .snap files
 License:        GPL-3.0
@@ -90,45 +123,45 @@ Group:          System/Packages
 Url:            https://%{import_path}
 Source0:        https://github.com/snapcore/snapd/releases/download/%{version}/%{name}_%{version}.vendor.tar.xz
 Source1:        snapd-rpmlintrc
+
 BuildRequires:  autoconf
 BuildRequires:  autoconf-archive
 BuildRequires:  automake
+BuildRequires:  m4
+BuildRequires:  distribution-release
 BuildRequires:  fakeroot
-BuildRequires:  glib2-devel
 BuildRequires:  glibc-devel-static
 BuildRequires:  go >= 1.18
 BuildRequires:  gpg2
-BuildRequires:  indent
 BuildRequires:  libcap-devel
-BuildRequires:  libseccomp-devel
-BuildRequires:  libtool
-BuildRequires:  libudev-devel
-BuildRequires:  libuuid-devel
-BuildRequires:  make
-BuildRequires:  openssh
-BuildRequires:  pkg-config
+BuildRequires:  openssh-common
 BuildRequires:  python3-docutils
 BuildRequires:  squashfs
-# Due to: rpm -q --whatprovides /usr/share/pkgconfig/systemd.pc
-BuildRequires:  systemd
+BuildRequires:  pkgconfig(glib-2.0)
+BuildRequires:  pkgconfig(libseccomp)
+BuildRequires:  pkgconfig(libudev)
+BuildRequires:  pkgconfig(systemd)
+BuildRequires:  pkgconfig(udev)
 BuildRequires:  systemd-rpm-macros
-BuildRequires:  timezone
-BuildRequires:  udev
+%if %{with valgrind}
+BuildRequires:  valgrind
+%endif
 BuildRequires:  xfsprogs-devel
-BuildRequires:  xz
-%ifarch x86_64
+%ifarch x86_64 %x86_64
 # This is needed for seccomp tests
 BuildRequires:  glibc-devel-32bit
 BuildRequires:  glibc-devel-static-32bit
 BuildRequires:  gcc-32bit
 %endif
-BuildRequires:  ca-certificates
-BuildRequires:  ca-certificates-mozilla
 
 %if %{with apparmor}
-BuildRequires:  libapparmor-devel
+BuildRequires:  pkgconfig(libapparmor)
 BuildRequires:  apparmor-rpm-macros
-BuildRequires:  apparmor-parser
+%endif
+
+%if %{with selinux}
+BuildRequires:  pkgconfig(libselinux)
+%{?selinux_requires}
 %endif
 
 PreReq:         permissions
@@ -139,12 +172,14 @@ Requires:       apparmor-parser
 Requires:       apparmor-profiles
 %endif
 Requires:       gpg2
-Requires:       openssh
 Requires:       squashfs
 Requires:       system-user-daemon
+%if %{with selinux}
+Requires:       (snapd-selinux = %{version} if selinux-policy-%{selinuxtype})
+%endif
 
 # Old versions of xdg-document-portal can expose data belonging to
-# other confied apps.  Older OpenSUSE releases are unlikely to change,
+# other confined apps.  Older OpenSUSE releases are unlikely to change,
 # so for now limit this to Tumbleweed.
 %if 0%{?suse_version} >= 1550 || 0%{?sle_version} >= 150300
 Conflicts:      xdg-desktop-portal < 0.11
@@ -165,6 +200,25 @@ This package contains the official build, endorsed by snapd developers. It is
 updated as soon as new upstream releases are made and is designed to live in
 the system:snappy repository.
 
+%if %{with selinux}
+%package selinux
+Summary:        SELinux policy module for snapd
+Group:          System Environment/Base
+License:        GPL-3.0
+BuildArch:      noarch
+BuildRequires:  pkgconfig(libselinux)
+BuildRequires:  selinux-policy-%{selinuxtype}
+BuildRequires:  selinux-policy-devel
+BuildRequires:  make
+
+Requires:       snapd
+%{?selinux_requires}
+
+%description selinux
+The package provides SELinux policy module for snapd and snap execution tool-chain.
+
+%endif
+
 %prep
 # NOTE: Instead of using setup -q we are unpacking a subdirectory of the source
 # tarball into a directory that is automatically on the future GOPATH. This
@@ -180,7 +234,24 @@ tar -axf %{_sourcedir}/%{name}_%{version}.vendor.tar.xz --strip-components=1 -C 
 pushd %{indigo_srcdir}
 # Add patch0 -p1 ... as appropriate here.
 %autopatch -p1
+
 popd
+
+build_with_static_pie=0
+# PIE static binaries are not supported on all architectures. We detect the
+# availability of the runtime object here, and GCC's support for such binaries.
+if test -e %{_libdir}/rcrt1.o && cc -static-pie -xc /dev/null -o /dev/null -S; then
+build_with_static_pie=1
+fi
+
+%ifarch s390x
+# disabling static PIE on s390x, too fragile apparently
+build_with_static_pie=0
+%endif
+
+if [ "$build_with_static_pie" = "1" ]; then
+    touch build-with-static-pie
+fi
 
 # Generate snapd.defines.mk, this file is included by snapd.mk. It contains a
 # number of variable definitions that are set based on their RPM equivalents.
@@ -199,41 +270,51 @@ localstatedir = %{_localstatedir}
 sharedstatedir = %{_sharedstatedir}
 unitdir = %{_unitdir}
 builddir = %{_builddir}
+sourcedir = %{indigo_srcdir}
 # Build configuration
 with_core_bits = 0
 with_alt_snap_mount_dir = %{!?with_alt_snap_mount_dir:0}%{?with_alt_snap_mount_dir:1}
 with_apparmor = %{with apparmor}
-with_testkeys = %{with_testkeys}
+with_testkeys = %{!?with_testkeys:0}%{?with_testkeys:1}
+with_static_pie = $build_with_static_pie
+with_vendor = 1
+EXTRA_GO_BUILD_FLAGS = -v -x
+# fix broken debuginfo bsc#1215402
+EXTRA_GO_LDFLAGS = -compressdwarf=false
 __DEFINES__
 
-# Set the version that is compiled into the various executables/
-pushd %{indigo_srcdir}
-./mkversion.sh %{version}
-popd
+# The source tarball carries the upstream version (snapdtool/version_generated.go,
+# cmd/VERSION, data/info) and openSUSE's package version matches it, so no
+# downstream_version_suffix is needed here. Still, run mod-version.sh with the
+# package version as a sanity check: it is a no-op when the spec and the
+# tarball agree, and fails the build otherwise (a desync would otherwise
+# silently ship an info file that does not match the binaries).
 
 # Sanity check, ensure that systemd system generator directory is in agreement between the build system and packaging.
 if [ "$(pkg-config --variable=systemdsystemgeneratordir systemd)" != "%{_systemdgeneratordir}" ]; then
-  echo "pkg-confing and rpm macros disagree about the location of systemd system generator directory"
+  echo "pkg-config and rpm macros disagree about the location of systemd system generator directory"
   exit 1
 fi
 
+%build
+
 # Enable hardening; Also see https://bugzilla.redhat.com/show_bug.cgi?id=1343892
-CFLAGS="$RPM_OPT_FLAGS -fPIC -Wl,-z,relro -Wl,-z,now"
-CXXFLAGS="$RPM_OPT_FLAGS -fPIC -Wl,-z,relro -Wl,-z,now"
-LDFLAGS=""
+export CFLAGS="$RPM_OPT_FLAGS -fpie"
+export CXXFLAGS="$RPM_OPT_FLAGS -fpie"
+export LDFLAGS="%{?build_ldflags} -zrelro -znow"
 
-# On openSUSE Leap 15 or more recent build position independent executables.
-# For a helpful guide about the versions and macros used below, please see:
-# https://en.opensuse.org/openSUSE:Build_Service_cross_distribution_howto
-%if 0%{?suse_version} >= 1500
-CFLAGS="$CFLAGS -fPIE"
-CXXFLAGS="$CXXFLAGS -fPIE"
-LDFLAGS="$LDFLAGS -pie"
-%endif
+export CGO_CFLAGS="$CFLAGS"
+export CGO_CXXFLAGS="$CXXFLAGS"
+export CGO_LDFLAGS="$LDFLAGS"
 
-export CFLAGS
-export CXXFLAGS
-export LDFLAGS
+static_pie=
+if [ -e build-with-static-pie ]; then
+    static_pie=--enable-static-PIE
+fi
+
+# Stamp cmd/VERSION and data/info with the package version (see above); must
+# run before cmd/configure reads cmd/VERSION.
+%{indigo_srcdir}/packaging/mod-version.sh %{version} %{indigo_srcdir}
 
 # Generate autotools build system files.
 pushd %{indigo_srcdir}/cmd
@@ -242,15 +323,17 @@ autoreconf -i -f
 %configure \
     %{!?with_apparmor:--disable-apparmor} \
     %{?with_apparmor:--enable-apparmor} \
+    %{!?with_selinux:--disable-selinux} \
+    %{?with_selinux:--enable-selinux} \
     --libexecdir=%{_libexecdir}/snapd \
     --enable-nvidia-biarch \
     %{?with_multilib:--with-32bit-libdir=%{_prefix}/lib} \
     --with-snap-mount-dir=%{snap_mount_dir} \
-    --enable-merged-usr
+    --enable-merged-usr \
+    $static_pie
 
 popd
 
-%build
 %make_build -C %{indigo_srcdir}/cmd
 # Use the common packaging helper for building.
 #
@@ -260,16 +343,39 @@ popd
             GOPATH=%{indigo_gopath}:$GOPATH SNAPD_DEFINES_DIR=%{_builddir} \
             all
 
-%check
-for binary in snap-exec snap-update-ns snapctl; do
-    ldd $binary 2>&1 | grep 'not a dynamic executable'
-done
+%if %{with selinux}
+M4PARAM='-D distro_opensuse' %make_build -C %{indigo_srcdir}/data/selinux
+%endif
 
-%make_build -C %{indigo_srcdir}/cmd check
+%make_build -C %{indigo_srcdir}/data \
+		BINDIR=%{_bindir} \
+		LIBEXECDIR=%{_libexecdir} \
+		DATADIR=%{_datadir} \
+		SYSTEMDSYSTEMUNITDIR=%{_unitdir} \
+		TMPFILESDIR=%{_tmpfilesdir} \
+		USE_CANONICAL_SNAP_MOUNT_DIR=true \
+		USE_ALT_SNAP_MOUNT_DIR=true
+
+%check
+# Verify that statically linked binaries are indeed static
+%make_build -f %{indigo_srcdir}/packaging/snapd.mk SNAPD_DEFINES_DIR=%{_builddir} check-static-binaries
+
+export CFLAGS="$RPM_OPT_FLAGS -fpie"
+export CXXFLAGS="$RPM_OPT_FLAGS -fpie"
+export LDFLAGS="%{?build_ldflags} -zrelro -znow"
+export CGO_CFLAGS="$CFLAGS"
+export CGO_CXXFLAGS="$CXXFLAGS"
+export CGO_LDFLAGS="$LDFLAGS"
+
+%make_build -C %{indigo_srcdir}/cmd -k check
+%make_build -C %{indigo_srcdir}/data -k check
+%if %{with_go_unit_tests}
 # Use the common packaging helper for testing.
+export SNAPD_SKIP_SLOW_TESTS=1
 %make_build -C %{indigo_srcdir} -f %{indigo_srcdir}/packaging/snapd.mk \
             GOPATH=%{indigo_gopath}:$GOPATH SNAPD_DEFINES_DIR=%{_builddir} \
             check
+%endif
 
 %install
 # Install all systemd and dbus units, and env files.
@@ -279,13 +385,34 @@ done
 		DATADIR=%{_datadir} \
 		SYSTEMDSYSTEMUNITDIR=%{_unitdir} \
 		TMPFILESDIR=%{_tmpfilesdir} \
-		SNAP_MOUNT_DIR=%{snap_mount_dir}
+		USE_CANONICAL_SNAP_MOUNT_DIR=true \
+		USE_ALT_SNAP_MOUNT_DIR=true
+
 # Install all the C executables.
 %make_install -C %{indigo_srcdir}/cmd
 # Use the common packaging helper for bulk of installation.
 %make_install -f %{indigo_srcdir}/packaging/snapd.mk \
             GOPATH=%{indigo_gopath}:$GOPATH SNAPD_DEFINES_DIR=%{_builddir} \
             install
+
+%if %{with selinux}
+# Install the CLI wrapper as /usr/bin/snap, replacing the symlink installed by
+# snapd.mk. The wrapper is a real binary carrying snappy_cli_exec_t so that
+# the SELinux domain transition to snappy_cli_t fires correctly on exec.
+rm -f %{buildroot}%{_bindir}/snap
+install -m 0755 %{indigo_srcdir}/cmd/snap-cli-wrap/snap-cli-wrap %{buildroot}%{_bindir}/snap
+
+# Install SELinux module
+install -D -p -m 0644 %{indigo_srcdir}/data/selinux/snappy.if \
+    %{buildroot}%{_datadir}/selinux/devel/include/contrib/snappy.if
+install -D -p -m 0644 %{indigo_srcdir}/data/selinux/snappy.pp.bz2 \
+    %{buildroot}%{_datadir}/selinux/packages/snappy.pp.bz2
+%endif
+
+# Drop tools not shipped on openSUSE (handled via snapd multi-call dispatch
+# on Ubuntu/Debian; on openSUSE these binaries are not needed)
+rm -fv %{buildroot}%{_libexecdir}/snapd/snap-preseed
+rm -fv %{buildroot}%{_libexecdir}/snapd/snap-gpio-helper
 
 # Undo special permissions of the void directory. We handle that in RPM files
 # section below.
@@ -295,8 +422,11 @@ chmod 755 %{buildroot}%{_localstatedir}/lib/snapd/void
 # once snap-confine is added to the permissions package. This is done following
 # the recommendations on
 # https://en.opensuse.org/openSUSE:Package_security_guidelines
-install -m 644 -D %{indigo_srcdir}/packaging/opensuse/permissions %{buildroot}%{_sysconfdir}/permissions.d/snapd
-install -m 644 -D %{indigo_srcdir}/packaging/opensuse/permissions.paranoid %{buildroot}%{_sysconfdir}/permissions.d/snapd.paranoid
+install_caps="$(cat %{buildroot}%{_libexecdir}/snapd/snap-confine.v2-only.caps)"
+sed -e 's,@LIBEXECDIR@,%{_libexecdir},' -e "s#@CAPS@#$install_caps#" < %{indigo_srcdir}/packaging/opensuse/permissions.in > permissions
+install -pm 644 -D permissions %{buildroot}%{_sysconfdir}/permissions.d/snapd
+sed -e 's,@LIBEXECDIR@,%{_libexecdir},' -e "s#@CAPS@#$install_caps#" < %{indigo_srcdir}/packaging/opensuse/permissions.paranoid.in > permissions.paranoid
+install -pm 644 -D permissions.paranoid %{buildroot}%{_sysconfdir}/permissions.d/snapd.paranoid
 
 # See https://en.opensuse.org/openSUSE:Packaging_checks#suse-missing-rclink for details
 install -d %{buildroot}%{_sbindir}
@@ -306,22 +436,28 @@ ln -sf %{_sbindir}/service %{buildroot}%{_sbindir}/rcsnapd.seeded
 ln -sf %{_sbindir}/service %{buildroot}%{_sbindir}/rcsnapd.apparmor
 %endif
 
-# Install Polkit configuration.
-# TODO: This should be handled by data makefile.
-install -m 644 -D %{indigo_srcdir}/data/polkit/io.snapcraft.snapd.policy %{buildroot}%{_datadir}/polkit-1/actions
 
 # Install the "info" data file with snapd version
 # TODO: This should be handled by data makefile.
-install -m 644 -D %{indigo_srcdir}/data/info %{buildroot}%{_libexecdir}/snapd/info
+install -pm 644 -D %{indigo_srcdir}/data/info %{buildroot}%{_libexecdir}/snapd/info
 
 # Install bash completion for "snap"
 # TODO: This should be handled by data makefile.
-install -m 644 -D %{indigo_srcdir}/data/completion/bash/snap %{buildroot}%{_datadir}/bash-completion/completions/snap
-install -m 644 -D %{indigo_srcdir}/data/completion/bash/complete.sh %{buildroot}%{_libexecdir}/snapd
-install -m 644 -D %{indigo_srcdir}/data/completion/bash/etelpmoc.sh %{buildroot}%{_libexecdir}/snapd
+install -pm 644 -D %{indigo_srcdir}/data/completion/bash/snap %{buildroot}%{_datadir}/bash-completion/completions/snap
+install -pm 644 -D %{indigo_srcdir}/data/completion/bash/complete.sh %{buildroot}%{_libexecdir}/snapd
+install -pm 644 -D %{indigo_srcdir}/data/completion/bash/etelpmoc.sh %{buildroot}%{_libexecdir}/snapd
 # Install zsh completion for "snap"
 install -d -p %{buildroot}%{_datadir}/zsh/site-functions
-install -m 644 -D %{indigo_srcdir}/data/completion/zsh/_snap %{buildroot}%{_datadir}/zsh/site-functions/_snap
+install -pm 644 -D %{indigo_srcdir}/data/completion/zsh/_snap %{buildroot}%{_datadir}/zsh/site-functions/_snap
+
+# Install the NEWS file
+install -pm 644 -D %{indigo_srcdir}/NEWS.md %{buildroot}%{_defaultdocdir}/snapd/NEWS.md
+
+# Remove gpio-chardev ordering target
+rm -f %{buildroot}%{_unitdir}/snapd.gpio-chardev-setup.target
+
+# Drop the last remaining Ubuntu Core specific service
+rm -fv %{buildroot}%{_unitdir}/snapd.failure.service
 
 %verifyscript
 %verify_permissions -e %{_libexecdir}/snapd/snap-confine
@@ -330,10 +466,22 @@ install -m 644 -D %{indigo_srcdir}/data/completion/zsh/_snap %{buildroot}%{_data
 %service_add_pre %{systemd_services_list}
 
 %post
+# Create the private tmp directory for snap-confine
+install -d -m 0700 /tmp/snap-private-tmp
+
 %set_permissions %{_libexecdir}/snapd/snap-confine
 %if %{with apparmor}
 %apparmor_reload /etc/apparmor.d/%{apparmor_snapconfine_profile}
 %endif
+
+if test ! -e %{snap_mount_dir} && test ! -e %{alt_snap_mount_dir} ; then
+    # neither location exists, it's likely a new installation, but we
+    # need one of the directories to exist for snapd and snap-confine
+    # to be able to figure out the desired configuration at runtime
+    echo "Using %{alt_snap_mount_dir} as snap mount directory"
+    mkdir -p -m 755 %{alt_snap_mount_dir} || :
+fi
+
 %service_add_post %{systemd_services_list}
 %systemd_user_post %{systemd_user_services_list}
 %if %{with apparmor}
@@ -371,6 +519,30 @@ fi
 %service_del_postun %{systemd_services_list}
 %systemd_user_postun %{systemd_user_services_list}
 
+%if %{with selinux}
+%pre selinux
+%selinux_relabel_pre -s %{selinuxtype}
+
+%post selinux
+%selinux_modules_install -s %{selinuxtype} %{_datadir}/selinux/packages/snappy.pp.bz2
+# Ensure the private tmp directory for snap-confine exists and has the correct
+# SELinux label now that the policy module is loaded
+install -d -m 0700 /tmp/snap-private-tmp
+restorecon /tmp/snap-private-tmp || :
+
+%preun selinux
+%selinux_relabel_pre -s %{selinuxtype}
+
+%postun selinux
+%selinux_modules_uninstall -s %{selinuxtype} snappy
+if [ $1 -eq 0 ]; then
+    %selinux_relabel_post -s %{selinuxtype}
+fi
+
+%posttrans selinux
+%selinux_relabel_post -s %{selinuxtype}
+%endif
+
 %files
 
 # Configuration files
@@ -386,6 +558,7 @@ fi
 %dir %{_datadir}/dbus-1/system.d
 %dir %{_datadir}/polkit-1
 %dir %{_datadir}/polkit-1/actions
+%dir %{_datadir}/snapd
 %dir %{_environmentdir}
 %dir %{_libexecdir}/snapd
 %dir %{_localstatedir}/cache/snapd
@@ -419,14 +592,20 @@ fi
 %dir %{_tmpfilesdir}
 %dir %{_systemdgeneratordir}
 %dir %{_userunitdir}
-%dir %{snap_mount_dir}
-%dir %{snap_mount_dir}/bin
+%ghost %dir %{snap_mount_dir}
+%ghost %dir %{snap_mount_dir}/bin
+# Ghost entries for alternative mount directory
+%ghost %dir %{alt_snap_mount_dir}
+%ghost %dir %{alt_snap_mount_dir}/bin
+
 # this is typically owned by zsh, but we do not want to explicitly require zsh
 %dir %{_datadir}/zsh
 %dir %{_datadir}/zsh/site-functions
 # similar case for fish
 %dir %{_datadir}/fish
 %dir %{_datadir}/fish/vendor_conf.d
+%dir %{_defaultdocdir}/snapd
+%{_defaultdocdir}/snapd/NEWS.md
 
 # Ghost entries for things created at runtime
 %ghost %dir %{_localstatedir}/snap
@@ -437,7 +616,11 @@ fi
 %ghost %{_sharedstatedir}/snapd/state.json
 %ghost %{_sharedstatedir}/snapd/system-key
 %ghost %{snap_mount_dir}/README
-%verify(not user group mode) %attr(04755,root,root) %{_libexecdir}/snapd/snap-confine
+%ghost %{alt_snap_mount_dir}/README
+# capabilities and permissions are set through permctl and set_permissions snippet in post
+%verify(not caps) %attr(0755,root,root) %{_libexecdir}/snapd/snap-confine
+%{_libexecdir}/snapd/snap-confine.v2-only.caps
+%{_libexecdir}/snapd/snap-confine.caps
 %{_bindir}/snap
 %{_bindir}/snapctl
 %{_datadir}/applications/io.snapcraft.SessionAgent.desktop
@@ -453,15 +636,20 @@ fi
 %{_datadir}/fish/vendor_conf.d/snapd.fish
 %{_datadir}/snapd/snapcraft-logo-bird.svg
 %{_environmentdir}/990-snapd.conf
+%dir %{_prefix}/lib/dracut/dracut.conf.d
+%{_prefix}/lib/dracut/dracut.conf.d/50-snapd.conf
 %{_libexecdir}/snapd/complete.sh
 %{_libexecdir}/snapd/etelpmoc.sh
 %{_libexecdir}/snapd/info
 %{_libexecdir}/snapd/snap-device-helper
 %{_libexecdir}/snapd/snap-discard-ns
 %{_libexecdir}/snapd/snap-exec
-%{_libexecdir}/snapd/snap-gdb-shim
 %{_libexecdir}/snapd/snap-gdbserver-shim
+%{_libexecdir}/snapd/snap-strace-shim
 %{_libexecdir}/snapd/snap-mgmt
+%if %{with selinux}
+%{_libexecdir}/snapd/snap-mgmt-selinux
+%endif
 %{_libexecdir}/snapd/snap-seccomp
 %{_libexecdir}/snapd/snap-update-ns
 %{_libexecdir}/snapd/snapctl
@@ -476,8 +664,8 @@ fi
 %{_sysconfdir}/xdg/autostart/snap-userd-autostart.desktop
 %{_systemd_system_env_generator_dir}/snapd-env-generator
 %{_systemdgeneratordir}/snapd-generator
+# TODO: will need whitelisting in rpmlint?
 %{_tmpfilesdir}/snapd.conf
-%{_unitdir}/snapd.failure.service
 %{_unitdir}/snapd.seeded.service
 %{_unitdir}/snapd.service
 %{_unitdir}/snapd.socket
@@ -485,6 +673,7 @@ fi
 %{_unitdir}/snapd.mounts-pre.target
 %{_userunitdir}/snapd.session-agent.service
 %{_userunitdir}/snapd.session-agent.socket
+%{_libexecdir}/snapd/snapd-tool-wrap
 
 # When apparmor is enabled there are some additional entries.
 %if %{with apparmor}
@@ -493,6 +682,12 @@ fi
 %{_sbindir}/rcsnapd.apparmor
 %{_sysconfdir}/apparmor.d/%{apparmor_snapconfine_profile}
 %{_unitdir}/snapd.apparmor.service
+%endif
+
+%if %{with selinux}
+%files selinux
+%{_datadir}/selinux/packages/snappy.pp.bz2
+%{_datadir}/selinux/devel/include/contrib/snappy.if
 %endif
 
 %changelog

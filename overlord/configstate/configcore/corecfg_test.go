@@ -43,18 +43,18 @@ func Test(t *testing.T) { TestingT(t) }
 
 type mockConf struct {
 	state   *state.State
-	conf    map[string]interface{}
-	changes map[string]interface{}
+	conf    map[string]any
+	changes map[string]any
 	err     error
 	task    *state.Task
 }
 
-func (cfg *mockConf) Get(snapName, key string, result interface{}) error {
+func (cfg *mockConf) Get(snapName, key string, result any) error {
 	if snapName != "core" {
 		return fmt.Errorf("mockConf only knows about core")
 	}
 
-	var value interface{}
+	var value any
 	value = cfg.changes[key]
 	if value == nil {
 		value = cfg.conf[key]
@@ -67,7 +67,7 @@ func (cfg *mockConf) Get(snapName, key string, result interface{}) error {
 	return cfg.err
 }
 
-func (cfg *mockConf) GetMaybe(snapName, key string, result interface{}) error {
+func (cfg *mockConf) GetMaybe(snapName, key string, result any) error {
 	err := cfg.Get(snapName, key, result)
 	if err != nil && !config.IsNoOption(err) {
 		return err
@@ -75,12 +75,12 @@ func (cfg *mockConf) GetMaybe(snapName, key string, result interface{}) error {
 	return nil
 }
 
-func (cfg *mockConf) GetPristine(snapName, key string, result interface{}) error {
+func (cfg *mockConf) GetPristine(snapName, key string, result any) error {
 	if snapName != "core" {
 		return fmt.Errorf("mockConf only knows about core")
 	}
 
-	var value interface{}
+	var value any
 	value = cfg.conf[key]
 	if value != nil {
 		v1 := reflect.ValueOf(result)
@@ -90,7 +90,7 @@ func (cfg *mockConf) GetPristine(snapName, key string, result interface{}) error
 	return cfg.err
 }
 
-func (cfg *mockConf) GetPristineMaybe(snapName, key string, result interface{}) error {
+func (cfg *mockConf) GetPristineMaybe(snapName, key string, result any) error {
 	err := cfg.GetPristine(snapName, key, result)
 	if err != nil && !config.IsNoOption(err) {
 		return err
@@ -102,12 +102,12 @@ func (cfg *mockConf) Task() *state.Task {
 	return cfg.task
 }
 
-func (cfg *mockConf) Set(snapName, key string, v interface{}) error {
+func (cfg *mockConf) Set(snapName, key string, v any) error {
 	if snapName != "core" {
 		return fmt.Errorf("mockConf only knows about core")
 	}
 	if cfg.conf == nil {
-		cfg.conf = make(map[string]interface{})
+		cfg.conf = make(map[string]any)
 	}
 	cfg.conf[key] = v
 	return nil
@@ -133,7 +133,7 @@ type configcoreSuite struct {
 
 	state *state.State
 
-	systemctlOutput   func(args ...string) []byte
+	systemctlOutput   func(args ...string) ([]byte, error)
 	systemctlArgs     [][]string
 	systemdSysctlArgs [][]string
 }
@@ -148,7 +148,7 @@ func (s *configcoreSuite) SetUpTest(c *C) {
 
 	s.AddCleanup(osutil.MockMountInfo(""))
 
-	s.systemctlOutput = func(args ...string) []byte {
+	s.systemctlOutput = func(args ...string) ([]byte, error) {
 		if args[0] == "show" {
 			return []byte(fmt.Sprintf(`Type=notify
 Id=%[1]s
@@ -156,14 +156,14 @@ Names=%[1]s
 ActiveState=inactive
 UnitFileState=enabled
 NeedDaemonReload=no
-`, args[len(args)-1]))
+`, args[len(args)-1])), nil
 		}
-		return []byte("ActiveState=inactive")
+		return []byte("ActiveState=inactive"), nil
 	}
 
 	s.AddCleanup(systemd.MockSystemctl(func(args ...string) ([]byte, error) {
 		s.systemctlArgs = append(s.systemctlArgs, args[:])
-		return s.systemctlOutput(args...), nil
+		return s.systemctlOutput(args...)
 	}))
 	s.systemctlArgs = nil
 	s.AddCleanup(systemd.MockSystemdSysctl(func(args ...string) error {
@@ -198,12 +198,12 @@ type mockDev struct {
 	mode    string
 	classic bool
 	kernel  string
-	uc20    bool
+	base    string
 }
 
 func (d mockDev) RunMode() bool    { return d.mode == "" || d.mode == "run" }
 func (d mockDev) Classic() bool    { return d.classic }
-func (d mockDev) HasModeenv() bool { return d.uc20 }
+func (d mockDev) HasModeenv() bool { return d.base == "core20" }
 func (d mockDev) Kernel() string {
 	if d.Classic() {
 		return ""
@@ -213,12 +213,14 @@ func (d mockDev) Kernel() string {
 	}
 	return d.kernel
 }
+func (d mockDev) Base() string { return d.base }
 
 var (
 	coreDev    = mockDev{classic: false}
 	classicDev = mockDev{classic: true}
 
-	core20Dev = mockDev{classic: false, uc20: true}
+	core20Dev = mockDev{classic: false, base: "core20"}
+	core24Dev = mockDev{classic: false, base: "core24"}
 )
 
 // applyCfgSuite tests configcore.Apply()
@@ -246,26 +248,26 @@ func (s *applyCfgSuite) TestEmptyRootDir(c *C) {
 }
 
 func (s *applyCfgSuite) TestSmoke(c *C) {
-	c.Assert(configcore.FilesystemOnlyApply(coreDev, s.tmpDir, map[string]interface{}{}), IsNil)
+	c.Assert(configcore.FilesystemOnlyApply(coreDev, s.tmpDir, map[string]any{}), IsNil)
 }
 
 func (s *applyCfgSuite) TestPlainCoreConfigGetErrorIfNotCore(c *C) {
-	conf := configcore.PlainCoreConfig(map[string]interface{}{})
-	var val interface{}
+	conf := configcore.PlainCoreConfig(map[string]any{})
+	var val any
 	c.Assert(conf.Get("some-snap", "a", &val), ErrorMatches, `internal error: expected core snap in Get\(\), "some-snap" was requested`)
 }
 
 func (s *applyCfgSuite) TestPlainCoreConfigGet(c *C) {
-	conf := configcore.PlainCoreConfig(map[string]interface{}{"foo": "bar"})
-	var val interface{}
+	conf := configcore.PlainCoreConfig(map[string]any{"foo": "bar"})
+	var val any
 	c.Assert(conf.Get("core", "a", &val), DeepEquals, &config.NoOptionError{SnapName: "core", Key: "a"})
 	c.Assert(conf.Get("core", "foo", &val), IsNil)
 	c.Check(val, DeepEquals, "bar")
 }
 
 func (s *applyCfgSuite) TestPlainCoreConfigGetMaybe(c *C) {
-	conf := configcore.PlainCoreConfig(map[string]interface{}{"foo": "bar"})
-	var val interface{}
+	conf := configcore.PlainCoreConfig(map[string]any{"foo": "bar"})
+	var val any
 	c.Assert(conf.GetMaybe("core", "a", &val), IsNil)
 	c.Assert(val, IsNil)
 	c.Assert(conf.Get("core", "foo", &val), IsNil)

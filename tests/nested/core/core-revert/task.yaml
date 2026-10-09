@@ -1,11 +1,24 @@
 summary: core revert test
 
+details: |
+    Older versions of snapd used to change the way seccomp profiles are handled, which could cause
+    problems when future snapd was reverted to old snapd, causing old profiles to
+    fail to parse and load. This was addressed with the introduction of a system
+    key and eventually with the switch to pre-compiled seccomp profiles. This
+    test uses a virtual machine to ensure that the core snap can be safely
+    reverted in case this is required for another reason.
+
 systems: [ubuntu-18.04-64]
 
 kill-timeout: 30m
 
 environment:
-    IMAGE_FILE: /tmp/work-dir/images/ubuntu-core-new.img
+    IMAGE_FILE: $SNAPD_WORK_DIR/images/ubuntu-core-new.img
+
+skip:
+    - reason: This test needs to start from beta/candidate/stable channel
+      if: |
+        [ "$NESTED_BUILD_SNAPD_FROM_CURRENT" = "true" ] || [ "$NESTED_CORE_CHANNEL" = "$NESTED_CORE_REFRESH_CHANNEL" ]
 
 debug: |
     systemctl stop nested-vm || true
@@ -25,17 +38,12 @@ debug: |
     fi
 
 execute: |
-    if [ "$NESTED_BUILD_SNAPD_FROM_CURRENT" = "true" ] || [ "$NESTED_CORE_CHANNEL" = "$NESTED_CORE_REFRESH_CHANNEL" ]; then
-        echo "This test need to start from beta/candidate/stable channel"
-        exit 0
-    fi
-
     echo "Refresh the core snap to $NESTED_CORE_REFRESH_CHANNEL channel"
     remote.exec "snap info core" | MATCH "tracking: +latest/${NESTED_CORE_CHANNEL}"
     remote.exec "sudo snap refresh --${NESTED_CORE_REFRESH_CHANNEL} core" || true
 
     if ! tests.nested wait-for ssh; then
-        echo "ssh not stablished, exiting..."
+        echo "ssh connection not established, exiting..."
         exit 1
     fi
 
@@ -50,7 +58,7 @@ execute: |
     remote.exec "sudo snap revert core" || true
 
     if ! tests.nested wait-for ssh; then
-        echo "ssh not stablished, exiting..."
+        echo "ssh connection not established, exiting..."
         exit 1
     fi
 

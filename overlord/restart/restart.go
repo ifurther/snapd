@@ -30,6 +30,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 
 	"github.com/snapcore/snapd/boot"
 	"github.com/snapcore/snapd/dirs"
@@ -39,7 +40,7 @@ import (
 	"github.com/snapcore/snapd/release"
 )
 
-type RestartType int
+type RestartType int32
 
 const (
 	RestartUnset RestartType = iota
@@ -57,6 +58,27 @@ const (
 	// RestartSystemPoweroffNow will shutdown --poweroff the system asap
 	RestartSystemPoweroffNow
 )
+
+func (r RestartType) String() string {
+	switch r {
+	case RestartDaemon:
+		return "restart-daemon"
+	case RestartSystem:
+		return "restart-system"
+	case RestartSystemNow:
+		return "restart-system-now"
+	case RestartSocket:
+		return "restart-socket"
+	case StopDaemon:
+		return "stop-daemon"
+	case RestartSystemHaltNow:
+		return "restart-system-halt-now"
+	case RestartSystemPoweroffNow:
+		return "restart-system-poweroff-now"
+	default:
+		return fmt.Sprintf("restart-type(%d)", r)
+	}
+}
 
 // RestartBoundaryDirection defines in which direction a task may have a restart
 // boundary set. A restart boundary is when the task must restart, before it's dependencies
@@ -109,7 +131,7 @@ func (rb *RestartBoundaryDirection) UnmarshalJSON(data []byte) error {
 
 // Handler can handle restart requests and whether expected reboots happen.
 type Handler interface {
-	HandleRestart(t RestartType, rebootInfo *boot.RebootInfo)
+	HandleRestart(t RestartType, rebootInfo *boot.RebootInfo, reason RestartReason)
 	// RebootAsExpected is called early when either a reboot was
 	// requested by snapd and happened or no reboot was expected at all.
 	RebootAsExpected(st *state.State) error
@@ -123,7 +145,7 @@ type restartManagerKey struct{}
 // RestartManager takes care of restart-related state.
 type RestartManager struct {
 	state            *state.State
-	restarting       RestartType
+	restarting       int32 // really of type RestartType -- TODO:GOVERSION: use atomic.Int32 once on go 1.19+
 	h                Handler
 	bootID           string
 	changeCallbackID int
@@ -237,9 +259,9 @@ func (rm *RestartManager) Stop() {
 	st.RemoveChangeStatusChangedHandler(rm.changeCallbackID)
 }
 
-func (rm *RestartManager) handleRestart(t RestartType, rebootInfo *boot.RebootInfo) {
+func (rm *RestartManager) handleRestart(t RestartType, rebootInfo *boot.RebootInfo, reason RestartReason) {
 	if rm.h != nil {
-		rm.h.HandleRestart(t, rebootInfo)
+		rm.h.HandleRestart(t, rebootInfo, reason)
 	}
 }
 
@@ -260,6 +282,13 @@ func (rm *RestartManager) rebootDidNotHappen() error {
 // pendingForSystemRestart returns true if the change has tasks that are set to
 // wait pending a manual system restart. It is registered with the prune logic.
 func (rm *RestartManager) pendingForSystemRestart(chg *state.Change) bool {
+	return rm.pendingForSystemRestartTasks(chg, nil)
+}
+
+// pendingForSystemRestart returns true if the change has tasks set to wait,
+// if considerTasks is non-nil only those tasks are considered. It is registered
+// with the prune logic.
+func (rm *RestartManager) pendingForSystemRestartTasks(chg *state.Change, considerTasks map[string]bool) bool {
 	if chg.IsReady() {
 		return false
 	}
@@ -268,6 +297,11 @@ func (rm *RestartManager) pendingForSystemRestart(chg *state.Change) bool {
 	}
 	for _, t := range chg.Tasks() {
 		if t.Status() != state.WaitStatus {
+			continue
+		}
+
+		// if we're considering only a subset, ignore tasks not in it
+		if considerTasks != nil && !considerTasks[t.ID()] {
 			continue
 		}
 
@@ -324,16 +358,45 @@ func restartManager(st *state.State, errMsg string) *RestartManager {
 	return cached.(*RestartManager)
 }
 
+// RestartReason identifies why a restart was requested. Values are kebab-case.
+// The same field is meant to cover daemon and later system restart types.
+// Prefer keeping existing values stable and try not to rename them.
+// New reasons may still be added.
+type RestartReason string
+
+// Reasons for type RestartDaemon.
+const (
+	// RestartSnapdUpdate is a restart after a snapd (or classic
+	// core/os) install or refresh.
+	RestartSnapdUpdate RestartReason = "snapd-update"
+	// RestartSnapdRevert is a restart after an explicit snap revert of
+	// snapd (or classic core/os).
+	RestartSnapdRevert RestartReason = "snapd-revert"
+	// RestartSnapdUndo is a restart after a snapd (or classic core/os)
+	// binary change is undone.
+	RestartSnapdUndo RestartReason = "snapd-undo"
+	// RestartSnapdFeatureChange is a restart after a snapd feature
+	// change.
+	RestartSnapdFeatureChange RestartReason = "snapd-feature-change"
+)
+
+// Reasons for type RestartSocket.
+const (
+	// RestartSnapdIdle is socket-activation standby because snapd is idle.
+	RestartSnapdIdle RestartReason = "snapd-idle"
+)
+
 // Request asks for a restart of the managing process.
 // The state needs to be locked to request a restart.
-func Request(st *state.State, t RestartType, rebootInfo *boot.RebootInfo) {
+// reason may be empty when the caller has no more specific context yet.
+func Request(st *state.State, t RestartType, rebootInfo *boot.RebootInfo, reason RestartReason) {
 	rm := restartManager(st, "internal error: cannot request a restart before RestartManager initialization")
 	switch t {
 	case RestartSystem, RestartSystemNow, RestartSystemHaltNow, RestartSystemPoweroffNow:
 		st.Set("system-restart-from-boot-id", rm.bootID)
 	}
-	rm.restarting = t
-	rm.handleRestart(t, rebootInfo)
+	atomic.StoreInt32(&rm.restarting, int32(t))
+	rm.handleRestart(t, rebootInfo, reason)
 }
 
 func setWaitForSystemRestart(chg *state.Change) {
@@ -375,20 +438,37 @@ func notifyRebootRequiredClassic(rebootRequiredSnap string) error {
 	return nil
 }
 
-// Pending returns whether a restart was requested with Request and of which type.
-func Pending(st *state.State) (bool, RestartType) {
+// Pending returns the type of restart requested with Request or RestartUnset
+// if no restart is pending.
+func Pending(st *state.State) RestartType {
 	cached := st.Cached(restartManagerKey{})
 	if cached == nil {
-		return false, RestartUnset
+		return RestartUnset
 	}
 	rm := cached.(*RestartManager)
-	return rm.restarting != RestartUnset, rm.restarting
+	return rm.Pending()
+}
+
+// Pending returns the type of restart requested with Request or RestartUnset
+// if no restart is pending.
+// NOTE: the state does not need to be locked to fetch this information.
+func (rm *RestartManager) Pending() RestartType {
+	if rm == nil {
+		// This check is here because some tests don't set a RestartManager.
+		// This should generally not occur in production.
+		return RestartUnset
+	}
+	return RestartType(atomic.LoadInt32(&rm.restarting))
 }
 
 func MockPending(st *state.State, restarting RestartType) RestartType {
 	rm := restartManager(st, "internal error: cannot mock a restart request before RestartManager initialization")
-	old := rm.restarting
-	rm.restarting = restarting
+	return rm.MockPending(restarting)
+}
+
+// NOTE: the state does not need to be locked to set this information.
+func (rm *RestartManager) MockPending(restarting RestartType) RestartType {
+	old := RestartType(atomic.SwapInt32(&rm.restarting, int32(restarting)))
 	return old
 }
 
@@ -479,6 +559,12 @@ func MarkTaskAsRestartBoundary(t *state.Task, dir RestartBoundaryDirection) {
 	t.Set("restart-boundary", dir)
 }
 
+// FinishTaskWithDaemonRestart sets the task status and requests a snapd
+// process restart with the given reason. The state needs to be locked.
+func FinishTaskWithDaemonRestart(t *state.Task, status state.Status, reason RestartReason) error {
+	return FinishTaskWithRestart(t, status, RestartDaemon, "", nil, reason)
+}
+
 // FinishTaskWithRestart either schedules a restart for the given task or it
 // does an immediate restart of the snapd daemon, depending on the type of restart
 // provided.
@@ -486,13 +572,13 @@ func MarkTaskAsRestartBoundary(t *state.Task, dir RestartBoundaryDirection) {
 // change has run out of tasks to run.
 // For tasks that request restarts as a part of their undo, any tasks that previously scheduled
 // restarts as a part of their 'do' will be unscheduled.
-func FinishTaskWithRestart(t *state.Task, status state.Status, restartType RestartType, snapName string, rebootInfo *boot.RebootInfo) error {
+func FinishTaskWithRestart(t *state.Task, status state.Status, restartType RestartType, snapName string, rebootInfo *boot.RebootInfo, reason RestartReason) error {
 	switch restartType {
 	case RestartSystem, RestartSystemNow, RestartSystemHaltNow, RestartSystemPoweroffNow:
 		break
 	default:
 		t.SetStatus(status)
-		Request(t.State(), restartType, rebootInfo)
+		Request(t.State(), restartType, rebootInfo, reason)
 		return nil
 	}
 
@@ -506,7 +592,7 @@ func FinishTaskWithRestart(t *state.Task, status state.Status, restartType Resta
 	if snapName == "" {
 		snapName = "snapd"
 	}
-	rp.init(snapName, restartType, rebootInfo)
+	rp.init(snapName, restartType, rebootInfo, reason)
 
 	// set restart parameters before call to markTaskForRestart as that
 	// can trigger a new change status
@@ -534,8 +620,14 @@ func FinishTaskWithRestart(t *state.Task, status state.Status, restartType Resta
 
 // PendingForChange checks if a system restart is pending for a change.
 func PendingForChange(st *state.State, chg *state.Change) bool {
+	return PendingForChangeTasks(st, chg, nil)
+}
+
+// PendingForChangeTasks checks if a system restart is pending for a
+// change, ignoring tasks other than the task IDs supplied.
+func PendingForChangeTasks(st *state.State, chg *state.Change, considerTasks map[string]bool) bool {
 	rm := restartManager(st, "internal error: cannot request a restart before RestartManager initialization")
-	return rm.pendingForSystemRestart(chg)
+	return rm.pendingForSystemRestartTasks(chg, considerTasks)
 }
 
 // TaskWaitForRestart can be used for tasks that need to wait for a pending
@@ -604,7 +696,7 @@ func processRestartForChange(chg *state.Change, old, new state.Status) {
 		logger.Noticef("Postponing restart until a manual system restart allows to continue")
 		return
 	}
-	Request(chg.State(), rp.RestartType, &boot.RebootInfo{RebootRequired: true, BootloaderOptions: rp.BootloaderOptions})
+	Request(chg.State(), rp.RestartType, &boot.RebootInfo{RebootRequired: true, BootloaderOptions: rp.BootloaderOptions}, rp.Reason)
 }
 
 // MockAfterRestartForChange is added solely for unit test purposes, to help simulate restarts.

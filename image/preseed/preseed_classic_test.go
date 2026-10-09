@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	. "gopkg.in/check.v1"
 
@@ -44,14 +45,14 @@ func mockVersionFiles(c *C, rootDir1, version1, rootDir2, version2 string) {
 }
 
 func (s *preseedSuite) TestChrootDoesntExist(c *C) {
-	c.Assert(preseed.Classic("/non-existing-dir"), ErrorMatches, `cannot verify "/non-existing-dir": is not a directory`)
+	c.Assert(preseed.Classic("/non-existing-dir"), ErrorMatches, `chroot verification failed: cannot verify "/non-existing-dir": is not a directory`)
 }
 
 func (s *preseedSuite) TestChrootValidationUnhappy(c *C) {
 	tmpDir := c.MkDir()
 	defer osutil.MockMountInfo("")()
 
-	c.Check(preseed.Classic(tmpDir), ErrorMatches, "cannot preseed without the following mountpoints:\n - .*/dev\n - .*/proc\n - .*/sys/kernel/security")
+	c.Check(preseed.Classic(tmpDir), ErrorMatches, "chroot verification failed: cannot preseed without the following mountpoints:\n - .*/dev\n - .*/proc\n - .*/sys/kernel/security")
 }
 
 func (s *preseedSuite) TestRunPreseedMountUnhappy(c *C) {
@@ -77,14 +78,14 @@ fi
 	restoreSystemSnapFromSeed := preseed.MockSystemSnapFromSeed(func(string, string) (string, string, error) { return "/a/core.snap", "", nil })
 	defer restoreSystemSnapFromSeed()
 
-	c.Check(preseed.Classic(tmpDir), ErrorMatches, `cannot mount .+ at .+ in preseed mode: exit status 32\n'mount -t squashfs -o ro,x-gdu.hide,x-gvfs-hide /a/core.snap .*/target-core-mounted-here' failed with: something went wrong\n`)
+	c.Check(preseed.Classic(tmpDir), ErrorMatches, `cannot prepare chroot: cannot mount .+ at .+ in preseed mode: exit status 32\n'mount -t squashfs -o ro,x-gdu.hide,x-gvfs-hide /a/core.snap .*/target-core-mounted-here' failed with: something went wrong\n`)
 }
 
 func (s *preseedSuite) TestChrootValidationUnhappyNoApparmor(c *C) {
 	tmpDir := c.MkDir()
 	defer mockChrootDirs(c, tmpDir, false)()
 
-	c.Check(preseed.Classic(tmpDir), ErrorMatches, `cannot preseed without access to ".*sys/kernel/security/apparmor"`)
+	c.Check(preseed.Classic(tmpDir), ErrorMatches, `chroot verification failed: cannot preseed without access to ".*sys/kernel/security/apparmor"`)
 }
 
 func (s *preseedSuite) TestChrootValidationAlreadyPreseeded(c *C) {
@@ -93,7 +94,7 @@ func (s *preseedSuite) TestChrootValidationAlreadyPreseeded(c *C) {
 	c.Assert(os.MkdirAll(filepath.Join(tmpDir, snapdDir), 0755), IsNil)
 	c.Assert(os.WriteFile(filepath.Join(tmpDir, dirs.SnapStateFile), nil, os.ModePerm), IsNil)
 
-	c.Check(preseed.Classic(tmpDir), ErrorMatches, fmt.Sprintf("the system at %q appears to be preseeded, pass --reset flag to clean it up", tmpDir))
+	c.Check(preseed.Classic(tmpDir), ErrorMatches, fmt.Sprintf("chroot verification failed: the system at %q appears to be preseeded, pass --reset flag to clean it up", tmpDir))
 }
 
 func (s *preseedSuite) TestChrootFailure(c *C) {
@@ -105,7 +106,7 @@ func (s *preseedSuite) TestChrootFailure(c *C) {
 	tmpDir := c.MkDir()
 	defer mockChrootDirs(c, tmpDir, true)()
 
-	c.Check(preseed.Classic(tmpDir), ErrorMatches, fmt.Sprintf("cannot chroot into %s: FAIL: %s", tmpDir, tmpDir))
+	c.Check(preseed.Classic(tmpDir), ErrorMatches, fmt.Sprintf("cannot prepare chroot: cannot chroot into %s: FAIL: %s", tmpDir, tmpDir))
 }
 
 func (s *preseedSuite) TestRunPreseedHappy(c *C) {
@@ -129,11 +130,11 @@ func (s *preseedSuite) TestRunPreseedHappy(c *C) {
 	restoreSystemSnapFromSeed := preseed.MockSystemSnapFromSeed(func(string, string) (string, string, error) { return "/a/core.snap", "", nil })
 	defer restoreSystemSnapFromSeed()
 
-	mockTargetSnapd := testutil.MockCommand(c, filepath.Join(targetSnapdRoot, "usr/lib/snapd/snapd"), `#!/bin/sh
-	if [ "$SNAPD_PRESEED" != "1" ]; then
-		exit 1
-	fi
-`)
+	mockTargetSnapd := testutil.MockCommand(c, filepath.Join(targetSnapdRoot, "usr/lib/snapd/snapd"), fmt.Sprintf(`#!/bin/sh
+	set -eu
+	[ -L %s/snap/snapd/current ]
+	[ "${SNAPD_PRESEED}" = "1" ]
+`, tmpDir))
 	defer mockTargetSnapd.Restore()
 
 	mockSnapdFromDeb := testutil.MockCommand(c, filepath.Join(tmpDir, "usr/lib/snapd/snapd"), `#!/bin/sh
@@ -172,6 +173,68 @@ func (s *preseedSuite) TestRunPreseedHappy(c *C) {
 	}()
 	c.Assert(os.Chdir(tmpDirPath), IsNil)
 	c.Check(preseed.Classic(relativeChroot), IsNil)
+}
+
+func (s *preseedSuite) TestRunPreseedHybridHappy(c *C) {
+	tmpDir := c.MkDir()
+	dirs.SetRootDir(tmpDir)
+	defer mockChrootDirs(c, tmpDir, true)()
+
+	restoreSyscallChroot := preseed.MockSyscallChroot(func(path string) error { return nil })
+	defer restoreSyscallChroot()
+
+	mockMountCmd := testutil.MockCommand(c, "mount", "")
+	defer mockMountCmd.Restore()
+
+	mockUmountCmd := testutil.MockCommand(c, "umount", "")
+	defer mockUmountCmd.Restore()
+
+	targetSnapdRoot := filepath.Join(tmpDir, "target-core-mounted-here")
+	restoreMountPath := preseed.MockSnapdMountPath(targetSnapdRoot)
+	defer restoreMountPath()
+
+	var gotLabel string
+	restoreSystemSnapFromSeed := preseed.MockSystemSnapFromSeed(func(rootDir, label string) (string, string, error) {
+		gotLabel = label
+		return "/a/core.snap", "", nil
+	})
+	defer restoreSystemSnapFromSeed()
+
+	mockTargetSnapd := testutil.MockCommand(c, filepath.Join(targetSnapdRoot, "usr/lib/snapd/snapd"), fmt.Sprintf(`#!/bin/sh
+	set -eu
+	[ -L %s/snap/snapd/current ]
+	[ "${SNAPD_PRESEED}" = "1" ]
+	[ "${SNAPD_PRESEED_HYBRID}" = "1" ]
+`, tmpDir))
+	defer mockTargetSnapd.Restore()
+
+	mockSnapdFromDeb := testutil.MockCommand(c, filepath.Join(tmpDir, "usr/lib/snapd/snapd"), `#!/bin/sh
+	exit 1
+`)
+	defer mockSnapdFromDeb.Restore()
+
+	// snapd from the snap is newer than deb
+	mockVersionFiles(c, targetSnapdRoot, "2.44.0", tmpDir, "2.41.0")
+
+	c.Check(preseed.Hybrid(tmpDir, "system-label"), IsNil)
+	c.Check(gotLabel, Equals, "system-label")
+
+	c.Assert(mockMountCmd.Calls(), HasLen, 3)
+	c.Check(mockMountCmd.Calls()[0], DeepEquals, []string{"mount", "-t", "proc", "none", filepath.Join(tmpDir, "/proc")})
+	c.Check(mockMountCmd.Calls()[1], DeepEquals, []string{"mount", "-t", "devtmpfs", "none", filepath.Join(tmpDir, "/dev")})
+	// note, tmpDir, targetSnapdRoot are contactenated again cause we're not really chrooting in the test
+	// and mocking dirs.RootDir
+	c.Check(mockMountCmd.Calls()[2], DeepEquals, []string{"mount", "-t", "squashfs", "-o", "ro,x-gdu.hide,x-gvfs-hide", "/a/core.snap", filepath.Join(tmpDir, targetSnapdRoot)})
+
+	c.Assert(mockTargetSnapd.Calls(), HasLen, 1)
+	c.Check(mockTargetSnapd.Calls()[0], DeepEquals, []string{"snapd"})
+
+	c.Assert(mockSnapdFromDeb.Calls(), HasLen, 0)
+
+	c.Assert(mockUmountCmd.Calls(), HasLen, 3)
+	c.Check(mockUmountCmd.Calls()[0], DeepEquals, []string{"umount", filepath.Join(tmpDir, targetSnapdRoot)})
+	c.Check(mockUmountCmd.Calls()[1], DeepEquals, []string{"umount", "--lazy", filepath.Join(tmpDir, "/dev")})
+	c.Check(mockUmountCmd.Calls()[2], DeepEquals, []string{"umount", filepath.Join(tmpDir, "/proc")})
 }
 
 func (s *preseedSuite) TestRunPreseedHappyPremounted(c *C) {
@@ -316,7 +379,7 @@ func (s *preseedSuite) TestRunPreseedUnsupportedVersion(c *C) {
 	c.Assert(os.WriteFile(infoFile, []byte("VERSION=2.41.0"), 0644), IsNil)
 
 	c.Check(preseed.Classic(tmpDir), ErrorMatches,
-		`snapd 2.43.0 from the target system does not support preseeding, the minimum required version is 2.43.3\+`)
+		`cannot prepare chroot: snapd 2.43.0 from the target system does not support preseeding, the minimum required version is 2.43.3\+`)
 }
 
 func (s *preseedSuite) TestReset(c *C) {
@@ -391,6 +454,28 @@ func (s *preseedSuite) TestReset(c *C) {
 			}
 		}
 
+		emptiedDirs := []string{
+			dirs.SnapDataDir,
+			dirs.SnapCacheDir,
+			apparmor_sandbox.CacheDir,
+			dirs.SnapDesktopFilesDir,
+			dirs.SnapDBusSessionServicesDir,
+			dirs.SnapDBusSystemServicesDir,
+			dirs.SnapMountDir,
+		}
+
+		removedDirs := []string{
+			dirs.SnapAssertsDBDir,
+			dirs.FeaturesDir,
+			dirs.SnapDesktopIconsDir,
+			dirs.SnapDeviceDir,
+			dirs.SnapCookieDir,
+			dirs.SnapMountPolicyDir,
+			dirs.SnapAppArmorDir,
+			dirs.SnapSeqDir,
+			dirs.SnapSeccompBase,
+		}
+
 		checkArtifacts := func(exists bool) {
 			for _, art := range artifacts {
 				fullPath := filepath.Join(tmpDir, art.path)
@@ -398,6 +483,23 @@ func (s *preseedSuite) TestReset(c *C) {
 					c.Check(osutil.IsSymlink(fullPath), Equals, exists, Commentf("offending symlink: %s", fullPath))
 				} else {
 					c.Check(osutil.FileExists(fullPath), Equals, exists, Commentf("offending file: %s", fullPath))
+				}
+				if exists {
+					continue
+				}
+				dir := filepath.Dir(art.path)
+				for _, d := range emptiedDirs {
+					if strings.HasPrefix(dir, d) {
+						c.Check(osutil.IsDirectory(filepath.Join(tmpDir, d)), Equals, true)
+						entries, err := os.ReadDir(filepath.Join(tmpDir, d))
+						c.Assert(err, IsNil)
+						c.Check(len(entries), Equals, 0, Commentf("directory %s should be empty", d))
+					}
+				}
+				for _, d := range removedDirs {
+					if strings.HasPrefix(dir, d) {
+						c.Check(osutil.IsDirectory(filepath.Join(tmpDir, d)), Equals, false)
+					}
 				}
 			}
 		}
@@ -477,6 +579,57 @@ func (s *preseedSuite) TestResetRexec(c *C) {
 	c.Assert(os.WriteFile(infoFile, []byte("VERSION=2.58"), 0644), IsNil)
 
 	c.Assert(preseed.ClassicReset(tmpDir), IsNil)
+
+	c.Assert(mockTargetSnapPreseed.Calls(), HasLen, 1)
+}
+
+func (s *preseedSuite) TestHybridResetRexec(c *C) {
+	tmpDir := c.MkDir()
+	c.Assert(os.MkdirAll(filepath.Join(tmpDir, "usr/lib/snapd/"), 0755), IsNil)
+	defer mockChrootDirs(c, tmpDir, true)()
+	dirs.SetRootDir(tmpDir)
+
+	mockMountCmd := testutil.MockCommand(c, "mount", "")
+	defer mockMountCmd.Restore()
+
+	mockUmountCmd := testutil.MockCommand(c, "umount", "")
+	defer mockUmountCmd.Restore()
+
+	restoreSyscallChroot := preseed.MockSyscallChroot(func(path string) error { return nil })
+	defer restoreSyscallChroot()
+
+	var gotLabel string
+	restoreSystemSnapFromSeed := preseed.MockSystemSnapFromSeed(func(rootDir, label string) (string, string, error) {
+		gotLabel = label
+		return "/a/core.snap", "", nil
+	})
+	defer restoreSystemSnapFromSeed()
+
+	targetSnapdRoot := filepath.Join(tmpDir, "target-core-mounted-here")
+	restoreMountPath := preseed.MockSnapdMountPath(targetSnapdRoot)
+	defer restoreMountPath()
+
+	c.Assert(os.MkdirAll(filepath.Join(targetSnapdRoot, "usr/lib/snapd/"), 0755), IsNil)
+	mockTargetSnapPreseed := testutil.MockCommand(c, filepath.Join(targetSnapdRoot, "usr/lib/snapd/snap-preseed"), `#!/bin/sh
+		test "$1" = --reset-chroot
+	`)
+	defer mockTargetSnapPreseed.Restore()
+
+	// Before chroot
+	c.Assert(os.MkdirAll(filepath.Join(tmpDir, targetSnapdRoot, dirs.CoreLibExecDir), 0755), IsNil)
+	infoFile := filepath.Join(tmpDir, targetSnapdRoot, dirs.CoreLibExecDir, "info")
+	c.Assert(os.WriteFile(infoFile, []byte("VERSION=2.59"), 0644), IsNil)
+
+	// After chroot
+	c.Assert(os.MkdirAll(filepath.Join(targetSnapdRoot, dirs.CoreLibExecDir), 0755), IsNil)
+	infoFile = filepath.Join(targetSnapdRoot, dirs.CoreLibExecDir, "info")
+	c.Assert(os.WriteFile(infoFile, []byte("VERSION=2.59"), 0644), IsNil)
+
+	infoFile = filepath.Join(filepath.Join(tmpDir, dirs.CoreLibExecDir, "info"))
+	c.Assert(os.WriteFile(infoFile, []byte("VERSION=2.58"), 0644), IsNil)
+
+	c.Assert(preseed.HybridReset(tmpDir, "system-label"), IsNil)
+	c.Check(gotLabel, Equals, "system-label")
 
 	c.Assert(mockTargetSnapPreseed.Calls(), HasLen, 1)
 }

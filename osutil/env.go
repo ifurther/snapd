@@ -22,6 +22,7 @@ package osutil
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -209,6 +210,38 @@ func NewExpandableEnv(pairs ...string) ExpandableEnv {
 	return ExpandableEnv{OrderedMap: strutil.NewOrderedMap(pairs...)}
 }
 
+var envExpandRegExp = regexp.MustCompile("[a-zA-Z0-9_]+:[+-]")
+
+// Adds support for bash conditional syntax ${VARIABLE:+XXX} and ${VARIABLE:-XXX}
+func (env *Environment) expand(value string) string {
+	return os.Expand(value, func(varName string) string {
+		loc := envExpandRegExp.FindStringIndex(varName)
+		if loc == nil {
+			return (*env)[varName]
+		}
+		envVar := string(varName[loc[0]:(loc[1] - 2)])
+		operation := string(varName[loc[1]-1])
+		newVal := string(varName[loc[1]:])
+		envVarValue := (*env)[envVar]
+		switch operation {
+		case "-":
+			if envVarValue == "" {
+				return env.expand(newVal)
+			} else {
+				return envVarValue
+			}
+		case "+":
+			if envVarValue == "" {
+				return ""
+			} else {
+				return env.expand(newVal)
+			}
+		default: // never can really happen, but the compiler complains without it
+			return (*env)[varName]
+		}
+	})
+}
+
 // ExtendWithExpanded extends the environment with eenv.
 //
 // Environment is modified in place. Each variable defined by eenv is
@@ -220,9 +253,7 @@ func (env *Environment) ExtendWithExpanded(eenv ExpandableEnv) {
 	}
 
 	for _, key := range eenv.Keys() {
-		(*env)[key] = os.Expand(eenv.Get(key), func(varName string) string {
-			return (*env)[varName]
-		})
+		(*env)[key] = env.expand(eenv.Get(key))
 	}
 }
 
@@ -232,28 +263,39 @@ func (env *Environment) ExtendWithExpanded(eenv ExpandableEnv) {
 // Taken from https://sourceware.org/git/?p=glibc.git;a=blob_plain;f=sysdeps/generic/unsecvars.h;hb=HEAD
 // TODO: use go generate to obtain this list at build time.
 var unsafeEnv = map[string]bool{
-	"GCONV_PATH":       true,
-	"GETCONF_DIR":      true,
-	"GLIBC_TUNABLES":   true,
-	"HOSTALIASES":      true,
-	"LD_AUDIT":         true,
-	"LD_DEBUG":         true,
-	"LD_DEBUG_OUTPUT":  true,
-	"LD_DYNAMIC_WEAK":  true,
-	"LD_HWCAP_MASK":    true,
-	"LD_LIBRARY_PATH":  true,
-	"LD_ORIGIN_PATH":   true,
-	"LD_PRELOAD":       true,
-	"LD_PROFILE":       true,
-	"LD_SHOW_AUXV":     true,
-	"LD_USE_LOAD_BIAS": true,
-	"LOCALDOMAIN":      true,
-	"LOCPATH":          true,
-	"MALLOC_TRACE":     true,
-	"NIS_PATH":         true,
-	"NLSPATH":          true,
-	"RESOLV_HOST_CONF": true,
-	"RES_OPTIONS":      true,
-	"TMPDIR":           true,
-	"TZDIR":            true,
+	"GCONV_PATH":             true,
+	"GETCONF_DIR":            true,
+	"GLIBC_TUNABLES":         true,
+	"HOSTALIASES":            true,
+	"LD_AUDIT":               true,
+	"LD_DEBUG":               true,
+	"LD_DEBUG_OUTPUT":        true,
+	"LD_DYNAMIC_WEAK":        true,
+	"LD_HWCAP_MASK":          true,
+	"LD_LIBRARY_PATH":        true,
+	"LD_ORIGIN_PATH":         true,
+	"LD_PRELOAD":             true,
+	"LD_PROFILE":             true,
+	"LD_SHOW_AUXV":           true,
+	"LD_USE_LOAD_BIAS":       true,
+	"LOCALDOMAIN":            true,
+	"LOCPATH":                true,
+	"MALLOC_TRACE":           true,
+	"NIS_PATH":               true,
+	"NLSPATH":                true,
+	"RESOLV_HOST_CONF":       true,
+	"RES_OPTIONS":            true,
+	"SNAPD_LD_AUDIT":         true,
+	"SNAPD_LD_DEBUG":         true,
+	"SNAPD_LD_DEBUG_OUTPUT":  true,
+	"SNAPD_LD_DYNAMIC_WEAK":  true,
+	"SNAPD_LD_HWCAP_MASK":    true,
+	"SNAPD_LD_LIBRARY_PATH":  true,
+	"SNAPD_LD_ORIGIN_PATH":   true,
+	"SNAPD_LD_PRELOAD":       true,
+	"SNAPD_LD_PROFILE":       true,
+	"SNAPD_LD_SHOW_AUXV":     true,
+	"SNAPD_LD_USE_LOAD_BIAS": true,
+	"TMPDIR":                 true,
+	"TZDIR":                  true,
 }

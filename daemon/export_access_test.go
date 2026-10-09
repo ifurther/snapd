@@ -23,10 +23,13 @@ import (
 	"net/http"
 
 	"github.com/snapcore/snapd/polkit"
+	"github.com/snapcore/snapd/seclog"
 )
 
 type (
 	AccessChecker = accessChecker
+
+	AccessOptions = accessOptions
 
 	OpenAccess                   = openAccess
 	AuthenticatedAccess          = authenticatedAccess
@@ -34,9 +37,28 @@ type (
 	SnapAccess                   = snapAccess
 	InterfaceOpenAccess          = interfaceOpenAccess
 	InterfaceAuthenticatedAccess = interfaceAuthenticatedAccess
+	InterfaceProviderRootAccess  = interfaceProviderRootAccess
+	InterfaceRootAccess          = interfaceRootAccess
+	ByActionAccess               = byActionAccess
+
+	InterfaceAccessReqs = interfaceAccessReqs
+
+	InterfaceAccessMatch = interfaceAccessMatch
+
+	AccessLevel = accessLevel
 )
 
-var CheckPolkitActionImpl = checkPolkitActionImpl
+const (
+	AccessLevelOpen          = accessLevelOpen
+	AccessLevelAuthenticated = accessLevelAuthenticated
+	AccessLevelRoot          = accessLevelRoot
+)
+
+var (
+	CheckAccess                   = checkAccess
+	CheckPolkitActionImpl         = checkPolkitActionImpl
+	RequireInterfaceApiAccessImpl = requireInterfaceApiAccessImpl
+)
 
 func MockCheckPolkitAction(new func(r *http.Request, ucred *Ucrednet, action string) *APIError) (restore func()) {
 	old := checkPolkitAction
@@ -54,20 +76,20 @@ func MockPolkitCheckAuthorization(new func(pid int32, uid uint32, actionId strin
 	}
 }
 
-func MockCgroupSnapNameFromPid(new func(pid int) (string, error)) (restore func()) {
-	old := cgroupSnapNameFromPid
-	cgroupSnapNameFromPid = new
-	return func() {
-		cgroupSnapNameFromPid = old
-	}
-}
-
-var RequireInterfaceApiAccessImpl = requireInterfaceApiAccessImpl
-
-func MockRequireInterfaceApiAccess(new func(d *Daemon, r *http.Request, ucred *ucrednet, interfaceNames []string) *apiError) (restore func()) {
+func MockRequireInterfaceApiAccess(new func(d *Daemon, r *http.Request, ucred *ucrednet, reqs InterfaceAccessReqs, rec *authzRecorder, level AccessLevel) (InterfaceAccessMatch, *apiError)) (restore func()) {
 	old := requireInterfaceApiAccess
 	requireInterfaceApiAccess = new
 	return func() {
 		requireInterfaceApiAccess = old
 	}
+}
+
+// AuthzGrantedReason returns the grant reason stored on rec.
+func AuthzGrantedReason(rec *authzRecorder) seclog.GrantReason {
+	return rec.reasonGranted
+}
+
+// AuthzDeniedReason returns the denial reason stored on rec.
+func AuthzDeniedReason(rec *authzRecorder) seclog.DenialReason {
+	return rec.reasonDenied
 }

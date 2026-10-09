@@ -21,14 +21,11 @@ package pack_test
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -39,7 +36,6 @@ import (
 	// for SanitizePlugsSlots
 	_ "github.com/snapcore/snapd/interfaces/builtin"
 	"github.com/snapcore/snapd/snap"
-	"github.com/snapcore/snapd/snap/integrity"
 	"github.com/snapcore/snapd/snap/pack"
 	"github.com/snapcore/snapd/snap/squashfs"
 	"github.com/snapcore/snapd/testutil"
@@ -144,6 +140,31 @@ no-colon
 	c.Assert(err, ErrorMatches, `cannot parse snap.yaml: yaml: line 4: could not find expected ':'`)
 }
 
+func (s *packSuite) TestPackInvalidUbuntuCoreTracksFails(c *C) {
+	sourceDir := makeExampleSnapSourceDir(c, `name: snapd
+version: 1.0
+type: snapd
+snapd-info:
+  ubuntu-core-tracks:
+    "18":
+      latest: "18/stable"
+`)
+	_, err := pack.Pack(sourceDir, pack.Defaults)
+	c.Assert(err, ErrorMatches, `invalid ubuntu-core-tracks: target track "18/stable" for boot base 18 is not a track-only channel`)
+}
+
+func (s *packSuite) TestPackSnapdInfoOnAppFails(c *C) {
+	sourceDir := makeExampleSnapSourceDir(c, `name: hello
+version: 1.0
+snapd-info:
+  ubuntu-core-tracks:
+    "18":
+      latest: "18"
+`)
+	_, err := pack.Pack(sourceDir, pack.Defaults)
+	c.Assert(err, ErrorMatches, `cannot specify snapd-info except on the snapd snap`)
+}
+
 func (s *packSuite) TestPackComponentBadName(c *C) {
 	sourceDir := makeExampleComponentSourceDir(c, "{component: hello, version: 0}")
 	pathName, err := pack.Pack(sourceDir, pack.Defaults)
@@ -167,7 +188,65 @@ apps:
 `)
 	c.Assert(os.Remove(filepath.Join(sourceDir, "bin", "hello-world")), IsNil)
 	_, err := pack.Pack(sourceDir, pack.Defaults)
-	c.Assert(err, Equals, snap.ErrMissingPaths)
+	c.Check(err, testutil.ErrorIs, snap.ErrMissingPaths)
+	c.Assert(err, ErrorMatches, `snap is unusable due to missing files: path "bin/hello-world" does not exist`)
+}
+
+func (s *packSuite) TestPackKernelGadgetOSAppWithConfigureHookHappy(c *C) {
+	for _, snapType := range []string{"kernel", "gadget", "os", "app"} {
+		snapYaml := fmt.Sprintf(`name: %[1]s
+version: 0
+type: %[1]s`, snapType)
+		sourceDir := makeExampleSnapSourceDir(c, snapYaml)
+		c.Assert(os.Mkdir(filepath.Join(sourceDir, "meta", "hooks"), 0755), IsNil)
+		c.Assert(os.WriteFile(filepath.Join(sourceDir, "meta", "hooks", "configure"), []byte("#!/bin/sh"), 0755), IsNil)
+		_, err := pack.Pack(sourceDir, pack.Defaults)
+		c.Assert(err, IsNil)
+	}
+}
+
+func (s *packSuite) TestPackKernelGadgetAppWithDefaultConfigureAndConfigureHookHappy(c *C) {
+	for _, snapType := range []string{"kernel", "gadget", "app"} {
+		snapYaml := fmt.Sprintf(`name: %[1]s
+version: 0
+type: %[1]s`, snapType)
+		sourceDir := makeExampleSnapSourceDir(c, snapYaml)
+		configureHooks := []string{"default-configure", "configure"}
+		c.Assert(os.Mkdir(filepath.Join(sourceDir, "meta", "hooks"), 0755), IsNil)
+		for _, hook := range configureHooks {
+			c.Assert(os.WriteFile(filepath.Join(sourceDir, "meta", "hooks", hook), []byte("#!/bin/sh"), 0755), IsNil)
+		}
+		_, err := pack.Pack(sourceDir, pack.Defaults)
+		c.Assert(err, IsNil)
+	}
+}
+
+func (s *packSuite) TestPackSnapdBaseWithConfigureHookError(c *C) {
+	for _, snapType := range []string{"snapd", "base"} {
+		snapYaml := fmt.Sprintf(`name: %[1]s
+version: 0
+type: %[1]s`, snapType)
+		sourceDir := makeExampleSnapSourceDir(c, snapYaml)
+		c.Assert(os.Mkdir(filepath.Join(sourceDir, "meta", "hooks"), 0755), IsNil)
+		c.Assert(os.WriteFile(filepath.Join(sourceDir, "meta", "hooks", "configure"), []byte("#!/bin/sh"), 0755), IsNil)
+		_, err := pack.Pack(sourceDir, pack.Defaults)
+		c.Check(err, ErrorMatches, fmt.Sprintf(`cannot validate snap %[1]q: cannot specify "configure" hook for %[1]q snap %[1]q`, snapType))
+	}
+}
+
+func (s *packSuite) TestPackSnapdBaseOSWithDefaultConfigureHookError(c *C) {
+	for _, snapType := range []string{"snapd", "base", "os"} {
+		snapYaml := fmt.Sprintf(`name: %[1]s
+version: 0
+type: %[1]s`, snapType)
+		sourceDir := makeExampleSnapSourceDir(c, snapYaml)
+		c.Assert(os.Mkdir(filepath.Join(sourceDir, "meta", "hooks"), 0755), IsNil)
+		c.Assert(os.WriteFile(filepath.Join(sourceDir, "meta", "hooks", "default-configure"), []byte("#!/bin/sh"), 0755), IsNil)
+		_, err := pack.Pack(sourceDir, pack.Defaults)
+		// an error due to a prohibited hook for the snap type takes precedence over the
+		// error for missing a configure hook when default-configure is present
+		c.Check(err, ErrorMatches, fmt.Sprintf(`cannot validate snap %[1]q: cannot specify "default-configure" hook for %[1]q snap %[1]q`, snapType))
+	}
 }
 
 func (s *packSuite) TestPackDefaultConfigureWithoutConfigureError(c *C) {
@@ -180,7 +259,7 @@ apps:
 	c.Assert(os.Mkdir(filepath.Join(sourceDir, "meta", "hooks"), 0755), IsNil)
 	c.Assert(os.WriteFile(filepath.Join(sourceDir, "meta", "hooks", "default-configure"), []byte("#!/bin/sh"), 0755), IsNil)
 	_, err := pack.Pack(sourceDir, pack.Defaults)
-	c.Check(err, ErrorMatches, "cannot validate snap \"hello\": cannot specify \"default-configure\" hook without \"configure\" hook")
+	c.Check(err, ErrorMatches, `cannot validate snap "hello": cannot specify "default-configure" hook without "configure" hook`)
 }
 
 func (s *packSuite) TestPackConfigureHooksPermissionsError(c *C) {
@@ -193,25 +272,12 @@ apps:
 	c.Assert(os.Mkdir(filepath.Join(sourceDir, "meta", "hooks"), 0755), IsNil)
 	configureHooks := []string{"configure", "default-configure"}
 	for _, hook := range configureHooks {
-		c.Assert(os.WriteFile(filepath.Join(sourceDir, "meta", "hooks", hook), []byte("#!/bin/sh"), 0666), IsNil)
+		c.Assert(os.WriteFile(filepath.Join(sourceDir, "meta", "hooks", hook), []byte("#!/bin/sh"), 0644), IsNil)
 		_, err := pack.Pack(sourceDir, pack.Defaults)
-		c.Check(err, ErrorMatches, "snap is unusable due to bad permissions")
-	}
-}
-
-func (s *packSuite) TestPackConfigureHooksHappy(c *C) {
-	sourceDir := makeExampleSnapSourceDir(c, `name: hello
-version: 0
-apps:
- foo:
-  command: bin/hello-world
-`)
-	c.Assert(os.Mkdir(filepath.Join(sourceDir, "meta", "hooks"), 0755), IsNil)
-	configureHooks := []string{"configure", "default-configure"}
-	for _, hook := range configureHooks {
-		c.Assert(os.WriteFile(filepath.Join(sourceDir, "meta", "hooks", hook), []byte("#!/bin/sh"), 0755), IsNil)
-		_, err := pack.Pack(sourceDir, pack.Defaults)
-		c.Assert(err, IsNil)
+		c.Check(err, testutil.ErrorIs, snap.ErrBadModes)
+		c.Check(err, ErrorMatches, fmt.Sprintf(`snap is unusable due to bad permissions: "meta/hooks/%s" should be executable, and isn't: -rw-r--r--`, hook))
+		// Fix hook error to catch next hook's error
+		c.Assert(os.Chmod(filepath.Join(sourceDir, "meta", "hooks", hook), 0755), IsNil)
 	}
 }
 
@@ -246,7 +312,8 @@ apps:
 `
 	c.Assert(os.WriteFile(filepath.Join(sourceDir, "meta", "snapshots.yaml"), []byte(invalidSnapshotYaml), 0411), IsNil)
 	_, err := pack.Pack(sourceDir, pack.Defaults)
-	c.Assert(err, ErrorMatches, "snap is unusable due to bad permissions")
+	c.Check(err, testutil.ErrorIs, snap.ErrBadModes)
+	c.Assert(err, ErrorMatches, `snap is unusable due to bad permissions: "meta/snapshots.yaml" should be world-readable, and isn't: -r----x--x`)
 }
 
 func (s *packSuite) TestPackSnapshotYamlHappy(c *C) {
@@ -283,7 +350,8 @@ apps:
 	c.Assert(os.Remove(filepath.Join(sourceDir, "bin", "hello-world")), IsNil)
 
 	err = pack.CheckSkeleton(&buf, sourceDir)
-	c.Assert(err, Equals, snap.ErrMissingPaths)
+	c.Check(err, testutil.ErrorIs, snap.ErrMissingPaths)
+	c.Assert(err, ErrorMatches, `snap is unusable due to missing files: path "bin/hello-world" does not exist`)
 	c.Check(buf.String(), Equals, "")
 }
 
@@ -346,9 +414,9 @@ func (s *packSuite) TestDebArchitecture(c *C) {
 	c.Check(pack.DebArchitecture(&snap.Info{Architectures: nil}), Equals, "all")
 }
 
-func (s *packSuite) TestPackSimple(c *C) {
+func (s *packSuite) TestPackComponentSimple(c *C) {
 	sourceDir := makeExampleComponentSourceDir(c, `component: hello+test
-type: test
+type: standard
 version: 1.0.1
 `)
 
@@ -395,7 +463,49 @@ version: 1.0.1
 	}
 }
 
-func (s *packSuite) TestPackComponentSimple(c *C) {
+func (s *packSuite) TestPackComponentProvenance(c *C) {
+	sourceDir := makeExampleComponentSourceDir(c, `component: hello+test
+type: standard
+version: 1.0.1
+provenance: prov
+`)
+
+	result, err := pack.Pack(sourceDir, nil)
+	c.Assert(err, IsNil)
+
+	// check that there is result
+	_, err = os.Stat(result)
+	c.Assert(err, IsNil)
+	c.Assert(result, Equals, "hello+test_1.0.1.comp")
+
+	// check that the content looks sane
+	output, err := exec.Command("unsquashfs", "-ll", result).CombinedOutput()
+	c.Assert(err, IsNil)
+	expr := fmt.Sprintf(`(?ms).*%s.*`, regexp.QuoteMeta("meta/component.yaml"))
+	c.Assert(string(output), Matches, expr)
+}
+
+func (s *packSuite) TestPackComponentNoVersion(c *C) {
+	sourceDir := makeExampleComponentSourceDir(c, `component: hello+test
+type: standard
+`)
+
+	result, err := pack.Pack(sourceDir, nil)
+	c.Assert(err, IsNil)
+
+	// check that there is result
+	_, err = os.Stat(result)
+	c.Assert(err, IsNil)
+	c.Assert(result, Equals, "hello+test.comp")
+
+	// check that the content looks sane
+	output, err := exec.Command("unsquashfs", "-ll", result).CombinedOutput()
+	c.Assert(err, IsNil)
+	expr := fmt.Sprintf(`(?ms).*%s.*`, regexp.QuoteMeta("meta/component.yaml"))
+	c.Assert(string(output), Matches, expr)
+}
+
+func (s *packSuite) TestPackSimple(c *C) {
 	sourceDir := makeExampleSnapSourceDir(c, `name: hello
 version: 1.0.1
 architectures: ["i386", "amd64"]
@@ -538,89 +648,312 @@ func (s *packSuite) TestPackWithCompressionUnhappy(c *C) {
 	}
 }
 
-func (s *packSuite) TestPackWithIntegrity(c *C) {
-	sourceDir := makeExampleSnapSourceDir(c, "{name: hello, version: 0}")
-	targetDir := c.MkDir()
-
-	// 8192 is the hash size that is created when running 'veritysetup format'
-	// on a minimally sized snap. there is not an easy way to calculate this
-	// value dynamically.
-	const verityHashSize = 8192
-
-	// mock the verity-setup command, what it does is make a copy of the snap
-	// and then returns pre-calculated output
-	vscmd := testutil.MockCommand(c, "veritysetup", fmt.Sprintf(`
-case "$1" in
-	--version)
-		echo "veritysetup 2.2.6"
-		exit 0
-		;;
-	format)
-		truncate -s %[1]d %[2]s/hello_0_all.snap.verity
-		echo "VERITY header information for %[2]s/hello_0_all.snap.verity"
-		echo "UUID:            	606d10a2-24d8-4c6b-90cf-68207aa7c850"
-		echo "Hash type:       	1"
-		echo "Data blocks:     	4"
-		echo "Data block size: 	4096"
-		echo "Hash block size: 	4096"
-		echo "Hash algorithm:  	sha256"
-		echo "Salt:            	eba61f2091bb6122226aef83b0d6c1623f095fc1fda5712d652a8b34a02024ea"
-		echo "Root hash:      	3fbfef5f1f0214d727d03eebc4723b8ef5a34740fd8f1359783cff1ef9c3f334"
-		;;
-esac
-`, verityHashSize, targetDir))
-	defer vscmd.Restore()
-
-	snapPath, err := pack.Pack(sourceDir, &pack.Options{
-		TargetDir: targetDir,
-		Integrity: true,
-	})
+func (s *packSuite) TestCheckSkeletonContentPlugTargetExists(c *C) {
+	sourceDir := makeExampleSnapSourceDir(c, `name: hello
+version: 0
+base: core26
+plugs:
+ shared-data:
+  interface: content
+  target: $SNAP/import
+`)
+	c.Assert(os.Mkdir(filepath.Join(sourceDir, "import"), 0755), IsNil)
+	var buf bytes.Buffer
+	err := pack.CheckSkeleton(&buf, sourceDir)
 	c.Assert(err, IsNil)
-	c.Check(snapPath, testutil.FilePresent)
-	c.Assert(vscmd.Calls(), HasLen, 2)
-	c.Check(vscmd.Calls()[0], DeepEquals, []string{"veritysetup", "--version"})
-	c.Check(vscmd.Calls()[1], DeepEquals, []string{"veritysetup", "format", snapPath, snapPath + ".verity"})
+}
 
-	magic := []byte{'s', 'n', 'a', 'p', 'e', 'x', 't'}
+func (s *packSuite) TestCheckSkeletonContentPlugTargetMissing(c *C) {
+	sourceDir := makeExampleSnapSourceDir(c, `name: hello
+version: 0
+base: core26
+plugs:
+ shared-data:
+  interface: content
+  target: $SNAP/import
+`)
+	var buf bytes.Buffer
+	err := pack.CheckSkeleton(&buf, sourceDir)
+	c.Assert(err, ErrorMatches, `content interface plug "shared-data" target \$SNAP/import must exist and must be a directory, ensure it is present in the snap or created before packing`)
+}
 
-	snapFile, err := os.Open(snapPath)
-	c.Assert(err, IsNil)
-	defer snapFile.Close()
+func (s *packSuite) TestCheckSkeletonContentPlugTargetNotDirectory(c *C) {
+	sourceDir := makeExampleSnapSourceDir(c, `name: hello
+version: 0
+base: core26
+plugs:
+ shared-data:
+  interface: content
+  target: $SNAP/import
+`)
+	c.Assert(os.WriteFile(filepath.Join(sourceDir, "import"), []byte(""), 0644), IsNil)
+	var buf bytes.Buffer
+	err := pack.CheckSkeleton(&buf, sourceDir)
+	c.Assert(err, ErrorMatches, `content interface plug "shared-data" target \$SNAP/import must exist and must be a directory, ensure it is present in the snap or created before packing`)
+}
 
-	fi, err := snapFile.Stat()
-	c.Assert(err, IsNil)
-
-	integrityStartOffset := squashfs.MinimumSnapSize
-	if fi.Size() > int64(65536) {
-		// on openSUSE, the squashfs image is padded up to 64k,
-		// including the integrator data, the overall size is > 64k
-		integrityStartOffset = 65536
+func (s *packSuite) TestCheckSkeletonContentPlugTargetOldBaseSkipped(c *C) {
+	const snapYamlTemplate = `name: hello
+version: 0
+base: %s
+plugs:
+ shared-data:
+  interface: content
+  target: $SNAP/import
+`
+	for _, base := range []string{"core", "core18", "core20", "core22", "core24"} {
+		sourceDir := makeExampleSnapSourceDir(c, fmt.Sprintf(snapYamlTemplate, base))
+		var buf bytes.Buffer
+		err := pack.CheckSkeleton(&buf, sourceDir)
+		c.Assert(err, IsNil, Commentf("base: %s", base))
 	}
+}
 
-	// example snap has a size of 16384 (4 blocks)
-	_, err = snapFile.Seek(integrityStartOffset, io.SeekStart)
+func (s *packSuite) TestCheckSkeletonContentPlugTargetBareBase(c *C) {
+	sourceDir := makeExampleSnapSourceDir(c, `name: hello
+version: 0
+base: bare
+plugs:
+ shared-data:
+  interface: content
+  target: $SNAP/import
+`)
+	var buf bytes.Buffer
+	err := pack.CheckSkeleton(&buf, sourceDir)
+	c.Assert(err, ErrorMatches, `content interface plug "shared-data" target \$SNAP/import must exist and must be a directory, ensure it is present in the snap or created before packing`)
+}
+
+func (s *packSuite) TestCheckSkeletonContentPlugTargetEmptyBase(c *C) {
+	sourceDir := makeExampleSnapSourceDir(c, `name: hello
+version: 0
+plugs:
+ shared-data:
+  interface: content
+  target: $SNAP/import
+`)
+	var buf bytes.Buffer
+	err := pack.CheckSkeleton(&buf, sourceDir)
 	c.Assert(err, IsNil)
+}
 
-	integrityHdr := make([]byte, integrity.HeaderSize)
-	_, err = snapFile.Read(integrityHdr)
-	c.Assert(err, IsNil)
+func (s *packSuite) TestCheckSkeletonContentPlugTargetRuntimePathSkipped(c *C) {
+	const snapYamlTemplate = `name: hello
+version: 0
+base: core26
+plugs:
+ shared-data:
+  interface: content
+  target: %s/import
+`
+	for _, prefix := range []string{"$SNAP_DATA", "$SNAP_COMMON"} {
+		sourceDir := makeExampleSnapSourceDir(c, fmt.Sprintf(snapYamlTemplate, prefix))
+		var buf bytes.Buffer
+		err := pack.CheckSkeleton(&buf, sourceDir)
+		c.Assert(err, IsNil, Commentf("target prefix: %s", prefix))
+	}
+}
 
-	c.Assert(bytes.HasPrefix(integrityHdr, magic), Equals, true)
+func (s *packSuite) TestCheckSkeletonContentPlugTargetNoPrefix(c *C) {
+	sourceDir := makeExampleSnapSourceDir(c, `name: hello
+version: 0
+base: core26
+plugs:
+ shared-data:
+  interface: content
+  target: import
+`)
+	var buf bytes.Buffer
+	err := pack.CheckSkeleton(&buf, sourceDir)
+	c.Assert(err, ErrorMatches, `content interface plug "shared-data" target import must exist and must be a directory, ensure it is present in the snap or created before packing`)
+}
 
-	var hdr interface{}
-	integrityHdr = bytes.Trim(integrityHdr, "\x00")
-	err = json.Unmarshal(integrityHdr[len(magic):], &hdr)
-	c.Check(err, IsNil)
+func (s *packSuite) TestCheckSkeletonContentPlugTargetEdgeCases(c *C) {
+	const snapYamlTemplate = `name: hello
+version: 0
+base: core26
+plugs:
+ shared-data:
+  interface: content
+  target: %s
+`
+	for _, tc := range []struct {
+		target string
+		ok     bool
+	}{
+		// all of these resolve to $SNAP and validation is always successful
+		{"$SNAP", true},
+		{"$SNAP/", true},
+		{"/", true},
+		// /path has implicit $SNAP prefix, leading / is stripped
+		{"/import", false},
+	} {
+		sourceDir := makeExampleSnapSourceDir(c, fmt.Sprintf(snapYamlTemplate, tc.target))
+		var buf bytes.Buffer
+		err := pack.CheckSkeleton(&buf, sourceDir)
+		if tc.ok {
+			c.Assert(err, IsNil, Commentf("target: %s", tc.target))
+		} else {
+			c.Assert(err, ErrorMatches, `content interface plug "shared-data" target.*must exist and must be a directory.*`, Commentf("target: %s", tc.target))
+		}
+	}
+}
 
-	integrityDataHeader, ok := hdr.(map[string]interface{})
-	c.Assert(ok, Equals, true)
-	hdrSizeStr, ok := integrityDataHeader["size"].(string)
-	c.Assert(ok, Equals, true)
-	hdrSize, err := strconv.ParseUint(hdrSizeStr, 10, 64)
-	c.Assert(err, IsNil)
-	c.Check(hdrSize, Equals, uint64(integrity.HeaderSize+verityHashSize))
+func (s *packSuite) TestCheckSkeletonContentPlugTargetMultiplePlugs(c *C) {
+	sourceDir := makeExampleSnapSourceDir(c, `name: hello
+version: 0
+base: core26
+plugs:
+ plug-existing:
+  interface: content
+  target: $SNAP/existing
+ plug-missing:
+  interface: content
+  target: $SNAP/missing
+`)
+	c.Assert(os.Mkdir(filepath.Join(sourceDir, "existing"), 0755), IsNil)
+	var buf bytes.Buffer
+	err := pack.CheckSkeleton(&buf, sourceDir)
+	c.Assert(err, ErrorMatches, `content interface plug "plug-missing" target \$SNAP/missing must exist and must be a directory, ensure it is present in the snap or created before packing`)
+}
 
-	fi, err = snapFile.Stat()
-	c.Assert(err, IsNil)
-	c.Check(fi.Size(), Equals, int64(integrityStartOffset+(integrity.HeaderSize+verityHashSize)))
+type layoutSourceTestCase struct {
+	summary  string
+	base     string
+	layout   string   // layout fragment (indented, under "layout:" key)
+	plugs    string   // plugs fragment (indented, under "plugs:" key)
+	create   []string // paths to create: trailing "/" = dir, 'A -> B' = symlink A pointing to B, otherwise a file
+	errMatch string   // expected error regex, "" = no error expected
+}
+
+func (s *packSuite) checkSkeletonLayoutPath(c *C, tc layoutSourceTestCase) {
+	c.Logf("tc: %+v", tc)
+
+	yamlStr := fmt.Sprintf("name: hello\nversion: 0\nbase: %s\n", tc.base)
+	if tc.plugs != "" {
+		yamlStr += "plugs:\n" + tc.plugs
+	}
+	yamlStr += "layout:\n" + tc.layout
+
+	sourceDir := makeExampleSnapSourceDir(c, yamlStr)
+	for _, f := range tc.create {
+		if before, after, ok := strings.Cut(f, " -> "); ok {
+			// "name -> target" creates a symlink
+			path := filepath.Join(sourceDir, before)
+			c.Assert(os.MkdirAll(filepath.Dir(path), 0755), IsNil)
+			c.Assert(os.Symlink(after, path), IsNil)
+		} else if strings.HasSuffix(f, "/") {
+			path := filepath.Join(sourceDir, f)
+			c.Assert(os.MkdirAll(path, 0755), IsNil)
+		} else {
+			path := filepath.Join(sourceDir, f)
+			c.Assert(os.MkdirAll(filepath.Dir(path), 0755), IsNil)
+			c.Assert(os.WriteFile(path, []byte(""), 0644), IsNil)
+		}
+	}
+	var buf bytes.Buffer
+	err := pack.CheckSkeleton(&buf, sourceDir)
+	if tc.errMatch == "" {
+		c.Assert(err, IsNil, Commentf("test: %s", tc.summary))
+	} else {
+		c.Assert(err, ErrorMatches, tc.errMatch, Commentf("test: %s", tc.summary))
+	}
+}
+
+func (s *packSuite) TestCheckSkeletonLayoutSourceValid(c *C) {
+	for _, tc := range []layoutSourceTestCase{
+		{
+			summary: "bind source directory exists",
+			base:    "core26",
+			layout:  " /opt/lib:\n  bind: $SNAP/lib\n",
+			create:  []string{"lib/"},
+		}, {
+			summary: "bind-file source file exists",
+			base:    "core26",
+			layout:  " /opt/foo.conf:\n  bind-file: $SNAP/foo.conf\n",
+			create:  []string{"foo.conf"},
+		}, {
+			// setup similar to what snapcraft desktop extension injects during build
+			summary: "source under content target with full path present",
+			base:    "core26",
+			plugs:   " gnome:\n  interface: content\n  target: $SNAP/gnome-platform\n",
+			layout:  " /usr/lib/webkit:\n  bind: $SNAP/gnome-platform/usr/lib/webkit\n",
+			create:  []string{"gnome-platform/usr/lib/webkit/"},
+		}, {
+			// symlink target in $SNAP is not required to exist
+			summary: "symlink layout not checked",
+			base:    "core26",
+			layout:  " /opt/data:\n  symlink: $SNAP/data\n",
+		}, {
+			summary: "$SNAP_DATA source skipped",
+			base:    "core26",
+			layout:  " /opt/lib:\n  bind: $SNAP_DATA/lib\n",
+		}, {
+			summary: "$SNAP_COMMON source skipped",
+			base:    "core26",
+			layout:  " /opt/lib:\n  bind: $SNAP_COMMON/lib\n",
+		}, {
+			summary: "tmpfs under $SNAP with directory present",
+			base:    "core26",
+			layout:  " $SNAP/tmpdir:\n  type: tmpfs\n",
+			create:  []string{"tmpdir/"},
+		}, {
+			summary: "tmpfs at system path not checked",
+			base:    "core26",
+			layout:  " /usr/share/foo:\n  type: tmpfs\n",
+		},
+	} {
+		s.checkSkeletonLayoutPath(c, tc)
+	}
+}
+
+func (s *packSuite) TestCheckSkeletonLayoutSourceInvalid(c *C) {
+	for _, tc := range []layoutSourceTestCase{
+		{
+			summary:  "bind source missing",
+			base:     "core26",
+			layout:   " /opt/lib:\n  bind: $SNAP/lib\n",
+			errMatch: `layout "/opt/lib" source "\$SNAP/lib" must exist and be a directory, ensure it is present in the snap or created before packing`,
+		}, {
+			summary:  "bind source is a file not directory",
+			base:     "core26",
+			layout:   " /opt/lib:\n  bind: $SNAP/lib\n",
+			create:   []string{"lib"},
+			errMatch: `layout "/opt/lib" source "\$SNAP/lib" must exist and be a directory, ensure it is present in the snap or created before packing`,
+		}, {
+			summary:  "bind-file source is a directory not file",
+			base:     "core26",
+			layout:   " /opt/foo.conf:\n  bind-file: $SNAP/foo.conf\n",
+			create:   []string{"foo.conf/"},
+			errMatch: `layout "/opt/foo.conf" source "\$SNAP/foo.conf" must exist and be a file, ensure it is present in the snap or created before packing`,
+		}, {
+			summary:  "bind-file source is a symlink not file",
+			base:     "core26",
+			layout:   " /opt/foo.conf:\n  bind-file: $SNAP/foo.conf\n",
+			create:   []string{"foo.conf -> some-target"},
+			errMatch: `layout "/opt/foo.conf" source "\$SNAP/foo.conf" must exist and be a file, ensure it is present in the snap or created before packing`,
+		}, {
+			summary:  "tmpfs under $SNAP directory missing",
+			base:     "core26",
+			layout:   " $SNAP/missing:\n  type: tmpfs\n",
+			errMatch: `layout "\$SNAP/missing" must exist as a directory in the snap, ensure it is present or created before packing`,
+		}, {
+			summary:  "tmpfs under $SNAP target is a file not directory",
+			base:     "core26",
+			layout:   " $SNAP/notadir:\n  type: tmpfs\n",
+			create:   []string{"notadir"},
+			errMatch: `layout "\$SNAP/notadir" must exist as a directory in the snap, ensure it is present or created before packing`,
+		},
+	} {
+		s.checkSkeletonLayoutPath(c, tc)
+	}
+}
+
+func (s *packSuite) TestCheckSkeletonLayoutSourceOldBaseSkipped(c *C) {
+	for _, base := range []string{"core", "core18", "core20", "core22", "core24"} {
+		s.checkSkeletonLayoutPath(c, layoutSourceTestCase{
+			summary: "old base " + base,
+			base:    base,
+			layout:  " /opt/lib:\n  bind: $SNAP/lib\n",
+		})
+	}
 }

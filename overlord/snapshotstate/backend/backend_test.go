@@ -32,7 +32,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"os/user"
 	"path"
 	"path/filepath"
 	"sort"
@@ -47,8 +46,11 @@ import (
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/osutil/sys"
+	"github.com/snapcore/snapd/osutil/user"
 	"github.com/snapcore/snapd/overlord/snapshotstate/backend"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/systemd"
+	"github.com/snapcore/snapd/systemd/systemdtest"
 	"github.com/snapcore/snapd/testutil"
 )
 
@@ -58,6 +60,7 @@ type snapshotSuite struct {
 	restore   []func()
 	tarPath   string
 	isTesting bool
+	sysd      *systemdtest.FakeSystemd
 }
 
 // silly wrappers to get better failure messages
@@ -114,6 +117,7 @@ func (s *snapshotSuite) SetUpTest(c *check.C) {
 	cur, err := user.Current()
 	c.Assert(err, check.IsNil)
 
+	s.sysd = &systemdtest.FakeSystemd{}
 	s.restore = append(s.restore, backend.MockUserLookup(func(username string) (*user.User, error) {
 		if username != "snapuser" {
 			return nil, user.UnknownUserError(username)
@@ -124,6 +128,10 @@ func (s *snapshotSuite) SetUpTest(c *check.C) {
 		return &rv, nil
 	}),
 		backend.MockIsTesting(s.isTesting),
+		osutil.MockMountInfo(""),
+		systemd.MockNewSystemd(func(_ systemd.Backend, _ string, _ systemd.InstanceMode, _ systemd.Reporter) systemd.Systemd {
+			return s.sysd
+		}),
 	)
 
 	s.tarPath, err = exec.LookPath("tar")
@@ -444,11 +452,11 @@ func (s *snapshotSuite) TestIterSetIDoverride(c *check.C) {
 	if os.Geteuid() == 0 {
 		c.Skip("this test cannot run as root (runuser will fail)")
 	}
-	logger.SimpleSetup()
+	logger.SimpleSetup(nil)
 
 	epoch := snap.E("42*")
 	info := &snap.Info{SideInfo: snap.SideInfo{RealName: "hello-snap", Revision: snap.R(42), SnapID: "hello-id"}, Version: "v1.33", Epoch: epoch}
-	cfg := map[string]interface{}{"some-setting": false}
+	cfg := map[string]any{"some-setting": false}
 
 	shw, err := backend.Save(context.TODO(), 12, info, cfg, []string{"snapuser"}, nil, nil)
 	c.Assert(err, check.IsNil)
@@ -585,7 +593,7 @@ func (s *snapshotSuite) TestAddDirToZipTarFails(c *check.C) {
 	var buf bytes.Buffer
 	z := zip.NewWriter(&buf)
 	savingUserData := false
-	c.Assert(backend.AddSnapDirToZip(ctx, &client.Snapshot{Revision: rev}, z, "", "an/entry", s.root, savingUserData, nil), check.ErrorMatches, ".* context canceled")
+	c.Assert(backend.AddSnapDirToZip(ctx, &client.Snapshot{Revision: rev}, z, "root", "an/entry", s.root, savingUserData, nil), check.ErrorMatches, ".* context canceled")
 }
 
 func (s *snapshotSuite) TestAddDirToZip(c *check.C) {
@@ -602,7 +610,7 @@ func (s *snapshotSuite) TestAddDirToZip(c *check.C) {
 		Revision: rev,
 	}
 	savingUserData := false
-	c.Assert(backend.AddSnapDirToZip(context.Background(), snapshot, z, "", "an/entry", s.root, savingUserData, nil), check.IsNil)
+	c.Assert(backend.AddSnapDirToZip(context.Background(), snapshot, z, "root", "an/entry", s.root, savingUserData, nil), check.IsNil)
 	z.Close() // write out the central directory
 
 	c.Check(snapshot.SHA3_384, check.HasLen, 1)
@@ -628,7 +636,7 @@ func (s *snapshotSuite) TestAddDirToZipExclusions(c *check.C) {
 	defer z.Close()
 
 	var tarArgs []string
-	restore := backend.MockTarAsUser(func(username string, args ...string) *exec.Cmd {
+	restore := backend.MockTarAsUser(func(ctx context.Context, username string, args ...string) *exec.Cmd {
 		// We care only about the exclusion arguments in this test
 		tarArgs = nil
 		for _, arg := range args {
@@ -712,11 +720,11 @@ func (s *snapshotSuite) testHappyRoundtrip(c *check.C, marker string) {
 	if os.Geteuid() == 0 {
 		c.Skip("this test cannot run as root (runuser will fail)")
 	}
-	logger.SimpleSetup()
+	logger.SimpleSetup(nil)
 
 	epoch := snap.E("42*")
 	info := &snap.Info{SideInfo: snap.SideInfo{RealName: "hello-snap", Revision: snap.R(42), SnapID: "hello-id"}, Version: "v1.33", Epoch: epoch}
-	cfg := map[string]interface{}{"some-setting": false}
+	cfg := map[string]any{"some-setting": false}
 	shID := uint64(12)
 
 	statExcludes := []string{"$SNAP_USER_DATA/exclude", "$SNAP_USER_COMMON/exclude"}
@@ -735,7 +743,7 @@ func (s *snapshotSuite) testHappyRoundtrip(c *check.C, marker string) {
 	shw, err := backend.Save(context.TODO(), shID, info, cfg, []string{"snapuser"}, dynSnapshotOpts, nil)
 	c.Assert(err, check.IsNil)
 	c.Check(shw.SetID, check.Equals, shID)
-	c.Check(shw.Snap, check.Equals, info.InstanceName())
+	c.Check(shw.Snap, check.Equals, info.InstanceName().String())
 	c.Check(shw.SnapID, check.Equals, info.SnapID)
 	c.Check(shw.Version, check.Equals, info.Version)
 	c.Check(shw.Epoch, check.DeepEquals, epoch)
@@ -760,7 +768,7 @@ func (s *snapshotSuite) testHappyRoundtrip(c *check.C, marker string) {
 	for label, sh := range map[string]*client.Snapshot{"open": &shr.Snapshot, "list": shs[0].Snapshots[0]} {
 		comm := check.Commentf("%q", label)
 		c.Check(sh.SetID, check.Equals, shID, comm)
-		c.Check(sh.Snap, check.Equals, info.InstanceName(), comm)
+		c.Check(sh.Snap, check.Equals, info.InstanceName().String(), comm)
 		c.Check(sh.SnapID, check.Equals, info.SnapID, comm)
 		c.Check(sh.Version, check.Equals, info.Version, comm)
 		c.Check(sh.Epoch, check.DeepEquals, epoch)
@@ -804,11 +812,11 @@ func (s *snapshotSuite) TestOpenSetIDoverride(c *check.C) {
 	if os.Geteuid() == 0 {
 		c.Skip("this test cannot run as root (runuser will fail)")
 	}
-	logger.SimpleSetup()
+	logger.SimpleSetup(nil)
 
 	epoch := snap.E("42*")
 	info := &snap.Info{SideInfo: snap.SideInfo{RealName: "hello-snap", Revision: snap.R(42), SnapID: "hello-id"}, Version: "v1.33", Epoch: epoch}
-	cfg := map[string]interface{}{"some-setting": false}
+	cfg := map[string]any{"some-setting": false}
 
 	shw, err := backend.Save(context.TODO(), 12, info, cfg, []string{"snapuser"}, nil, nil)
 	c.Assert(err, check.IsNil)
@@ -828,7 +836,7 @@ func (s *snapshotSuite) TestRestoreRoundtripDifferentRevision(c *check.C) {
 	if os.Geteuid() == 0 {
 		c.Skip("this test cannot run as root (runuser will fail)")
 	}
-	logger.SimpleSetup()
+	logger.SimpleSetup(nil)
 
 	epoch := snap.E("42*")
 	info := &snap.Info{SideInfo: snap.SideInfo{RealName: "hello-snap", Revision: snap.R(42), SnapID: "hello-id"}, Version: "v1.33", Epoch: epoch}
@@ -926,19 +934,17 @@ func (s *snapshotSuite) TestMaybeRunuserHappyRunuser(c *check.C) {
 	logbuf, restore := logger.MockLogger()
 	defer restore()
 
-	c.Check(backend.TarAsUser("test", "--bar"), check.DeepEquals, &exec.Cmd{
+	c.Check(backend.TarAsUser(context.Background(), "test", "--bar"), check.DeepEquals, &exec.Cmd{
 		Path: "/sbin/runuser",
 		Args: []string{"/sbin/runuser", "-u", "test", "--", "tar", "--bar"},
 	})
-	c.Check(backend.TarAsUser("root", "--bar"), check.DeepEquals, &exec.Cmd{
-		Path: s.tarPath,
-		Args: []string{"tar", "--bar"},
-	})
+	cmd := backend.TarAsUser(context.Background(), "root", "--bar")
+	c.Check(cmd.Path, check.Equals, s.tarPath)
+	c.Check(cmd.Args, check.DeepEquals, []string{"tar", "--bar"})
 	uid = 42
-	c.Check(backend.TarAsUser("test", "--bar"), check.DeepEquals, &exec.Cmd{
-		Path: s.tarPath,
-		Args: []string{"tar", "--bar"},
-	})
+	cmd = backend.TarAsUser(context.Background(), "test", "--bar")
+	c.Check(cmd.Path, check.Equals, s.tarPath)
+	c.Check(cmd.Args, check.DeepEquals, []string{"tar", "--bar"})
 	c.Check(logbuf.String(), check.Equals, "")
 }
 
@@ -949,20 +955,19 @@ func (s *snapshotSuite) TestMaybeRunuserHappySudo(c *check.C) {
 	logbuf, restore := logger.MockLogger()
 	defer restore()
 
-	cmd := backend.TarAsUser("test", "--bar")
+	cmd := backend.TarAsUser(context.Background(), "test", "--bar")
 	c.Check(cmd, check.DeepEquals, &exec.Cmd{
 		Path: "/usr/bin/sudo",
 		Args: []string{"/usr/bin/sudo", "-u", "test", "--", "tar", "--bar"},
 	})
-	c.Check(backend.TarAsUser("root", "--bar"), check.DeepEquals, &exec.Cmd{
-		Path: s.tarPath,
-		Args: []string{"tar", "--bar"},
-	})
+
+	cmd = backend.TarAsUser(context.Background(), "root", "--bar")
+	c.Check(cmd.Path, check.Equals, s.tarPath)
+	c.Check(cmd.Args, check.DeepEquals, []string{"tar", "--bar"})
 	uid = 42
-	c.Check(backend.TarAsUser("test", "--bar"), check.DeepEquals, &exec.Cmd{
-		Path: s.tarPath,
-		Args: []string{"tar", "--bar"},
-	})
+	cmd = backend.TarAsUser(context.Background(), "test", "--bar")
+	c.Check(cmd.Path, check.Equals, s.tarPath)
+	c.Check(cmd.Args, check.DeepEquals, []string{"tar", "--bar"})
 	c.Check(logbuf.String(), check.Equals, "")
 }
 
@@ -973,19 +978,17 @@ func (s *snapshotSuite) TestMaybeRunuserNoHappy(c *check.C) {
 	logbuf, restore := logger.MockLogger()
 	defer restore()
 
-	c.Check(backend.TarAsUser("test", "--bar"), check.DeepEquals, &exec.Cmd{
-		Path: s.tarPath,
-		Args: []string{"tar", "--bar"},
-	})
-	c.Check(backend.TarAsUser("root", "--bar"), check.DeepEquals, &exec.Cmd{
-		Path: s.tarPath,
-		Args: []string{"tar", "--bar"},
-	})
+	cmd := backend.TarAsUser(context.Background(), "test", "--bar")
+	c.Check(cmd.Path, check.Equals, s.tarPath)
+	c.Check(cmd.Args, check.DeepEquals, []string{"tar", "--bar"})
+	cmd = backend.TarAsUser(context.Background(), "root", "--bar")
+	c.Check(cmd.Path, check.Equals, s.tarPath)
+	c.Check(cmd.Args, check.DeepEquals, []string{"tar", "--bar"})
 	uid = 42
-	c.Check(backend.TarAsUser("test", "--bar"), check.DeepEquals, &exec.Cmd{
-		Path: s.tarPath,
-		Args: []string{"tar", "--bar"},
-	})
+	cmd = backend.TarAsUser(context.Background(), "test", "--bar")
+	c.Check(cmd.Path, check.Equals, s.tarPath)
+	c.Check(cmd.Args, check.DeepEquals, []string{"tar", "--bar"})
+
 	c.Check(strings.TrimSpace(logbuf.String()), check.Matches, ".* No user wrapper found.*")
 }
 
@@ -1100,6 +1103,10 @@ func (s *snapshotSuite) TestImportCheckError(c *check.C) {
 }
 
 func (s *snapshotSuite) TestImportDuplicated(c *check.C) {
+	if os.Geteuid() == 0 {
+		c.Skip("this test cannot run as root (runuser will fail)")
+	}
+
 	err := os.MkdirAll(dirs.SnapshotsDir, 0755)
 	c.Assert(err, check.IsNil)
 
@@ -1129,6 +1136,10 @@ func (s *snapshotSuite) TestImportDuplicated(c *check.C) {
 }
 
 func (s *snapshotSuite) TestImportExportRoundtrip(c *check.C) {
+	if os.Geteuid() == 0 {
+		c.Skip("this test cannot run as root (runuser will fail)")
+	}
+
 	err := os.MkdirAll(dirs.SnapshotsDir, 0755)
 	c.Assert(err, check.IsNil)
 
@@ -1136,7 +1147,7 @@ func (s *snapshotSuite) TestImportExportRoundtrip(c *check.C) {
 
 	epoch := snap.E("42*")
 	info := &snap.Info{SideInfo: snap.SideInfo{RealName: "hello-snap", Revision: snap.R(42), SnapID: "hello-id"}, Version: "v1.33", Epoch: epoch}
-	cfg := map[string]interface{}{"some-setting": false}
+	cfg := map[string]any{"some-setting": false}
 	shID := uint64(12)
 
 	shw, err := backend.Save(ctx, shID, info, cfg, []string{"snapuser"}, nil, nil)
@@ -1289,6 +1300,10 @@ func (s *snapshotSuite) TestEstimateSnapshotSizeNotDataDirs(c *check.C) {
 }
 
 func (s *snapshotSuite) TestExportTwice(c *check.C) {
+	if os.Geteuid() == 0 {
+		c.Skip("this test cannot run as root (runuser will fail)")
+	}
+
 	// use mocking done in snapshotSuite.SetUpTest
 	info := &snap.Info{
 		SideInfo: snap.SideInfo{
@@ -1305,6 +1320,25 @@ func (s *snapshotSuite) TestExportTwice(c *check.C) {
 
 	// content.json + num_files + export.json + footer
 	expectedSize := int64(1024 + 4*512 + 1024 + 2*512)
+
+	// If a file's UID or GID exceeds USTAR limits, go's tar uses PAX format which adds
+	// a PAX "header block" (512 bytes) with "extended header records" (512 bytes per record)
+	// for that file.
+	// See https://pubs.opengroup.org/onlinepubs/009695399/utilities/pax.html#tag_04_100_13_01.
+	//
+	// Snapshot creation uses tar.Header's default UID=0, GID=0 for content.json and export.json.
+	// But uses current UID/GID for the snapshot file and this current UID/GID may
+	// exceed USTAR limits and trigger PAX. For setting UID and/or GID in PAX, a single
+	// "extended header record" is sufficient.
+	//
+	// Thus, whenever UID/GID exceeds USTAR limits, the snapshot size will increase by 1024 bytes
+	// (512 for PAX "header block" + 512 for PAX single "extended header record").
+
+	const ustarMaxID = 0o7777777 // 2097151
+	if os.Getuid() > ustarMaxID || os.Getgid() > ustarMaxID {
+		expectedSize += 1024
+	}
+
 	// do on export at the start of the epoch
 	restore := backend.MockTimeNow(func() time.Time { return time.Time{} })
 	defer restore()
@@ -1519,7 +1553,7 @@ func (s *snapshotSuite) TestIterWithMockedSnapshotFiles(c *check.C) {
 	c.Check(callbackCalled, check.Equals, 0)
 }
 
-func (s *snapshotSuite) TestCleanupAbandondedImports(c *check.C) {
+func (s *snapshotSuite) TestCleanupAbandonedImports(c *check.C) {
 	err := os.MkdirAll(dirs.SnapshotsDir, 0755)
 	c.Assert(err, check.IsNil)
 
@@ -1546,7 +1580,7 @@ func (s *snapshotSuite) TestCleanupAbandondedImports(c *check.C) {
 	c.Assert(err, check.IsNil)
 
 	// run cleanup
-	cleaned, err := backend.CleanupAbandondedImports()
+	cleaned, err := backend.CleanupAbandonedImports()
 	c.Check(cleaned, check.Equals, 1)
 	c.Check(err, check.IsNil)
 
@@ -1558,7 +1592,7 @@ func (s *snapshotSuite) TestCleanupAbandondedImports(c *check.C) {
 	c.Check(snapshotFiles[2][1], testutil.FileAbsent)
 }
 
-func (s *snapshotSuite) TestCleanupAbandondedImportsFailMany(c *check.C) {
+func (s *snapshotSuite) TestCleanupAbandonedImportsFailMany(c *check.C) {
 	restore := backend.MockFilepathGlob(func(string) ([]string, error) {
 		return []string{
 			"/var/lib/snapd/snapshots/NaN_importing",
@@ -1568,7 +1602,7 @@ func (s *snapshotSuite) TestCleanupAbandondedImportsFailMany(c *check.C) {
 	})
 	defer restore()
 
-	_, err := backend.CleanupAbandondedImports()
+	_, err := backend.CleanupAbandonedImports()
 	c.Assert(err, check.ErrorMatches, `cannot cleanup imports:
 - cannot determine snapshot id from "/var/lib/snapd/snapshots/NaN_importing"
 - cannot cancel import for set id 11:
@@ -1637,6 +1671,10 @@ func (s *snapshotSuite) TestMultiErrorCycle(c *check.C) {
 }
 
 func (s *snapshotSuite) TestSnapshotExportContentHash(c *check.C) {
+	if os.Geteuid() == 0 {
+		c.Skip("this test cannot run as root (runuser will fail)")
+	}
+
 	ctx := context.TODO()
 	info := &snap.Info{
 		SideInfo: snap.SideInfo{
@@ -1675,4 +1713,86 @@ func (s *snapshotSuite) TestSnapshotExportContentHash(c *check.C) {
 	export3, err := backend.NewSnapshotExport(ctx, shw.SetID)
 	c.Assert(err, check.IsNil)
 	c.Check(export.ContentHash(), check.Not(check.DeepEquals), export3.ContentHash())
+}
+
+func (s *snapshotSuite) TestMapSnapDataDirToSnapVarNilUsernames(c *check.C) {
+	info := &snap.Info{
+		SideInfo: snap.SideInfo{RealName: "foo", Revision: snap.R(7)},
+	}
+	restore := backend.MockUsersForUsernames(func(usernames []string, opts *dirs.SnapDirOptions) ([]*user.User, error) {
+		c.Assert(usernames, check.IsNil)
+		return []*user.User{
+			{HomeDir: "/home/user1"},
+			{HomeDir: "/home/user2"},
+		}, nil
+	})
+	defer restore()
+
+	mappings, err := backend.MapSnapDataDirToSnapVar(info, nil, nil)
+	c.Assert(err, check.IsNil)
+	c.Check(mappings, check.DeepEquals, map[string]string{
+		info.DataDir():                             "$SNAP_DATA",
+		info.CommonDataDir():                       "$SNAP_COMMON",
+		info.UserDataDir("/home/user1", nil):       "$SNAP_USER_DATA",
+		info.UserCommonDataDir("/home/user1", nil): "$SNAP_USER_COMMON",
+		info.UserDataDir("/home/user2", nil):       "$SNAP_USER_DATA",
+		info.UserCommonDataDir("/home/user2", nil): "$SNAP_USER_COMMON",
+	})
+}
+
+func (s *snapshotSuite) TestMapSnapDataDirToSnapVarNoUsers(c *check.C) {
+	info := &snap.Info{
+		SideInfo: snap.SideInfo{RealName: "foo", Revision: snap.R(7)},
+	}
+	restore := backend.MockUsersForUsernames(func(usernames []string, opts *dirs.SnapDirOptions) ([]*user.User, error) {
+		c.Assert(usernames, check.IsNil)
+		return nil, nil
+	})
+	defer restore()
+
+	mappings, err := backend.MapSnapDataDirToSnapVar(info, nil, nil)
+	c.Assert(err, check.IsNil)
+	c.Check(mappings, check.DeepEquals, map[string]string{
+		info.DataDir():       "$SNAP_DATA",
+		info.CommonDataDir(): "$SNAP_COMMON",
+	})
+}
+
+func (s *snapshotSuite) TestMapSnapDataDirToSnapVarSelectedUsernames(c *check.C) {
+	info := &snap.Info{
+		SideInfo: snap.SideInfo{RealName: "foo", Revision: snap.R(7)},
+	}
+
+	usernames := []string{"user2"}
+	opts := &dirs.SnapDirOptions{HiddenSnapDataDir: true}
+
+	restore := backend.MockUsersForUsernames(func(gotUsernames []string, gotOpts *dirs.SnapDirOptions) ([]*user.User, error) {
+		c.Assert(gotUsernames, check.DeepEquals, usernames)
+		c.Assert(gotOpts, check.DeepEquals, opts)
+		return []*user.User{{HomeDir: "/home/user2"}}, nil
+	})
+	defer restore()
+
+	mappings, err := backend.MapSnapDataDirToSnapVar(info, opts, usernames)
+	c.Assert(err, check.IsNil)
+	c.Check(mappings, check.DeepEquals, map[string]string{
+		info.DataDir():                              "$SNAP_DATA",
+		info.CommonDataDir():                        "$SNAP_COMMON",
+		info.UserDataDir("/home/user2", opts):       "$SNAP_USER_DATA",
+		info.UserCommonDataDir("/home/user2", opts): "$SNAP_USER_COMMON",
+	})
+}
+
+func (s *snapshotSuite) TestMapSnapDataDirToSnapVarUserLookupError(c *check.C) {
+	info := &snap.Info{
+		SideInfo: snap.SideInfo{RealName: "foo", Revision: snap.R(7)},
+	}
+	restore := backend.MockUsersForUsernames(func(_ []string, _ *dirs.SnapDirOptions) ([]*user.User, error) {
+		return nil, fmt.Errorf("mock usersForUsernames error")
+	})
+	defer restore()
+
+	mappings, err := backend.MapSnapDataDirToSnapVar(info, nil, nil)
+	c.Assert(err, check.ErrorMatches, "mock usersForUsernames error")
+	c.Check(mappings, check.IsNil)
 }

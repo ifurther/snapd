@@ -71,6 +71,10 @@ func (Store) DownloadStream(ctx context.Context, name string, downloadInfo *snap
 	panic("Store.DownloadStream not expected")
 }
 
+func (Store) DownloadIcon(context.Context, string, string, string) error {
+	panic("Store.DownloadIcon not expected")
+}
+
 func (Store) SuggestedCurrency() string {
 	panic("Store.SuggestedCurrency not expected")
 }
@@ -121,4 +125,16 @@ func (Store) LoginUser(username, password, otp string) (string, string, error) {
 
 func (Store) UserInfo(email string) (userinfo *store.User, err error) {
 	panic("UserInfo not expected")
+}
+
+func (Store) CleanDownloadsCache() error {
+	panic("CleanDownloadsCache not expected")
+}
+
+func (Store) CleanupDownloadArtifacts(targetFn string, dl *snap.DownloadInfo) error {
+	panic("CleanupDownloadArtifacts not expected")
+}
+
+func (Store) ExchangeMessages(ctx context.Context, req *store.MessageExchangeRequest) (*store.MessageExchangeResponse, error) {
+	panic("ExchangeMessages not expected")
 }

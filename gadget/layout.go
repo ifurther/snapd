@@ -26,9 +26,9 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/snapcore/snapd/gadget/device"
 	"github.com/snapcore/snapd/gadget/quantity"
 	"github.com/snapcore/snapd/kernel"
-	"github.com/snapcore/snapd/secboot"
 )
 
 // LayoutOptions defines the options to layout a given volume.
@@ -49,7 +49,7 @@ type LayoutOptions struct {
 	GadgetRootDir string
 	KernelRootDir string
 
-	EncType secboot.EncryptionType
+	EncType device.EncryptionType
 }
 
 // NonMBRStartOffset is the minimum start offset of the first non-MBR structure
@@ -219,10 +219,10 @@ func layoutVolumePartially(volume *Volume, gadgetToDiskStruct map[int]*OnDiskStr
 	return vol, nil
 }
 
-func setOnDiskLabelAndTypeInLaidOut(los *LaidOutStructure, encType secboot.EncryptionType) {
+func setOnDiskLabelAndTypeInLaidOut(los *LaidOutStructure, encType device.EncryptionType) {
 	los.PartitionFSLabel = los.Label()
 	los.PartitionFSType = los.Filesystem()
-	if encType != secboot.EncryptionTypeNone {
+	if encType != device.EncryptionTypeNone {
 		switch los.Role() {
 		case SystemData, SystemSave:
 			los.PartitionFSLabel += "-enc"
@@ -463,8 +463,14 @@ func layOutStructureContent(gadgetRootDir string, ps *LaidOutStructure) ([]LaidO
 			Index:         idx,
 		}
 		previousEnd = start + quantity.Offset(actualSize)
-		if quantity.Size(previousEnd) > ps.VolumeStructure.Size {
-			return nil, fmt.Errorf("cannot lay out structure %v: content %q does not fit in the structure", ps, c.Image)
+
+		// On EMMC devices, we do not create the structures, they already exist
+		// and thus the size check happens against the hardware device size, so skip
+		// any checks against the volume structure here.
+		if ps.VolumeStructure.EnclosingVolume.Schema != "emmc" {
+			if quantity.Size(previousEnd) > ps.VolumeStructure.Size {
+				return nil, fmt.Errorf("cannot lay out structure %v: content %q does not fit in the structure", ps, c.Image)
+			}
 		}
 	}
 

@@ -17,13 +17,11 @@ systems:
   - -ubuntu-18.04-*
   - -ubuntu-20.04-*
   - -ubuntu-core-*
-  - -centos-7-*
-  - -centos-8-*
   - -centos-9-*
 
 prepare: |
     tests.session -u test prepare
-    if command -v setenforce; then
+    if command -v getenforce && [ "$(getenforce)" != "Disabled" ]; then
         # an SELinux enabled system, switch the mode to enforcing
         getenforce > enforcing.mode
         setenforce 1
@@ -34,37 +32,24 @@ prepare: |
 restore: |
     systemctl stop snap.test-snapd-service.test-snapd-service.service
     rm -f /sys/fs/bpf/snap/snap_test-snapd-service_sh
+    snap remove --purge test-snapd-service || true
     tests.session -u test restore
     if test -f enforcing.mode; then
         setenforce "$(cat enforcing.mode)"
     fi
 
 debug: |
-    if test -f "cgroup_device.progs-1" -a -f "cgroup_device.progs-2"; then
-        echo "cgroup devices before:"
-        cat "cgroup_device.progs-1"
-        echo "cgroup devices after installation:"
-        cat "cgroup_device.progs-2"
-    fi
-    if test -f "cgroup_device.progs-3"; then
-        echo "cgroup devices after connecting the interface:"
-        cat "cgroup_device.progs-3"
-    fi
-    if test -f "cgroup_device.progs-4"; then
-        echo "cgroup devices after restarting the service:"
-        cat "cgroup_device.progs-4"
-    fi
     systemctl status snap.test-snapd-service.test-snapd-service.service || true
     journalctl -u snap.test-snapd-service.test-snapd-service.service || true
 
 execute: |
     dump_cgroup_device_progs() {
-        # dump all progs but those that are assigned to systemd, in which case
-        # they have the pids list non empty
-        bpftool prog list -j | jq -r '.[] | select(.type == "cgroup_device") | select(.pids == null) | .id'
+        # dump all snap progs
+        bpftool prog list -j | gojq -r '.[] | select(.type == "cgroup_device") | select(.name != null) | select(.name | startswith("s_")) | .name'
     }
-    echo "Dump BPF programs that are of type cgroup_device"
-    dump_cgroup_device_progs > cgroup_device.progs-1
+
+    echo "Before running the snap, there are no snap BPF programs"
+    test -z "$(dump_cgroup_device_progs)"
 
     echo "Install a test service"
     # Because this service is of type "simple" it is considered "ready" instantly.
@@ -92,10 +77,8 @@ execute: |
 
     # Initially since there are no devices assigned to snap, there is no map with device access
     test ! -e /sys/fs/bpf/snap/snap_test-snapd-service_test-snapd-service
-    # Do another dump
-    dump_cgroup_device_progs > cgroup_device.progs-2
-    echo "Verify no new device cgroup programs are present"
-    test "$(wc -l < cgroup_device.progs-1)" = "$(wc -l < cgroup_device.progs-2)"
+    echo "Verify there continue to be no snap BPF programs"
+    test -z "$(dump_cgroup_device_progs)"
 
     echo "Connect the joystick interface"
     snap connect test-snapd-service:joystick
@@ -119,11 +102,19 @@ execute: |
     # but there are no new programs, as they go away when cgroup is removed
     # (also wait until systemd cleans up the cgroup)
     retry -n 10 test ! -e "/sys/fs/cgroup/$testshcgroup"
-    dump_cgroup_device_progs > cgroup_device.progs-3
-    test "$(wc -l < cgroup_device.progs-1)" = "$(wc -l < cgroup_device.progs-3)"
+    echo "Verify there continue to be no snap BPF programs"
+    # retry as the kernel may not immediately free BPF programs after cgroup dir removal
+    export -f dump_cgroup_device_progs
+    # shellcheck disable=SC2016
+    retry -n 10 bash -c 'test -z "$(dump_cgroup_device_progs)"'
 
     # dump the map
     bpftool map dump pinned /sys/fs/bpf/snap/snap_test-snapd-service_sh > device-access.map-app
+
+    echo "Verify snap debug device-cgroup shows the allowed devices for the app"
+    snap debug device-cgroup test-snapd-service > device-cgroup-devices.out
+    MATCH 'Security tag: snap\.test-snapd-service\.sh' < device-cgroup-devices.out
+    MATCH 'c +1:3 +rwm +/dev/null' < device-cgroup-devices.out
 
     # NOTE: the actual permissions may drift over time. We just care about the fact
     # that there *are* some constraints here now and there were none before.
@@ -150,14 +141,18 @@ execute: |
     # dump the map
     bpftool map dump pinned /sys/fs/bpf/snap/snap_test-snapd-service_test-snapd-service > device-access.map-service
 
+    echo "Verify snap debug device-cgroup also shows the service's allowed devices"
+    snap debug device-cgroup test-snapd-service > device-cgroup-devices-service.out
+    MATCH 'Security tag: snap\.test-snapd-service\.test-snapd-service' < device-cgroup-devices-service.out
+    MATCH 'c +1:3 +rwm +/dev/null' < device-cgroup-devices-service.out
+
     # we use a hash map, and there may be a random element introduced affecting
     # the ordering, so just verify the basics
     echo "Verify the constraints in device cgroup imposed by snapd on the snap service"
     MATCH 'key: 63 01 00 00 00 03 00 00 +00 +value: 01' < device-access.map-service
 
     # since the service is up, we'll observe that a new program was loaded
-    dump_cgroup_device_progs > cgroup_device.progs-4
-    test "$(wc -l < cgroup_device.progs-1)" -lt "$(wc -l < cgroup_device.progs-4)"
+    test "$(dump_cgroup_device_progs | wc -l)" -eq 1
 
     # unmount /sys/fs/bpf and observe how s-c- restores it
     echo "Verify the bpffs mount is created when needed"
@@ -172,6 +167,11 @@ execute: |
     test -e /sys/fs/bpf/snap/snap_test-snapd-service_sh
 
     if test -f enforcing.mode; then
-        # there should have been no denials
-        ausearch -i --checkpoint stamp --start checkpoint -m AVC 2>&1 | MATCH 'no matches'
+        # Ignore expected SELinux denials from syslogd_t using netlink_tcpdiag_socket
+        # Fail on any other unexpected AVCs.
+        ausearch --checkpoint stamp --start checkpoint -m AVC > avc-after 2>&1 || true
+        grep -v -E 'avc:  denied  \{ .* \} .* scontext=.*:syslogd_t:s0 .* tclass=netlink_tcpdiag_socket' < avc-after | \
+        grep -v -E 'avc:  denied  \{ .* \} .* scontext=.*:system_dbusd_t:s0.* tclass=fifo_file' | \
+        grep -v -E 'avc:  denied  \{ .* \} .* scontext=.*:init_t:s0.* tclass=fifo_file' | \
+            NOMATCH 'type=AVC'
     fi

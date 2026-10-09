@@ -20,9 +20,11 @@
 package snapstate_test
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"time"
 
 	. "gopkg.in/check.v1"
@@ -30,13 +32,19 @@ import (
 	"github.com/snapcore/snapd/asserts"
 	"github.com/snapcore/snapd/asserts/snapasserts"
 	"github.com/snapcore/snapd/dirs"
+	"github.com/snapcore/snapd/features"
+	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/overlord/assertstate"
 	"github.com/snapcore/snapd/overlord/configstate/config"
 	"github.com/snapcore/snapd/overlord/snapstate"
+	"github.com/snapcore/snapd/overlord/snapstate/backend"
+	"github.com/snapcore/snapd/overlord/snapstate/sequence"
 	"github.com/snapcore/snapd/overlord/snapstate/snapstatetest"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
+	"github.com/snapcore/snapd/snap/snaptest"
 	"github.com/snapcore/snapd/testutil"
 )
 
@@ -58,6 +66,8 @@ func (s *snapmgrTestSuite) TestRemoveTasks(c *C) {
 
 	c.Assert(s.state.TaskCount(), Equals, len(ts.Tasks()))
 	verifyRemoveTasks(c, ts)
+	t := findKindInTaskSet(ts, "auto-disconnect")
+	c.Assert(t.Has("full-remove"), Equals, true)
 }
 
 func (s *snapmgrTestSuite) TestRemoveTasksAutoSnapshotDisabled(c *C) {
@@ -231,8 +241,11 @@ func (s *snapmgrTestSuite) TestRemoveDiskSpaceForSnapshotError(c *C) {
 }
 
 func (s *snapmgrTestSuite) TestRemoveRunThrough(c *C) {
-	c.Assert(snapstate.KeepAuxStoreInfo("some-snap-id", nil), IsNil)
-	c.Check(snapstate.AuxStoreInfoFilename("some-snap-id"), testutil.FilePresent)
+	aux := backend.AuxStoreInfo{}    // doesn't matter for this test
+	linkCtx := backend.LinkContext{} // doesn't matter for this test
+	_, err := backend.InstallStoreMetadata("some-snap-id", aux, linkCtx)
+	c.Check(err, IsNil)
+	c.Check(backend.AuxStoreInfoFilename("some-snap-id"), testutil.FilePresent)
 	si := snap.SideInfo{
 		SnapID:   "some-snap-id",
 		RealName: "some-snap",
@@ -274,6 +287,16 @@ func (s *snapmgrTestSuite) TestRemoveRunThrough(c *C) {
 			op:    "remove-profiles:Doing",
 			name:  "some-snap",
 			revno: snap.R(7),
+		},
+		{
+			op:    "list-non-snapctl-mounts-all",
+			name:  "some-snap",
+			revno: snap.R(7),
+		},
+		{
+			op:     "remove-snap-mount-units",
+			name:   "some-snap",
+			origin: "mount-control",
 		},
 		{
 			op:   "remove-snap-data",
@@ -369,7 +392,7 @@ func (s *snapmgrTestSuite) TestRemoveRunThrough(c *C) {
 	var snapst snapstate.SnapState
 	err = snapstate.Get(s.state, "some-snap", &snapst)
 	c.Assert(err, testutil.ErrorIs, state.ErrNoState)
-	c.Check(snapstate.AuxStoreInfoFilename("some-snap-id"), testutil.FileAbsent)
+	c.Check(backend.AuxStoreInfoFilename("some-snap-id"), testutil.FileAbsent)
 
 }
 
@@ -415,13 +438,24 @@ func (s *snapmgrTestSuite) TestParallelInstanceRemoveRunThrough(c *C) {
 			name: "some-snap_instance",
 		},
 		{
-			op:   "unlink-snap",
-			path: filepath.Join(dirs.SnapMountDir, "some-snap_instance/7"),
+			op:             "unlink-snap",
+			path:           filepath.Join(dirs.SnapMountDir, "some-snap_instance/7"),
+			otherInstances: true,
 		},
 		{
 			op:    "remove-profiles:Doing",
 			name:  "some-snap_instance",
 			revno: snap.R(7),
+		},
+		{
+			op:    "list-non-snapctl-mounts-all",
+			name:  "some-snap_instance",
+			revno: snap.R(7),
+		},
+		{
+			op:     "remove-snap-mount-units",
+			name:   "some-snap_instance",
+			origin: "mount-control",
 		},
 		{
 			op:   "remove-snap-data",
@@ -438,7 +472,7 @@ func (s *snapmgrTestSuite) TestParallelInstanceRemoveRunThrough(c *C) {
 		{
 			op:             "remove-snap-data-dir",
 			name:           "some-snap_instance",
-			path:           filepath.Join(dirs.SnapDataDir, "some-snap"),
+			path:           filepath.Join(dirs.SnapDataDir, "some-snap_instance"),
 			otherInstances: true,
 		},
 		{
@@ -461,7 +495,7 @@ func (s *snapmgrTestSuite) TestParallelInstanceRemoveRunThrough(c *C) {
 		{
 			op:             "remove-snap-dir",
 			name:           "some-snap_instance",
-			path:           filepath.Join(dirs.SnapMountDir, "some-snap"),
+			path:           filepath.Join(dirs.SnapMountDir, "some-snap_instance"),
 			otherInstances: true,
 		},
 	}
@@ -569,13 +603,24 @@ func (s *snapmgrTestSuite) TestParallelInstanceRemoveRunThroughOtherInstances(c 
 			name: "some-snap_instance",
 		},
 		{
-			op:   "unlink-snap",
-			path: filepath.Join(dirs.SnapMountDir, "some-snap_instance/7"),
+			op:             "unlink-snap",
+			path:           filepath.Join(dirs.SnapMountDir, "some-snap_instance/7"),
+			otherInstances: true,
 		},
 		{
 			op:    "remove-profiles:Doing",
 			name:  "some-snap_instance",
 			revno: snap.R(7),
+		},
+		{
+			op:    "list-non-snapctl-mounts-all",
+			name:  "some-snap_instance",
+			revno: snap.R(7),
+		},
+		{
+			op:     "remove-snap-mount-units",
+			name:   "some-snap_instance",
+			origin: "mount-control",
 		},
 		{
 			op:   "remove-snap-data",
@@ -592,7 +637,7 @@ func (s *snapmgrTestSuite) TestParallelInstanceRemoveRunThroughOtherInstances(c 
 		{
 			op:             "remove-snap-data-dir",
 			name:           "some-snap_instance",
-			path:           filepath.Join(dirs.SnapDataDir, "some-snap"),
+			path:           filepath.Join(dirs.SnapDataDir, "some-snap_instance"),
 			otherInstances: true,
 		},
 		{
@@ -615,7 +660,7 @@ func (s *snapmgrTestSuite) TestParallelInstanceRemoveRunThroughOtherInstances(c 
 		{
 			op:             "remove-snap-dir",
 			name:           "some-snap_instance",
-			path:           filepath.Join(dirs.SnapMountDir, "some-snap"),
+			path:           filepath.Join(dirs.SnapMountDir, "some-snap_instance"),
 			otherInstances: true,
 		},
 	}
@@ -690,6 +735,17 @@ func (s *snapmgrTestSuite) TestRemoveWithManyRevisionsRunThrough(c *C) {
 			revno: snap.R(7),
 		},
 		{
+			op:    "list-non-snapctl-mounts-rev",
+			name:  "some-snap",
+			revno: snap.R(3),
+		},
+		{
+			op:     "remove-snap-mount-units",
+			name:   "some-snap",
+			origin: "mount-control",
+			dirs:   []string{snap.DataDir("some-snap", snap.R(3))},
+		},
+		{
 			op:   "remove-snap-data",
 			path: filepath.Join(dirs.SnapMountDir, "some-snap/3"),
 		},
@@ -699,6 +755,17 @@ func (s *snapmgrTestSuite) TestRemoveWithManyRevisionsRunThrough(c *C) {
 			stype: "app",
 		},
 		{
+			op:    "list-non-snapctl-mounts-rev",
+			name:  "some-snap",
+			revno: snap.R(5),
+		},
+		{
+			op:     "remove-snap-mount-units",
+			name:   "some-snap",
+			origin: "mount-control",
+			dirs:   []string{snap.DataDir("some-snap", snap.R(5))},
+		},
+		{
 			op:   "remove-snap-data",
 			path: filepath.Join(dirs.SnapMountDir, "some-snap/5"),
 		},
@@ -706,6 +773,16 @@ func (s *snapmgrTestSuite) TestRemoveWithManyRevisionsRunThrough(c *C) {
 			op:    "remove-snap-files",
 			path:  filepath.Join(dirs.SnapMountDir, "some-snap/5"),
 			stype: "app",
+		},
+		{
+			op:    "list-non-snapctl-mounts-all",
+			name:  "some-snap",
+			revno: snap.R(7),
+		},
+		{
+			op:     "remove-snap-mount-units",
+			name:   "some-snap",
+			origin: "mount-control",
 		},
 		{
 			op:   "remove-snap-data",
@@ -842,8 +919,18 @@ func (s *snapmgrTestSuite) TestRemoveOneRevisionRunThrough(c *C) {
 
 	s.settle(c)
 
-	c.Check(len(s.fakeBackend.ops), Equals, 2)
 	expected := fakeOps{
+		{
+			op:    "list-non-snapctl-mounts-rev",
+			name:  "some-snap",
+			revno: snap.R(3),
+		},
+		{
+			op:     "remove-snap-mount-units",
+			name:   "some-snap",
+			origin: "mount-control",
+			dirs:   []string{snap.DataDir("some-snap", snap.R(3))},
+		},
 		{
 			op:   "remove-snap-data",
 			path: filepath.Join(dirs.SnapMountDir, "some-snap/3"),
@@ -855,6 +942,7 @@ func (s *snapmgrTestSuite) TestRemoveOneRevisionRunThrough(c *C) {
 		},
 	}
 	// start with an easier-to-read error if this fails:
+	c.Check(len(s.fakeBackend.ops), Equals, len(expected))
 	c.Assert(s.fakeBackend.ops.Ops(), DeepEquals, expected.Ops())
 	c.Assert(s.fakeBackend.ops, DeepEquals, expected)
 
@@ -954,14 +1042,26 @@ func (s *snapmgrTestSuite) TestRemoveLastRevisionRunThrough(c *C) {
 	c.Assert(err, IsNil)
 	chg.AddAll(ts)
 
+	t := findKindInTaskSet(ts, "auto-disconnect")
+	c.Assert(t.Has("full-remove"), Equals, true)
+
 	s.settle(c)
 
-	c.Check(len(s.fakeBackend.ops), Equals, 10)
 	expected := fakeOps{
 		{
 			op:    "auto-disconnect:Doing",
 			name:  "some-snap",
 			revno: snap.R(2),
+		},
+		{
+			op:    "list-non-snapctl-mounts-all",
+			name:  "some-snap",
+			revno: snap.R(2),
+		},
+		{
+			op:     "remove-snap-mount-units",
+			name:   "some-snap",
+			origin: "mount-control",
 		},
 		{
 			op:   "remove-snap-data",
@@ -1004,6 +1104,7 @@ func (s *snapmgrTestSuite) TestRemoveLastRevisionRunThrough(c *C) {
 		},
 	}
 	// start with an easier-to-read error if this fails:
+	c.Check(len(s.fakeBackend.ops), Equals, len(expected))
 	c.Assert(s.fakeBackend.ops.Ops(), DeepEquals, expected.Ops())
 	c.Assert(s.fakeBackend.ops, DeepEquals, expected)
 
@@ -1042,7 +1143,10 @@ func (s *snapmgrTestSuite) TestRemoveLastRevisionRunThrough(c *C) {
 	c.Assert(err, testutil.ErrorIs, state.ErrNoState)
 }
 
-func (s *snapmgrTestSuite) TestRemoveCurrentActiveRevisionRefused(c *C) {
+func (s *snapmgrTestSuite) TestRemoveLastActiveRevisionRunThrough(c *C) {
+	// run through a removal of a last active revision of a snap where revision
+	// is expliciltly provided in options, making it effectively the same as
+	// regular removal of all revisions of the snap
 	si := snap.SideInfo{
 		RealName: "some-snap",
 		Revision: snap.R(2),
@@ -1058,15 +1162,114 @@ func (s *snapmgrTestSuite) TestRemoveCurrentActiveRevisionRefused(c *C) {
 		SnapType: "app",
 	})
 
-	_, err := snapstate.Remove(s.state, "some-snap", snap.R(2), nil)
+	chg := s.state.NewChange("remove", "remove a snap")
+	// remove last active revision, is essentially like snap remove
+	ts, err := snapstate.Remove(s.state, "some-snap", snap.R(2), nil)
+	c.Assert(err, IsNil)
+	chg.AddAll(ts)
 
-	c.Check(err, ErrorMatches, `cannot remove active revision 2 of snap "some-snap"`)
+	s.settle(c)
+
+	expected := fakeOps{
+		{
+			op:    "auto-disconnect:Doing",
+			name:  "some-snap",
+			revno: snap.R(2),
+		},
+		{
+			op:   "remove-snap-aliases",
+			name: "some-snap",
+		},
+		{
+			op:   "unlink-snap",
+			path: filepath.Join(dirs.SnapMountDir, "some-snap/2"),
+		},
+		{
+			op:    "remove-profiles:Doing",
+			name:  "some-snap",
+			revno: snap.R(2),
+		},
+		{
+			op:    "list-non-snapctl-mounts-all",
+			name:  "some-snap",
+			revno: snap.R(2),
+		},
+		{
+			op:     "remove-snap-mount-units",
+			name:   "some-snap",
+			origin: "mount-control",
+		},
+		{
+			op:   "remove-snap-data",
+			path: filepath.Join(dirs.SnapMountDir, "some-snap/2"),
+		},
+		{
+			op:   "remove-snap-common-data",
+			path: filepath.Join(dirs.SnapMountDir, "some-snap/2"),
+		},
+		{
+			op:   "remove-snap-save-data",
+			path: filepath.Join(dirs.SnapDataSaveDir, "some-snap"),
+		},
+		{
+			op:   "remove-snap-data-dir",
+			name: "some-snap",
+			path: filepath.Join(dirs.SnapDataDir, "some-snap"),
+		},
+		{
+			op:    "remove-snap-files",
+			path:  filepath.Join(dirs.SnapMountDir, "some-snap/2"),
+			stype: "app",
+		},
+		{
+			op:   "remove-snap-mount-units",
+			name: "some-snap",
+		},
+		{
+			op:   "discard-namespace",
+			name: "some-snap",
+		},
+		{
+			op:   "remove-inhibit-lock",
+			name: "some-snap",
+		},
+		{
+			op:   "remove-snap-dir",
+			name: "some-snap",
+			path: filepath.Join(dirs.SnapMountDir, "some-snap"),
+		},
+	}
+	// start with an easier-to-read error if this fails:
+	c.Check(len(s.fakeBackend.ops), Equals, len(expected))
+	c.Assert(s.fakeBackend.ops.Ops(), DeepEquals, expected.Ops())
+	c.Assert(s.fakeBackend.ops, DeepEquals, expected)
+
+	// verify snapSetup info
+	tasks := ts.Tasks()
+	for _, t := range tasks {
+		c.Logf("task kind: %v", t.Kind())
+		if t.Kind() == "save-snapshot" || t.Kind() == "run-hook" {
+			continue
+		}
+
+		_, err := snapstate.TaskSnapSetup(t)
+		c.Assert(err, IsNil)
+	}
+
+	// verify that the snap was removed and no more snaps remain in the system
+	var snapst snapstate.SnapState
+	err = snapstate.Get(s.state, "some-snap", &snapst)
+	c.Assert(err, testutil.ErrorIs, state.ErrNoState)
 }
 
 func (s *snapmgrTestSuite) TestRemoveCurrentRevisionOfSeveralRefused(c *C) {
-	si := snap.SideInfo{
+	si2 := snap.SideInfo{
 		RealName: "some-snap",
 		Revision: snap.R(2),
+	}
+	si1 := snap.SideInfo{
+		RealName: "some-snap",
+		Revision: snap.R(1),
 	}
 
 	s.state.Lock()
@@ -1074,8 +1277,8 @@ func (s *snapmgrTestSuite) TestRemoveCurrentRevisionOfSeveralRefused(c *C) {
 
 	snapstate.Set(s.state, "some-snap", &snapstate.SnapState{
 		Active:   true,
-		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{&si, &si}),
-		Current:  si.Revision,
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{&si2, &si1}),
+		Current:  si2.Revision,
 		SnapType: "app",
 	})
 
@@ -1145,6 +1348,74 @@ func (s *snapmgrTestSuite) TestRemoveRefusedLastRevision(c *C) {
 	_, err := snapstate.Remove(s.state, "brand-gadget", snap.R(7), nil)
 
 	c.Check(err, ErrorMatches, `snap "brand-gadget" is not removable: snap is used by the model`)
+}
+
+func (s *snapmgrTestSuite) TestRemoveConsultsSeedRefreshRemoveHookOnlyWhenEnabled(c *C) {
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	si := snap.SideInfo{
+		RealName: "some-snap",
+		Revision: snap.R(7),
+	}
+
+	snapstate.Set(s.state, "some-snap", &snapstate.SnapState{
+		Active:   true,
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{&si}),
+		Current:  si.Revision,
+		SnapType: "app",
+	})
+
+	called := false
+	restore := snapstate.MockCheckSeedRefreshRemove(func(*state.State, snapstate.SeedRefreshCandidate, snapstate.DeviceContext) error {
+		called = true
+		return errors.New("blocked by test hook")
+	})
+	defer restore()
+
+	_, err := snapstate.Remove(s.state, "some-snap", snap.R(0), nil)
+	c.Assert(err, IsNil)
+	c.Check(called, Equals, false)
+
+	s.AddCleanup(features.MockFeaturesWIPEnvironment(features.SeedRefresh))
+
+	_, err = snapstate.Remove(s.state, "some-snap", snap.R(0), nil)
+	c.Assert(err, ErrorMatches, `snap "some-snap" is not removable: blocked by test hook`)
+	c.Check(called, Equals, true)
+}
+
+func (s *snapmgrTestSuite) TestRemoveSpecificRevisionDoesNotConsultSeedRefreshRemoveHook(c *C) {
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	si2 := snap.SideInfo{
+		RealName: "some-snap",
+		Revision: snap.R(2),
+	}
+	si1 := snap.SideInfo{
+		RealName: "some-snap",
+		Revision: snap.R(1),
+	}
+
+	snapstate.Set(s.state, "some-snap", &snapstate.SnapState{
+		Active:   true,
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{&si2, &si1}),
+		Current:  si2.Revision,
+		SnapType: "app",
+	})
+
+	s.AddCleanup(features.MockFeaturesWIPEnvironment(features.SeedRefresh))
+
+	called := false
+	restore := snapstate.MockCheckSeedRefreshRemove(func(*state.State, snapstate.SeedRefreshCandidate, snapstate.DeviceContext) error {
+		called = true
+		return errors.New("blocked by test hook")
+	})
+	defer restore()
+
+	_, err := snapstate.Remove(s.state, "some-snap", snap.R(1), nil)
+	c.Assert(err, IsNil)
+	c.Check(called, Equals, false)
 }
 
 func (s *snapmgrTestSuite) TestRemoveDeletesConfigOnLastRevision(c *C) {
@@ -1260,14 +1531,16 @@ func (s *snapmgrTestSuite) TestRemoveMany(c *C) {
 		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
 			{RealName: "one", SnapID: "one-id", Revision: snap.R(1)},
 		}),
-		Current: snap.R(1),
+		Current:  snap.R(1),
+		SnapType: string(snap.TypeApp),
 	})
 	snapstate.Set(s.state, "two", &snapstate.SnapState{
 		Active: true,
 		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
 			{RealName: "two", SnapID: "two-id", Revision: snap.R(1)},
 		}),
-		Current: snap.R(1),
+		Current:  snap.R(1),
+		SnapType: string(snap.TypeApp),
 	})
 
 	removed, tts, err := snapstate.RemoveMany(s.state, []string{"one", "two"}, nil)
@@ -1275,12 +1548,14 @@ func (s *snapmgrTestSuite) TestRemoveMany(c *C) {
 	c.Assert(tts, HasLen, 2)
 	c.Check(removed, DeepEquals, []string{"one", "two"})
 
-	c.Assert(s.state.TaskCount(), Equals, 8*2)
+	// snaps of app type will also have snapshots taken if the purge is not set
+	c.Assert(s.state.TaskCount(), Equals, 9*2)
 	for i, ts := range tts {
 		c.Assert(taskKinds(ts.Tasks()), DeepEquals, []string{
 			"stop-snap-services",
 			"run-hook[remove]",
 			"auto-disconnect",
+			"save-snapshot",
 			"remove-aliases",
 			"unlink-snap",
 			"remove-profiles",
@@ -1320,7 +1595,7 @@ func (s *snapmgrTestSuite) testRemoveManyDiskSpaceCheck(c *C, featureFlag, autom
 	restore := snapstate.MockOsutilCheckFreeSpace(func(path string, required uint64) error {
 		checkFreeSpaceCall++
 		// required size is the sum of snapshot sizes of test snaps
-		c.Check(required, Equals, snapstate.SafetyMarginDiskSpace(30))
+		c.Check(required, Equals, uint64(30)+snapstate.DefaultDiskSpaceReservation)
 		if freeSpaceCheckFail {
 			return &osutil.NotEnoughDiskSpaceError{}
 		}
@@ -1386,6 +1661,57 @@ func (s *snapmgrTestSuite) TestRemoveManyDiskSpaceError(c *C) {
 	c.Check(diskSpaceErr.ChangeKind, Equals, "remove")
 }
 
+func (s *snapmgrTestSuite) TestRemoveConfigureDiskSpaceReservation(c *C) {
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	const freeDiskSpace = uint64(1500)
+	var requiredSizes []uint64
+	restore := snapstate.MockOsutilCheckFreeSpace(func(path string, required uint64) error {
+		c.Check(path, Equals, filepath.Join(dirs.GlobalRootDir, "/var/lib/snapd"))
+		requiredSizes = append(requiredSizes, required)
+		if required > freeDiskSpace {
+			return &osutil.NotEnoughDiskSpaceError{}
+		}
+		return nil
+	})
+	defer restore()
+
+	snapstate.EstimateSnapshotSize = func(st *state.State, instanceName string, users []string) (uint64, error) {
+		return 123, nil
+	}
+
+	snapstate.AutomaticSnapshot = func(st *state.State, instanceName string) (ts *state.TaskSet, err error) {
+		t := s.state.NewTask("foo", "")
+		return state.NewTaskSet(t), nil
+	}
+
+	tr := config.NewTransaction(s.state)
+	tr.Set("core", "experimental.check-disk-space-remove", true)
+	tr.Set("core", "disk-reservation.size", "2000")
+	tr.Commit()
+
+	snapstate.Set(s.state, "one", &snapstate.SnapState{
+		Active:   true,
+		SnapType: "app",
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "one", SnapID: "one-id", Revision: snap.R(1)},
+		}),
+		Current: snap.R(1),
+	})
+
+	_, _, err := snapstate.RemoveMany(s.state, []string{"one"}, nil)
+	c.Assert(err, FitsTypeOf, &snapstate.InsufficientSpaceError{})
+
+	tr = config.NewTransaction(s.state)
+	tr.Set("core", "disk-reservation.size", "1000")
+	tr.Commit()
+
+	_, _, err = snapstate.RemoveMany(s.state, []string{"one"}, nil)
+	c.Assert(err, IsNil)
+	c.Check(requiredSizes, DeepEquals, []uint64{2123, 1123})
+}
+
 func (s *snapmgrTestSuite) TestRemoveManyDiskSpaceCheckDisabled(c *C) {
 	featureFlag := false
 	automaticSnapshot := true
@@ -1410,12 +1736,62 @@ func (s *snapmgrTestSuite) TestRemoveManyDiskSpaceCheckPasses(c *C) {
 	c.Check(err, IsNil)
 }
 
+func (s *snapmgrTestSuite) TestRemoveManyDiskSpaceReservationZeroChecksSnapshotSize(c *C) {
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	var snapshotSizeCall int
+	snapstate.EstimateSnapshotSize = func(st *state.State, instanceName string, users []string) (uint64, error) {
+		snapshotSizeCall++
+		c.Check(instanceName, Equals, "one")
+		return 123, nil
+	}
+
+	var requiredSizes []uint64
+	restore := snapstate.MockOsutilCheckFreeSpace(func(path string, required uint64) error {
+		c.Check(path, Equals, filepath.Join(dirs.GlobalRootDir, "/var/lib/snapd"))
+		requiredSizes = append(requiredSizes, required)
+		return nil
+	})
+	defer restore()
+
+	var automaticSnapshotCalled bool
+	snapstate.AutomaticSnapshot = func(st *state.State, instanceName string) (ts *state.TaskSet, err error) {
+		automaticSnapshotCalled = true
+		t := s.state.NewTask("foo", "")
+		return state.NewTaskSet(t), nil
+	}
+
+	tr := config.NewTransaction(s.state)
+	tr.Set("core", "experimental.check-disk-space-remove", true)
+	// snap set stores plain numbers in their parsed form, so a zero
+	// reservation comes through as a number rather than a string
+	tr.Set("core", "disk-reservation.size", 0)
+	tr.Commit()
+
+	snapstate.Set(s.state, "one", &snapstate.SnapState{
+		Active:   true,
+		SnapType: "app",
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "one", SnapID: "one-id", Revision: snap.R(1)},
+		}),
+		Current: snap.R(1),
+	})
+
+	_, _, err := snapstate.RemoveMany(s.state, []string{"one"}, nil)
+	c.Assert(err, IsNil)
+	c.Check(automaticSnapshotCalled, Equals, true)
+	// 0B reservation means checks run with just the snapshot size, no buffer
+	c.Check(snapshotSizeCall, Equals, 1)
+	c.Check(requiredSizes, DeepEquals, []uint64{123})
+}
+
 type snapdBackend struct {
 	fakeSnappyBackend
 }
 
 func (f *snapdBackend) RemoveSnapData(info *snap.Info, opts *dirs.SnapDirOptions) error {
-	dir := snap.DataDir(info.SnapName(), info.Revision)
+	dir := snap.DataDir(info.SnapName().String(), info.Revision)
 	if err := os.Remove(dir); err != nil {
 		return fmt.Errorf("unexpected error: %v", err)
 	}
@@ -1423,7 +1799,7 @@ func (f *snapdBackend) RemoveSnapData(info *snap.Info, opts *dirs.SnapDirOptions
 }
 
 func (f *snapdBackend) RemoveSnapCommonData(info *snap.Info, opts *dirs.SnapDirOptions) error {
-	dir := snap.CommonDataDir(info.SnapName())
+	dir := snap.CommonDataDir(info.SnapName().String())
 	if err := os.Remove(dir); err != nil {
 		return fmt.Errorf("unexpected error: %v", err)
 	}
@@ -1431,7 +1807,7 @@ func (f *snapdBackend) RemoveSnapCommonData(info *snap.Info, opts *dirs.SnapDirO
 }
 
 func (f *snapdBackend) RemoveSnapSaveData(info *snap.Info, dev snap.Device) error {
-	dir := snap.CommonDataSaveDir(info.InstanceName())
+	dir := snap.CommonDataSaveDir(info.InstanceName().String())
 	if err := os.RemoveAll(dir); err != nil {
 		return fmt.Errorf("unexpected error: %v", err)
 	}
@@ -1548,6 +1924,17 @@ func (s *snapmgrTestSuite) TestRemoveManyUndoRestoresCurrent(c *C) {
 			revno: snap.R(1),
 		},
 		{
+			op:    "list-non-snapctl-mounts-rev",
+			name:  "some-snap",
+			revno: snap.R(2),
+		},
+		{
+			op:     "remove-snap-mount-units",
+			name:   "some-snap",
+			origin: "mount-control",
+			dirs:   []string{snap.DataDir("some-snap", snap.R(2))},
+		},
+		{
 			op:   "remove-snap-data",
 			path: filepath.Join(dirs.SnapMountDir, "some-snap/2"),
 		},
@@ -1564,6 +1951,10 @@ func (s *snapmgrTestSuite) TestRemoveManyUndoRestoresCurrent(c *C) {
 		{
 			op:   "link-snap",
 			path: filepath.Join(dirs.SnapMountDir, "some-snap/1"),
+		},
+		{
+			op:     "maybe-set-next-boot",
+			isUndo: true,
 		},
 		{
 			op: "update-aliases",
@@ -1628,6 +2019,17 @@ func (s *snapmgrTestSuite) TestRemoveManyUndoLeavesInactiveSnapAfterDataIsLost(c
 			revno: snap.R(1),
 		},
 		{
+			op:    "list-non-snapctl-mounts-rev",
+			name:  "some-snap",
+			revno: snap.R(2),
+		},
+		{
+			op:     "remove-snap-mount-units",
+			name:   "some-snap",
+			origin: "mount-control",
+			dirs:   []string{snap.DataDir("some-snap", snap.R(2))},
+		},
+		{
 			op:   "remove-snap-data",
 			path: filepath.Join(dirs.SnapMountDir, "some-snap/2"),
 		},
@@ -1635,6 +2037,16 @@ func (s *snapmgrTestSuite) TestRemoveManyUndoLeavesInactiveSnapAfterDataIsLost(c
 			op:    "remove-snap-files",
 			path:  filepath.Join(dirs.SnapMountDir, "some-snap/2"),
 			stype: "app",
+		},
+		{
+			op:    "list-non-snapctl-mounts-all",
+			name:  "some-snap",
+			revno: snap.R(1),
+		},
+		{
+			op:     "remove-snap-mount-units",
+			name:   "some-snap",
+			origin: "mount-control",
 		},
 		{
 			op:   "remove-snap-data",
@@ -1674,10 +2086,7 @@ func (s *snapmgrTestSuite) TestRemovePrunesRefreshGatingDataOnLastRevision(c *C)
 	st.Lock()
 	defer st.Unlock()
 
-	// enable gate-auto-refresh-hook feature
-	tr := config.NewTransaction(s.state)
-	tr.Set("core", "experimental.gate-auto-refresh-hook", true)
-	tr.Commit()
+	s.AddCleanup(mockGateAutoRefreshFeature(c, st))
 
 	for _, sn := range []string{"some-snap", "another-snap", "foo-snap"} {
 		si := snap.SideInfo{
@@ -1755,6 +2164,7 @@ func (s *snapmgrTestSuite) TestRemoveKeepsGatingDataIfNotLastRevision(c *C) {
 	st := s.state
 	st.Lock()
 	defer st.Unlock()
+	s.AddCleanup(mockGateAutoRefreshFeature(c, st))
 
 	t := time.Now()
 	snapstate.Set(s.state, "some-snap", &snapstate.SnapState{
@@ -1811,7 +2221,7 @@ func (s *snapmgrTestSuite) TestRemoveKeepsGatingDataIfNotLastRevision(c *C) {
 func (s *validationSetsSuite) removeSnapReferencedByValidationSet(c *C, presence string) error {
 	restore := snapstate.MockEnforcedValidationSets(func(st *state.State, extraVss ...*asserts.ValidationSet) (*snapasserts.ValidationSets, error) {
 		vs := snapasserts.NewValidationSets()
-		someSnap := map[string]interface{}{
+		someSnap := map[string]any{
 			"id":       "yOqKhntON3vR7kwEbVPsILm7bUViPDzx",
 			"name":     "some-snap",
 			"presence": presence,
@@ -1868,7 +2278,7 @@ func (s *validationSetsSuite) TestRemoveInvalidSnapOK(c *C) {
 func (s *validationSetsSuite) TestRemoveSnapRequiredByValidationSetAtSpecificRevisionRefused(c *C) {
 	restore := snapstate.MockEnforcedValidationSets(func(st *state.State, extraVss ...*asserts.ValidationSet) (*snapasserts.ValidationSets, error) {
 		vs := snapasserts.NewValidationSets()
-		someSnap := map[string]interface{}{
+		someSnap := map[string]any{
 			"id":       "yOqKhntON3vR7kwEbVPsILm7bUViPDzx",
 			"name":     "some-snap",
 			"presence": "required",
@@ -1921,7 +2331,7 @@ func (s *validationSetsSuite) TestRemoveSnapRequiredByValidationSetAtSpecificRev
 func (s *validationSetsSuite) TestRemoveSnapRequiredByValidationSetAtSpecificRevisionNotActive(c *C) {
 	restore := snapstate.MockEnforcedValidationSets(func(st *state.State, extraVss ...*asserts.ValidationSet) (*snapasserts.ValidationSets, error) {
 		vs := snapasserts.NewValidationSets()
-		someSnap := map[string]interface{}{
+		someSnap := map[string]any{
 			"id":       "yOqKhntON3vR7kwEbVPsILm7bUViPDzx",
 			"name":     "some-snap",
 			"presence": "required",
@@ -1997,24 +2407,190 @@ func (s *snapmgrTestSuite) TestRemoveDeduplicatesSnapNames(c *C) {
 			SnapID:   "some-snap-id",
 			Revision: snap.R(1),
 		}}),
-		Current: snap.R(1),
-		Active:  true,
+		Current:  snap.R(1),
+		Active:   true,
+		SnapType: string(snap.TypeApp),
 	})
 
-	snapstate.Set(s.state, "some-base", &snapstate.SnapState{
+	snapstate.Set(s.state, "some-other-snap", &snapstate.SnapState{
 		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{{
-			RealName: "some-base",
-			SnapID:   "some-base-id",
+			RealName: "some-other-snap",
+			SnapID:   "some-other-snap-id",
 			Revision: snap.R(1),
 		}}),
-		Current: snap.R(1),
-		Active:  true,
+		Current:  snap.R(1),
+		Active:   true,
+		SnapType: string(snap.TypeApp),
 	})
 
-	removed, ts, err := snapstate.RemoveMany(s.state, []string{"some-snap", "some-base", "some-snap", "some-base"}, nil)
+	removed, ts, err := snapstate.RemoveMany(s.state, []string{"some-snap", "some-other-snap", "some-snap", "some-other-snap"}, nil)
 	c.Assert(err, IsNil)
-	c.Check(removed, testutil.DeepUnsortedMatches, []string{"some-snap", "some-base"})
+	c.Check(removed, testutil.DeepUnsortedMatches, []string{"some-snap", "some-other-snap"})
 	c.Check(ts, HasLen, 2)
+}
+
+func (s *snapmgrTestSuite) TestRemoveAppGadgetAndBase(c *C) {
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	si := &snap.SideInfo{RealName: "some-snap", Revision: snap.R(1)}
+	snaptest.MockSnap(c, "name: some-snap\nversion: 1.0\ntype: app\nbase: some-base", si)
+	snapstate.Set(s.state, "some-snap", &snapstate.SnapState{
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{si}),
+		Current:  si.Revision,
+		SnapType: string(snap.TypeApp),
+		Base:     "some-base",
+	})
+
+	si2 := &snap.SideInfo{RealName: "some-gadget", Revision: snap.R(1)}
+	snaptest.MockSnap(c, "name: some-gadget\nversion: 1.0\ntype: gadget\nbase: some-base", si2)
+	snapstate.Set(s.state, "some-gadget", &snapstate.SnapState{
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{si2}),
+		Current:  si2.Revision,
+		SnapType: string(snap.TypeGadget),
+		Base:     "some-base",
+	})
+
+	si3 := &snap.SideInfo{RealName: "some-base", Revision: snap.R(1)}
+	snaptest.MockSnapCurrent(c, "name: some-base\nversion: 1.0\ntype: base\n", si3)
+	snapstate.Set(s.state, "some-base", &snapstate.SnapState{
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{si3}),
+		Current:  si3.Revision,
+		SnapType: string(snap.TypeBase),
+	})
+
+	// removing the base should only succeed when both some-snap and some-gadget
+	// are also removed
+	_, _, err := snapstate.RemoveMany(s.state, []string{"some-base"}, nil)
+	c.Check(err, ErrorMatches, "snap \"some-base\" is not removable: snap is being used by snaps some-gadget and some-snap.")
+
+	_, _, err = snapstate.RemoveMany(s.state, []string{"some-base", "some-snap"}, nil)
+	c.Check(err, ErrorMatches, "snap \"some-base\" is not removable: snap is being used by snap some-gadget.")
+
+	_, _, err = snapstate.RemoveMany(s.state, []string{"some-base", "some-gadget"}, nil)
+	c.Check(err, ErrorMatches, "snap \"some-base\" is not removable: snap is being used by snap some-snap.")
+
+	removed, tss, err := snapstate.RemoveMany(s.state, []string{"some-base", "some-snap", "some-gadget"}, nil)
+	c.Check(err, IsNil)
+
+	c.Check(removed, testutil.DeepUnsortedMatches, []string{"some-snap", "some-base", "some-gadget"})
+	c.Check(tss, HasLen, 3)
+
+	// check that the tasks for the bases depend on the tasks for the app and gadget
+	baseFirstTask := tss[0].Tasks()[0]
+	gadgetLastTask := tss[1].Tasks()[len(tss[1].Tasks())-1]
+	appLastTask := tss[2].Tasks()[len(tss[2].Tasks())-1]
+	c.Check(baseFirstTask.WaitTasks(), testutil.Contains, appLastTask)
+	c.Check(baseFirstTask.WaitTasks(), testutil.Contains, gadgetLastTask)
+}
+
+func (s *snapmgrTestSuite) TestRemoveAppAndCore16(c *C) {
+	s.AddCleanup(snapstatetest.MockDeviceModel(ModelWithBase("core20")))
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	si := &snap.SideInfo{RealName: "some-snap", Revision: snap.R(1)}
+	snaptest.MockSnap(c, "name: some-snap\nversion: 1.0\ntype: app\nbase: core16", si)
+	snapstate.Set(s.state, "some-snap", &snapstate.SnapState{
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{si}),
+		Current:  si.Revision,
+		SnapType: string(snap.TypeApp),
+		Base:     "core16",
+	})
+
+	si2 := &snap.SideInfo{RealName: "core", Revision: snap.R(1)}
+	snaptest.MockSnapCurrent(c, "name: core\nversion: 1.0\ntype: base\n", si2)
+	snapstate.Set(s.state, "core", &snapstate.SnapState{
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{si2}),
+		Current:  si2.Revision,
+		SnapType: string(snap.TypeOS),
+	})
+
+	// some-app should fall back to using core as base
+	_, _, err := snapstate.RemoveMany(s.state, []string{"core"}, nil)
+	c.Check(err, ErrorMatches, "snap \"core\" is not removable: snap is being used by snap some-snap.")
+
+	// removing core should succeed when removing some-app as well
+	removed, tss, err := snapstate.RemoveMany(s.state, []string{"core", "some-snap"}, nil)
+	c.Check(err, IsNil)
+	c.Check(removed, testutil.DeepUnsortedMatches, []string{"some-snap", "core"})
+	// check that the tasks for the bases depend on the tasks for the app
+	baseFirstTask := tss[0].Tasks()[0]
+	appLastTask := tss[1].Tasks()[len(tss[1].Tasks())-1]
+	c.Check(baseFirstTask.WaitTasks(), testutil.Contains, appLastTask)
+
+	si3 := &snap.SideInfo{RealName: "core16", Revision: snap.R(1)}
+	snaptest.MockSnapCurrent(c, "name: core16\nversion: 1.0\ntype: base\n", si3)
+	snapstate.Set(s.state, "core16", &snapstate.SnapState{
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{si3}),
+		Current:  si3.Revision,
+		SnapType: string(snap.TypeBase),
+	})
+
+	// some-app should not fall back to using core as base since core16 is installed
+	_, _, err = snapstate.RemoveMany(s.state, []string{"core16"}, nil)
+	c.Check(err, ErrorMatches, "snap \"core16\" is not removable: snap is being used by snap some-snap.")
+
+	// removing core16 should succeed when removing some-app as well
+	removed, tss, err = snapstate.RemoveMany(s.state, []string{"core16", "some-snap"}, nil)
+	c.Check(err, IsNil)
+	c.Check(removed, testutil.DeepUnsortedMatches, []string{"some-snap", "core16"})
+	// check that the tasks for the bases depend on the tasks for the app
+	baseFirstTask = tss[0].Tasks()[0]
+	appLastTask = tss[1].Tasks()[len(tss[1].Tasks())-1]
+	c.Check(baseFirstTask.WaitTasks(), testutil.Contains, appLastTask)
+}
+
+func (s *snapmgrTestSuite) TestRemoveManyAppRevisionsWithDifferentBases(c *C) {
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	// set up different revisions of some-snap to have different bases
+	siRev1 := &snap.SideInfo{RealName: "some-snap", Revision: snap.R(1)}
+	snaptest.MockSnap(c, "name: some-snap\nversion: 1.0\ntype: app\nbase: some-base", siRev1)
+	siRev2 := &snap.SideInfo{RealName: "some-snap", Revision: snap.R(2)}
+	snaptest.MockSnap(c, "name: some-snap\nversion: 1.0\ntype: app\nbase: core16", siRev2)
+	snapstate.Set(s.state, "some-snap", &snapstate.SnapState{
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{siRev1, siRev2}),
+		Current:  siRev1.Revision,
+		SnapType: string(snap.TypeApp),
+		Base:     "some-base",
+	})
+
+	si2 := &snap.SideInfo{RealName: "core16", Revision: snap.R(1)}
+	snaptest.MockSnapCurrent(c, "name: core16\nversion: 1.0\ntype: base\n", si2)
+	snapstate.Set(s.state, "core16", &snapstate.SnapState{
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{si2}),
+		Current:  si2.Revision,
+		SnapType: string(snap.TypeBase),
+	})
+
+	si3 := &snap.SideInfo{RealName: "some-base", Revision: snap.R(1)}
+	snaptest.MockSnapCurrent(c, "name: some-base\nversion: 1.0\ntype: base\n", si3)
+	snapstate.Set(s.state, "some-base", &snapstate.SnapState{
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{si3}),
+		Current:  si3.Revision,
+		SnapType: string(snap.TypeBase),
+	})
+
+	// removing both core16 and some-base should fail since they are used
+	// by some-snap
+	_, _, err := snapstate.RemoveMany(s.state, []string{"core16"}, nil)
+	c.Check(err, ErrorMatches, "snap \"core16\" is not removable: snap is being used by snap some-snap.")
+
+	_, _, err = snapstate.RemoveMany(s.state, []string{"some-base"}, nil)
+	c.Check(err, ErrorMatches, "snap \"some-base\" is not removable: snap is being used by snap some-snap.")
+
+	removed, tss, err := snapstate.RemoveMany(s.state, []string{"some-base", "core16", "some-snap"}, nil)
+	c.Check(err, IsNil)
+	c.Check(removed, testutil.DeepUnsortedMatches, []string{"some-base", "core16", "some-snap"})
+	c.Check(tss, HasLen, 3)
+
+	base1FirstTask := tss[0].Tasks()[0]
+	base2FirstTask := tss[1].Tasks()[0]
+	appLastTask := tss[2].Tasks()[len(tss[2].Tasks())-1]
+	c.Check(base1FirstTask.WaitTasks(), testutil.Contains, appLastTask)
+	c.Check(base2FirstTask.WaitTasks(), testutil.Contains, appLastTask)
 }
 
 func (s *snapmgrTestSuite) TestRemoveManyWithPurge(c *C) {
@@ -2057,5 +2633,621 @@ func (s *snapmgrTestSuite) TestRemoveManyWithPurge(c *C) {
 			"discard-snap",
 		})
 	}
+}
 
+func (s *snapmgrTestSuite) TestRemoveWithCompsTasks(c *C) {
+	const snapName = "snap1"
+	const comp1name = "comp1"
+	const comp2name = "comp2"
+
+	cref1 := naming.NewComponentRef(snapName, comp1name)
+	cref2 := naming.NewComponentRef(snapName, comp2name)
+
+	s.AddCleanup(snapstate.MockReadComponentInfo(func(compMntDir string,
+		snapInfo *snap.Info, csi *snap.ComponentSideInfo) (*snap.ComponentInfo, error) {
+		switch csi.Component.ComponentName {
+		case comp1name:
+			return &snap.ComponentInfo{
+				Component:         cref1,
+				Type:              snap.StandardComponent,
+				ComponentSideInfo: *csi,
+			}, nil
+		case comp2name:
+			return &snap.ComponentInfo{
+				Component:         cref2,
+				Type:              snap.StandardComponent,
+				ComponentSideInfo: *csi,
+			}, nil
+		}
+		return nil, errors.New("unexpected component")
+	}))
+
+	s.AddCleanup(snapstate.MockSnapReadInfo(func(name naming.InstanceName, si *snap.SideInfo) (*snap.Info, error) {
+		info := &snap.Info{
+			SuggestedName: name.SnapName().String(),
+			SideInfo:      *si,
+			SnapType:      snap.TypeApp,
+			Components: map[string]*snap.Component{
+				comp1name: {Name: comp1name, Type: snap.StandardComponent},
+				comp2name: {Name: comp2name, Type: snap.StandardComponent},
+			},
+		}
+		info.Apps = map[string]*snap.AppInfo{
+			"app": {Snap: info, Name: "app"},
+		}
+		return info, nil
+	}))
+
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	siRev1 := &snap.SideInfo{RealName: snapName, Revision: snap.R(1)}
+	siRev2 := &snap.SideInfo{RealName: snapName, Revision: snap.R(2)}
+	comp1si := snap.NewComponentSideInfo(cref1, snap.R(11))
+	comp11si := snap.NewComponentSideInfo(cref1, snap.R(111))
+	comp2si := snap.NewComponentSideInfo(cref2, snap.R(22))
+	comp22si := snap.NewComponentSideInfo(cref2, snap.R(222))
+	seq := snapstatetest.NewSequenceFromRevisionSideInfos(
+		[]*sequence.RevisionSideState{
+			sequence.NewRevisionSideState(siRev1,
+				[]*sequence.ComponentState{
+					sequence.NewComponentState(
+						comp1si, snap.StandardComponent),
+					sequence.NewComponentState(
+						comp2si, snap.StandardComponent),
+				}),
+			sequence.NewRevisionSideState(siRev2,
+				[]*sequence.ComponentState{
+					sequence.NewComponentState(
+						comp11si, snap.StandardComponent),
+					sequence.NewComponentState(
+						comp22si, snap.StandardComponent),
+				}),
+		})
+	snapstate.Set(s.state, snapName, &snapstate.SnapState{
+		Active:   true,
+		Sequence: seq,
+		Current:  snap.R(1),
+		SnapType: "app",
+	})
+
+	ts, err := snapstate.Remove(s.state, snapName, snap.R(0), nil)
+	c.Assert(err, IsNil)
+
+	c.Assert(s.state.TaskCount(), Equals, len(ts.Tasks()))
+	c.Assert(taskKinds(ts.Tasks()), DeepEquals, []string{
+		"stop-snap-services",
+		"run-hook[remove]", // component remove hook
+		"run-hook[remove]", // component remove hook
+		"run-hook[remove]", // snap remove hook
+		"auto-disconnect",
+		"save-snapshot",
+		"remove-aliases",
+		"unlink-snap",
+		"remove-profiles",
+		"clear-snap",
+		"unlink-component",
+		"discard-component",
+		"unlink-component",
+		"discard-component",
+		"discard-snap",
+		"clear-snap",
+		"unlink-component",
+		"discard-component",
+		"unlink-component",
+		"discard-component",
+		"discard-snap",
+	})
+	verifyStopReason(c, ts, "remove")
+
+	// Run the created tasks
+	chg := s.state.NewChange("remove", "remove a snap")
+	c.Assert(err, IsNil)
+	chg.AddAll(ts)
+
+	s.settle(c)
+
+	expected := fakeOps{
+		{
+			op:    "auto-disconnect:Doing",
+			name:  "snap1",
+			revno: snap.R(1),
+		},
+		{
+			op:   "remove-snap-aliases",
+			name: "snap1",
+		},
+		{
+			op:   "unlink-snap",
+			path: filepath.Join(dirs.SnapMountDir, "snap1/1"),
+		},
+		{
+			op:    "remove-profiles:Doing",
+			name:  "snap1",
+			revno: snap.R(1),
+		},
+		{
+			op:    "list-non-snapctl-mounts-rev",
+			name:  "snap1",
+			revno: snap.R(2),
+		},
+		{
+			op:     "remove-snap-mount-units",
+			name:   "snap1",
+			origin: "mount-control",
+			dirs:   []string{snap.DataDir("snap1", snap.R(2))},
+		},
+		{
+			op:   "remove-snap-data",
+			path: filepath.Join(dirs.SnapMountDir, "snap1/2"),
+		},
+		{
+			op:   "unlink-component",
+			path: filepath.Join(dirs.SnapMountDir, "snap1/components/mnt/comp1/111"),
+		},
+		{
+			op:                "undo-setup-component",
+			containerName:     "snap1+comp1",
+			containerFileName: "snap1+comp1_111.comp",
+		},
+		{
+			op:                "remove-component-dir",
+			containerName:     "snap1+comp1",
+			containerFileName: "snap1+comp1_111.comp",
+		},
+		{
+			op:   "unlink-component",
+			path: filepath.Join(dirs.SnapMountDir, "snap1/components/mnt/comp2/222"),
+		},
+		{
+			op:                "undo-setup-component",
+			containerName:     "snap1+comp2",
+			containerFileName: "snap1+comp2_222.comp",
+		},
+		{
+			op:                "remove-component-dir",
+			containerName:     "snap1+comp2",
+			containerFileName: "snap1+comp2_222.comp",
+		},
+		{
+			op:    "remove-snap-files",
+			path:  filepath.Join(dirs.SnapMountDir, "snap1/2"),
+			stype: "app",
+		},
+		{
+			op:    "list-non-snapctl-mounts-all",
+			name:  "snap1",
+			revno: snap.R(1),
+		},
+		{
+			op:     "remove-snap-mount-units",
+			name:   "snap1",
+			origin: "mount-control",
+		},
+		{
+			op:   "remove-snap-data",
+			path: filepath.Join(dirs.SnapMountDir, "snap1/1"),
+		},
+		{
+			op:   "remove-snap-common-data",
+			path: filepath.Join(dirs.SnapMountDir, "snap1/1"),
+		},
+		{
+			op:   "remove-snap-save-data",
+			path: filepath.Join(dirs.SnapDataSaveDir, "snap1"),
+		},
+		{
+			op:   "remove-snap-data-dir",
+			name: "snap1",
+			path: filepath.Join(dirs.SnapDataDir, "snap1"),
+		},
+		{
+			op:   "unlink-component",
+			path: filepath.Join(dirs.SnapMountDir, "snap1/components/mnt/comp1/11"),
+		},
+		{
+			op:                "undo-setup-component",
+			containerName:     "snap1+comp1",
+			containerFileName: "snap1+comp1_11.comp",
+		},
+		{
+			containerName:     "snap1+comp1",
+			containerFileName: "snap1+comp1_11.comp",
+			op:                "remove-component-dir",
+		},
+		{
+			op:   "unlink-component",
+			path: filepath.Join(dirs.SnapMountDir, "snap1/components/mnt/comp2/22"),
+		},
+		{
+			op:                "undo-setup-component",
+			containerName:     "snap1+comp2",
+			containerFileName: "snap1+comp2_22.comp",
+		},
+		{
+			op:                "remove-component-dir",
+			containerName:     "snap1+comp2",
+			containerFileName: "snap1+comp2_22.comp",
+		},
+		{
+			op:    "remove-snap-files",
+			path:  filepath.Join(dirs.SnapMountDir, "snap1/1"),
+			stype: "app",
+		},
+		{
+			op:   "remove-snap-mount-units",
+			name: "snap1",
+		},
+		{
+			op:   "discard-namespace",
+			name: "snap1",
+		},
+		{
+			op:   "remove-inhibit-lock",
+			name: "snap1",
+		},
+		{
+			op:   "remove-snap-dir",
+			name: "snap1",
+			path: filepath.Join(dirs.SnapMountDir, "snap1"),
+		},
+	}
+	// start with an easier-to-read error if this fails:
+	c.Assert(len(s.fakeBackend.ops), Equals, len(expected))
+	c.Check(s.fakeBackend.ops[0:7], DeepEquals, expected[0:7])
+	c.Check(s.fakeBackend.ops[13:20], DeepEquals, expected[13:20])
+	c.Check(s.fakeBackend.ops[26:], DeepEquals, expected[26:])
+	// Check component tasks, that can run in parallel so the order is not
+	// deterministic, but still needs to follow an order per component.
+	checkComps := func(ops, exp1, exp2 fakeOps) {
+		var op1idx, op2idx int
+		for _, op := range ops {
+			switch {
+			case op1idx < 3 && reflect.DeepEqual(exp1[op1idx], op):
+				op1idx++
+			case op2idx < 3 && reflect.DeepEqual(exp2[op2idx], op):
+				op2idx++
+			default:
+				c.Error("expected op not found", op)
+			}
+		}
+	}
+	checkComps(s.fakeBackend.ops[7:13], expected[7:10], expected[10:13])
+	checkComps(s.fakeBackend.ops[20:26], expected[20:23], expected[23:26])
+}
+
+func (s *snapmgrTestSuite) TestRemoveWithTerminate(c *C) {
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	snapstate.Set(s.state, "foo", &snapstate.SnapState{
+		Active: true,
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "foo", Revision: snap.R(11)},
+		}),
+		Current:  snap.R(11),
+		SnapType: "app",
+	})
+
+	ts, err := snapstate.Remove(s.state, "foo", snap.R(0), &snapstate.RemoveFlags{Terminate: true})
+	c.Assert(err, IsNil)
+
+	c.Assert(taskKinds(ts.Tasks()), DeepEquals, []string{
+		"stop-snap-services",
+		"run-hook[remove]",
+		"auto-disconnect",
+		"kill-snap-apps",
+		"save-snapshot",
+		"remove-aliases",
+		"unlink-snap",
+		"remove-profiles",
+		"clear-snap",
+		"discard-snap",
+	})
+}
+
+func (s *snapmgrTestSuite) TestRemoveWithTerminateAndRevisionSet(c *C) {
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	snapstate.Set(s.state, "foo", &snapstate.SnapState{
+		Active: true,
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "foo", Revision: snap.R(11)},
+			{RealName: "foo", Revision: snap.R(10)},
+		}),
+		Current:  snap.R(11),
+		SnapType: "app",
+	})
+
+	_, err := snapstate.Remove(s.state, "foo", snap.R(10), &snapstate.RemoveFlags{Terminate: true})
+	c.Assert(err, ErrorMatches, "cannot terminate running apps unless all revisions are removed")
+}
+
+func (s *snapmgrTestSuite) TestRemoveManyWithTerminate(c *C) {
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	snapstate.Set(s.state, "some-snap", &snapstate.SnapState{
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "some-snap", SnapID: "some-snap-id", Revision: snap.R(1)},
+		}),
+		Current:  snap.R(1),
+		SnapType: "app",
+		Active:   true,
+	})
+
+	snapstate.Set(s.state, "foo", &snapstate.SnapState{
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "foo", SnapID: "foo-id", Revision: snap.R(11)},
+		}),
+		Current:  snap.R(11),
+		SnapType: "app",
+		Active:   true,
+	})
+
+	removed, tss, err := snapstate.RemoveMany(s.state, []string{"some-snap", "foo"}, &snapstate.RemoveFlags{Terminate: true})
+	c.Check(removed, DeepEquals, []string{"some-snap", "foo"})
+	c.Check(tss, NotNil)
+	c.Check(err, IsNil)
+
+	// tasks to take snapshot aren't generated
+	for _, ts := range tss {
+		c.Assert(taskKinds(ts.Tasks()), DeepEquals, []string{
+			"stop-snap-services",
+			"run-hook[remove]",
+			"auto-disconnect",
+			"kill-snap-apps",
+			"save-snapshot",
+			"remove-aliases",
+			"unlink-snap",
+			"remove-profiles",
+			"clear-snap",
+			"discard-snap",
+		})
+	}
+}
+
+func (s *snapmgrTestSuite) TestRemoveWithNFSSnapDirMustPurge(c *C) {
+	restore := osutil.MockSnapDirsUnderNFSMounts(func() (bool, error) {
+		return true, nil
+	})
+	defer restore()
+
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	for _, sn := range []string{"some-snap", "foo"} {
+		snapstate.Set(s.state, sn, &snapstate.SnapState{
+			Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+				{RealName: sn, SnapID: sn + "-id", Revision: snap.R(1)},
+			}),
+			Current:  snap.R(1),
+			SnapType: "app",
+			Active:   true,
+		})
+	}
+
+	_, _, err := snapstate.RemoveMany(s.state, []string{"some-snap", "foo"}, nil)
+	c.Assert(err, ErrorMatches, "cannot snapshot user data directories in NFS mounts: use --purge to skip taking a snapshot")
+
+	_, err = snapstate.Remove(s.state, "some-snap", snap.Revision{}, nil)
+	c.Assert(err, ErrorMatches, "cannot snapshot user data directories in NFS mounts: use --purge to skip taking a snapshot")
+
+	flags := &snapstate.RemoveFlags{Purge: true}
+	_, err = snapstate.Remove(s.state, "some-snap", snap.Revision{}, flags)
+	c.Assert(err, IsNil)
+
+	_, _, err = snapstate.RemoveMany(s.state, []string{"some-snap", "foo"}, flags)
+	c.Assert(err, IsNil)
+
+	warns, _ := s.state.PendingWarnings()
+	c.Assert(warns, HasLen, 1)
+	c.Assert(warns[0].String(), Equals, "May not be able to remove user data under NFS mounted snap directory")
+}
+
+func (s *snapmgrTestSuite) TestClearSnapDataRemovesMountControlMountsLastRevision(c *C) {
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	// Last revision; removing it removes all mount-control mounts for the snap.
+	snapstate.Set(s.state, "some-snap", &snapstate.SnapState{
+		Active: true,
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "some-snap", SnapID: "some-snap-id", Revision: snap.R(7)},
+		}),
+		Current:  snap.R(7),
+		SnapType: "app",
+	})
+
+	chg := s.state.NewChange("remove", "remove snap")
+	ts, err := snapstate.Remove(s.state, "some-snap", snap.R(0), &snapstate.RemoveFlags{Purge: true})
+	c.Assert(err, IsNil)
+	chg.AddAll(ts)
+
+	s.settle(c)
+
+	// doClearSnapData and doDiscardSnap both call RemoveContainerMountUnits when
+	// removing the last revision.
+	mountOps := s.fakeBackend.ops.Filter("remove-snap-mount-units")
+	c.Assert(mountOps, HasLen, 2)
+	// doClearSnapData: last revision → no path filter (nil dirs), origin="mount-control".
+	c.Check(mountOps[0], DeepEquals, fakeOp{
+		op:     "remove-snap-mount-units",
+		name:   "some-snap",
+		origin: "mount-control",
+	})
+	// doDiscardSnap: snap fully removed → no origin filter, no path filter.
+	c.Check(mountOps[1], DeepEquals, fakeOp{
+		op:   "remove-snap-mount-units",
+		name: "some-snap",
+	})
+}
+
+func (s *snapmgrTestSuite) TestClearSnapDataRemovesMountControlMountsSingleRevision(c *C) {
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	// Two revisions present; removing only rev3 removes its revision-specific mounts.
+	snapstate.Set(s.state, "some-snap", &snapstate.SnapState{
+		Active: true,
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "some-snap", SnapID: "some-snap-id", Revision: snap.R(3)},
+			{RealName: "some-snap", SnapID: "some-snap-id", Revision: snap.R(7)},
+		}),
+		Current:  snap.R(7),
+		SnapType: "app",
+	})
+
+	chg := s.state.NewChange("remove", "remove snap revision")
+	ts, err := snapstate.Remove(s.state, "some-snap", snap.R(3), nil)
+	c.Assert(err, IsNil)
+	chg.AddAll(ts)
+
+	s.settle(c)
+
+	// doClearSnapData calls RemoveContainerMountUnits once for the removed revision;
+	// doDiscardSnap skips it because other revisions remain.
+	mountOps := s.fakeBackend.ops.Filter("remove-snap-mount-units")
+	c.Assert(mountOps, HasLen, 1)
+	// doClearSnapData: non-last revision → path filter to revision-specific data dir only.
+	c.Check(mountOps[0], DeepEquals, fakeOp{
+		op:     "remove-snap-mount-units",
+		name:   "some-snap",
+		origin: "mount-control",
+		dirs:   []string{snap.DataDir("some-snap", snap.R(3))},
+	})
+}
+
+func (s *snapmgrTestSuite) TestClearSnapDataAbortsWhenRemoveMountUnitsErrors(c *C) {
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	snapstate.Set(s.state, "some-snap", &snapstate.SnapState{
+		Active: true,
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "some-snap", SnapID: "some-snap-id", Revision: snap.R(7)},
+		}),
+		Current:  snap.R(7),
+		SnapType: "app",
+	})
+
+	s.fakeBackend.maybeInjectErr = func(op *fakeOp) error {
+		if op.op == "remove-snap-mount-units" {
+			return errors.New("mock remove-snap-mount-units error")
+		}
+		return nil
+	}
+
+	chg := s.state.NewChange("remove", "remove snap")
+	ts, err := snapstate.Remove(s.state, "some-snap", snap.R(0), &snapstate.RemoveFlags{Purge: true})
+	c.Assert(err, IsNil)
+	chg.AddAll(ts)
+
+	s.settle(c)
+
+	// The change must have failed because clear-snap propagated the error.
+	c.Check(chg.Status(), Equals, state.ErrorStatus)
+	c.Check(chg.Err(), ErrorMatches, "(?s).*mock remove-snap-mount-units error.*")
+}
+
+func (s *snapmgrTestSuite) TestClearSnapDataAbortsWhenNonSnapctlMountsInNonLastRevision(c *C) {
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	snapstate.Set(s.state, "some-snap", &snapstate.SnapState{
+		Active: true,
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "some-snap", SnapID: "some-snap-id", Revision: snap.R(3)},
+			{RealName: "some-snap", SnapID: "some-snap-id", Revision: snap.R(7)},
+		}),
+		Current:  snap.R(7),
+		SnapType: "app",
+	})
+
+	s.fakeBackend.nonSnapctlMounts = []string{"/var/snap/some-snap/3/user-mount", "/var/snap/some-snap/3/sub/user-mount"}
+
+	chg := s.state.NewChange("remove", "remove snap revision")
+	ts, err := snapstate.Remove(s.state, "some-snap", snap.R(3), nil)
+	c.Assert(err, IsNil)
+	chg.AddAll(ts)
+
+	s.settle(c)
+
+	c.Check(chg.Status(), Equals, state.ErrorStatus)
+	c.Check(chg.Err(), ErrorMatches,
+		"(?s).*cannot clear snap data due to unknown active mounts at:\\n"+
+			"- /var/snap/some-snap/3/user-mount\\n"+
+			"- /var/snap/some-snap/3/sub/user-mount\\n"+
+			"unmount them and try again.*")
+	// mount-control mount units must not have been removed.
+	c.Check(s.fakeBackend.ops.Filter("remove-snap-mount-units"), HasLen, 0)
+}
+
+func (s *snapmgrTestSuite) TestClearSnapDataAbortsWhenNonSnapctlMountsInLastRevision(c *C) {
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	snapstate.Set(s.state, "some-snap", &snapstate.SnapState{
+		Active: true,
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "some-snap", SnapID: "some-snap-id", Revision: snap.R(3)},
+		}),
+		Current:  snap.R(3),
+		SnapType: "app",
+	})
+
+	s.fakeBackend.nonSnapctlMounts = []string{"/var/snap/some-snap/3/user-mount", "/var/snap/some-snap/common/sub/user-mount"}
+
+	chg := s.state.NewChange("remove", "remove snap")
+	ts, err := snapstate.Remove(s.state, "some-snap", snap.R(0), &snapstate.RemoveFlags{Purge: true})
+	c.Assert(err, IsNil)
+	chg.AddAll(ts)
+
+	s.settle(c)
+
+	c.Check(chg.Status(), Equals, state.ErrorStatus)
+	c.Check(chg.Err(), ErrorMatches,
+		"(?s).*cannot clear snap data due to unknown active mounts at:\\n"+
+			"- /var/snap/some-snap/3/user-mount\\n"+
+			"- /var/snap/some-snap/common/sub/user-mount\\n"+
+			"unmount them and try again.*")
+	// mount-control mount units must not have been removed.
+	c.Check(s.fakeBackend.ops.Filter("remove-snap-mount-units"), HasLen, 0)
+}
+
+func (s *snapmgrTestSuite) TestClearSnapDataLogsWhenListNonSnapctlMountsErrors(c *C) {
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	snapstate.Set(s.state, "some-snap", &snapstate.SnapState{
+		Active: true,
+		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
+			{RealName: "some-snap", SnapID: "some-snap-id", Revision: snap.R(7)},
+		}),
+		Current:  snap.R(7),
+		SnapType: "app",
+	})
+
+	logbuf, restoreLogger := logger.MockLogger()
+	defer restoreLogger()
+
+	s.fakeBackend.maybeInjectErr = func(op *fakeOp) error {
+		if op.op == "list-non-snapctl-mounts-all" {
+			return errors.New("mock error")
+		}
+		return nil
+	}
+
+	chg := s.state.NewChange("remove", "remove snap")
+	ts, err := snapstate.Remove(s.state, "some-snap", snap.R(0), &snapstate.RemoveFlags{Purge: true})
+	c.Assert(err, IsNil)
+	chg.AddAll(ts)
+
+	s.settle(c)
+
+	// The listing error must not abort the task; removal proceeds normally.
+	c.Check(chg.Status(), Equals, state.DoneStatus)
+	c.Check(logbuf.String(), testutil.Contains,
+		"cannot list mounts other than snapctl mounts: mock error")
 }

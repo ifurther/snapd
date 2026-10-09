@@ -25,6 +25,7 @@ import (
 	"errors"
 	"net/http"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/snapcore/snapd/arch"
@@ -37,10 +38,14 @@ import (
 	"github.com/snapcore/snapd/overlord/auth"
 	"github.com/snapcore/snapd/overlord/configstate/config"
 	"github.com/snapcore/snapd/overlord/devicestate"
+	"github.com/snapcore/snapd/overlord/fdestate"
+	"github.com/snapcore/snapd/overlord/hookstate/ctlcmd"
+	"github.com/snapcore/snapd/overlord/ifacestate"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/release"
 	"github.com/snapcore/snapd/sandbox"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snapdtool"
 )
 
 var (
@@ -52,8 +57,21 @@ var (
 	}
 
 	sysInfoCmd = &Command{
-		Path:       "/v2/system-info",
-		GET:        sysInfo,
+		Path:        "/v2/system-info",
+		GET:         sysInfo,
+		POST:        sysInfoPost,
+		Actions:     []string{"advise-system-key-mismatch"},
+		ReadAccess:  interfaceOpenAccess{Interfaces: []string{"snap-interfaces-requests-control"}},
+		WriteAccess: openAccess{},
+	}
+
+	sysInfoStorageEncCmd = &Command{
+		Path: "/v2/system-info/storage-encrypted",
+		GET:  sysInfoStorageEnc,
+		// The "status" field is publicly accessible. If additional sensitive fields
+		// are added in the future, they must not be included in the response unless
+		// the caller satisfies the required access constraints. Any such filtering
+		// is performed at a lower level.
 		ReadAccess: openAccess{},
 	}
 
@@ -61,7 +79,8 @@ var (
 		Path:        "/v2/changes/{id}",
 		GET:         getChange,
 		POST:        abortChange,
-		ReadAccess:  interfaceOpenAccess{Interfaces: []string{"snap-refresh-observe"}},
+		Actions:     []string{"abort"},
+		ReadAccess:  interfaceOpenAccess{Interfaces: []string{"snap-refresh-observe", "ros-snapd-support"}},
 		WriteAccess: authenticatedAccess{Polkit: polkitActionManage},
 	}
 
@@ -75,6 +94,7 @@ var (
 		Path:        "/v2/warnings",
 		GET:         getWarnings,
 		POST:        ackWarnings,
+		Actions:     []string{"okay"},
 		ReadAccess:  openAccess{},
 		WriteAccess: authenticatedAccess{Polkit: polkitActionManage},
 	}
@@ -82,15 +102,25 @@ var (
 
 var (
 	buildID     = "unknown"
-	systemdVirt = ""
+	buildIDOnce sync.Once
+
+	snapdtoolIsReexecd  = snapdtool.IsReexecd
+	fdestateSystemState = fdestate.SystemState
+
+	// TODO:GOVERSION: use sync.OnceValue
+	systemdVirt     string
+	systemdVirtOnce sync.Once
 )
 
-func init() {
+var setBuildID = func() {
 	// cache the build-id on startup to ensure that changes in
 	// the underlying binary do not affect us
 	if bid, err := osutil.MyBuildID(); err == nil {
 		buildID = bid
 	}
+}
+
+var setSystemdDetectVirt = func() {
 	// cache systemd-detect-virt output as it's unlikely to change :-)
 	if buf, _, err := osutil.RunSplitOutput("systemd-detect-virt"); err == nil {
 		systemdVirt = string(bytes.TrimSpace(buf))
@@ -105,6 +135,10 @@ func sysInfo(c *Command, r *http.Request, user *auth.UserState) Response {
 	st := c.d.overlord.State()
 	snapMgr := c.d.overlord.SnapManager()
 	deviceMgr := c.d.overlord.DeviceManager()
+
+	buildIDOnce.Do(setBuildID)
+	systemdVirtOnce.Do(setSystemdDetectVirt)
+
 	st.Lock()
 	defer st.Unlock()
 	tr := config.NewTransaction(st)
@@ -120,6 +154,16 @@ func sysInfo(c *Command, r *http.Request, user *auth.UserState) Response {
 		return InternalError("cannot get user auth data: %s", err)
 	}
 
+	reexecd, err := snapdtoolIsReexecd()
+	if err != nil {
+		return InternalError("cannot obtain snapd reexec status: %s", err)
+	}
+
+	snapdFrom := "snap"
+	if !reexecd {
+		snapdFrom = "native-package"
+	}
+
 	refreshInfo := client.RefreshInfo{
 		Last: formatRefreshTime(lastRefresh),
 		Hold: formatRefreshTime(refreshHold),
@@ -131,7 +175,7 @@ func sysInfo(c *Command, r *http.Request, user *auth.UserState) Response {
 		refreshInfo.Schedule = refreshScheduleStr
 	}
 
-	m := map[string]interface{}{
+	m := map[string]any{
 		"series":         release.Series,
 		"version":        c.d.Version,
 		"build-id":       buildID,
@@ -139,15 +183,17 @@ func sysInfo(c *Command, r *http.Request, user *auth.UserState) Response {
 		"on-classic":     release.OnClassic,
 		"managed":        len(users) > 0,
 		"kernel-version": osutil.KernelVersion(),
-		"locations": map[string]interface{}{
+		"locations": map[string]any{
 			"snap-mount-dir": dirs.SnapMountDir,
 			"snap-bin-dir":   dirs.SnapBinariesDir,
 		},
-		"refresh":      refreshInfo,
-		"architecture": arch.DpkgArchitecture(),
-		"system-mode":  deviceMgr.SystemMode(devicestate.SysAny),
-		"features":     features.All(tr),
+		"refresh":        refreshInfo,
+		"architecture":   arch.DpkgArchitecture(),
+		"system-mode":    deviceMgr.SystemMode(devicestate.SysAny),
+		"features":       features.All(tr),
+		"snapd-bin-from": snapdFrom,
 	}
+
 	if systemdVirt != "" {
 		m["virtualization"] = systemdVirt
 	}
@@ -169,6 +215,56 @@ func sysInfo(c *Command, r *http.Request, user *auth.UserState) Response {
 	}
 
 	return SyncResponse(m)
+}
+
+func sysInfoPost(c *Command, r *http.Request, user *auth.UserState) Response {
+	var d struct {
+		Action    string `json:"action"`
+		SystemKey string `json:"system-key"`
+	}
+
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(&d); err != nil {
+		return BadRequest("cannot decode request body: %v", err)
+	}
+
+	if dec.More() {
+		return BadRequest("unexpected additional content in request body")
+	}
+
+	switch d.Action {
+	case "advise-system-key-mismatch":
+	case "":
+		return BadRequest("no action")
+	default:
+		return BadRequest("unsupported action %q", d.Action)
+	}
+
+	var sk any
+	if maybeSk, err := interfaces.SystemKeyFromString(d.SystemKey); err != nil {
+		return BadRequest("cannot decode system key: %v", err)
+	} else {
+		sk = maybeSk
+	}
+
+	st := c.d.state
+	st.Lock()
+	defer st.Unlock()
+
+	logger.Debugf("client reports mismatch with system-key: %v", d.SystemKey)
+	chg, err := ifacestate.AdviseReportedSystemKeyMismatch(c.d.state, sk)
+	if err != nil {
+		return errToResponse(err, nil, InternalError, "cannot process system key: %v")
+	}
+
+	if chg == nil {
+		// proceed
+		return SyncResponse("")
+	}
+
+	ensureStateSoon(c.d.state)
+	// we have a new change
+	return AsyncResponse(nil, chg.ID())
 }
 
 func formatRefreshTime(t time.Time) string {
@@ -213,7 +309,7 @@ func getChange(c *Command, r *http.Request, user *auth.UserState) Response {
 		return NotFound("cannot find change with id %q", chID)
 	}
 
-	return SyncResponse(change2changeInfo(chg))
+	return SyncResponse(ctlcmd.StateChangeToChangeInfo(chg))
 }
 
 func getChanges(c *Command, r *http.Request, user *auth.UserState) Response {
@@ -265,12 +361,12 @@ func getChanges(c *Command, r *http.Request, user *auth.UserState) Response {
 	state.Lock()
 	defer state.Unlock()
 	chgs := state.Changes()
-	chgInfos := make([]*changeInfo, 0, len(chgs))
+	chgInfos := make([]*ctlcmd.ChangeInfo, 0, len(chgs))
 	for _, chg := range chgs {
 		if !filter(chg) {
 			continue
 		}
-		chgInfos = append(chgInfos, change2changeInfo(chg))
+		chgInfos = append(chgInfos, ctlcmd.StateChangeToChangeInfo(chg))
 	}
 	return SyncResponse(chgInfos)
 }
@@ -308,93 +404,7 @@ func abortChange(c *Command, r *http.Request, user *auth.UserState) Response {
 	// actually ask to proceed with the abort
 	ensureStateSoon(state)
 
-	return SyncResponse(change2changeInfo(chg))
-}
-
-type changeInfo struct {
-	ID      string      `json:"id"`
-	Kind    string      `json:"kind"`
-	Summary string      `json:"summary"`
-	Status  string      `json:"status"`
-	Tasks   []*taskInfo `json:"tasks,omitempty"`
-	Ready   bool        `json:"ready"`
-	Err     string      `json:"err,omitempty"`
-
-	SpawnTime time.Time  `json:"spawn-time,omitempty"`
-	ReadyTime *time.Time `json:"ready-time,omitempty"`
-
-	Data map[string]*json.RawMessage `json:"data,omitempty"`
-}
-
-type taskInfo struct {
-	ID       string           `json:"id"`
-	Kind     string           `json:"kind"`
-	Summary  string           `json:"summary"`
-	Status   string           `json:"status"`
-	Log      []string         `json:"log,omitempty"`
-	Progress taskInfoProgress `json:"progress"`
-
-	SpawnTime time.Time  `json:"spawn-time,omitempty"`
-	ReadyTime *time.Time `json:"ready-time,omitempty"`
-}
-
-type taskInfoProgress struct {
-	Label string `json:"label"`
-	Done  int    `json:"done"`
-	Total int    `json:"total"`
-}
-
-func change2changeInfo(chg *state.Change) *changeInfo {
-	status := chg.Status()
-	chgInfo := &changeInfo{
-		ID:      chg.ID(),
-		Kind:    chg.Kind(),
-		Summary: chg.Summary(),
-		Status:  status.String(),
-		Ready:   status.Ready(),
-
-		SpawnTime: chg.SpawnTime(),
-	}
-	readyTime := chg.ReadyTime()
-	if !readyTime.IsZero() {
-		chgInfo.ReadyTime = &readyTime
-	}
-	if err := chg.Err(); err != nil {
-		chgInfo.Err = err.Error()
-	}
-
-	tasks := chg.Tasks()
-	taskInfos := make([]*taskInfo, len(tasks))
-	for j, t := range tasks {
-		label, done, total := t.Progress()
-
-		taskInfo := &taskInfo{
-			ID:      t.ID(),
-			Kind:    t.Kind(),
-			Summary: t.Summary(),
-			Status:  t.Status().String(),
-			Log:     t.Log(),
-			Progress: taskInfoProgress{
-				Label: label,
-				Done:  done,
-				Total: total,
-			},
-			SpawnTime: t.SpawnTime(),
-		}
-		readyTime := t.ReadyTime()
-		if !readyTime.IsZero() {
-			taskInfo.ReadyTime = &readyTime
-		}
-		taskInfos[j] = taskInfo
-	}
-	chgInfo.Tasks = taskInfos
-
-	var data map[string]*json.RawMessage
-	if chg.Get("api-data", &data) == nil {
-		chgInfo.Data = data
-	}
-
-	return chgInfo
+	return SyncResponse(ctlcmd.StateChangeToChangeInfo(chg))
 }
 
 var (
@@ -417,8 +427,6 @@ func getWarnings(c *Command, r *http.Request, _ *auth.UserState) Response {
 	}
 
 	st := c.d.overlord.State()
-	st.Lock()
-	defer st.Unlock()
 
 	var ws []*state.Warning
 	if all {
@@ -453,4 +461,24 @@ func ackWarnings(c *Command, r *http.Request, _ *auth.UserState) Response {
 	n := stateOkayWarnings(st, op.Timestamp)
 
 	return SyncResponse(n)
+}
+
+func sysInfoStorageEnc(c *Command, r *http.Request, user *auth.UserState) Response {
+	st := c.d.overlord.State()
+	st.Lock()
+	defer st.Unlock()
+
+	devmgr := c.d.overlord.DeviceManager()
+
+	model, err := devmgr.Model()
+	if err != nil && !errors.Is(err, state.ErrNoState) {
+		return InternalError("cannot find model: %v", err)
+	}
+
+	state, err := fdestateSystemState(st, model)
+	if err != nil {
+		return InternalError("cannot determine system encrypted state: %s", err)
+	}
+
+	return SyncResponse(state)
 }

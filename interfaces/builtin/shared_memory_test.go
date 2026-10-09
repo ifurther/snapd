@@ -308,6 +308,28 @@ apps:
 			`shared-memory interface path is invalid: "mem\*\*" contains \*\* which is unsupported.*`,
 		},
 		{
+			`read: ["mem?"]`,
+			`shared-memory interface path is invalid: "mem\?" contains a reserved apparmor char`,
+		},
+		{
+			`read: ["m[em]"]`,
+			`shared-memory interface path is invalid: "m\[em\]" contains a reserved apparmor char`,
+		},
+		{
+			`read: ['me"m']`,
+			`shared-memory interface path is invalid: "me\\"m" contains a reserved apparmor char`,
+		},
+		{
+			// a single "*" is fine, but other AARE chars are still
+			// rejected even in its presence
+			`read: ["m*em?"]`,
+			`shared-memory interface path is invalid: "m\*em\?" contains a reserved apparmor char`,
+		},
+		{
+			`read: ["mem{"]`,
+			`shared-memory interface path is invalid: "mem{" contains a reserved apparmor char`,
+		},
+		{
 			`read: [..]`,
 			`shared-memory interface path is not clean: ".."`,
 		},
@@ -383,7 +405,9 @@ func (s *SharedMemoryInterfaceSuite) TestStaticInfo(c *C) {
 }
 
 func (s *SharedMemoryInterfaceSuite) TestAppArmorSpec(c *C) {
-	spec := apparmor.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	appSet, err := interfaces.NewSnapAppSet(s.plug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec := apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedPlug(s.iface, s.plug, s.slot), IsNil)
 	plugSnippet := spec.SnippetForTag("snap.consumer.app")
 
@@ -392,7 +416,9 @@ func (s *SharedMemoryInterfaceSuite) TestAppArmorSpec(c *C) {
 	c.Check(plugSnippet, testutil.Contains, `"/{dev,run}/shm/bar" mrwlk,`)
 	c.Check(plugSnippet, testutil.Contains, `"/{dev,run}/shm/bar-ro" r,`)
 
-	spec = apparmor.NewSpecification(interfaces.NewSnapAppSet(s.slot.Snap()))
+	appSet, err = interfaces.NewSnapAppSet(s.slot.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec = apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedSlot(s.iface, s.plug, s.slot), IsNil)
 	c.Assert(spec.SecurityTags(), DeepEquals, []string{"snap.provider.app"})
 
@@ -402,7 +428,9 @@ func (s *SharedMemoryInterfaceSuite) TestAppArmorSpec(c *C) {
 	c.Check(slotSnippet, testutil.Contains, `"/{dev,run}/shm/bar" mrwlk,`)
 	c.Check(slotSnippet, testutil.Contains, `"/{dev,run}/shm/bar-ro" mrwlk,`)
 
-	wildcardSpec := apparmor.NewSpecification(interfaces.NewSnapAppSet(s.wildcardPlug.Snap()))
+	appSet, err = interfaces.NewSnapAppSet(s.wildcardPlug.Snap(), nil)
+	c.Assert(err, IsNil)
+	wildcardSpec := apparmor.NewSpecification(appSet)
 	c.Assert(wildcardSpec.AddConnectedPlug(s.iface, s.wildcardPlug, s.wildcardSlot), IsNil)
 	wildcardPlugSnippet := wildcardSpec.SnippetForTag("snap.consumer.app")
 
@@ -411,7 +439,9 @@ func (s *SharedMemoryInterfaceSuite) TestAppArmorSpec(c *C) {
 	c.Check(wildcardPlugSnippet, testutil.Contains, `"/{dev,run}/shm/bar*" mrwlk,`)
 	c.Check(wildcardPlugSnippet, testutil.Contains, `"/{dev,run}/shm/bar-ro*" r,`)
 
-	wildcardSpec = apparmor.NewSpecification(interfaces.NewSnapAppSet(s.wildcardSlot.Snap()))
+	appSet, err = interfaces.NewSnapAppSet(s.wildcardSlot.Snap(), nil)
+	c.Assert(err, IsNil)
+	wildcardSpec = apparmor.NewSpecification(appSet)
 	c.Assert(wildcardSpec.AddConnectedSlot(s.iface, s.wildcardPlug, s.wildcardSlot), IsNil)
 
 	c.Assert(wildcardSpec.SecurityTags(), DeepEquals, []string{"snap.provider.app"})
@@ -422,7 +452,9 @@ func (s *SharedMemoryInterfaceSuite) TestAppArmorSpec(c *C) {
 	c.Check(wildcardSlotSnippet, testutil.Contains, `"/{dev,run}/shm/bar*" mrwlk,`)
 	c.Check(wildcardSlotSnippet, testutil.Contains, `"/{dev,run}/shm/bar-ro*" mrwlk,`)
 
-	spec = apparmor.NewSpecification(interfaces.NewSnapAppSet(s.privatePlug.Snap()))
+	appSet, err = interfaces.NewSnapAppSet(s.privatePlug.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec = apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedPlug(s.iface, s.privatePlug, s.privateSlot), IsNil)
 	privatePlugSnippet := spec.SnippetForTag("snap.consumer.app")
 	privateUpdateNS := spec.UpdateNS()
@@ -434,7 +466,9 @@ func (s *SharedMemoryInterfaceSuite) TestAppArmorSpec(c *C) {
   mount options=(bind, rw) /dev/shm/snap.consumer/ -> /dev/shm/,
   umount /dev/shm/,`)
 
-	spec = apparmor.NewSpecification(interfaces.NewSnapAppSet(s.privateSlot.Snap()))
+	appSet, err = interfaces.NewSnapAppSet(s.privateSlot.Snap(), nil)
+	c.Assert(err, IsNil)
+	spec = apparmor.NewSpecification(appSet)
 	c.Assert(spec.AddConnectedSlot(s.iface, s.privatePlug, s.privateSlot), IsNil)
 	privateSlotSnippet := spec.SnippetForTag("snap.core.app")
 
@@ -473,6 +507,23 @@ func (s *SharedMemoryInterfaceSuite) TestMountSpec(c *C) {
 
 func (s *SharedMemoryInterfaceSuite) TestAutoConnect(c *C) {
 	c.Assert(s.iface.AutoConnect(s.plugInfo, s.slotInfo), Equals, true)
+}
+
+func (s *SharedMemoryInterfaceSuite) TestParallelInstancesSupportedForPlug(c *C) {
+	definer, ok := s.iface.(interfaces.ParallelInstancesPlugDefiner)
+	c.Assert(ok, Equals, true)
+
+	// private=false does not support parallel instances
+	c.Check(definer.ParallelInstancesSupportedForPlug(s.plugInfo), ErrorMatches, `"private" attribute must be set to true`)
+
+	// private=true supports parallel instances
+	c.Check(definer.ParallelInstancesSupportedForPlug(s.privatePlugInfo), IsNil)
+}
+
+func (s *SharedMemoryInterfaceSuite) TestParallelInstancesSupportedForSlot(c *C) {
+	definer, ok := s.iface.(interfaces.ParallelInstancesSlotDefiner)
+	c.Assert(ok, Equals, true)
+	c.Check(definer.ParallelInstancesSupportedForSlot(s.slotInfo), ErrorMatches, "conflicting operations on the same shared memory")
 }
 
 func (s *SharedMemoryInterfaceSuite) TestInterfaces(c *C) {

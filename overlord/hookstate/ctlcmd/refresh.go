@@ -37,6 +37,7 @@ import (
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 )
 
 var autoRefreshForGatingSnap = snapstate.AutoRefreshForGatingSnap
@@ -45,19 +46,25 @@ type refreshCommand struct {
 	baseCommand
 
 	Pending bool `long:"pending" description:"Show pending refreshes of the calling snap"`
-	// these two options are mutually exclusive
-	Proceed bool `long:"proceed" description:"Proceed with potentially disruptive refreshes"`
-	Hold    bool `long:"hold" description:"Do not proceed with potentially disruptive refreshes"`
+	// these three options are mutually exclusive
+	Proceed  bool `long:"proceed" description:"Proceed with potentially disruptive refreshes"`
+	Hold     bool `long:"hold" description:"Do not proceed with potentially disruptive refreshes"`
+	Tracking bool `long:"tracking" description:"Show the channel the snap is tracking"`
 
 	PrintInhibitLock bool `long:"show-lock" description:"Show the value of the run inhibit lock held during refreshes (empty means not held)"`
 }
 
 var shortRefreshHelp = i18n.G("The refresh command prints pending refreshes and can hold back disruptive ones.")
 var longRefreshHelp = i18n.G(`
-The refresh command prints pending refreshes of the calling snap and can hold
-back disruptive refreshes of other snaps, such as refreshes of the kernel or
-base snaps that can trigger a restart. This command can be used from the
-gate-auto-refresh hook which is only run during auto-refresh.
+The refresh command prints pending refreshes or the tracking channel of the
+calling snap and can hold back disruptive refreshes of other snaps, such as
+refreshes of the kernel or base snaps that can trigger a restart.
+This command can be used from the gate-auto-refresh hook which is only run
+during auto-refresh.
+
+To show the channel the current snap is tracking:
+    $ snapctl refresh --tracking
+    channel: latest/stable
 
 Snap can query pending refreshes with:
     $ snapctl refresh --pending
@@ -96,6 +103,15 @@ func init() {
 	cmd.hidden = true
 }
 
+func (c *refreshCommand) nonRootExecute(context *hookstate.Context) error {
+	switch {
+	case c.Tracking:
+		return c.printTrackingInfo(context)
+	default:
+		return &ForbiddenCommandError{Message: "non-root users can only use --tracking with the refresh command"}
+	}
+}
+
 func (c *refreshCommand) Execute(args []string) error {
 	context, err := c.ensureContext()
 	if err != nil {
@@ -114,6 +130,7 @@ func (c *refreshCommand) Execute(args []string) error {
 		{c.PrintInhibitLock, "--show-lock"},
 		{c.Hold, "--hold"},
 		{c.Proceed, "--proceed"},
+		{c.Tracking, "--tracking"},
 	} {
 		if opt.val && which != "" {
 			return fmt.Errorf("cannot use %s and %s together", opt.name, which)
@@ -121,6 +138,14 @@ func (c *refreshCommand) Execute(args []string) error {
 		if opt.val {
 			which = opt.name
 		}
+	}
+
+	if c.Tracking && c.Pending {
+		return fmt.Errorf("--tracking cannot be used with --pending")
+	}
+
+	if c.uid != "0" {
+		return c.nonRootExecute(context)
 	}
 
 	// --pending --proceed is a verbose way of saying --proceed, so only
@@ -138,6 +163,8 @@ func (c *refreshCommand) Execute(args []string) error {
 		return c.hold()
 	case c.PrintInhibitLock:
 		return c.printInhibitLockHint()
+	case c.Tracking:
+		return c.printTrackingInfo(context)
 	}
 
 	return nil
@@ -179,17 +206,17 @@ func getUpdateDetails(context *hookstate.Context) (*updateDetails, error) {
 	}
 
 	var base, restart bool
-	if affectedInfo, ok := affected[context.InstanceName()]; ok {
+	if affectedInfo, ok := affected[context.InstanceName().String()]; ok {
 		base = affectedInfo.Base
 		restart = affectedInfo.Restart
 	}
 
 	var snapst snapstate.SnapState
-	if err := snapstate.Get(st, context.InstanceName(), &snapst); err != nil {
+	if err := snapstate.Get(st, context.InstanceName().String(), &snapst); err != nil {
 		return nil, fmt.Errorf("internal error: cannot get snap state for %q: %v", context.InstanceName(), err)
 	}
 
-	var candidates map[string]*refreshCandidate
+	var candidates map[naming.InstanceName]*refreshCandidate
 	if err := st.Get("refresh-candidates", &candidates); err != nil && !errors.Is(err, state.ErrNoState) {
 		return nil, err
 	}
@@ -210,7 +237,7 @@ func getUpdateDetails(context *hookstate.Context) (*updateDetails, error) {
 		Pending: pending,
 	}
 
-	hasRefreshControl, err := hasSnapRefreshControlInterface(st, context.InstanceName())
+	hasRefreshControl, err := hasSnapRefreshControlInterface(st, context.InstanceName().String())
 	if err != nil {
 		return nil, err
 	}
@@ -232,6 +259,34 @@ func getUpdateDetails(context *hookstate.Context) (*updateDetails, error) {
 	// refresh-hint not present, look up channel info in snapstate
 	up.Channel = snapst.TrackingChannel
 	return &up, nil
+}
+
+func (c *refreshCommand) printTrackingInfo(context *hookstate.Context) error {
+	context.Lock()
+	defer context.Unlock()
+
+	st := context.State()
+	var snapst snapstate.SnapState
+	err := snapstate.Get(st, context.InstanceName().String(), &snapst)
+	if err != nil {
+		return fmt.Errorf("internal error: %v", err)
+	}
+
+	var res []byte
+
+	if snapst.TrackingChannel != "" {
+		res, err = yaml.Marshal(map[string]string{"channel": snapst.TrackingChannel})
+	} else {
+		res, err = yaml.Marshal(map[string]*string{"channel": nil})
+	}
+
+	if err != nil {
+		return fmt.Errorf("internal error: could not marshal tracking info: %v", err)
+	}
+
+	c.print(string(res))
+
+	return nil
 }
 
 func (c *refreshCommand) printPendingInfo() error {
@@ -259,7 +314,7 @@ func (c *refreshCommand) hold() error {
 	// cache the action so that hook handler can implement default behavior
 	ctx.Cache("action", snapstate.GateAutoRefreshHold)
 
-	affecting, err := snapstate.AffectingSnapsForAffectedByRefreshCandidates(st, ctx.InstanceName())
+	affecting, err := snapstate.AffectingSnapsForAffectedByRefreshCandidates(st, ctx.InstanceName().String())
 	if err != nil {
 		return err
 	}
@@ -274,7 +329,7 @@ func (c *refreshCommand) hold() error {
 	// no duration specified, use maximum allowed for this gating snap.
 	var holdDuration time.Duration
 	// XXX for now snaps hold other snaps only for auto-refreshes
-	remaining, err := snapstate.HoldRefresh(st, snapstate.HoldAutoRefresh, ctx.InstanceName(), holdDuration, affecting...)
+	remaining, err := snapstate.HoldRefresh(st, snapstate.HoldAutoRefresh, ctx.InstanceName().String(), holdDuration, affecting...)
 	if err != nil {
 		// TODO: let a snap hold again once for 1h.
 		return err
@@ -299,7 +354,7 @@ func (c *refreshCommand) proceed() error {
 	// running outside of hook
 	if ctx.IsEphemeral() {
 		st := ctx.State()
-		hasRefreshControl, err := hasSnapRefreshControlInterface(st, ctx.InstanceName())
+		hasRefreshControl, err := hasSnapRefreshControlInterface(st, ctx.InstanceName().String())
 		if err != nil {
 			return err
 		}
@@ -315,10 +370,10 @@ func (c *refreshCommand) proceed() error {
 			return err
 		}
 		if !gateAutoRefreshHook {
-			return fmt.Errorf("cannot proceed without experimental.gate-auto-refresh feature enabled")
+			return fmt.Errorf("cannot proceed: gate-auto-refresh-hook is disabled")
 		}
 
-		return autoRefreshForGatingSnap(st, ctx.InstanceName())
+		return autoRefreshForGatingSnap(st, ctx.InstanceName().String())
 	}
 
 	// cache the action, hook handler will trigger proceed logic; we cannot
@@ -342,7 +397,7 @@ func hasSnapRefreshControlInterface(st *state.State, snapName string) (bool, err
 		if err != nil {
 			return false, fmt.Errorf("internal error: %s", err)
 		}
-		if connRef.PlugRef.Snap == snapName {
+		if connRef.PlugRef.Snap.String() == snapName {
 			return true, nil
 		}
 	}
@@ -352,11 +407,11 @@ func hasSnapRefreshControlInterface(st *state.State, snapName string) (bool, err
 func (c *refreshCommand) printInhibitLockHint() error {
 	ctx := c.context()
 	ctx.Lock()
-	snapName := ctx.InstanceName()
+	instanceName := ctx.InstanceName()
 	ctx.Unlock()
 
 	// obtain snap lock before manipulating runinhibit lock.
-	lock, err := snaplock.OpenLock(snapName)
+	lock, err := snaplock.OpenLock(instanceName.String())
 	if err != nil {
 		return err
 	}
@@ -365,7 +420,7 @@ func (c *refreshCommand) printInhibitLockHint() error {
 	}
 	defer lock.Unlock()
 
-	hint, _, err := runinhibit.IsLocked(snapName)
+	hint, _, err := runinhibit.IsLocked(instanceName, nil)
 	if err != nil {
 		return err
 	}

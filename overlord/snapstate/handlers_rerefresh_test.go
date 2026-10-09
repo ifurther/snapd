@@ -101,7 +101,7 @@ func (s *reRefreshSuite) TestDoCheckReRefreshFailsIfUpdateFails(c *C) {
 	s.state.Lock()
 	chg := changeWithLanesAndSnapSetups(s.state, "some-snap")
 	task := s.state.NewTask("check-rerefresh", "test")
-	task.Set("rerefresh-setup", map[string]interface{}{})
+	task.Set("rerefresh-setup", map[string]any{})
 	chg.AddTask(task)
 	s.state.Unlock()
 
@@ -125,7 +125,7 @@ func (s *reRefreshSuite) TestDoCheckReRefreshNoReRefreshes(c *C) {
 	s.state.Lock()
 	chg := changeWithLanesAndSnapSetups(s.state, "some-snap")
 	task := s.state.NewTask("check-rerefresh", "test")
-	task.Set("rerefresh-setup", map[string]interface{}{})
+	task.Set("rerefresh-setup", map[string]any{})
 	chg.AddTask(task)
 	s.state.Unlock()
 
@@ -158,7 +158,7 @@ func (s *reRefreshSuite) TestDoCheckReRefreshPassesReRefreshSetupData(c *C) {
 
 	s.state.Lock()
 	task := s.state.NewTask("check-rerefresh", "test")
-	task.Set("rerefresh-setup", map[string]interface{}{
+	task.Set("rerefresh-setup", map[string]any{
 		"user-id":  42,
 		"devmode":  true,
 		"jailmode": true,
@@ -194,7 +194,7 @@ func (s *reRefreshSuite) TestDoCheckReRefreshAddsNewTasks(c *C) {
 	s.state.Lock()
 	chg := changeWithLanesAndSnapSetups(s.state, "foo", "bar", "baz")
 	task := s.state.NewTask("check-rerefresh", "check rerefresh")
-	task.Set("rerefresh-setup", map[string]interface{}{})
+	task.Set("rerefresh-setup", map[string]any{})
 	chg.AddTask(task)
 	s.state.Unlock()
 
@@ -225,7 +225,7 @@ func (s *reRefreshSuite) TestDoCheckReRefreshWaitOnPendingRestart(c *C) {
 		st := task.State()
 		st.Lock()
 		defer st.Unlock()
-		return restart.FinishTaskWithRestart(task, state.DoneStatus, restart.RestartSystem, "foo", nil)
+		return restart.FinishTaskWithRestart(task, state.DoneStatus, restart.RestartSystem, "foo", nil, "")
 	}, nil)
 
 	// setup the change for check-rerefresh, then we manually request for
@@ -243,7 +243,7 @@ func (s *reRefreshSuite) TestDoCheckReRefreshWaitOnPendingRestart(c *C) {
 	chg.AddTask(tsk)
 	tsk.JoinLane(lane)
 	task := s.state.NewTask("check-rerefresh", "test")
-	task.Set("rerefresh-setup", map[string]interface{}{})
+	task.Set("rerefresh-setup", map[string]any{})
 	chg.AddTask(task)
 	s.state.Unlock()
 
@@ -281,7 +281,7 @@ func (s *reRefreshSuite) TestDoCheckReRefreshWaitOnPendingRestart(c *C) {
 
 // wrapper around snapstate.RefreshedSnaps for easier testing
 func refreshedSnaps(c *C, task *state.Task) string {
-	snaps, _, err := snapstate.RefreshedSnaps(task)
+	snaps, _, err := snapstate.RefreshedSnaps(task, nil)
 	c.Assert(err, IsNil)
 	sort.Strings(snaps)
 	return strings.Join(snaps, ",")
@@ -440,7 +440,7 @@ func (s *reRefreshSuite) TestLaneSnapsInvalidSetup(c *C) {
 	task := s.state.NewTask("check-rerefresh", "...")
 	chg.AddTask(task)
 
-	snaps, _, err := snapstate.RefreshedSnaps(task)
+	snaps, _, err := snapstate.RefreshedSnaps(task, nil)
 	c.Check(snaps, HasLen, 0)
 	c.Check(err, ErrorMatches, `internal error: expected SnapSetup for download-snap: no state entry for key "snap-setup"`)
 }
@@ -501,7 +501,7 @@ func (s *reRefreshSuite) TestFilterReturnsFalseIfEpochEqualZero(c *C) {
 
 func (s *refreshSuite) TestMaybeRestoreValidationSetsAndRevertSnaps(c *C) {
 	restore := snapstate.MockEnforcedValidationSets(func(st *state.State, extraVss ...*asserts.ValidationSet) (*snapasserts.ValidationSets, error) {
-		return nil, nil
+		return snapasserts.NewValidationSets(), nil
 	})
 	defer restore()
 
@@ -522,8 +522,8 @@ func (s *validationSetsSuite) TestMaybeRestoreValidationSetsAndRevertSnapsOneRev
 		enforcedValidationSetsCalled++
 
 		vs := snapasserts.NewValidationSets()
-		var snap1, snap2, snap3 map[string]interface{}
-		snap3 = map[string]interface{}{
+		var snap1, snap2, snap3 map[string]any
+		snap3 = map[string]any{
 			"id":       "abcKhntON3vR7kwEbVPsILm7bUViPDzx",
 			"name":     "some-snap3",
 			"presence": "required",
@@ -532,7 +532,7 @@ func (s *validationSetsSuite) TestMaybeRestoreValidationSetsAndRevertSnapsOneRev
 		switch enforcedValidationSetsCalled {
 		case 1:
 			// refreshed validation sets
-			snap1 = map[string]interface{}{
+			snap1 = map[string]any{
 				"id":       "aaqKhntON3vR7kwEbVPsILm7bUViPDzx",
 				"name":     "some-snap1",
 				"presence": "required",
@@ -540,7 +540,7 @@ func (s *validationSetsSuite) TestMaybeRestoreValidationSetsAndRevertSnapsOneRev
 			}
 			// require snap2 at revision 5 (if snap refresh succeeded, but it didn't, so
 			// current revision of the snap is wrong)
-			snap2 = map[string]interface{}{
+			snap2 = map[string]any{
 				"id":       "bgtKhntON3vR7kwEbVPsILm7bUViPDzx",
 				"name":     "some-snap2",
 				"presence": "required",
@@ -548,13 +548,13 @@ func (s *validationSetsSuite) TestMaybeRestoreValidationSetsAndRevertSnapsOneRev
 			}
 		case 2:
 			// validation sets restored from history
-			snap1 = map[string]interface{}{
+			snap1 = map[string]any{
 				"id":       "aaqKhntON3vR7kwEbVPsILm7bUViPDzx",
 				"name":     "some-snap1",
 				"presence": "required",
 				"revision": "1",
 			}
-			snap2 = map[string]interface{}{
+			snap2 = map[string]any{
 				"id":       "bgtKhntON3vR7kwEbVPsILm7bUViPDzx",
 				"name":     "some-snap2",
 				"presence": "required",
@@ -630,6 +630,7 @@ func (s *validationSetsSuite) TestMaybeRestoreValidationSetsAndRevertSnapsOneRev
 	c.Assert(taskKinds(revertTasks), DeepEquals, []string{
 		"prerequisites",
 		"prepare-snap",
+		"prerequisites",
 		"stop-snap-services",
 		"remove-aliases",
 		"unlink-current-snap",
@@ -646,7 +647,7 @@ func (s *validationSetsSuite) TestMaybeRestoreValidationSetsAndRevertSnapsOneRev
 	snapsup, err := snapstate.TaskSnapSetup(revertTasks[0])
 	c.Assert(err, IsNil)
 	c.Check(snapsup.Flags, Equals, snapstate.Flags{Revert: true, RevertStatus: snapstate.NotBlocked})
-	c.Check(snapsup.InstanceName(), Equals, "some-snap1")
+	c.Check(snapsup.InstanceName().String(), Equals, "some-snap1")
 	c.Check(snapsup.Revision(), Equals, snap.R(1))
 
 	c.Check(restoreValidationSetsTrackingCalled, Equals, 1)
@@ -659,7 +660,7 @@ func (s *validationSetsSuite) TestMaybeRestoreValidationSetsAndRevertNoSnapsRefr
 		enforcedValidationSetsCalled++
 
 		vs := snapasserts.NewValidationSets()
-		snap1 := map[string]interface{}{
+		snap1 := map[string]any{
 			"id":       "aaqKhntON3vR7kwEbVPsILm7bUViPDzx",
 			"name":     "some-snap1",
 			"presence": "required",
@@ -710,8 +711,8 @@ func (s *validationSetsSuite) TestMaybeRestoreValidationSetsAndRevertJustValidat
 		enforcedValidationSetsCalled++
 
 		vs := snapasserts.NewValidationSets()
-		var snap1, snap2 map[string]interface{}
-		snap2 = map[string]interface{}{
+		var snap1, snap2 map[string]any
+		snap2 = map[string]any{
 			"id":       "abcKhntON3vR7kwEbVPsILm7bUViPDzx",
 			"name":     "some-snap2",
 			"presence": "required",
@@ -721,7 +722,7 @@ func (s *validationSetsSuite) TestMaybeRestoreValidationSetsAndRevertJustValidat
 		case 1:
 			// refreshed validation sets
 			// snap1 revision 3 is now required (but snap wasn't refreshed)
-			snap1 = map[string]interface{}{
+			snap1 = map[string]any{
 				"id":       "aaqKhntON3vR7kwEbVPsILm7bUViPDzx",
 				"name":     "some-snap1",
 				"presence": "required",
@@ -729,7 +730,7 @@ func (s *validationSetsSuite) TestMaybeRestoreValidationSetsAndRevertJustValidat
 			}
 		case 2:
 			// validation sets restored from history
-			snap1 = map[string]interface{}{
+			snap1 = map[string]any{
 				"id":       "aaqKhntON3vR7kwEbVPsILm7bUViPDzx",
 				"name":     "some-snap1",
 				"presence": "required",
@@ -790,7 +791,7 @@ func (s *validationSetsSuite) TestMaybeRestoreValidationSetsAndRevertStillValid(
 		enforcedValidationSetsCalled++
 
 		vs := snapasserts.NewValidationSets()
-		snap2 := map[string]interface{}{
+		snap2 := map[string]any{
 			"id":       "abcKhntON3vR7kwEbVPsILm7bUViPDzx",
 			"name":     "some-snap2",
 			"presence": "required",
@@ -800,7 +801,7 @@ func (s *validationSetsSuite) TestMaybeRestoreValidationSetsAndRevertStillValid(
 
 		// refreshed validation sets
 		// snap1 revision 3 is now required (but snap wasn't refreshed)
-		snap1 := map[string]interface{}{
+		snap1 := map[string]any{
 			"id":       "aaqKhntON3vR7kwEbVPsILm7bUViPDzx",
 			"name":     "some-snap1",
 			"presence": "required",

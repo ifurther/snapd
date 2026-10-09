@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2016-2018 Canonical Ltd
+ * Copyright (C) 2016-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -21,23 +21,30 @@ package devicestate
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"net/http"
-	"os/user"
 	"time"
 
 	"github.com/snapcore/snapd/asserts"
+	"github.com/snapcore/snapd/asserts/snapasserts"
 	"github.com/snapcore/snapd/boot"
+	"github.com/snapcore/snapd/bootloader"
 	"github.com/snapcore/snapd/gadget"
+	"github.com/snapcore/snapd/gadget/device"
 	"github.com/snapcore/snapd/gadget/install"
 	"github.com/snapcore/snapd/httputil"
 	"github.com/snapcore/snapd/kernel/fde"
 	"github.com/snapcore/snapd/osutil"
+	"github.com/snapcore/snapd/osutil/keyboard"
+	"github.com/snapcore/snapd/osutil/user"
+	"github.com/snapcore/snapd/overlord/fdestate"
+	fdeBackend "github.com/snapcore/snapd/overlord/fdestate/backend"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/overlord/storecontext"
 	"github.com/snapcore/snapd/secboot"
 	"github.com/snapcore/snapd/secboot/keys"
+	"github.com/snapcore/snapd/seclog"
 	"github.com/snapcore/snapd/seed"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/sysconfig"
@@ -46,9 +53,10 @@ import (
 )
 
 var (
-	SystemForPreseeding         = systemForPreseeding
-	GetUserDetailsFromAssertion = getUserDetailsFromAssertion
-	ShouldRequestSerial         = shouldRequestSerial
+	SystemForPreseeding             = systemForPreseeding
+	FindVerifiedSystemUserAssertion = findVerifiedSystemUserAssertion
+	AddUserOptionsFromAssertion     = addUserOptionsFromAssertion
+	ShouldRequestSerial             = shouldRequestSerial
 )
 
 func MockKeyLength(n int) (restore func()) {
@@ -119,6 +127,10 @@ func EnsureOperationalShouldBackoff(m *DeviceManager, now time.Time) bool {
 	return m.ensureOperationalShouldBackoff(now)
 }
 
+func LoadSystemAndEssentialSnaps(m *DeviceManager, wantedSystemLabel string, types []snap.Type, modeForComps string) (*systemAndEssentialSnaps, error) {
+	return m.loadSystemAndEssentialSnaps(wantedSystemLabel, types, modeForComps)
+}
+
 func BecomeOperationalBackoff(m *DeviceManager) time.Duration {
 	return m.becomeOperationalBackoff
 }
@@ -161,33 +173,35 @@ func MockRepeatRequestSerial(label string) (restore func()) {
 	}
 }
 
-func MockSnapstateInstallWithDeviceContext(f func(ctx context.Context, st *state.State, name string, opts *snapstate.RevisionOptions, userID int, flags snapstate.Flags, prqt snapstate.PrereqTracker, deviceCtx snapstate.DeviceContext, fromChange string) (*state.TaskSet, error)) (restore func()) {
-	r := testutil.Backup(&snapstateInstallWithDeviceContext)
-	snapstateInstallWithDeviceContext = f
-	return r
+func MockSnapstateUpdateOne(mock func(ctx context.Context, st *state.State, goal snapstate.UpdateGoal, filter func(*snap.Info, *snapstate.SnapState) bool, opts snapstate.Options) (*state.TaskSet, error)) (restore func()) {
+	return testutil.Mock(&snapstateUpdateOne, mock)
 }
 
-func MockSnapstateInstallPathWithDeviceContext(f func(st *state.State, si *snap.SideInfo, path, name string, opts *snapstate.RevisionOptions, userID int, flags snapstate.Flags, prqt snapstate.PrereqTracker, deviceCtx snapstate.DeviceContext, fromChange string) (*state.TaskSet, error)) (restore func()) {
-	r := testutil.Backup(&snapstateInstallPathWithDeviceContext)
-	snapstateInstallPathWithDeviceContext = f
-	return r
+func MockSnapstatePathUpdateGoal(mock func(snaps ...snapstate.PathSnap) snapstate.UpdateGoal) (restore func()) {
+	return testutil.Mock(&snapstatePathUpdateGoal, mock)
 }
 
-func MockSnapstateUpdateWithDeviceContext(f func(st *state.State, name string, opts *snapstate.RevisionOptions, userID int, flags snapstate.Flags, prqt snapstate.PrereqTracker, deviceCtx snapstate.DeviceContext, fromChange string) (*state.TaskSet, error)) (restore func()) {
-	r := testutil.Backup(&snapstateUpdateWithDeviceContext)
-	snapstateUpdateWithDeviceContext = f
-	return r
+func MockSnapstateStoreUpdateGoal(mock func(snaps ...snapstate.StoreUpdate) snapstate.UpdateGoal) (restore func()) {
+	return testutil.Mock(&snapstateStoreUpdateGoal, mock)
 }
 
-func MockSnapstateUpdatePathWithDeviceContext(f func(st *state.State, si *snap.SideInfo, path, name string, opts *snapstate.RevisionOptions, userID int, flags snapstate.Flags, prqt snapstate.PrereqTracker, deviceCtx snapstate.DeviceContext, fromChange string) (*state.TaskSet, error)) (restore func()) {
-	r := testutil.Backup(&snapstateUpdatePathWithDeviceContext)
-	snapstateUpdatePathWithDeviceContext = f
-	return r
+func MockSnapstateInstallComponents(mock func(ctx context.Context, st *state.State, names []string, info *snap.Info, vsets *snapasserts.ValidationSets, opts snapstate.Options) ([]*state.TaskSet, error)) (restore func()) {
+	return testutil.Mock(&snapstateInstallComponents, mock)
 }
 
-func MockSnapstateDownload(f func(ctx context.Context, st *state.State, name string, blobDirectory string, opts *snapstate.RevisionOptions, userID int, flags snapstate.Flags, deviceCtx snapstate.DeviceContext) (*state.TaskSet, *snap.Info, error)) (restore func()) {
+func MockSnapstateInstallComponentPath(mock func(st *state.State, csi *snap.ComponentSideInfo, info *snap.Info, path string, opts snapstate.Options) (*state.TaskSet, error)) (restore func()) {
+	return testutil.Mock(&snapstateInstallComponentPath, mock)
+}
+
+func MockSnapstateDownload(f func(ctx context.Context, st *state.State, name string, components []string, blobDirectory string, revOpts snapstate.RevisionOptions, opts snapstate.Options) (*state.TaskSet, *snap.Info, error)) (restore func()) {
 	r := testutil.Backup(&snapstateDownload)
 	snapstateDownload = f
+	return r
+}
+
+func MockSnapstateDownloadComponents(f func(ctx context.Context, st *state.State, name string, components []string, blobDirectory string, revOpts snapstate.RevisionOptions, opts snapstate.Options) (*state.TaskSet, error)) (restore func()) {
+	r := testutil.Backup(&snapstateDownloadComponents)
+	snapstateDownloadComponents = f
 	return r
 }
 
@@ -195,12 +209,34 @@ func EnsureSeeded(m *DeviceManager) error {
 	return m.ensureSeeded()
 }
 
-func EnsureCloudInitRestricted(m *DeviceManager) error {
-	return m.ensureCloudInitRestricted()
+func EnsureClassicModelAfterSeed(m *DeviceManager) error {
+	return m.ensureClassicModelAfterSeed()
 }
 
-func ImportAssertionsFromSeed(m *DeviceManager, isCoreBoot bool) (seed.Seed, error) {
-	return m.importAssertionsFromSeed(isCoreBoot)
+func EnsureCloudInitRestricted(m *DeviceManager) error {
+	deviceCtx, err := ensureDeviceCtxForTest(m)
+	if err != nil {
+		return err
+	}
+	return m.ensureCloudInitRestrictedAfterSeed(deviceCtx)
+}
+
+func ensureDeviceCtxForTest(m *DeviceManager) (snapstate.DeviceContext, error) {
+	m.state.Lock()
+	defer m.state.Unlock()
+	return snapstate.DeviceCtxForEnsure(m.state)
+}
+
+func EnsureSerialBoundSystemUserAssertionsProcessed(m *DeviceManager) error {
+	deviceCtx, err := ensureDeviceCtxForTest(m)
+	if err != nil {
+		return err
+	}
+	return m.ensureSerialBoundSystemUserAssertionsProcessedAfterSeed(deviceCtx)
+}
+
+func ImportAssertionsFromSeed(m *DeviceManager, mode string, isCoreBoot bool) (seed.Seed, error) {
+	return m.importAssertionsFromSeed(mode, isCoreBoot)
 }
 
 func PopulateStateFromSeedImpl(m *DeviceManager, tm timings.Measurer) ([]*state.TaskSet, error) {
@@ -221,8 +257,12 @@ func MockPopulateStateFromSeed(m *DeviceManager, f func(seedLabel, seedMode stri
 	}
 }
 
-func EnsureAutoImportAssertions(m *DeviceManager) error {
-	return m.ensureAutoImportAssertions()
+func EarlyDeviceSeed(m *DeviceManager) seed.Seed {
+	return m.earlyDeviceSeed
+}
+
+func EnsureAutoImportAssertions(m *DeviceManager, deviceSeed seed.Seed) error {
+	return m.ensureAutoImportAssertionsWithEarlySeed(deviceSeed)
 }
 
 func ReloadEarlyDeviceSeed(m *DeviceManager, seedLoadErr error) (snapstate.DeviceContext, seed.Seed, error) {
@@ -238,12 +278,34 @@ func MockProcessAutoImportAssertion(f func(*state.State, seed.Seed, asserts.RODa
 	}
 }
 
-func EnsureBootOk(m *DeviceManager) error {
-	return m.ensureBootOk()
+func EnsureFDE(m *DeviceManager) error {
+	deviceCtx, err := ensureDeviceCtxForTest(m)
+	if errors.Is(err, state.ErrNoState) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return m.ensureFDE(deviceCtx)
 }
 
-func SetBootOkRan(m *DeviceManager, b bool) {
-	m.bootOkRan = b
+func EnsureBootOk(m *DeviceManager) error {
+	deviceCtx, err := ensureDeviceCtxForTest(m)
+	if err != nil && !errors.Is(err, state.ErrNoState) {
+		return err
+	}
+	return m.ensureBootOk(deviceCtx)
+}
+
+func SetBootOkRanForCurrentBootID(m *DeviceManager, b bool) (restore func()) {
+	f := func(st *state.State, currentBootID string) (bool, error) {
+		return b, nil
+	}
+	return testutil.Mock(&bootOkRanForBootID, f)
+}
+
+func SetEnsureBootOkRan(m *DeviceManager, b bool) {
+	m.ensureBootOkRan = b
 }
 
 func SetBootRevisionsUpdated(m *DeviceManager, b bool) {
@@ -262,15 +324,20 @@ func SetPostFactoryResetRan(m *DeviceManager, b bool) {
 	m.ensurePostFactoryResetRan = b
 }
 
+func SetEarlyBootLocaleConfigUpdatedRan(m *DeviceManager, b bool) {
+	m.ensureEarlyBootLocaleConfigUpdatedRan = b
+}
+
 func StartTime() time.Time {
 	return startTime
 }
 
 type (
-	RegistrationContext = registrationContext
-	RemodelContext      = remodelContext
-	SeededSystem        = seededSystem
-	RecoverySystemSetup = recoverySystemSetup
+	RegistrationContext               = registrationContext
+	RemodelContext                    = remodelContext
+	SeededSystem                      = seededSystem
+	RecoverySystemSetup               = recoverySystemSetup
+	ExtraSnapdKernelCmdlineFragmentID = extraSnapdKernelCommandLineFragmentID
 )
 
 func RegistrationCtx(m *DeviceManager, t *state.Task) (registrationContext, error) {
@@ -308,8 +375,9 @@ var (
 	CleanupRemodelCtx = cleanupRemodelCtx
 	CachedRemodelCtx  = cachedRemodelCtx
 
-	GadgetUpdateBlocked = gadgetUpdateBlocked
-	PendingGadgetInfo   = pendingGadgetData
+	GadgetUpdateBlocked         = gadgetUpdateBlocked
+	RemoveRecoverySystemBlocked = removeRecoverySystemBlocked
+	PendingGadgetInfo           = pendingGadgetData
 
 	CriticalTaskEdges = criticalTaskEdges
 
@@ -317,6 +385,12 @@ var (
 	LogNewSystemSnapFile                   = logNewSystemSnapFile
 	PurgeNewSystemSnapFiles                = purgeNewSystemSnapFiles
 	CreateRecoverySystemTasks              = createRecoverySystemTasks
+
+	SetExtraSnapdKernelCommandLineFragment = setExtraSnapdKernelCommandLineFragment
+
+	RenderExtraSnapdKernelCommandLineFragments = renderExtraSnapdKernelCommandLineFragments
+	KernelCommandLineAppendArgsFromSnapd       = kernelCommandLineAppendArgsFromSnapd
+	InstalledComponentRevision                 = installedComponentRevision
 )
 
 func MockApplyPreseededData(f func(deviceSeed seed.PreseedCapable, writableDir string) error) (restore func()) {
@@ -347,15 +421,21 @@ func MockGadgetIsCompatible(mock func(current, update *gadget.Info) error) (rest
 	}
 }
 
-func MockBootMakeSystemRunnable(f func(model *asserts.Model, bootWith *boot.BootableSet, seal *boot.TrustedAssetsInstallObserver) error) (restore func()) {
+func MockBootMakeSystemRunnable(f func(model *asserts.Model, bootWith *boot.BootableSet, bootAssets boot.BootAssets, encryption *boot.EncryptionSetup) error) (restore func()) {
 	restore = testutil.Backup(&bootMakeRunnable)
 	bootMakeRunnable = f
 	return restore
 }
 
-func MockBootMakeSystemRunnableAfterDataReset(f func(model *asserts.Model, bootWith *boot.BootableSet, seal *boot.TrustedAssetsInstallObserver) error) (restore func()) {
+func MockBootMakeSystemRunnableAfterDataReset(f func(model *asserts.Model, bootWith *boot.BootableSet, bootAssets boot.BootAssets, encryption *boot.EncryptionSetup) error) (restore func()) {
 	restore = testutil.Backup(&bootMakeRunnableAfterDataReset)
 	bootMakeRunnableAfterDataReset = f
+	return restore
+}
+
+func MockBootMakeRecoverySystemBootable(f func(model *asserts.Model, rootdir string, relativeRecoverySystemDir string, bootWith *boot.RecoverySystemBootableSet) error) (restore func()) {
+	restore = testutil.Backup(&bootMakeRecoverySystemBootable)
+	bootMakeRecoverySystemBootable = f
 	return restore
 }
 
@@ -381,7 +461,11 @@ func MockInstallLogicPrepareRunSystemData(f func(mod *asserts.Model, gadgetDir s
 	return r
 }
 
-func MockInstallRun(f func(model gadget.Model, gadgetRoot, kernelRoot, device string, options install.Options, observer gadget.ContentObserver, perfTimings timings.Measurer) (*install.InstalledSystemSideData, error)) (restore func()) {
+func MockCopyInstallModeHostname(f func(rootdir string) error) (restore func()) {
+	return testutil.Mock(&copyInstallModeHostname, f)
+}
+
+func MockInstallRun(f func(model gadget.Model, gadgetRoot string, kernelSnapInfo *install.KernelSnapInfo, device string, options install.Options, observer gadget.ContentObserver, perfTimings timings.Measurer) (*install.InstalledSystemSideData, error)) (restore func()) {
 	old := installRun
 	installRun = f
 	return func() {
@@ -389,13 +473,13 @@ func MockInstallRun(f func(model gadget.Model, gadgetRoot, kernelRoot, device st
 	}
 }
 
-func MockInstallFactoryReset(f func(model gadget.Model, gadgetRoot, kernelRoot, device string, options install.Options, observer gadget.ContentObserver, perfTimings timings.Measurer) (*install.InstalledSystemSideData, error)) (restore func()) {
+func MockInstallFactoryReset(f func(model gadget.Model, gadgetRoot string, kernelSnapInfo *install.KernelSnapInfo, device string, options install.Options, observer gadget.ContentObserver, perfTimings timings.Measurer) (*install.InstalledSystemSideData, error)) (restore func()) {
 	restore = testutil.Backup(&installFactoryReset)
 	installFactoryReset = f
 	return restore
 }
 
-func MockInstallWriteContent(f func(onVolumes map[string]*gadget.Volume, allLaidOutVols map[string]*gadget.LaidOutVolume, encSetupData *install.EncryptionSetupData, observer gadget.ContentObserver, perfTimings timings.Measurer) ([]*gadget.OnDiskVolume, error)) (restore func()) {
+func MockInstallWriteContent(f func(onVolumes map[string]*gadget.Volume, allLaidOutVols map[string]*gadget.LaidOutVolume, encSetupData *install.EncryptionSetupData, kSnapInfo *install.KernelSnapInfo, observer gadget.ContentObserver, perfTimings timings.Measurer) ([]*gadget.OnDiskVolume, error)) (restore func()) {
 	old := installWriteContent
 	installWriteContent = f
 	return func() {
@@ -411,7 +495,17 @@ func MockInstallMountVolumes(f func(onVolumes map[string]*gadget.Volume, encSetu
 	}
 }
 
-func MockInstallEncryptPartitions(f func(onVolumes map[string]*gadget.Volume, encryptionType secboot.EncryptionType, model *asserts.Model, gadgetRoot, kernelRoot string, perfTimings timings.Measurer) (*install.EncryptionSetupData, error)) (restore func()) {
+func MockInstallEncryptPartitions(f func(
+	onVolumes map[string]*gadget.Volume,
+	volumesAuth *device.VolumesAuthOptions,
+	encryptionType device.EncryptionType,
+	checkContext *secboot.PreinstallCheckContext,
+	model *asserts.Model,
+	gadgetRoot,
+	kernelRoot string,
+	extraSnapdKernelCommandLineFragments map[string]string,
+	perfTimings timings.Measurer,
+) (*install.EncryptionSetupData, error)) (restore func()) {
 	old := installEncryptPartitions
 	installEncryptPartitions = f
 	return func() {
@@ -462,15 +556,15 @@ func MockRestrictCloudInit(f func(sysconfig.CloudInitState, *sysconfig.CloudInit
 	}
 }
 
-func DeviceManagerHasFDESetupHook(mgr *DeviceManager, kernelInfo *snap.Info) (bool, error) {
-	return mgr.hasFDESetupHook(kernelInfo)
+func DeviceManagerHookKeyProtectorFactory(mgr *DeviceManager, kernelInfo *snap.Info) (secboot.KeyProtectorFactory, error) {
+	return mgr.hookKeyProtectorFactory(kernelInfo)
 }
 
 func DeviceManagerRunFDESetupHook(mgr *DeviceManager, req *fde.SetupRequest) ([]byte, error) {
 	return mgr.runFDESetupHook(req)
 }
 
-func DeviceManagerCheckEncryption(mgr *DeviceManager, st *state.State, deviceCtx snapstate.DeviceContext, mode secboot.TPMProvisionMode) (secboot.EncryptionType, error) {
+func DeviceManagerCheckEncryption(mgr *DeviceManager, st *state.State, deviceCtx snapstate.DeviceContext, mode secboot.TPMProvisionMode) (device.EncryptionType, error) {
 	return mgr.checkEncryption(st, deviceCtx, mode)
 }
 
@@ -506,12 +600,6 @@ func MockSecbootRemoveRecoveryKeys(f func(rkeyDevToKey map[secboot.RecoveryKeyDe
 	return restore
 }
 
-func MockMarkFactoryResetComplete(f func(encrypted bool) error) (restore func()) {
-	restore = testutil.Backup(&bootMarkFactoryResetComplete)
-	bootMarkFactoryResetComplete = f
-	return restore
-}
-
 func MockSecbootMarkSuccessful(f func() error) (restore func()) {
 	r := testutil.Backup(&secbootMarkSuccessful)
 	secbootMarkSuccessful = f
@@ -541,18 +629,51 @@ func MockUserLookup(lookup func(username string) (*user.User, error)) (restore f
 }
 
 func EnsureExpiredUsersRemoved(m *DeviceManager) error {
-	return m.ensureExpiredUsersRemoved()
+	m.state.Lock()
+	seeded, err := snapstate.SystemSeeded(m.state)
+	m.state.Unlock()
+	if err != nil || !seeded {
+		return err
+	}
+	return m.ensureExpiredUsersRemovedAfterSeed()
+}
+
+func MockKeyboardCurrentXKBConfig(f func() (*keyboard.XKBConfig, error)) (restore func()) {
+	return testutil.Mock(&keyboardCurrentXKBConfig, f)
+}
+
+func MockKeyboardNewXKBConfigListener(f func(ctx context.Context, cb func(config *keyboard.XKBConfig)) (*keyboard.XKBConfigListener, error)) (restore func()) {
+	return testutil.Mock(&keyboardNewXKBConfigListener, f)
+}
+
+func EnsureEarlyBootXKBConfigUpdated(m *DeviceManager) error {
+	deviceCtx, err := ensureDeviceCtxForTest(m)
+	if err != nil {
+		return err
+	}
+	return m.ensureEarlyBootXKBConfigUpdatedAfterSeed(deviceCtx)
+}
+
+func EnsureExtraSnapdKernelCommandLineFragmentsApplied(m *DeviceManager) error {
+	return m.ensureExtraSnapdKernelCommandLineFragmentsApplied()
 }
 
 var ProcessAutoImportAssertions = processAutoImportAssertions
 
-func MockCreateAllKnownSystemUsers(createAllUsers func(state *state.State, assertDb asserts.RODatabase, model *asserts.Model, serial *asserts.Serial, sudoer bool) ([]*CreatedUser, error)) (restore func()) {
+func MockCreateAllKnownSystemUsers(createAllUsers func(state *state.State, assertDb asserts.RODatabase, model *asserts.Model, serial *asserts.Serial, sudoer bool, addReason seclog.SystemUserAddReason) ([]*CreatedUser, error)) (restore func()) {
 	restore = testutil.Backup(&createAllKnownSystemUsers)
 	createAllKnownSystemUsers = createAllUsers
 	return restore
 }
 
-func MockEncryptionSetupDataInCache(st *state.State, label string) (restore func()) {
+func MockEncryptionSetupDataInCache(
+	st *state.State,
+	label string,
+	rkey *keys.RecoveryKey,
+	volumesAuth *device.VolumesAuthOptions,
+	checkContext *secboot.PreinstallCheckContext,
+	extraSnapdKernelCommandLineFragments map[string]string,
+) (restore func()) {
 	st.Lock()
 	defer st.Unlock()
 	var esd *install.EncryptionSetupData
@@ -566,20 +687,17 @@ func MockEncryptionSetupDataInCache(st *state.State, label string) (restore func
 			EncryptedDevice: "/dev/mapper/ubuntu-data",
 		},
 	}
-	esd = install.MockEncryptionSetupData(labelToEncData)
+	esd = install.MockEncryptionSetupData(labelToEncData, rkey, volumesAuth, checkContext, extraSnapdKernelCommandLineFragments)
 	st.Cache(encryptionSetupDataKey{label}, esd)
 	return func() { CleanUpEncryptionSetupDataInCache(st, label) }
 }
 
-func CheckEncryptionSetupDataFromCache(st *state.State, label string) error {
+func GetEncryptionSetupDataFromCache(st *state.State, label string) *install.EncryptionSetupData {
 	cached := st.Cached(encryptionSetupDataKey{label})
 	if cached == nil {
-		return fmt.Errorf("no EncryptionSetupData found in cache")
+		return nil
 	}
-	if _, ok := cached.(*install.EncryptionSetupData); !ok {
-		return fmt.Errorf("wrong data type under encryptionSetupDataKey")
-	}
-	return nil
+	return cached.(*install.EncryptionSetupData)
 }
 
 func CleanUpEncryptionSetupDataInCache(st *state.State, label string) {
@@ -590,3 +708,207 @@ func CleanUpEncryptionSetupDataInCache(st *state.State, label string) {
 }
 
 type UniqueSnapsInRecoverySystem = uniqueSnapsInRecoverySystem
+
+func MockSecbootAddBootstrapKeyOnExistingDisk(f func(node string, newKey keys.EncryptionKey) error) (restore func()) {
+	old := secbootAddBootstrapKeyOnExistingDisk
+	secbootAddBootstrapKeyOnExistingDisk = f
+	return func() {
+		secbootAddBootstrapKeyOnExistingDisk = old
+	}
+}
+
+func MockSecbootRenameKeysForFactoryReset(f func(node string, renames map[string]string) error) (restore func()) {
+	old := secbootRenameKeysForFactoryReset
+	secbootRenameKeysForFactoryReset = f
+	return func() {
+		secbootRenameKeysForFactoryReset = old
+	}
+}
+
+func MockSecbootCreateBootstrappedContainer(f func(key secboot.DiskUnlockKey, devicePath string) secboot.BootstrappedContainer) (restore func()) {
+	old := secbootCreateBootstrappedContainer
+	secbootCreateBootstrappedContainer = f
+	return func() {
+		secbootCreateBootstrappedContainer = old
+	}
+}
+
+func MockSecbootDeleteKeys(f func(node string, matches map[string]bool) error) (restore func()) {
+	old := secbootDeleteKeys
+	secbootDeleteKeys = f
+	return func() {
+		secbootDeleteKeys = old
+	}
+}
+
+func MockSecbootDeleteOldKeys(f func(devicePath string) error) (restore func()) {
+	old := secbootDeleteOldKeys
+	secbootDeleteOldKeys = f
+	return func() {
+		secbootDeleteOldKeys = old
+	}
+}
+
+func MockSecbootTemporaryNameOldKeys(f func(devicePath string) error) (restore func()) {
+	old := secbootTemporaryNameOldKeys
+	secbootTemporaryNameOldKeys = f
+	return func() {
+		secbootTemporaryNameOldKeys = old
+	}
+}
+
+func MockDisksDMCryptUUIDFromMountPoint(f func(mountpoint string) (string, error)) (restore func()) {
+	old := disksDMCryptUUIDFromMountPoint
+	disksDMCryptUUIDFromMountPoint = f
+	return func() {
+		disksDMCryptUUIDFromMountPoint = old
+	}
+}
+
+func VolumesAuthOptionsKeyByLabel(label string) volumesAuthOptionsKey {
+	return volumesAuthOptionsKey{label}
+}
+
+func MockSecbootRemoveOldCounterHandles(f func(node string, possibleOldKeys map[string]bool, possibleKeyFiles []string, hintExpectFDEHook bool) error) (restore func()) {
+	old := secbootRemoveOldCounterHandles
+	secbootRemoveOldCounterHandles = f
+	return func() {
+		secbootRemoveOldCounterHandles = old
+	}
+}
+
+func MockFdestateGenerateRecoveryKey(f func(st *state.State) (rkey keys.RecoveryKey, keyID string, err error)) (restore func()) {
+	return testutil.Mock(&fdestateGenerateRecoveryKey, f)
+}
+
+func MockFdestateGetRecoveryKey(f func(st *state.State, keyID string) (rkey keys.RecoveryKey, err error)) (restore func()) {
+	return testutil.Mock(&fdestateGetRecoveryKey, f)
+}
+
+func MockFdestateGetKeyslots(f func(st *state.State, keyslotRefs []fdestate.KeyslotRef) (keyslots []fdestate.Keyslot, missingRefs []fdestate.KeyslotRef, err error)) (restore func()) {
+	return testutil.Mock(&fdestateGetKeyslots, f)
+}
+
+func MockSnapstateGadgetInfo(f func(st *state.State, deviceCtx snapstate.DeviceContext) (*snap.Info, error)) (restore func()) {
+	return testutil.Mock(&snapstateGadgetInfo, f)
+}
+
+func MockOsutilBootID(bootID string) (restore func()) {
+	return testutil.Mock(&osutilBootID, func() (string, error) { return bootID, nil })
+}
+
+func MockFdestateAttemptAutoRepairIfNeeded(f func(st *state.State, locktoutResetErr error, runPostInstallChecks bool) error) (restore func()) {
+	return testutil.Mock(&fdestateAttemptAutoRepairIfNeeded, f)
+}
+
+func MockSecbootPostinstallCheck(f func(ctx context.Context, bootChain []bootloader.BootFile) (*secboot.PreinstallCheckContext, []secboot.PreinstallErrorDetails, error)) (restore func()) {
+	old := secbootPostinstallCheck
+	secbootPostinstallCheck = f
+	return func() { secbootPostinstallCheck = old }
+}
+
+func MockBootReadModeenv(f func(rootdir string) (*boot.Modeenv, error)) (restore func()) {
+	return testutil.Mock(&bootReadModeenv, f)
+}
+
+func MockBootGetRunBootChain(f func(*boot.Modeenv) ([]bootloader.BootFile, error)) (restore func()) {
+	return testutil.Mock(&bootGetRunBootChain, f)
+}
+
+func MockSecbootPreinstallCheckAction(f func(pcc *secboot.PreinstallCheckContext, ctx context.Context, action *secboot.PreinstallAction) ([]secboot.PreinstallErrorDetails, error)) (restore func()) {
+	old := secbootPreinstallCheckAction
+	secbootPreinstallCheckAction = f
+	return func() {
+		secbootPreinstallCheckAction = old
+	}
+}
+
+type ReprovisionSetupDataKey = reprovisionSetupDataKey
+type ReprovisionSetupDataType = reprovisionSetupData
+
+func GetCachedReprovisionRecoveryKeyID(data *ReprovisionSetupDataType) string {
+	return data.recoveryKeyID
+}
+
+func MakeReprovisionSetupData(rkey string, checkContext *secboot.PreinstallCheckContext) *ReprovisionSetupDataType {
+	return &reprovisionSetupData{
+		recoveryKeyID: rkey,
+		checkContext:  checkContext,
+	}
+}
+
+func MockFdestateGetEncryptedContainers(f func(st *state.State) ([]fdeBackend.EncryptedContainer, error)) (restore func()) {
+	old := fdestateGetEncryptedContainers
+	fdestateGetEncryptedContainers = f
+	return func() {
+		fdestateGetEncryptedContainers = old
+	}
+}
+
+func DoReprovision(m *DeviceManager, t *state.Task) error {
+	return m.doReprovision(t, nil)
+}
+
+func MockSecbootListContainerUnlockKeyNames(f func(disk string) ([]string, error)) (restore func()) {
+	return testutil.Mock(&secbootListContainerUnlockKeyNames, f)
+}
+
+func MockSecbootTestProtectorKey(f func(ctx context.Context, disk string, keyName string, key []byte) (bool, error)) (restore func()) {
+	return testutil.Mock(&secbootTestProtectorKey, f)
+}
+
+func MockSecbootRenameContainerKey(f func(disk string, from, to string) error) (restore func()) {
+	return testutil.Mock(&secbootRenameContainerKey, f)
+}
+
+func MockSecbootGetPCRHandleFromToken(f func(disk string, name string) (uint32, error)) (restore func()) {
+	return testutil.Mock(&secbootGetPCRHandleFromToken, f)
+}
+
+func MockSecbootReleasePCRResourceHandle(f func(nv uint32) error) (restore func()) {
+	return testutil.Mock(&secbootReleasePCRResourceHandle, f)
+}
+
+func MockSecbootDeleteContainerKey(f func(disk string, name string) error) (restore func()) {
+	return testutil.Mock(&secbootDeleteContainerKey, f)
+}
+
+func MockBootMakeRunnableReprovision(f func(model *asserts.Model, protector secboot.KeyProtectorFactory, encryption *boot.EncryptionSetup, sealState boot.InitialSealState) error) (restore func()) {
+	return testutil.Mock(&bootMakeRunnableReprovision, f)
+}
+
+func MockSecbootListContainerRecoveryKeyNames(f func(disk string) ([]string, error)) (restore func()) {
+	return testutil.Mock(&secbootListContainerRecoveryKeyNames, f)
+}
+
+func MockSecbootSaveCheckResult(f func(pcc *secboot.PreinstallCheckContext, filename string) error) (restore func()) {
+	return testutil.Mock(&secbootSaveCheckResult, f)
+}
+
+func MockSecbootCheckResult(f func(pcc *secboot.PreinstallCheckContext) (*secboot.PreinstallCheckResult, error)) (restore func()) {
+	return testutil.Mock(&secbootCheckResult, f)
+}
+
+func MockSnapstateKernelInfo(f func(st *state.State, deviceCtx snapstate.DeviceContext) (*snap.Info, error)) (restore func()) {
+	return testutil.Mock(&snapstateKernelInfo, f)
+}
+
+func MockKeysNewProtectorKey(f func() (keys.ProtectorKey, error)) (restore func()) {
+	return testutil.Mock(&keysNewProtectorKey, f)
+}
+
+func MockKeysCreateProtectedKey(f func(k keys.ProtectorKey, primaryKey []byte) (*keys.PlainKey, []byte, []byte, error)) (restore func()) {
+	return testutil.Mock(&keysCreateProtectedKey, f)
+}
+
+func MockKeysPlainKeyWrite(f func(key *keys.PlainKey, writer keys.KeyDataWriter) error) (restore func()) {
+	return testutil.Mock(&keysPlainKeyWrite, f)
+}
+
+func MockHookKeyProtectorFactory(f func(*DeviceManager, *snap.Info) (secboot.KeyProtectorFactory, error)) (restore func()) {
+	return testutil.Mock(&hookKeyProtectorFactory, f)
+}
+
+func MockKeysSaveProtectorKey(f func(key keys.ProtectorKey, path string) error) (restore func()) {
+	return testutil.Mock(&keysSaveProtectorKey, f)
+}

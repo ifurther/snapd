@@ -47,7 +47,7 @@ var _ = Suite(&personalFilesInterfaceSuite{
 })
 
 func (s *personalFilesInterfaceSuite) SetUpTest(c *C) {
-	const mockPlugSnapInfo = `name: other
+	const mockPlugSnapInfoYaml = `name: other
 version: 1.0
 plugs:
  personal-files:
@@ -58,15 +58,15 @@ apps:
   command: foo
   plugs: [personal-files]
 `
-	s.slotInfo = &snap.SlotInfo{
-		Snap:      &snap.Info{SuggestedName: "core", SnapType: snap.TypeOS},
-		Name:      "personal-files",
-		Interface: "personal-files",
-	}
-	s.slot = interfaces.NewConnectedSlot(s.slotInfo, nil, nil)
-	plugSnap := snaptest.MockInfo(c, mockPlugSnapInfo, nil)
-	s.plugInfo = plugSnap.Plugs["personal-files"]
-	s.plug = interfaces.NewConnectedPlug(s.plugInfo, nil, nil)
+	const mockSlotSnapInfoYaml = `name: core
+version: 1.0
+type: os
+slots:
+ personal-files:
+  interface: personal-files
+`
+	s.slot, s.slotInfo = MockConnectedSlot(c, mockSlotSnapInfoYaml, nil, "personal-files")
+	s.plug, s.plugInfo = MockConnectedPlug(c, mockPlugSnapInfoYaml, nil, "personal-files")
 }
 
 func (s *personalFilesInterfaceSuite) TestName(c *C) {
@@ -74,7 +74,7 @@ func (s *personalFilesInterfaceSuite) TestName(c *C) {
 }
 
 func (s *personalFilesInterfaceSuite) TestConnectedPlugAppArmorHappy(c *C) {
-	apparmorSpec := apparmor.NewSpecification(interfaces.NewSnapAppSet(s.plug.Snap()))
+	apparmorSpec := apparmor.NewSpecification(s.plug.AppSet())
 	err := apparmorSpec.AddConnectedPlug(s.iface, s.plug, s.slot)
 	c.Assert(err, IsNil)
 	c.Assert(apparmorSpec.SecurityTags(), DeepEquals, []string{"snap.other.app"})
@@ -93,11 +93,31 @@ owner "@{HOME}/.local/share/dir1/dir2/target{,/,/**}" rwkl,
 
 	c.Check("\n"+strings.Join(apparmorSpec.UpdateNS(), "\n"), Equals, `
   # Allow the personal-files interface to create potentially missing directories
-  owner @{HOME}/ rw,
-  owner @{HOME}/.local/ rw,
-  owner @{HOME}/.local/share/ rw,
-  owner @{HOME}/.local/share/dir1/ rw,
-  owner @{HOME}/.local/share/dir1/dir2/ rw,`)
+  owner "@{HOME}/" rw,
+  owner "@{HOME}/.local/" rw,
+  owner "@{HOME}/.local/share/" rw,
+  owner "@{HOME}/.local/share/dir1/" rw,
+  owner "@{HOME}/.local/share/dir1/dir2/" rw,`)
+}
+
+func (s *personalFilesInterfaceSuite) TestConnectedPlugAppArmorPathWithSpaces(c *C) {
+	const mockPlugSnapInfo = `name: other
+version: 1.0
+plugs:
+ personal-files:
+  write: ["$HOME/dir with spaces/target"]
+apps:
+ app:
+  command: foo
+  plugs: [personal-files]
+`
+	plug, _ := MockConnectedPlug(c, mockPlugSnapInfo, nil, "personal-files")
+	apparmorSpec := apparmor.NewSpecification(plug.AppSet())
+	err := apparmorSpec.AddConnectedPlug(s.iface, plug, s.slot)
+	c.Assert(err, IsNil)
+
+	c.Check(apparmorSpec.SnippetForTag("snap.other.app"), testutil.Contains, `owner "@{HOME}/dir with spaces/target{,/,/**}" rwkl,`)
+	c.Check(strings.Join(apparmorSpec.UpdateNS(), "\n"), testutil.Contains, `owner "@{HOME}/dir with spaces/" rw,`)
 }
 
 func (s *personalFilesInterfaceSuite) TestConnectedPlugApparmorErrorNotString(c *C) {
@@ -112,10 +132,8 @@ apps:
   command: foo
   plugs: [personal-files]
 `
-	plugSnap := snaptest.MockInfo(c, mockPlugSnapInfo, nil)
-	plugInfo := plugSnap.Plugs["personal-files"]
-	plug := interfaces.NewConnectedPlug(plugInfo, nil, nil)
-	apparmorSpec := apparmor.NewSpecification(interfaces.NewSnapAppSet(plug.Snap()))
+	plug, _ := MockConnectedPlug(c, mockPlugSnapInfo, nil, "personal-files")
+	apparmorSpec := apparmor.NewSpecification(plug.AppSet())
 	err := apparmorSpec.AddConnectedPlug(s.iface, plug, s.slot)
 	c.Assert(err, ErrorMatches, `cannot connect plug personal-files: 123 \(int64\) is not a string`)
 }
@@ -132,10 +150,8 @@ apps:
   command: foo
   plugs: [personal-files]
 `
-	plugSnap := snaptest.MockInfo(c, mockPlugSnapInfo, nil)
-	plugInfo := plugSnap.Plugs["personal-files"]
-	plug := interfaces.NewConnectedPlug(plugInfo, nil, nil)
-	apparmorSpec := apparmor.NewSpecification(interfaces.NewSnapAppSet(plug.Snap()))
+	plug, _ := MockConnectedPlug(c, mockPlugSnapInfo, nil, "personal-files")
+	apparmorSpec := apparmor.NewSpecification(plug.AppSet())
 	err := apparmorSpec.AddConnectedPlug(s.iface, plug, s.slot)
 	c.Assert(err, ErrorMatches, `cannot connect plug personal-files: "\$NOTHOME/.local/share/target" must start with "\$HOME/"`)
 }
@@ -172,9 +188,7 @@ apps:
   command: foo
   plugs: [personal-files]
 `
-	plugSnap := snaptest.MockInfo(c, mockPlugSnapInfo, nil)
-	plugInfo := plugSnap.Plugs["personal-files"]
-	plug := interfaces.NewConnectedPlug(plugInfo, nil, nil)
+	plug, _ := MockConnectedPlug(c, mockPlugSnapInfo, nil, "personal-files")
 	mountSpec := &mount.Specification{}
 	err := mountSpec.AddConnectedPlug(s.iface, plug, s.slot)
 	c.Assert(err, ErrorMatches, `cannot connect plug personal-files: "\$NOTHOME/.local/share/target" must start with "\$HOME/"`)
@@ -192,9 +206,7 @@ apps:
   command: foo
   plugs: [personal-files]
 `
-	plugSnap := snaptest.MockInfo(c, mockPlugSnapInfo, nil)
-	plugInfo := plugSnap.Plugs["personal-files"]
-	plug := interfaces.NewConnectedPlug(plugInfo, nil, nil)
+	plug, _ := MockConnectedPlug(c, mockPlugSnapInfo, nil, "personal-files")
 	mountSpec := &mount.Specification{}
 	restore := builtin.MockDirsToEnsure(func(paths []string) ([]*interfaces.EnsureDirSpec, error) {
 		return []*interfaces.EnsureDirSpec{
@@ -252,6 +264,7 @@ plugs:
 		{`read: [ "$HOME/home/$HOME/foo" ]`, `\$HOME must only be used at the start of the path of "\$HOME/home/\$HOME/foo"`},
 		{`read: [ "$HOME/sweet/$HOME" ]`, `\$HOME must only be used at the start of the path of "\$HOME/sweet/\$HOME"`},
 		{`read: [ "/@{FOO}" ]`, `"/@{FOO}" contains a reserved apparmor char from .*`},
+		{`read: [ "/foo/bar@" ]`, `"/foo/bar@" cannot end with "@"`},
 		{`read: [ "/home/@{HOME}/foo" ]`, `"/home/@{HOME}/foo" contains a reserved apparmor char from .*`},
 		{`read: [ "${HOME}/foo" ]`, `"\${HOME}/foo" contains a reserved apparmor char from .*`},
 		{`read: [ "$HOME" ]`, `"\$HOME" must start with "\$HOME/"`},

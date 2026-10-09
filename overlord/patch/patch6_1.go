@@ -28,14 +28,14 @@ import (
 )
 
 type connStatePatch6_1 struct {
-	Auto             bool                   `json:"auto,omitempty"`
-	ByGadget         bool                   `json:"by-gadget,omitempty"`
-	Interface        string                 `json:"interface,omitempty"`
-	Undesired        bool                   `json:"undesired,omitempty"`
-	StaticPlugAttrs  map[string]interface{} `json:"plug-static,omitempty"`
-	DynamicPlugAttrs map[string]interface{} `json:"plug-dynamic,omitempty"`
-	StaticSlotAttrs  map[string]interface{} `json:"slot-static,omitempty"`
-	DynamicSlotAttrs map[string]interface{} `json:"slot-dynamic,omitempty"`
+	Auto             bool           `json:"auto,omitempty"`
+	ByGadget         bool           `json:"by-gadget,omitempty"`
+	Interface        string         `json:"interface,omitempty"`
+	Undesired        bool           `json:"undesired,omitempty"`
+	StaticPlugAttrs  map[string]any `json:"plug-static,omitempty"`
+	DynamicPlugAttrs map[string]any `json:"plug-dynamic,omitempty"`
+	StaticSlotAttrs  map[string]any `json:"slot-static,omitempty"`
+	DynamicSlotAttrs map[string]any `json:"slot-dynamic,omitempty"`
 }
 
 // processConns updates conns map and augments it with plug-static and slot-static attributes from current snap info.
@@ -63,16 +63,16 @@ func processConns(conns map[string]connStatePatch6_1, infos map[string]*snap.Inf
 		var plugSnapInfo, slotSnapInfo *snap.Info
 
 		// read current snap info from disk and keep it around in infos map
-		if plugSnapInfo, ok = infos[connRef.PlugRef.Snap]; !ok {
+		if plugSnapInfo, ok = infos[connRef.PlugRef.Snap.String()]; !ok {
 			plugSnapInfo, err = snap.ReadCurrentInfo(connRef.PlugRef.Snap)
 			if err == nil {
-				infos[connRef.PlugRef.Snap] = plugSnapInfo
+				infos[connRef.PlugRef.Snap.String()] = plugSnapInfo
 			}
 		}
-		if slotSnapInfo, ok = infos[connRef.SlotRef.Snap]; !ok {
+		if slotSnapInfo, ok = infos[connRef.SlotRef.Snap.String()]; !ok {
 			slotSnapInfo, err = snap.ReadCurrentInfo(connRef.SlotRef.Snap)
 			if err == nil {
-				infos[connRef.SlotRef.Snap] = slotSnapInfo
+				infos[connRef.SlotRef.Snap.String()] = slotSnapInfo
 			}
 		}
 

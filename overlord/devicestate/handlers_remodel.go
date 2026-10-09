@@ -169,9 +169,9 @@ func (m *DeviceManager) doSetModel(t *state.Task, _ *tomb.Tomb) (err error) {
 		remodCtx.setRecoverySystemLabel(recoverySetup.Label)
 	}
 
-	logEverywhere := func(format string, args ...interface{}) {
-		t.Logf(format, args)
-		logger.Noticef(format, args)
+	logEverywhere := func(format string, args ...any) {
+		t.Logf(format, args...)
+		logger.Noticef(format, args...)
 	}
 
 	// and finish (this will set the new model), note that changes done in
@@ -231,7 +231,7 @@ func rollBackValidationSets(st *state.State, oldSets []*asserts.ValidationSet, n
 	// early in the change. this would allow us to undo the validation sets
 	// after the snap installations/refreshes have been undone.
 	for _, sn := range snaps {
-		ignore[sn.SnapName()] = true
+		ignore[sn.SnapName().String()] = true
 	}
 
 	if err := assertstate.ApplyLocalEnforcedValidationSets(st, vSetKeys, nil, snaps, ignore); err != nil {
@@ -320,7 +320,7 @@ func (m *DeviceManager) doPrepareRemodeling(t *state.Task, tmb *tomb.Tomb) error
 
 	chgID := t.Change().ID()
 
-	tss, err := remodelTasks(tmb.Context(nil), st, current, remodCtx.Model(), remodCtx, chgID, nil, nil, RemodelOptions{})
+	tss, err := remodelTasks(tmb.Context(nil), st, current, remodCtx.Model(), remodCtx, chgID, RemodelOptions{})
 	if err != nil {
 		return err
 	}

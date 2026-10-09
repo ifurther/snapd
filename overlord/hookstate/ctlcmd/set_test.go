@@ -26,6 +26,8 @@ import (
 
 	. "gopkg.in/check.v1"
 
+	"github.com/snapcore/snapd/client"
+	"github.com/snapcore/snapd/confdb"
 	"github.com/snapcore/snapd/interfaces"
 	"github.com/snapcore/snapd/overlord/configstate/config"
 	"github.com/snapcore/snapd/overlord/hookstate"
@@ -56,6 +58,11 @@ func (s *setSuite) SetUpTest(c *C) {
 	state.Lock()
 	defer state.Unlock()
 
+	snapJSON := json.RawMessage(`{"base": "core26"}`)
+	state.Set("snaps", map[string]*json.RawMessage{
+		"test-snap": &snapJSON,
+	})
+
 	task := state.NewTask("test-task", "my test task")
 	setup := &hookstate.HookSetup{Snap: "test-snap", Revision: snap.R(1), Hook: "test-hook"}
 
@@ -65,16 +72,21 @@ func (s *setSuite) SetUpTest(c *C) {
 }
 
 func (s *setSuite) TestInvalidArguments(c *C) {
-	_, _, err := ctlcmd.Run(s.mockContext, []string{"set"}, 0)
+	_, _, _, err := ctlcmd.Run(s.mockContext, []string{"set"}, 0, nil)
 	c.Check(err, ErrorMatches, "set which option.*")
-	_, _, err = ctlcmd.Run(s.mockContext, []string{"set", "foo", "bar"}, 0)
-	c.Check(err, ErrorMatches, ".*invalid parameter.*want key=value.*")
-	_, _, err = ctlcmd.Run(s.mockContext, []string{"set", ":foo", "bar=baz"}, 0)
+	_, _, _, err = ctlcmd.Run(s.mockContext, []string{"set", "foo", "bar"}, 0, nil)
+	c.Check(err, ErrorMatches, ".*invalid configuration.*want key=value.*")
+	_, _, _, err = ctlcmd.Run(s.mockContext, []string{"set", ":foo", "bar=baz"}, 0, nil)
 	c.Check(err, ErrorMatches, ".*interface attributes can only be set during the execution of prepare hooks.*")
 }
 
+func (s *setSuite) TestSetInvalidValueKey(c *C) {
+	_, _, _, err := ctlcmd.Run(s.mockContext, []string{"set", `foo={"bad_key":1}`}, 0, nil)
+	c.Assert(err, ErrorMatches, `invalid JSON field name "bad_key": must only contain dashes and lowercase alphanumerics and may not begin nor end with a dash`)
+}
+
 func (s *setSuite) TestCommand(c *C) {
-	stdout, stderr, err := ctlcmd.Run(s.mockContext, []string{"set", "foo=bar", "baz=qux"}, 0)
+	stdout, stderr, _, err := ctlcmd.Run(s.mockContext, []string{"set", "foo=bar", "baz=qux"}, 0, nil)
 	c.Check(err, IsNil)
 	c.Check(string(stdout), Equals, "")
 	c.Check(string(stderr), Equals, "")
@@ -101,20 +113,20 @@ func (s *setSuite) TestCommand(c *C) {
 }
 
 func (s *setSuite) TestSetRegularUserForbidden(c *C) {
-	_, _, err := ctlcmd.Run(s.mockContext, []string{"set", "test-key1"}, 1000)
+	_, _, _, err := ctlcmd.Run(s.mockContext, []string{"set", "test-key1"}, 1000, nil)
 	c.Assert(err, ErrorMatches, `cannot use "set" with uid 1000, try with sudo`)
 	forbidden, _ := err.(*ctlcmd.ForbiddenCommandError)
 	c.Assert(forbidden, NotNil)
 }
 
 func (s *setSuite) TestSetHelpRegularUserAllowed(c *C) {
-	_, _, err := ctlcmd.Run(s.mockContext, []string{"set", "-h"}, 1000)
+	_, _, _, err := ctlcmd.Run(s.mockContext, []string{"set", "-h"}, 1000, nil)
 	c.Assert(err, NotNil)
 	c.Assert(strings.HasPrefix(err.Error(), "Usage:"), Equals, true)
 }
 
 func (s *setSuite) TestSetConfigOptionWithColon(c *C) {
-	stdout, stderr, err := ctlcmd.Run(s.mockContext, []string{"set", "device-service.url=192.168.0.1:5555"}, 0)
+	stdout, stderr, _, err := ctlcmd.Run(s.mockContext, []string{"set", "device-service.url=192.168.0.1:5555"}, 0, nil)
 	c.Check(err, IsNil)
 	c.Check(string(stdout), Equals, "")
 	c.Check(string(stderr), Equals, "")
@@ -142,7 +154,7 @@ func (s *setSuite) TestUnsetConfigOptionWithInitialConfiguration(c *C) {
 	tr.Commit()
 	s.mockContext.State().Unlock()
 
-	stdout, stderr, err := ctlcmd.Run(s.mockContext, []string{"set", "test-key1!", "test-key3.foo!"}, 0)
+	stdout, stderr, _, err := ctlcmd.Run(s.mockContext, []string{"set", "test-key1!", "test-key3.foo!"}, 0, nil)
 	c.Check(err, IsNil)
 	c.Check(string(stdout), Equals, "")
 	c.Check(string(stderr), Equals, "")
@@ -158,13 +170,13 @@ func (s *setSuite) TestUnsetConfigOptionWithInitialConfiguration(c *C) {
 	c.Check(tr.Get("test-snap", "test-key2", &value), IsNil)
 	c.Check(value, Equals, "test-value2")
 	c.Check(tr.Get("test-snap", "test-key1", &value), ErrorMatches, `snap "test-snap" has no "test-key1" configuration option`)
-	var value2 interface{}
+	var value2 any
 	c.Check(tr.Get("test-snap", "test-key3", &value2), IsNil)
-	c.Check(value2, DeepEquals, map[string]interface{}{"bar": "bar-value"})
+	c.Check(value2, DeepEquals, map[string]any{"bar": "bar-value"})
 }
 
 func (s *setSuite) TestUnsetConfigOptionWithNoInitialConfiguration(c *C) {
-	stdout, stderr, err := ctlcmd.Run(s.mockContext, []string{"set", "test-key.key1=value1", "test-key.key2=value2", "test-key.key1!"}, 0)
+	stdout, stderr, _, err := ctlcmd.Run(s.mockContext, []string{"set", "test-key.key1=value1", "test-key.key2=value2", "test-key.key1!"}, 0, nil)
 	c.Check(err, IsNil)
 	c.Check(string(stdout), Equals, "")
 	c.Check(string(stderr), Equals, "")
@@ -175,7 +187,7 @@ func (s *setSuite) TestUnsetConfigOptionWithNoInitialConfiguration(c *C) {
 	c.Check(s.mockContext.Done(), IsNil)
 
 	// Verify that the global config has been updated.
-	var value interface{}
+	var value any
 	tr := config.NewTransaction(s.mockContext.State())
 	c.Check(tr.Get("test-snap", "test-key.key2", &value), IsNil)
 	c.Check(value, DeepEquals, "value2")
@@ -184,7 +196,7 @@ func (s *setSuite) TestUnsetConfigOptionWithNoInitialConfiguration(c *C) {
 }
 
 func (s *setSuite) TestSetNumbers(c *C) {
-	stdout, stderr, err := ctlcmd.Run(s.mockContext, []string{"set", "foo=1234567890", "bar=123456.7890"}, 0)
+	stdout, stderr, _, err := ctlcmd.Run(s.mockContext, []string{"set", "foo=1234567890", "bar=123456.7890"}, 0, nil)
 	c.Check(err, IsNil)
 	c.Check(string(stdout), Equals, "")
 	c.Check(string(stderr), Equals, "")
@@ -195,7 +207,7 @@ func (s *setSuite) TestSetNumbers(c *C) {
 	c.Check(s.mockContext.Done(), IsNil)
 
 	// Verify that the global config has been updated.
-	var value interface{}
+	var value any
 	tr := config.NewTransaction(s.mockContext.State())
 	c.Check(tr.Get("test-snap", "foo", &value), IsNil)
 	c.Check(value, Equals, json.Number("1234567890"))
@@ -205,7 +217,7 @@ func (s *setSuite) TestSetNumbers(c *C) {
 }
 
 func (s *setSuite) TestSetStrictJSON(c *C) {
-	stdout, stderr, err := ctlcmd.Run(s.mockContext, []string{"set", "-t", `key={"a":"b", "c": 1, "d": {"e":"f"}}`}, 0)
+	stdout, stderr, _, err := ctlcmd.Run(s.mockContext, []string{"set", "-t", `key={"a":"b", "c": 1, "d": {"e":"f"}}`}, 0, nil)
 	c.Assert(err, IsNil)
 	c.Check(string(stdout), Equals, "")
 	c.Check(string(stderr), Equals, "")
@@ -216,20 +228,20 @@ func (s *setSuite) TestSetStrictJSON(c *C) {
 	c.Check(s.mockContext.Done(), IsNil)
 
 	// Verify that the global config has been updated.
-	var value interface{}
+	var value any
 	tr := config.NewTransaction(s.mockContext.State())
 	c.Assert(tr.Get("test-snap", "key", &value), IsNil)
-	c.Check(value, DeepEquals, map[string]interface{}{"a": "b", "c": json.Number("1"), "d": map[string]interface{}{"e": "f"}})
+	c.Check(value, DeepEquals, map[string]any{"a": "b", "c": json.Number("1"), "d": map[string]any{"e": "f"}})
 }
 
 func (s *setSuite) TestSetFailWithStrictJSON(c *C) {
-	_, _, err := ctlcmd.Run(s.mockContext, []string{"set", "-t", `key=a`}, 0)
+	_, _, _, err := ctlcmd.Run(s.mockContext, []string{"set", "-t", `key=a`}, 0, nil)
 	c.Assert(err, ErrorMatches, "failed to parse JSON:.*")
 }
 
 func (s *setSuite) TestSetAsString(c *C) {
 	expected := `{"a":"b", "c": 1, "d": {"e": "f"}}`
-	stdout, stderr, err := ctlcmd.Run(s.mockContext, []string{"set", "-s", fmt.Sprintf("key=%s", expected)}, 0)
+	stdout, stderr, _, err := ctlcmd.Run(s.mockContext, []string{"set", "-s", fmt.Sprintf("key=%s", expected)}, 0, nil)
 	c.Assert(err, IsNil)
 	c.Check(string(stdout), Equals, "")
 	c.Check(string(stderr), Equals, "")
@@ -240,14 +252,14 @@ func (s *setSuite) TestSetAsString(c *C) {
 	c.Check(s.mockContext.Done(), IsNil)
 
 	// Verify that the global config has been updated.
-	var value interface{}
+	var value any
 	tr := config.NewTransaction(s.mockContext.State())
 	c.Assert(tr.Get("test-snap", "key", &value), IsNil)
 	c.Check(value, Equals, expected)
 }
 
 func (s *setSuite) TestSetErrorOnStrictJSONAndString(c *C) {
-	stdout, stderr, err := ctlcmd.Run(s.mockContext, []string{"set", "-s", "-t", `{"a":"b"}`}, 0)
+	stdout, stderr, _, err := ctlcmd.Run(s.mockContext, []string{"set", "-s", "-t", `{"a":"b"}`}, 0, nil)
 	c.Assert(err, ErrorMatches, "cannot use -t and -s together")
 	c.Check(string(stdout), Equals, "")
 	c.Check(string(stderr), Equals, "")
@@ -262,7 +274,7 @@ func (s *setSuite) TestCommandSavesDeltasOnly(c *C) {
 	tr.Commit()
 	s.mockContext.State().Unlock()
 
-	stdout, stderr, err := ctlcmd.Run(s.mockContext, []string{"set", "test-key2=test-value3"}, 0)
+	stdout, stderr, _, err := ctlcmd.Run(s.mockContext, []string{"set", "test-key2=test-value3"}, 0, nil)
 	c.Check(err, IsNil)
 	c.Check(string(stdout), Equals, "")
 	c.Check(string(stderr), Equals, "")
@@ -282,7 +294,7 @@ func (s *setSuite) TestCommandSavesDeltasOnly(c *C) {
 }
 
 func (s *setSuite) TestCommandWithoutContext(c *C) {
-	_, _, err := ctlcmd.Run(nil, []string{"set", "foo=bar"}, 0)
+	_, _, _, err := ctlcmd.Run(nil, []string{"set", "foo=bar"}, 0, nil)
 	c.Check(err, ErrorMatches, `cannot invoke snapctl operation commands \(here "set"\) from outside of a snap`)
 }
 
@@ -295,13 +307,13 @@ func (s *setAttrSuite) SetUpTest(c *C) {
 	attrsTask := state.NewTask("connect-task", "my connect task")
 	attrsTask.Set("plug", &interfaces.PlugRef{Snap: "a", Name: "aplug"})
 	attrsTask.Set("slot", &interfaces.SlotRef{Snap: "b", Name: "bslot"})
-	staticAttrs := map[string]interface{}{
+	staticAttrs := map[string]any{
 		"lorem": "ipsum",
-		"nested": map[string]interface{}{
+		"nested": map[string]any{
 			"x": "y",
 		},
 	}
-	dynamicAttrs := make(map[string]interface{})
+	dynamicAttrs := make(map[string]any)
 	attrsTask.Set("plug-static", staticAttrs)
 	attrsTask.Set("plug-dynamic", dynamicAttrs)
 	attrsTask.Set("slot-static", staticAttrs)
@@ -344,7 +356,7 @@ func (s *setAttrSuite) SetUpTest(c *C) {
 }
 
 func (s *setAttrSuite) TestSetPlugAttributesInPlugHook(c *C) {
-	stdout, stderr, err := ctlcmd.Run(s.mockPlugHookContext, []string{"set", ":aplug", "foo=bar"}, 0)
+	stdout, stderr, _, err := ctlcmd.Run(s.mockPlugHookContext, []string{"set", ":aplug", "foo=bar"}, 0, nil)
 	c.Check(err, IsNil)
 	c.Check(string(stdout), Equals, "")
 	c.Check(string(stderr), Equals, "")
@@ -354,14 +366,14 @@ func (s *setAttrSuite) TestSetPlugAttributesInPlugHook(c *C) {
 	st := s.mockPlugHookContext.State()
 	st.Lock()
 	defer st.Unlock()
-	dynattrs := make(map[string]interface{})
+	dynattrs := make(map[string]any)
 	err = attrsTask.Get("plug-dynamic", &dynattrs)
 	c.Assert(err, IsNil)
 	c.Check(dynattrs["foo"], Equals, "bar")
 }
 
 func (s *setAttrSuite) TestSetPlugAttributesSupportsDottedSyntax(c *C) {
-	stdout, stderr, err := ctlcmd.Run(s.mockPlugHookContext, []string{"set", ":aplug", "my.attr1=foo", "my.attr2=bar"}, 0)
+	stdout, stderr, _, err := ctlcmd.Run(s.mockPlugHookContext, []string{"set", ":aplug", "my.attr1=foo", "my.attr2=bar"}, 0, nil)
 	c.Check(err, IsNil)
 	c.Check(string(stdout), Equals, "")
 	c.Check(string(stderr), Equals, "")
@@ -371,14 +383,14 @@ func (s *setAttrSuite) TestSetPlugAttributesSupportsDottedSyntax(c *C) {
 	st := s.mockPlugHookContext.State()
 	st.Lock()
 	defer st.Unlock()
-	dynattrs := make(map[string]interface{})
+	dynattrs := make(map[string]any)
 	err = attrsTask.Get("plug-dynamic", &dynattrs)
 	c.Assert(err, IsNil)
-	c.Check(dynattrs["my"], DeepEquals, map[string]interface{}{"attr1": "foo", "attr2": "bar"})
+	c.Check(dynattrs["my"], DeepEquals, map[string]any{"attr1": "foo", "attr2": "bar"})
 }
 
 func (s *setAttrSuite) TestPlugOrSlotEmpty(c *C) {
-	stdout, stderr, err := ctlcmd.Run(s.mockPlugHookContext, []string{"set", ":", "foo=bar"}, 0)
+	stdout, stderr, _, err := ctlcmd.Run(s.mockPlugHookContext, []string{"set", ":", "foo=bar"}, 0, nil)
 	c.Check(err, ErrorMatches, "plug or slot name not provided")
 	c.Check(string(stdout), Equals, "")
 	c.Check(string(stderr), Equals, "")
@@ -397,8 +409,124 @@ func (s *setAttrSuite) TestSetCommandFailsOutsideOfValidContext(c *C) {
 	mockContext, err = hookstate.NewContext(task, task.State(), setup, s.mockHandler, "")
 	c.Assert(err, IsNil)
 
-	stdout, stderr, err := ctlcmd.Run(mockContext, []string{"set", ":aplug", "foo=bar"}, 0)
+	stdout, stderr, _, err := ctlcmd.Run(mockContext, []string{"set", ":aplug", "foo=bar"}, 0, nil)
 	c.Check(err, ErrorMatches, `interface attributes can only be set during the execution of prepare hooks`)
 	c.Check(string(stdout), Equals, "")
 	c.Check(string(stderr), Equals, "")
+}
+
+func parsePath(c *C, path string) []confdb.Accessor {
+	accs, err := confdb.ParsePathIntoAccessors(path, confdb.ParseOptions{})
+	c.Assert(err, IsNil)
+	return accs
+}
+
+func (s *confdbSuite) TestConfdbSetSingleViewNewTransaction(c *C) {
+	var called bool
+	restore := ctlcmd.MockConfdbstateWriteConfdb(func(_ *hookstate.Context, _ *confdb.View, values map[string]any, _ *client.ConfdbOptions) error {
+		called = true
+		c.Assert(values, DeepEquals, map[string]any{
+			"ssid": "other-ssid",
+		})
+		return nil
+	})
+	defer restore()
+
+	stdout, stderr, _, err := ctlcmd.Run(s.mockContext, []string{"set", "--view", ":write-wifi", "ssid=other-ssid"}, 0, nil)
+	c.Assert(err, IsNil)
+	c.Check(stdout, IsNil)
+	c.Check(stderr, IsNil)
+	c.Assert(called, Equals, true)
+}
+
+func (s *confdbSuite) TestConfdbSetManyViews(c *C) {
+	restore := ctlcmd.MockConfdbstateWriteConfdb(func(_ *hookstate.Context, _ *confdb.View, values map[string]any, _ *client.ConfdbOptions) error {
+		c.Assert(values, DeepEquals, map[string]any{
+			"ssid":     "other-ssid",
+			"password": "other-secret",
+		})
+		return nil
+	})
+	defer restore()
+
+	stdout, stderr, _, err := ctlcmd.Run(s.mockContext, []string{"set", "--view", ":write-wifi", "ssid=other-ssid", "password=other-secret"}, 0, nil)
+	c.Assert(err, IsNil)
+	c.Check(stdout, IsNil)
+	c.Check(stderr, IsNil)
+}
+
+func (s *confdbSuite) TestConfdbSetInvalid(c *C) {
+	type testcase struct {
+		args []string
+		err  string
+	}
+
+	tcs := []testcase{
+		{
+			args: []string{":non-existent", "ssid=my-ssid"},
+			err:  `cannot find plug :non-existent for snap "test-snap"`,
+		},
+		{
+			args: []string{":non-existent", "ssid"},
+			err:  `cannot set :non-existent plug: invalid configuration: "ssid" \(want key=value\)`,
+		},
+	}
+
+	for _, tc := range tcs {
+		stdout, stderr, _, err := ctlcmd.Run(s.mockContext, append([]string{"set", "--view"}, tc.args...), 0, nil)
+		c.Assert(err, ErrorMatches, tc.err)
+		c.Check(stdout, IsNil)
+		c.Check(stderr, IsNil)
+	}
+}
+
+func (s *confdbSuite) TestConfdbSetExclamationMark(c *C) {
+	restore := ctlcmd.MockConfdbstateWriteConfdb(func(_ *hookstate.Context, _ *confdb.View, values map[string]any, _ *client.ConfdbOptions) error {
+		c.Assert(values, DeepEquals, map[string]any{"password": nil})
+		return nil
+	})
+	defer restore()
+
+	stdout, stderr, _, err := ctlcmd.Run(s.mockContext, []string{"set", "--view", ":write-wifi", "password!"}, 0, nil)
+	c.Assert(err, IsNil)
+	c.Check(stdout, IsNil)
+	c.Check(stderr, IsNil)
+}
+
+func (s *confdbSuite) TestConfdbModifyHooks(c *C) {
+	s.state.Lock()
+	defer s.state.Unlock()
+
+	restore := ctlcmd.MockConfdbstateWriteConfdb(func(_ *hookstate.Context, _ *confdb.View, values map[string]any, _ *client.ConfdbOptions) error {
+		c.Assert(values, DeepEquals, map[string]any{"password": "thing"})
+		return nil
+	})
+	defer restore()
+
+	task := s.state.NewTask("run-hook", "")
+	for _, hook := range []string{"save-view-plug", "observe-view-plug"} {
+		setup := &hookstate.HookSetup{Snap: "test-snap", Hook: hook}
+		ctx, err := hookstate.NewContext(task, s.state, setup, s.mockHandler, "")
+		c.Assert(err, IsNil)
+
+		s.state.Unlock()
+		stdout, stderr, _, err := ctlcmd.Run(ctx, []string{"set", "--view", ":write-wifi", "password=thing"}, 0, nil)
+		s.state.Lock()
+		c.Assert(err, ErrorMatches, fmt.Sprintf(`cannot modify confdb in %q hook`, hook))
+		c.Check(stdout, IsNil)
+		c.Check(stderr, IsNil)
+	}
+
+	for _, hook := range []string{"change-view-plug", "load-view-plug", "query-view-plug"} {
+		setup := &hookstate.HookSetup{Snap: "test-snap", Hook: hook}
+		ctx, err := hookstate.NewContext(task, s.state, setup, s.mockHandler, "")
+		c.Assert(err, IsNil)
+
+		s.state.Unlock()
+		stdout, stderr, _, err := ctlcmd.Run(ctx, []string{"set", "--view", ":write-wifi", "password=thing"}, 0, nil)
+		s.state.Lock()
+		c.Assert(err, IsNil)
+		c.Check(stdout, IsNil)
+		c.Check(stderr, IsNil)
+	}
 }

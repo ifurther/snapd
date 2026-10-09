@@ -9,8 +9,7 @@ systems:
   #TODO: bpftool is not available on core22+ and tests.device-cgroup needs it for cgroups v2
   - -ubuntu-core-22-*
   - -ubuntu-core-24-*
-  # no core20 i386
-  - -ubuntu-18.04-32
+  - -ubuntu-core-26-*
 
 execute: |
     #shellcheck source=tests/lib/systems.sh
@@ -21,8 +20,6 @@ execute: |
     test -f /var/lib/snapd/cgroup/snap.test-snapd-sh-core20.device
     NOMATCH "non-strict=true" < /var/lib/snapd/cgroup/snap.test-snapd-sh-core20.device
 
-    # XXX explicitly install core24 until there is no release into the stable channel
-    snap install --edge core24
     "$TESTSTOOLS"/snaps-state install-local test-snapd-sh-core24
     test -f /var/lib/snapd/cgroup/snap.test-snapd-sh-core24.device
     NOMATCH "non-strict=true" < /var/lib/snapd/cgroup/snap.test-snapd-sh-core24.device

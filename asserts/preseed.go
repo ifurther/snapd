@@ -21,6 +21,7 @@ package asserts
 
 import (
 	"crypto"
+	"errors"
 	"fmt"
 	"regexp"
 	"time"
@@ -46,8 +47,14 @@ func IsValidSystemLabel(label string) error {
 
 // PreseedSnap holds the details about a snap constrained by a preseed assertion.
 type PreseedSnap struct {
+	Name       string
+	SnapID     string
+	Revision   int
+	Components []PreseedComponent
+}
+
+type PreseedComponent struct {
 	Name     string
-	SnapID   string
 	Revision int
 }
 
@@ -64,7 +71,7 @@ func (s *PreseedSnap) ID() string {
 // Preseed holds preseed assertion, which is a statement about system-label,
 // model, set of snaps and preseed artifact used for preseeding of UC20 system.
 type Preseed struct {
-	assertionBase
+	AssertionBase
 	snaps     []*PreseedSnap
 	timestamp time.Time
 }
@@ -104,7 +111,7 @@ func (p *Preseed) Snaps() []*PreseedSnap {
 	return p.snaps
 }
 
-func checkPreseedSnap(snap map[string]interface{}) (*PreseedSnap, error) {
+func checkPreseedSnap(snap map[string]any) (*PreseedSnap, error) {
 	name, err := checkNotEmptyStringWhat(snap, "name", "of snap")
 	if err != nil {
 		return nil, err
@@ -124,7 +131,8 @@ func checkPreseedSnap(snap map[string]interface{}) (*PreseedSnap, error) {
 		}
 	}
 
-	var snapRevision int
+	// Revision is x1 if unasserted, as that is what we will get on first installation
+	snapRevision := -1
 	if _, ok := snap["revision"]; ok {
 		var err error
 		snapRevision, err = checkSnapRevisionWhat(snap, "revision", what)
@@ -140,17 +148,92 @@ func checkPreseedSnap(snap map[string]interface{}) (*PreseedSnap, error) {
 		return nil, fmt.Errorf("snap id is required when revision is set")
 	}
 
+	var components []PreseedComponent
+	if comps, ok := snap["components"]; ok {
+		components, err = checkPreseedComponents(comps, snapRevision)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return &PreseedSnap{
-		Name:     name,
-		SnapID:   snapID,
-		Revision: snapRevision,
+		Name:       name,
+		SnapID:     snapID,
+		Revision:   snapRevision,
+		Components: components,
 	}, nil
 }
 
-func checkPreseedSnaps(snapList interface{}) ([]*PreseedSnap, error) {
+func checkPreseedComponents(comps any, snapRevision int) ([]PreseedComponent, error) {
+	const wrongHeaderType = `"components" header must be a list of maps`
+
+	entries, ok := comps.([]any)
+	if !ok {
+		return nil, errors.New(wrongHeaderType)
+	}
+
+	seen := make(map[string]bool)
+	components := make([]PreseedComponent, 0, len(entries))
+	for _, entry := range entries {
+		comp, ok := entry.(map[string]any)
+		if !ok {
+			return nil, errors.New(wrongHeaderType)
+		}
+
+		preseedComp, err := checkPreseedComponent(comp, snapRevision)
+		if err != nil {
+			return nil, err
+		}
+
+		if _, ok := seen[preseedComp.Name]; ok {
+			return nil, fmt.Errorf("cannot list the same component %q multiple times", preseedComp.Name)
+		}
+
+		seen[preseedComp.Name] = true
+		components = append(components, preseedComp)
+	}
+
+	return components, nil
+}
+
+func checkPreseedComponent(comp map[string]any, snapRevision int) (PreseedComponent, error) {
+	name, err := checkNotEmptyStringWhat(comp, "name", "of component")
+	if err != nil {
+		return PreseedComponent{}, err
+	}
+
+	if err := naming.ValidateSnap(name); err != nil {
+		return PreseedComponent{}, err
+	}
+	what := fmt.Sprintf("of component %q", name)
+
+	// Revision is x1 if unasserted, as that is what we will get on first installation
+	revision := -1
+	if _, ok := comp["revision"]; ok {
+		revision, err = checkSnapRevisionWhat(comp, "revision", what)
+		if err != nil {
+			return PreseedComponent{}, err
+		}
+	}
+
+	if revision <= 0 && snapRevision > 0 {
+		return PreseedComponent{}, fmt.Errorf("component %q must have a revision since its snap has a revision", name)
+	}
+
+	if revision > 0 && snapRevision <= 0 {
+		return PreseedComponent{}, fmt.Errorf("component %q cannot have a revision since its snap has no revision", name)
+	}
+
+	return PreseedComponent{
+		Name:     name,
+		Revision: revision,
+	}, nil
+}
+
+func checkPreseedSnaps(snapList any) ([]*PreseedSnap, error) {
 	const wrongHeaderType = `"snaps" header must be a list of maps`
 
-	entries, ok := snapList.([]interface{})
+	entries, ok := snapList.([]any)
 	if !ok {
 		return nil, fmt.Errorf(wrongHeaderType)
 	}
@@ -159,10 +242,11 @@ func checkPreseedSnaps(snapList interface{}) ([]*PreseedSnap, error) {
 	seenIDs := make(map[string]string, len(entries))
 	snaps := make([]*PreseedSnap, 0, len(entries))
 	for _, entry := range entries {
-		snap, ok := entry.(map[string]interface{})
+		snap, ok := entry.(map[string]any)
 		if !ok {
 			return nil, fmt.Errorf(wrongHeaderType)
 		}
+
 		preseedSnap, err := checkPreseedSnap(snap)
 		if err != nil {
 			return nil, err
@@ -185,7 +269,7 @@ func checkPreseedSnaps(snapList interface{}) ([]*PreseedSnap, error) {
 	return snaps, nil
 }
 
-func assemblePreseed(assert assertionBase) (Assertion, error) {
+func assemblePreseed(assert AssertionBase) (Assertion, error) {
 	// because the authority-id and model-id can differ (as per the model),
 	// authority-id should be validated against allowed IDs when the preseed
 	// blob is being checked
@@ -219,7 +303,7 @@ func assemblePreseed(assert assertionBase) (Assertion, error) {
 		return nil, err
 	}
 	return &Preseed{
-		assertionBase: assert,
+		AssertionBase: assert,
 		snaps:         snaps,
 		timestamp:     timestamp,
 	}, nil

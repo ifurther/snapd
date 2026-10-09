@@ -31,10 +31,18 @@ import (
 	"github.com/snapcore/snapd/snap/naming"
 )
 
+// Component20 contains the options for components for grade: dangerous.
+type Component20 struct {
+	// Name is the component name
+	Name string `yaml:"name"`
+	// Unasserted has the filename for an unasserted local component
+	Unasserted string `yaml:"unasserted,omitempty"`
+}
+
 // Snap20 carries options for a model snap or an extra snap
 // in grade: dangerous.
 type Snap20 struct {
-	Name string `yaml:"name"`
+	Name naming.SnapName `yaml:"name"`
 	// id and unasserted can be both set, in which case it only
 	// cross-references the model
 	SnapID string `yaml:"id,omitempty"`
@@ -44,10 +52,15 @@ type Snap20 struct {
 
 	Channel string `yaml:"channel,omitempty"`
 	// TODO: DevMode bool   `yaml:"devmode,omitempty"`
+
+	// Components is a list of component options. It is only valid to add a
+	// list of unasserted local components when we are using an unasserted
+	// local snap.
+	Components []Component20 `yaml:"components,omitempty"`
 }
 
 // SnapName implements naming.SnapRef.
-func (sn *Snap20) SnapName() string {
+func (sn *Snap20) SnapName() naming.SnapName {
 	return sn.Name
 }
 
@@ -81,7 +94,7 @@ func ReadOptions20(optionsFn string) (*Options20, error) {
 		}
 		// TODO: check if it's a parallel install explicitly,
 		// need to move *Instance* helpers from snap to naming
-		if err := naming.ValidateSnap(sn.Name); err != nil {
+		if err := naming.ValidateSnap(sn.Name.String()); err != nil {
 			return nil, fmt.Errorf("%s: %v", errPrefix, err)
 		}
 		if sn.SnapID == "" && sn.Channel == "" && sn.Unasserted == "" {
@@ -100,12 +113,28 @@ func ReadOptions20(optionsFn string) (*Options20, error) {
 		if sn.Unasserted != "" && strings.Contains(sn.Unasserted, "/") {
 			return nil, fmt.Errorf("%s: %q must be a filename, not a path", errPrefix, sn.Unasserted)
 		}
+		if len(sn.Components) > 0 {
+			for _, comp := range sn.Components {
+				if err := naming.ValidateSnap(comp.Name); err != nil {
+					return nil, fmt.Errorf("%s: %v", errPrefix, err)
+				}
+				if comp.Unasserted == "" && sn.Unasserted != "" {
+					return nil, fmt.Errorf("%s: no file specified for unasserted component %q", errPrefix, comp.Name)
+				}
+				if comp.Unasserted != "" && sn.Unasserted == "" {
+					return nil, fmt.Errorf("%s: unasserted component specified for asserted snap %q", errPrefix, sn.Name)
+				}
+				if strings.Contains(comp.Unasserted, "/") {
+					return nil, fmt.Errorf("%s: %q must be a filename, not a path", errPrefix, comp.Unasserted)
+				}
+			}
+		}
 
 		// make sure names and file names are unique
-		if seenNames[sn.Name] {
+		if seenNames[sn.Name.String()] {
 			return nil, fmt.Errorf("%s: snap name %q must be unique", errPrefix, sn.Name)
 		}
-		seenNames[sn.Name] = true
+		seenNames[sn.Name.String()] = true
 	}
 
 	return &options, nil

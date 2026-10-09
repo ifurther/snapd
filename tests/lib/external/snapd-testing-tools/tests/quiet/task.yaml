@@ -1,6 +1,9 @@
 summary: test for the quiet tool
 
-backends: [google]
+details: |
+    Check the quiet tool hides the command stdout and but shows the stderr
+
+backends: [openstack*]
 
 execute: |
     quiet echo test | NOMATCH test

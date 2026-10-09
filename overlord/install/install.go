@@ -1,7 +1,7 @@
 // -*- Mode: Go; indent-tabs-mode: t -*-
 
 /*
- * Copyright (C) 2021-2023 Canonical Ltd
+ * Copyright (C) 2021-2024 Canonical Ltd
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 3 as
@@ -24,8 +24,10 @@ package install
 
 import (
 	"bytes"
+	"context"
 	"crypto"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -35,17 +37,21 @@ import (
 
 	"github.com/snapcore/snapd/asserts"
 	"github.com/snapcore/snapd/boot"
+	"github.com/snapcore/snapd/bootloader"
 	"github.com/snapcore/snapd/dirs"
 	"github.com/snapcore/snapd/gadget"
 	"github.com/snapcore/snapd/gadget/device"
+	gadgetInstall "github.com/snapcore/snapd/gadget/install"
 	"github.com/snapcore/snapd/kernel/fde"
 	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/randutil"
+	"github.com/snapcore/snapd/release"
 	"github.com/snapcore/snapd/secboot"
 	"github.com/snapcore/snapd/secboot/keys"
 	"github.com/snapcore/snapd/seed"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 	"github.com/snapcore/snapd/snap/squashfs"
 	"github.com/snapcore/snapd/strutil"
 	"github.com/snapcore/snapd/sysconfig"
@@ -69,26 +75,167 @@ type EncryptionSupportInfo struct {
 
 	// Type is set to the EncryptionType that can be used if
 	// Available is true.
-	Type secboot.EncryptionType
+	Type device.EncryptionType
 
 	// UnvailableErr is set if the encryption support availability of
 	// the this device and used gadget do not match the
 	// storage safety requirements.
 	UnavailableErr error
+
 	// UnavailbleWarning describes why encryption support is not
 	// available in case it is optional.
 	UnavailableWarning string
+
+	// AvailabilityCheckErrors holds details about encryption
+	// availability errors identified during preinstall check.
+	AvailabilityCheckErrors []secboot.PreinstallErrorDetails
+
+	// seenAvailabilityCheckErrorKinds holds a sticky list of all seen preinstall
+	// check error kinds for the lifetime of the check context.
+	seenAvailabilityCheckErrorKinds map[string]bool
+
+	// availabilityCheckContext holds the configuration and state captured during
+	// the preinstall check. It is required for performing follow-up checks with
+	// actions to resolve identified errors. It is also an indicator that the
+	// preinstall check was used instead of the general availability check.
+	availabilityCheckContext *secboot.PreinstallCheckContext
+
+	// PassphraseAuthAvailable is set if the passphrase authentication
+	// is supported.
+	PassphraseAuthAvailable bool
+
+	// PINAuthAvailable is set if the pin authentication is supported.
+	PINAuthAvailable bool
+}
+
+// CheckContext returns the underlying preinstall check context.
+func (esi *EncryptionSupportInfo) CheckContext() *secboot.PreinstallCheckContext {
+	return esi.availabilityCheckContext
+}
+
+type EncryptionSupportRequirement string
+
+const (
+	// Indicates that the system requires authentication (e.g. PIN, passphrase).
+	EncryptionSupportRequirementVolumesAuth EncryptionSupportRequirement = "volumes-auth"
+)
+
+// Requirements returns the list of encryption support requirements.
+func (esi *EncryptionSupportInfo) Requirements() []EncryptionSupportRequirement {
+	return encryptionSupportRequirements(esi.seenAvailabilityCheckErrorKinds)
+}
+
+func encryptionSupportRequirements(preinstallErrors map[string]bool) []EncryptionSupportRequirement {
+	var requirements []EncryptionSupportRequirement
+	if preinstallErrors[secboot.ErrorKindNoHardwareRootOfTrust] {
+		requirements = append(requirements, EncryptionSupportRequirementVolumesAuth)
+	}
+	return requirements
+}
+
+// ComponentSeedInfo contains information for a component from the seed and
+// from its metadata.
+type ComponentSeedInfo struct {
+	Info *snap.ComponentInfo
+	Seed *seed.Component
+}
+
+// KernelBootInfo contains information related to the kernel used on installation.
+type KernelBootInfo struct {
+	KSnapInfo     *gadgetInstall.KernelSnapInfo
+	BootableKMods []boot.BootableKModsComponents
+}
+
+// SystemSnapdVersions describes the snapd versions in a given systems.
+type SystemSnapdVersions struct {
+	// SnapdVersion is the version of snapd in a given system
+	SnapdVersion string
+	// SnapdInitramfsVersion is the version of snapd related component, which participates
+	// in the boot process and performs unlocking. Typically snap-bootstrap in the kernel snap.
+	SnapdInitramfsVersion string
 }
 
 var (
 	timeNow = time.Now
 
 	secbootCheckTPMKeySealingSupported = secboot.CheckTPMKeySealingSupported
-	sysconfigConfigureTargetSystem     = sysconfig.ConfigureTargetSystem
+	secbootPreinstallCheck             = secboot.PreinstallCheck
+	secbootPostinstallCheck            = secboot.PostinstallCheck
+	secbootPreinstallCheckAction       = (*secboot.PreinstallCheckContext).PreinstallCheckAction
+	secbootSaveCheckResult             = (*secboot.PreinstallCheckContext).SaveCheckResult
+	secbootCheckResult                 = (*secboot.PreinstallCheckContext).CheckResult
+	secbootLoadCheckResult             = secboot.LoadCheckResult
+	secbootFDEOpteeTAPresent           = secboot.FDEOpteeTAPresent
+	preinstallCheckTimeout             = 2 * time.Minute
+
+	sysconfigConfigureTargetSystem = sysconfig.ConfigureTargetSystem
+
+	bootUseTokens        = boot.UseTokens
+	bootMaybeReadModeenv = boot.MaybeReadModeenv
+
+	bootGetRunBootChain = boot.GetRunBootChain
+	bootReadModeenv     = boot.ReadModeenv
 )
 
-// MockSecbootCheckTPMKeySealingSupported mocks secboot.CheckTPMKeySealingSupported usage by the package for testing.
+// BuildKernelBootInfoOpts contains options for BuildKernelBootInfo.
+type BuildKernelBootInfoOpts struct {
+	// IsCore is true for UC, and false for hybrid systems
+	IsCore bool
+	// NeedsDriversTree is true if we need a drivers tree (UC/hybrid 24+)
+	NeedsDriversTree bool
+}
+
+// BuildKernelBootInfo constructs a KernelBootInfo.
+func BuildKernelBootInfo(kernInfo *snap.Info, compSeedInfos []ComponentSeedInfo, kernMntPoint string, mntPtForComps map[string]string, opts BuildKernelBootInfoOpts) KernelBootInfo {
+	bootKMods := make([]boot.BootableKModsComponents, 0, len(compSeedInfos))
+	modulesComps := make([]gadgetInstall.KernelModulesComponentInfo, 0, len(compSeedInfos))
+	for _, compSeedInfo := range compSeedInfos {
+		ci := compSeedInfo.Info
+		if ci.Type == snap.KernelModulesComponent {
+			cpi := snap.MinimalComponentContainerPlaceInfo(ci.Component.ComponentName,
+				ci.Revision, kernInfo.InstanceName())
+			modulesComps = append(modulesComps, gadgetInstall.KernelModulesComponentInfo{
+				Name:       ci.Component.ComponentName,
+				Revision:   ci.Revision,
+				MountPoint: mntPtForComps[ci.FullName()],
+			})
+			bootKMods = append(bootKMods, boot.BootableKModsComponents{
+				CompPlaceInfo: cpi,
+				CompPath:      compSeedInfo.Seed.Path,
+			})
+		}
+	}
+
+	kSnapInfo := &gadgetInstall.KernelSnapInfo{
+		Name:             kernInfo.SnapName().String(),
+		Revision:         kernInfo.Revision,
+		MountPoint:       kernMntPoint,
+		IsCore:           opts.IsCore,
+		ModulesComps:     modulesComps,
+		NeedsDriversTree: opts.NeedsDriversTree,
+	}
+
+	return KernelBootInfo{
+		KSnapInfo:     kSnapInfo,
+		BootableKMods: bootKMods,
+	}
+}
+
+// SetAvailabilityCheckContext is a test only helper for populating EncryptionSupportInfo field availabilityCheckContext.
+func (esi *EncryptionSupportInfo) SetAvailabilityCheckContext(checkContext *secboot.PreinstallCheckContext) {
+	osutil.MustBeTestBinary("secbootPreinstallCheck can only be used in tests")
+	esi.availabilityCheckContext = checkContext
+}
+
+// SetSeenAvailabilityCheckErrorKinds is a test only helper for populating EncryptionSupportInfo field seenAvailabilityCheckErrorKinds.
+func (esi *EncryptionSupportInfo) SetSeenAvailabilityCheckErrorKinds(kinds map[string]bool) {
+	osutil.MustBeTestBinary("SetSeenAvailabilityCheckErrorKinds can only be used in tests")
+	esi.seenAvailabilityCheckErrorKinds = kinds
+}
+
+// MockSecbootCheckTPMKeySealingSupported mocks secbootCheckTPMKeySealingSupported usage by the package for testing.
 func MockSecbootCheckTPMKeySealingSupported(f func(tpmMode secboot.TPMProvisionMode) error) (restore func()) {
+	osutil.MustBeTestBinary("secbootCheckTPMKeySealingSupported can only be mocked in tests")
 	old := secbootCheckTPMKeySealingSupported
 	secbootCheckTPMKeySealingSupported = f
 	return func() {
@@ -96,17 +243,114 @@ func MockSecbootCheckTPMKeySealingSupported(f func(tpmMode secboot.TPMProvisionM
 	}
 }
 
+// MockSecbootPreinstallCheck mocks secbootPreinstallCheck usage by the package for testing.
+func MockSecbootPreinstallCheck(f func(ctx context.Context, bootImageFiles []bootloader.BootFile) (*secboot.PreinstallCheckContext, []secboot.PreinstallErrorDetails, error)) (restore func()) {
+	osutil.MustBeTestBinary("secbootPreinstallCheck can only be mocked in tests")
+	old := secbootPreinstallCheck
+	secbootPreinstallCheck = f
+	return func() {
+		secbootPreinstallCheck = old
+	}
+}
+
+// MockSecbootPostinstallCheck mocks secbootPostinstallCheck usage by the package for testing.
+func MockSecbootPostinstallCheck(f func(ctx context.Context, bootImageFiles []bootloader.BootFile) (*secboot.PreinstallCheckContext, []secboot.PreinstallErrorDetails, error)) (restore func()) {
+	osutil.MustBeTestBinary("secbootPostinstallCheck can only be mocked in tests")
+	old := secbootPostinstallCheck
+	secbootPostinstallCheck = f
+	return func() {
+		secbootPostinstallCheck = old
+	}
+}
+
+// MockSecbootPreinstallCheckAction mocks secbootPreinstallCheckAction usage by the package for testing.
+func MockSecbootPreinstallCheckAction(f func(pcc *secboot.PreinstallCheckContext, ctx context.Context, action *secboot.PreinstallAction) ([]secboot.PreinstallErrorDetails, error)) (restore func()) {
+	osutil.MustBeTestBinary("secbootPreinstallCheckAction can only be mocked in tests")
+	old := secbootPreinstallCheckAction
+	secbootPreinstallCheckAction = f
+	return func() {
+		secbootPreinstallCheckAction = old
+	}
+}
+
+// MockSecbootSaveCheckResult mocks secbootSaveCheckResult usage by the package for testing.
+func MockSecbootSaveCheckResult(f func(pcc *secboot.PreinstallCheckContext, filename string) error) (restore func()) {
+	osutil.MustBeTestBinary("secbootSaveCheckResult can only be mocked in tests")
+	old := secbootSaveCheckResult
+	secbootSaveCheckResult = f
+	return func() {
+		secbootSaveCheckResult = old
+	}
+}
+
+// MockSecbootCheckResult mocks secbootCheckResult usage by the package for testing.
+func MockSecbootCheckResult(f func(pcc *secboot.PreinstallCheckContext) (*secboot.PreinstallCheckResult, error)) (restore func()) {
+	osutil.MustBeTestBinary("secbootCheckResult can only be mocked in tests")
+	old := secbootCheckResult
+	secbootCheckResult = f
+	return func() {
+		secbootCheckResult = old
+	}
+}
+
+func checkVolumesAuthSupportedByTargetSystem(sysVer SystemSnapdVersions) (bool, error) {
+	const minSnapdVersion = "2.74"
+	if sysVer.SnapdVersion == "" || sysVer.SnapdInitramfsVersion == "" {
+		return false, nil
+	}
+
+	// snapd snap must support passphrase/PINs
+	cmp, err := strutil.VersionCompare(sysVer.SnapdVersion, minSnapdVersion)
+	if err != nil {
+		return false, fmt.Errorf("invalid snapd version in info file from snapd snap: %v", err)
+	}
+	if cmp < 0 {
+		return false, nil
+	}
+	// snap-bootstrap inside the kernel must support passphrase/PINs
+	cmp, err = strutil.VersionCompare(sysVer.SnapdInitramfsVersion, minSnapdVersion)
+	if err != nil {
+		return false, fmt.Errorf("invalid snapd version in info file from kernel snap: %v", err)
+	}
+	if cmp < 0 {
+		return false, nil
+	}
+
+	return true, nil
+}
+
+// EncryptionConstraints is the set of constraints that
+// [GetEncryptionSupportInfo] must consider when deciding how to encrypt the
+// system.
+type EncryptionConstraints struct {
+	Model         *asserts.Model
+	Kernel        *snap.Info
+	Gadget        *gadget.Info
+	TPMMode       secboot.TPMProvisionMode
+	SnapdVersions SystemSnapdVersions
+	CheckAction   *secboot.PreinstallAction
+	PrevInfo      *EncryptionSupportInfo
+}
+
 // GetEncryptionSupportInfo returns the encryption support information
 // for the given model, TPM provision mode, kernel and gadget information and
 // system hardware. It uses runSetupHook to invoke the kernel fde-setup hook if
 // any is available, leaving the caller to decide how, based on the environment.
-func GetEncryptionSupportInfo(model *asserts.Model, tpmMode secboot.TPMProvisionMode, kernelInfo *snap.Info, gadgetInfo *gadget.Info, runSetupHook fde.RunSetupHookFunc) (EncryptionSupportInfo, error) {
-	secured := model.Grade() == asserts.ModelSecured
-	dangerous := model.Grade() == asserts.ModelDangerous
-	encrypted := model.StorageSafety() == asserts.StorageSafetyEncrypted
+func GetEncryptionSupportInfo(
+	constraints EncryptionConstraints,
+	runSetupHook fde.RunSetupHookFunc,
+) (EncryptionSupportInfo, error) {
+	secured := constraints.Model.Grade() == asserts.ModelSecured
+	dangerous := constraints.Model.Grade() == asserts.ModelDangerous
+	encrypted := constraints.Model.StorageSafety() == asserts.StorageSafetyEncrypted
 
 	res := EncryptionSupportInfo{
-		StorageSafety: model.StorageSafety(),
+		StorageSafety: constraints.Model.StorageSafety(),
+	}
+	if constraints.PrevInfo != nil {
+		// accumulate seen errors from previous checks even if they were cleared
+		// with a "proceed" action.
+		res.seenAvailabilityCheckErrorKinds = constraints.PrevInfo.seenAvailabilityCheckErrorKinds
 	}
 
 	// check if we should disable encryption non-secured devices
@@ -116,25 +360,62 @@ func GetEncryptionSupportInfo(model *asserts.Model, tpmMode secboot.TPMProvision
 		return res, nil
 	}
 
-	// check encryption: this can either be provided by the fde-setup
-	// hook mechanism or by the built-in secboot based encryption
-	checkFDESetupHookEncryption := hasFDESetupHookInKernel(kernelInfo)
-	// Note that having a fde-setup hook will disable the internal
-	// secboot based encryption
-	checkSecbootEncryption := !checkFDESetupHookEncryption
+	// check encryption: this can either be provided by one of three mechanisms,
+	// and they are checked in this order:
+	// - the fde-setup hook
+	// - the optee trusted application
+	// - the built-in secboot based encryption
+
+	checkFDESetupHookEncryption := hasFDESetupHookInKernel(constraints.Kernel)
+	// unlike the fde-setup hook, we don't have a way to statically verify that
+	// we should use optee. thus, we check for its presence and fall back to the
+	// tpm if we can't see optee. this means that this function won't return any
+	// optee-specific errors/warnings. change this?
+	checkOPTEEEncryption := !checkFDESetupHookEncryption && secbootFDEOpteeTAPresent()
+	checkSecbootEncryption := !checkOPTEEEncryption
+
+	logger.Noticef("has FDE hooks: %t; try snapd OP-TEE: %t",
+		checkFDESetupHookEncryption, checkOPTEEEncryption)
+
 	var checkEncryptionErr error
 	switch {
 	case checkFDESetupHookEncryption:
 		res.Type, checkEncryptionErr = checkFDEFeatures(runSetupHook)
+	case checkOPTEEEncryption:
+		res.Type = device.EncryptionTypeLUKS
 	case checkSecbootEncryption:
-		checkEncryptionErr = secbootCheckTPMKeySealingSupported(tpmMode)
-		if checkEncryptionErr == nil {
-			res.Type = secboot.EncryptionTypeLUKS
+		var prevCheckContext *secboot.PreinstallCheckContext
+		if constraints.PrevInfo != nil {
+			prevCheckContext = constraints.PrevInfo.availabilityCheckContext
+		}
+		preinstallCheckContext, unavailableReason, preinstallErrorDetails, err := encryptionAvailabilityCheck(
+			prevCheckContext,
+			constraints.CheckAction,
+			constraints.Model,
+		)
+		if err != nil {
+			return res, fmt.Errorf("internal error: cannot perform secboot encryption check: %v", err)
+		}
+		res.availabilityCheckContext = preinstallCheckContext
+
+		if unavailableReason == "" {
+			res.Type = device.EncryptionTypeLUKS
+		} else {
+			checkEncryptionErr = errors.New(unavailableReason)
+			res.AvailabilityCheckErrors = preinstallErrorDetails
+			if len(preinstallErrorDetails) > 0 {
+				if res.seenAvailabilityCheckErrorKinds == nil {
+					res.seenAvailabilityCheckErrorKinds = make(map[string]bool, len(preinstallErrorDetails))
+				}
+				for _, errDetails := range preinstallErrorDetails {
+					res.seenAvailabilityCheckErrorKinds[errDetails.Kind] = true
+				}
+			}
 		}
 	default:
 		return res, fmt.Errorf("internal error: no encryption checked in encryptionSupportInfo")
 	}
-	res.Available = (checkEncryptionErr == nil)
+	res.Available = checkEncryptionErr == nil
 
 	if checkEncryptionErr != nil {
 		switch {
@@ -154,21 +435,230 @@ func GetEncryptionSupportInfo(model *asserts.Model, tpmMode secboot.TPMProvision
 	// If encryption is available check if the gadget is
 	// compatible with encryption.
 	if res.Available {
+		// Passphrase/PIN support is only available for TPM based encryption for now.
+		// Hook based setup support does not make sense (at least for now) because
+		// it is usually in the context of embedded systems where passphrase/PIN
+		// authentication is not practical.
+		if checkSecbootEncryption {
+			volumesAuthAvailable, err := checkVolumesAuthSupportedByTargetSystem(constraints.SnapdVersions)
+			if err != nil {
+				return res, fmt.Errorf("cannot check volumes authentication support: %v", err)
+			}
+			res.PassphraseAuthAvailable = volumesAuthAvailable
+			res.PINAuthAvailable = volumesAuthAvailable
+		}
 		opts := &gadget.ValidationConstraints{
 			EncryptedData: true,
 		}
-		if err := gadget.Validate(gadgetInfo, model, opts); err != nil {
+		if err := gadget.Validate(constraints.Gadget, constraints.Model, opts); err != nil {
 			if secured || encrypted {
 				res.UnavailableErr = fmt.Errorf("cannot use encryption with the gadget: %v", err)
 			} else {
 				res.UnavailableWarning = fmt.Sprintf("cannot use encryption with the gadget, disabling encryption: %v", err)
 			}
 			res.Available = false
-			res.Type = secboot.EncryptionTypeNone
+			res.Type = device.EncryptionTypeNone
 		}
 	}
 
 	return res, nil
+}
+
+type bootMode int
+
+const (
+	ubuntuISOBootMode bootMode = iota
+	runBootMode
+	ephemeralBootMode
+)
+
+func encryptionAvailabilityCheck(
+	checkContext *secboot.PreinstallCheckContext,
+	checkAction *secboot.PreinstallAction,
+	model *asserts.Model,
+) (*secboot.PreinstallCheckContext, string, []secboot.PreinstallErrorDetails, error) {
+	var tpmMode secboot.TPMProvisionMode
+	var postInstall bool
+	var currentBootMode bootMode
+
+	// The model is the system we might install; modeenv is where we are
+	// running. Pre vs post install checks and which boot images to use
+	// follow the current boot, not the model.
+	modeenv, err := bootMaybeReadModeenv()
+	if err != nil {
+		return nil, "", nil, err
+	}
+
+	if modeenv == nil {
+		// No modeenv means a classic installer ISO, not a
+		// core-based installer.
+		currentBootMode = ubuntuISOBootMode
+		postInstall = false
+		tpmMode = secboot.TPMProvisionFull
+	} else {
+		switch modeenv.Mode {
+		case "install":
+			currentBootMode = ephemeralBootMode
+			postInstall = false
+			tpmMode = secboot.TPMProvisionFull
+		case "run":
+			currentBootMode = runBootMode
+			postInstall = true
+			tpmMode = secboot.TPMPartialReprovision
+		case "recover":
+			currentBootMode = ephemeralBootMode
+			postInstall = true
+			tpmMode = secboot.TPMPartialReprovision
+		case "factory-reset":
+			currentBootMode = ephemeralBootMode
+			postInstall = true
+			tpmMode = secboot.TPMPartialReprovision
+		default:
+			return nil, "", nil, fmt.Errorf("unknown boot mode %q", modeenv.Mode)
+		}
+	}
+
+	supported, err := preinstallCheckSupportedWithEnvFallback(model)
+	if err != nil {
+		return nil, "", nil, fmt.Errorf("cannot confirm preinstall check support: %v", err)
+	}
+
+	if supported {
+		// use comprehensive preinstall check
+		images, err := orderedCurrentBootImages(modeenv, currentBootMode)
+		if err != nil {
+			return nil, "", nil, fmt.Errorf("cannot locate ordered current boot images: %v", err)
+		}
+
+		if checkAction != nil && checkContext == nil {
+			return nil, "", nil, errors.New("cannot use preinstall check action without context")
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), preinstallCheckTimeout)
+		defer cancel()
+
+		var (
+			preinstallErrorDetails []secboot.PreinstallErrorDetails
+			newCheckContext        *secboot.PreinstallCheckContext
+		)
+
+		if checkContext != nil {
+			preinstallErrorDetails, err = secbootPreinstallCheckAction(checkContext, ctx, checkAction)
+			newCheckContext = checkContext
+		} else if postInstall {
+			newCheckContext, preinstallErrorDetails, err = secbootPostinstallCheck(ctx, images)
+		} else {
+			newCheckContext, preinstallErrorDetails, err = secbootPreinstallCheck(ctx, images)
+		}
+
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return nil, "", nil, fmt.Errorf("preinstall check timed out: %v", err)
+			}
+			return nil, "", nil, err
+		}
+
+		switch len(preinstallErrorDetails) {
+		case 0:
+			return newCheckContext, "", nil, nil
+		case 1:
+			return newCheckContext, preinstallErrorDetails[0].Message, preinstallErrorDetails, nil
+		default:
+			return newCheckContext, fmt.Sprintf("preinstall check identified %d errors", len(preinstallErrorDetails)), preinstallErrorDetails, nil
+		}
+	}
+
+	// use general availability check
+	err = secbootCheckTPMKeySealingSupported(tpmMode)
+	if err != nil {
+		return nil, err.Error(), nil, nil
+	}
+	return nil, "", nil, nil
+}
+
+func preinstallCheckSupportedWithEnvFallback(model *asserts.Model) (bool, error) {
+	//TODO:FDEM: This temporary fallback must be removed before release of snapd 2.71
+	if osutil.GetenvBool("SNAPD_DISABLE_PREINSTALL_CHECK") {
+		logger.Noticef(`preinstall check disabled by environment variable "SNAPD_DISABLE_PREINSTALL_CHECK"`)
+		return false, nil
+	}
+
+	return CheckHybridQuestingRelease(model)
+}
+
+// CheckHybridQuestingRelease returns true if the given model and runtime release
+// information indicates that this is a hybrid Ubuntu system with a version of
+// 25.10 or higher.
+func CheckHybridQuestingRelease(model *asserts.Model) (bool, error) {
+	if !model.HybridClassic() {
+		return false, nil
+	}
+
+	if release.ReleaseInfo.ID != "ubuntu" {
+		logger.Noticef("unexpected OS release ID %q", release.ReleaseInfo.ID)
+		return false, nil
+	}
+
+	const minSupportedVersion = "25.10"
+	cmp, err := strutil.VersionCompare(release.ReleaseInfo.VersionID, minSupportedVersion)
+	if err != nil {
+		return false, fmt.Errorf("cannot perform version comparison with OS release version ID: %v", err)
+	}
+
+	return cmp >= 0, nil
+}
+
+func orderedCurrentBootImages(modeenv *boot.Modeenv, currentBootMode bootMode) ([]bootloader.BootFile, error) {
+	// modeenv may be nil if the current system does not have one.
+	// Note that currentBootMode is the boot mode of what we have booted, not what we are installing.
+	switch currentBootMode {
+	case ubuntuISOBootMode:
+		images, err := orderedCurrentBootImagesHybrid()
+		if err != nil {
+			return nil, fmt.Errorf("cannot locate hybrid system boot images: %v", err)
+		}
+		return images, nil
+	case runBootMode:
+		if modeenv == nil {
+			return nil, fmt.Errorf("internal error: missing modeenv when looking for run boot chain")
+		}
+		return bootGetRunBootChain(modeenv)
+	case ephemeralBootMode:
+		// TODO: When support for post/pre install checks in
+		// Core, we will need to find the recover boot
+		// chain. For now this is not used.
+		return nil, fmt.Errorf("pre/post-install check is not yet implemented for ephemeral boot mode")
+	default:
+		return nil, fmt.Errorf("internal error: cannot find current boot chain: unknown current boot mode %v", currentBootMode)
+	}
+}
+
+func orderedCurrentBootImagesHybrid() ([]bootloader.BootFile, error) {
+	imageInfo := []struct {
+		name string
+		glob string
+	}{
+		{"shim", filepath.Join(dirs.GlobalRootDir, "cdrom/EFI/boot/boot*.efi")},
+		{"grub", filepath.Join(dirs.GlobalRootDir, "cdrom/EFI/boot/grub*.efi")},
+		{"kernel", filepath.Join(dirs.GlobalRootDir, "cdrom/casper/vmlinuz")},
+	}
+
+	var bootImageFiles []bootloader.BootFile
+	for _, info := range imageInfo {
+		matches, err := filepath.Glob(info.glob)
+		if err != nil {
+			return nil, fmt.Errorf("cannot use globbing pattern %q: %v", info.glob, err)
+		}
+		if len(matches) == 0 {
+			return nil, fmt.Errorf("cannot locate installer %s using globbing pattern %q", info.name, info.glob)
+		}
+		if len(matches) > 1 {
+			return nil, fmt.Errorf("unexpected multiple matches for installer %s obtained using globbing pattern %q", info.name, info.glob)
+		}
+		bootImageFiles = append(bootImageFiles, bootloader.NewBootFile("", matches[0], bootloader.RoleRunMode))
+	}
+
+	return bootImageFiles, nil
 }
 
 func hasFDESetupHookInKernel(kernelInfo *snap.Info) bool {
@@ -176,7 +666,7 @@ func hasFDESetupHookInKernel(kernelInfo *snap.Info) bool {
 	return ok
 }
 
-func checkFDEFeatures(runSetupHook fde.RunSetupHookFunc) (et secboot.EncryptionType, err error) {
+func checkFDEFeatures(runSetupHook fde.RunSetupHookFunc) (et device.EncryptionType, err error) {
 	// Run fde-setup hook with "op":"features". If the hook
 	// returns any {"features":[...]} reply we consider the
 	// hardware supported. If the hook errors or if it returns
@@ -187,19 +677,22 @@ func checkFDEFeatures(runSetupHook fde.RunSetupHookFunc) (et secboot.EncryptionT
 	}
 	switch {
 	case strutil.ListContains(features, "inline-crypto-engine"):
-		et = secboot.EncryptionTypeLUKSWithICE
+		et = device.EncryptionTypeLUKSWithICE
 	default:
-		et = secboot.EncryptionTypeLUKS
+		et = device.EncryptionTypeLUKS
 	}
 
 	return et, nil
 }
 
 // CheckEncryptionSupport checks the type of encryption support for disks
-// available if any and returns the corresponding secboot.EncryptionType,
+// available if any and returns the corresponding device.EncryptionType,
 // internally it uses GetEncryptionSupportInfo with the provided parameters.
-func CheckEncryptionSupport(model *asserts.Model, tpmMode secboot.TPMProvisionMode, kernelInfo *snap.Info, gadgetInfo *gadget.Info, runSetupHook fde.RunSetupHookFunc) (secboot.EncryptionType, error) {
-	res, err := GetEncryptionSupportInfo(model, tpmMode, kernelInfo, gadgetInfo, runSetupHook)
+func CheckEncryptionSupport(
+	constraints EncryptionConstraints,
+	runSetupHook fde.RunSetupHookFunc,
+) (device.EncryptionType, error) {
+	res, err := GetEncryptionSupportInfo(constraints, runSetupHook)
 	if err != nil {
 		return "", err
 	}
@@ -208,7 +701,7 @@ func CheckEncryptionSupport(model *asserts.Model, tpmMode secboot.TPMProvisionMo
 	}
 	// encryption disabled or preferred unencrypted: follow the model preferences here even if encryption would be available
 	if res.Disabled || res.StorageSafety == asserts.StorageSafetyPreferUnencrypted {
-		res.Type = secboot.EncryptionTypeNone
+		res.Type = device.EncryptionTypeNone
 	}
 
 	return res.Type, res.UnavailableErr
@@ -219,7 +712,7 @@ func CheckEncryptionSupport(model *asserts.Model, tpmMode secboot.TPMProvisionMo
 // The observer if any is also returned as non-nil trustedObserver if
 // encryption is in use.
 func BuildInstallObserver(model *asserts.Model, gadgetDir string, useEncryption bool) (
-	observer gadget.ContentObserver, trustedObserver *boot.TrustedAssetsInstallObserver, err error) {
+	observer gadget.ContentObserver, trustedObserver boot.TrustedAssetsInstallObserver, err error) {
 
 	// observer will be a nil interface by default
 	trustedObserver, err = boot.TrustedAssetsInstallObserverForModel(model, gadgetDir, useEncryption)
@@ -228,7 +721,7 @@ func BuildInstallObserver(model *asserts.Model, gadgetDir string, useEncryption 
 	}
 	if err == nil {
 		observer = trustedObserver
-		if !useEncryption {
+		if !useEncryption && !trustedObserver.BootLoaderSupportsEfiVariables() {
 			// there will be no key sealing, so past the
 			// installation pass no other methods need to be called
 			trustedObserver = nil
@@ -242,30 +735,102 @@ func BuildInstallObserver(model *asserts.Model, gadgetDir string, useEncryption 
 // * provides trustedInstallObserver with the chosen keys
 // * uses trustedInstallObserver to track any trusted assets in ubuntu-seed
 // * save keys and markers for ubuntu-data being able to safely open ubuntu-save
-func PrepareEncryptedSystemData(model *asserts.Model, keyForRole map[string]keys.EncryptionKey, trustedInstallObserver *boot.TrustedAssetsInstallObserver) error {
+// It is the responsibility of the caller to call
+// ObserveExistingTrustedRecoveryAssets on trustedInstallObserver.
+func PrepareEncryptedSystemData(
+	model *asserts.Model,
+	installKeyForRole map[string]secboot.BootstrappedContainer,
+	volumesAuth *device.VolumesAuthOptions,
+	checkContext *secboot.PreinstallCheckContext,
+	trustedInstallObserver boot.TrustedAssetsInstallObserver,
+) error {
 	// validity check
-	if len(keyForRole) == 0 || keyForRole[gadget.SystemData] == nil || keyForRole[gadget.SystemSave] == nil {
+	if len(installKeyForRole) == 0 || installKeyForRole[gadget.SystemData] == nil || installKeyForRole[gadget.SystemSave] == nil {
 		return fmt.Errorf("internal error: system encryption keys are unset")
 	}
-	dataEncryptionKey := keyForRole[gadget.SystemData]
-	saveEncryptionKey := keyForRole[gadget.SystemSave]
+	dataBootstrappedContainer := installKeyForRole[gadget.SystemData]
+	saveBootstrappedContainer := installKeyForRole[gadget.SystemSave]
 
-	// make note of the encryption keys
-	trustedInstallObserver.ChosenEncryptionKeys(dataEncryptionKey, saveEncryptionKey)
+	var primaryKey []byte
 
-	// XXX is the asset cache problematic from initramfs?
-	// keep track of recovery assets
-	if err := trustedInstallObserver.ObserveExistingTrustedRecoveryAssets(boot.InitramfsUbuntuSeedDir); err != nil {
-		return fmt.Errorf("cannot observe existing trusted recovery assets: %v", err)
+	if saveBootstrappedContainer != nil {
+		if bootUseTokens(model) {
+			protectorKey, err := keys.NewProtectorKey()
+			if err != nil {
+				return err
+			}
+
+			plainKey, generatedPK, diskKey, err := protectorKey.CreateProtectedKey(nil)
+			if err != nil {
+				return err
+			}
+
+			if err := saveBootstrappedContainer.AddKey("default", diskKey); err != nil {
+				return err
+			}
+			tokenWriter, err := saveBootstrappedContainer.GetTokenWriter("default")
+			if err != nil {
+				return err
+			}
+			if err := plainKey.Write(tokenWriter); err != nil {
+				return err
+			}
+
+			if err := saveKeys(model, protectorKey); err != nil {
+				return err
+			}
+
+			// This is the "default" key of save partition. So it should also
+			// be saved to keyring to have similar state as unlocking in run mode.
+			saveBootstrappedContainer.RegisterKeyAsUsed(generatedPK, diskKey)
+
+			primaryKey = generatedPK
+		} else {
+			saveKey, err := keys.NewEncryptionKey()
+			if err != nil {
+				return err
+			}
+
+			if err := saveBootstrappedContainer.AddKey("default", saveKey); err != nil {
+				return err
+			}
+
+			if err := saveLegacyKeys(model, saveKey); err != nil {
+				return err
+			}
+		}
 	}
-	if err := saveKeys(model, keyForRole); err != nil {
-		return err
+
+	// the check result contains information required for sealing and resealing
+	// using the optimum PCR configuration determined during preinstall check
+	var checkResult *secboot.PreinstallCheckResult
+	// non nil checkContext means that a preinstall check was performed
+	if checkContext != nil {
+		var err error
+		if checkResult, err = secbootCheckResult(checkContext); err != nil {
+			return err
+		}
+		// write the check result to file to make it available post-install for
+		// resealing operations
+		if err = saveCheckResult(checkContext); err != nil {
+			return err
+		}
 	}
+
 	// write markers containing a secret to pair data and save
 	if err := writeMarkers(model); err != nil {
 		return err
 	}
+
+	// make note of the encryption keys and auth options, and the check result
+	trustedInstallObserver.SetEncryptionParams(dataBootstrappedContainer, saveBootstrappedContainer, primaryKey, volumesAuth, checkResult)
+
 	return nil
+}
+
+func saveCheckResult(checkContext *secboot.PreinstallCheckContext) error {
+	saveCheckResultPath := device.PreinstallCheckResultUnder(boot.InstallHostFDESaveDir)
+	return secbootSaveCheckResult(checkContext, saveCheckResultPath)
 }
 
 // writeMarkers writes markers containing the same secret to pair data and save.
@@ -287,20 +852,24 @@ func writeMarkers(model *asserts.Model) error {
 	return device.WriteEncryptionMarkers(boot.InstallHostFDEDataDir(model), boot.InstallHostFDESaveDir, markerSecret)
 }
 
-func saveKeys(model *asserts.Model, keyForRole map[string]keys.EncryptionKey) error {
-	saveEncryptionKey := keyForRole[gadget.SystemSave]
-	if saveEncryptionKey == nil {
-		// no system-save support
-		return nil
-	}
-	// ensure directory for keys exists
-	if err := os.MkdirAll(boot.InstallHostFDEDataDir(model), 0755); err != nil {
+func saveKeys(model *asserts.Model, saveKey keys.ProtectorKey) error {
+	saveKeyPath := device.SaveKeyUnder(boot.InstallHostFDEDataDir(model))
+
+	if err := os.MkdirAll(filepath.Dir(saveKeyPath), 0755); err != nil {
 		return err
 	}
-	if err := saveEncryptionKey.Save(device.SaveKeyUnder(boot.InstallHostFDEDataDir(model))); err != nil {
-		return fmt.Errorf("cannot store system save key: %v", err)
+
+	return saveKey.SaveToFile(saveKeyPath)
+}
+
+func saveLegacyKeys(model *asserts.Model, saveKey keys.EncryptionKey) error {
+	saveKeyPath := device.SaveKeyUnder(boot.InstallHostFDEDataDir(model))
+
+	if err := os.MkdirAll(filepath.Dir(saveKeyPath), 0755); err != nil {
+		return err
 	}
-	return nil
+
+	return saveKey.Save(saveKeyPath)
 }
 
 // PrepareRunSystemData prepares the run system:
@@ -443,6 +1012,47 @@ func writeTimesyncdClock(srcRootDir, dstRootDir string) error {
 	return nil
 }
 
+func comparePreseedAndSeedSnaps(seedSnap *seed.Snap, preseedSnap *asserts.PreseedSnap) error {
+	if preseedSnap.Revision != seedSnap.SideInfo.Revision.N {
+		rev := snap.Revision{N: preseedSnap.Revision}
+		return fmt.Errorf("snap %q has wrong revision %s (expected: %s)", seedSnap.SnapName(), seedSnap.SideInfo.Revision, rev)
+	}
+	if preseedSnap.SnapID != seedSnap.SideInfo.SnapID {
+		return fmt.Errorf("snap %q has wrong snap id %q (expected: %q)", seedSnap.SnapName(), seedSnap.SideInfo.SnapID, preseedSnap.SnapID)
+	}
+
+	expectedComps := make(map[string]asserts.PreseedComponent, len(preseedSnap.Components))
+	for _, c := range preseedSnap.Components {
+		expectedComps[c.Name] = c
+	}
+
+	for _, c := range seedSnap.Components {
+		preseedComp, ok := expectedComps[c.CompSideInfo.Component.ComponentName]
+		if !ok {
+			return fmt.Errorf("component %q not present in the preseed assertion", c.CompSideInfo.Component)
+		}
+
+		if preseedComp.Revision != c.CompSideInfo.Revision.N {
+			rev := snap.Revision{N: preseedComp.Revision}
+			return fmt.Errorf("component %q has wrong revision %s (expected: %s)", c.CompSideInfo.Component, c.CompSideInfo.Revision, rev)
+		}
+
+		// once we've seen the component, remove it from the expected
+		// components. anything left over is missing from the seed.
+		delete(expectedComps, c.CompSideInfo.Component.ComponentName)
+	}
+
+	if len(expectedComps) != 0 {
+		missing := make([]string, 0, len(expectedComps))
+		for name := range expectedComps {
+			missing = append(missing, naming.NewComponentRef(seedSnap.SnapName(), name).String())
+		}
+		return fmt.Errorf("seed is missing components expected by preseed assertion: %s", strutil.Quoted(missing))
+	}
+
+	return nil
+}
+
 // ApplyPreseededData applies the preseed payload from the given seed, including
 // installing snaps, to the given target system filesystem.
 func ApplyPreseededData(preseedSeed seed.PreseedCapable, writableDir string) error {
@@ -491,18 +1101,11 @@ func ApplyPreseededData(preseedSeed seed.PreseedCapable, writableDir string) err
 	}
 
 	checkSnap := func(ssnap *seed.Snap) error {
-		ps, ok := preseedSnaps[ssnap.SnapName()]
+		ps, ok := preseedSnaps[ssnap.SnapName().String()]
 		if !ok {
 			return fmt.Errorf("snap %q not present in the preseed assertion", ssnap.SnapName())
 		}
-		if ps.Revision != ssnap.SideInfo.Revision.N {
-			rev := snap.Revision{N: ps.Revision}
-			return fmt.Errorf("snap %q has wrong revision %s (expected: %s)", ssnap.SnapName(), ssnap.SideInfo.Revision, rev)
-		}
-		if ps.SnapID != ssnap.SideInfo.SnapID {
-			return fmt.Errorf("snap %q has wrong snap id %q (expected: %q)", ssnap.SnapName(), ssnap.SideInfo.SnapID, ps.SnapID)
-		}
-		return nil
+		return comparePreseedAndSeedSnaps(ssnap, ps)
 	}
 
 	esnaps := preseedSeed.EssentialSnaps()
@@ -534,24 +1137,22 @@ type preseedSnapHandler struct {
 	writableDir string
 }
 
-func (p *preseedSnapHandler) HandleUnassertedSnap(name, path string, _ timings.Measurer) (string, error) {
-	pinfo := snap.MinimalPlaceInfo(name, snap.Revision{N: -1})
-	targetPath := filepath.Join(p.writableDir, pinfo.MountFile())
-	mountDir := filepath.Join(p.writableDir, pinfo.MountDir())
+func (p *preseedSnapHandler) HandleUnassertedContainer(cpi snap.ContainerPlaceInfo, path string, _ timings.Measurer) (string, error) {
+	targetPath := filepath.Join(p.writableDir, cpi.MountFile())
+	mountDir := filepath.Join(p.writableDir, cpi.MountDir())
 
 	sq := squashfs.New(path)
 	opts := &snap.InstallOptions{MustNotCrossDevices: true}
 	if _, err := sq.Install(targetPath, mountDir, opts); err != nil {
-		return "", fmt.Errorf("cannot install snap %q: %v", name, err)
+		return "", fmt.Errorf("cannot install snap %q: %v", cpi.ContainerName(), err)
 	}
 
 	return targetPath, nil
 }
 
-func (p *preseedSnapHandler) HandleAndDigestAssertedSnap(name, path string, essType snap.Type, snapRev *asserts.SnapRevision, _ func(string, uint64) (snap.Revision, error), _ timings.Measurer) (string, string, uint64, error) {
-	pinfo := snap.MinimalPlaceInfo(name, snap.Revision{N: snapRev.SnapRevision()})
-	targetPath := filepath.Join(p.writableDir, pinfo.MountFile())
-	mountDir := filepath.Join(p.writableDir, pinfo.MountDir())
+func (p *preseedSnapHandler) HandleAndDigestAssertedContainer(cpi snap.ContainerPlaceInfo, path string, _ timings.Measurer) (string, string, uint64, error) {
+	targetPath := filepath.Join(p.writableDir, cpi.MountFile())
+	mountDir := filepath.Join(p.writableDir, cpi.MountDir())
 
 	logger.Debugf("copying: %q to %q; mount dir=%q", path, targetPath, mountDir)
 
@@ -582,7 +1183,7 @@ func (p *preseedSnapHandler) HandleAndDigestAssertedSnap(name, path string, essT
 		return "", "", 0, err
 	}
 	if err := destFile.Commit(); err != nil {
-		return "", "", 0, fmt.Errorf("cannot copy snap %q: %v", name, err)
+		return "", "", 0, fmt.Errorf("cannot copy snap %q: %v", cpi.ContainerName(), err)
 	}
 
 	sq := squashfs.New(targetPath)
@@ -590,7 +1191,7 @@ func (p *preseedSnapHandler) HandleAndDigestAssertedSnap(name, path string, essT
 	// since Install target path is the same as source path passed to squashfs.New,
 	// Install isn't going to copy the blob, but we call it to set up mount directory etc.
 	if _, err := sq.Install(targetPath, mountDir, opts); err != nil {
-		return "", "", 0, fmt.Errorf("cannot install snap %q: %v", name, err)
+		return "", "", 0, fmt.Errorf("cannot install snap %q: %v", cpi.ContainerName(), err)
 	}
 
 	sha3_384, err := asserts.EncodeDigest(crypto.SHA3_384, h.Sum(nil))
@@ -598,4 +1199,35 @@ func (p *preseedSnapHandler) HandleAndDigestAssertedSnap(name, path string, essT
 		return "", "", 0, fmt.Errorf("cannot encode snap %q digest: %v", path, err)
 	}
 	return targetPath, sha3_384, uint64(size), nil
+}
+
+// PreinstallInfo holds preinstall check information persisted during install.
+type PreinstallInfo struct {
+	AcceptedErrors []string
+}
+
+// LoadPreinstallInfo loads persisted preinstall check information.
+func LoadPreinstallInfo() (*PreinstallInfo, error) {
+	checkResultPath := device.PreinstallCheckResultUnder(boot.InstallHostFDESaveDir)
+	checkResult, err := secbootLoadCheckResult(checkResultPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// no preinstall info was saved.
+			return &PreinstallInfo{}, nil
+		}
+		return nil, err
+	}
+
+	return &PreinstallInfo{
+		AcceptedErrors: checkResult.AcceptedErrors(),
+	}, nil
+}
+
+// Requirements returns the encryption support requirements implied by the accepted errors.
+func (info *PreinstallInfo) Requirements() []EncryptionSupportRequirement {
+	acceptedErrors := make(map[string]bool, len(info.AcceptedErrors))
+	for _, err := range info.AcceptedErrors {
+		acceptedErrors[err] = true
+	}
+	return encryptionSupportRequirements(acceptedErrors)
 }

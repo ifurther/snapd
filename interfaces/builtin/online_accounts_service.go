@@ -112,14 +112,14 @@ func (iface *onlineAccountsServiceInterface) StaticInfo() interfaces.StaticInfo 
 
 func (iface *onlineAccountsServiceInterface) AppArmorConnectedPlug(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	old := "###SLOT_SECURITY_TAGS###"
-	new := spec.SnapAppSet().SlotLabelExpression(slot)
+	new := slot.LabelExpression()
 	spec.AddSnippet(strings.Replace(onlineAccountsServiceConnectedPlugAppArmor, old, new, -1))
 	return nil
 }
 
 func (iface *onlineAccountsServiceInterface) AppArmorConnectedSlot(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
 	old := "###PLUG_SECURITY_TAGS###"
-	new := spec.SnapAppSet().PlugLabelExpression(plug)
+	new := plug.LabelExpression()
 	spec.AddSnippet(strings.Replace(onlineAccountsServiceConnectedSlotAppArmor, old, new, -1))
 	return nil
 }
@@ -136,6 +136,13 @@ func (iface *onlineAccountsServiceInterface) SecCompPermanentSlot(spec *seccomp.
 
 func (iface *onlineAccountsServiceInterface) AutoConnect(plug *snap.PlugInfo, slot *snap.SlotInfo) bool {
 	return true
+}
+
+func (iface *onlineAccountsServiceInterface) ParallelInstancesSupportedForSlot(_ *snap.SlotInfo) error {
+	// the online accounts service owns the well-known bus name
+	// com.ubuntu.OnlineAccounts.Manager on the session bus; only one snap
+	// instance can hold it at a time.
+	return errParallelInstancesUniqueResourceOwner
 }
 
 func init() {

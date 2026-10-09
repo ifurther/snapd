@@ -62,6 +62,45 @@ dbus send
      member="Resolve{Address,Hostname,Record,Service}"
      peer=(name="org.freedesktop.resolve1"),
 
+# systemd-networkd
+#
+# Allow access to listen for link property changes from systemd-networkd via the D-Bus API:
+#
+#   https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.network1.html
+#
+# This can be used to run things like networkd-dispatcher, or similar, inside a snap
+#
+#include <abstractions/dbus-strict>
+dbus receive
+     bus=system
+     path=/org/freedesktop/network1
+     interface=org.freedesktop.DBus.Properties
+     member=PropertiesChanged
+     peer=(label=unconfined),
+
+dbus receive
+     bus=system
+     path=/org/freedesktop/network1/link/_*
+     interface=org.freedesktop.DBus.Properties
+     member=PropertiesChanged
+     peer=(label=unconfined),
+
+# Allow reading systemd-networkd link properties explicitly if an app needs to query state on-demand
+dbus send
+     bus=system
+     path=/org/freedesktop/network1/link/_*
+     interface=org.freedesktop.DBus.Properties
+     member=Get{,All}
+     peer=(name=org.freedesktop.network1, label=unconfined),
+
+# Allow access to read only systemd-networkd Manager objects
+dbus send
+     bus=system
+     path=/org/freedesktop/network1
+     interface=org.freedesktop.network1.Manager
+     member={ListLinks,GetLinkByName,DescribeLink,Describe}
+     peer=(name=org.freedesktop.network1, label=unconfined),
+
 #include <abstractions/ssl_certs>
 
 # see loaded kernel modules
@@ -152,12 +191,13 @@ socket AF_NETLINK - NETLINK_KOBJECT_UEVENT
 
 func init() {
 	registerIface(&commonInterface{
-		name:                  "network-observe",
-		summary:               networkObserveSummary,
-		implicitOnCore:        true,
-		implicitOnClassic:     true,
-		baseDeclarationSlots:  networkObserveBaseDeclarationSlots,
-		connectedPlugAppArmor: networkObserveConnectedPlugAppArmor,
-		connectedPlugSecComp:  networkObserveConnectedPlugSecComp,
+		name:                     "network-observe",
+		summary:                  networkObserveSummary,
+		implicitOnCore:           true,
+		implicitOnClassic:        true,
+		baseDeclarationSlots:     networkObserveBaseDeclarationSlots,
+		connectedPlugAppArmor:    networkObserveConnectedPlugAppArmor,
+		connectedPlugSecComp:     networkObserveConnectedPlugSecComp,
+		parallelInstancesSlotErr: errParallelInstancesSystemSlot,
 	})
 }

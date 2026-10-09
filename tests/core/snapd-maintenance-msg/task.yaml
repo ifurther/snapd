@@ -7,22 +7,20 @@ details: |
 systems: [ubuntu-core-20-64]
 
 prepare: |
-    # devmode as the snap does not have snapd-control
-    snap install test-snapd-curl --devmode --edge
-    snap install jq
-
     # make sure that the snapd daemon gives us time for comms before
     # closing the socket
     echo "SNAPD_SHUTDOWN_DELAY=1" >> /etc/environment
     systemctl restart snapd
 
 restore: |
-    snap remove test-snapd-curl jq
-
     # remove SNAPD_SHUTDOWN_DELAY from /etc/environment again
     #shellcheck disable=SC2005
     echo "$(grep -v 'SNAPD_SHUTDOWN_DELAY=1' /etc/environment)" > /etc/environment
     systemctl restart snapd
+
+debug: |
+    snap info snapd || true
+    snap info core20 || true
 
 execute: |
     if [ "$SPREAD_REBOOT" = 0 ]; then
@@ -33,15 +31,40 @@ execute: |
         # closed so we need to catch it in that timeframe.
         echo "Testing maintenance message for daemon restarts"
         snap install --dangerous "$SNAPD_SNAP" &
-        retry -n 20 --wait 0.5 sh -c 'test-snapd-curl.curl -sS --unix-socket /run/snapd.socket http://localhost/v2/changes?select=all | jq ".maintenance" | MATCH "daemon is restarting"'
+        retry -n 20 --wait 0.5 sh -c 'snap debug api '/v2/changes?select=all' | gojq ".maintenance" | MATCH "daemon is restarting"'
         wait
 
         echo "Restoring the snapd snap"
         snap revert snapd
 
+        # Refresh core20 to a different revision so the change requests a reboot.
+        # Installed rev via readlink (same pattern as snapd above). Pick first
+        # store risk (stable -> candidate -> beta -> edge) whose revision
+        # differs from installed. If none differ, skip reboot maintenance check.
+        installed_revision=$(readlink /snap/core20/current)
+        if [ -z "$installed_revision" ]; then
+            echo "cannot resolve installed core20 revision"
+            exit 1
+        fi
+
+        refresh_channel=
+        for risk in stable candidate beta edge; do
+            # snap info channel lines: <channel>: <version> <date> (<revision>) ...
+            revision=$(snap info core20 | awk -v risk="$risk" '
+                $1 == risk":" || $1 == "latest/"risk":" { print $4; exit }
+            ' | sed -e 's/[()]//g')
+            if [ -n "$revision" ] && [ "$revision" != "$installed_revision" ]; then
+                refresh_channel="$risk"
+                break
+            fi
+        done
+        if [ -z "$refresh_channel" ]; then
+            exit 0
+        fi
+
         echo "Testing maintenance message for system reboots"
-        snap refresh core20 --channel=stable --amend &
-        retry -n 20 --wait 0.5 sh -c 'test-snapd-curl.curl -sS --unix-socket /run/snapd.socket http://localhost/v2/changes?select=all | jq ".maintenance" | MATCH "system is restarting"'
+        snap refresh core20 --channel="$refresh_channel" --amend &
+        retry -n 20 --wait 0.5 sh -c 'snap debug api '/v2/changes?select=all' | gojq ".maintenance" | MATCH "system is restarting"'
         wait
 
         REBOOT

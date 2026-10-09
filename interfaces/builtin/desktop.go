@@ -21,6 +21,7 @@ package builtin
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/snapcore/snapd/dirs"
@@ -39,9 +40,6 @@ const desktopSummary = `allows access to basic graphical desktop resources`
 // intended to prevent app snaps from the store that provide this slot
 // from installing without an override, while allowing an unpublished
 // snap to still be installed.
-//
-// The deny-connection and deny-auto-connection rules should ideally
-// use a slot-snap-type constraint when that is supported.
 const desktopBaseDeclarationSlots = `
   desktop:
     allow-installation:
@@ -51,6 +49,16 @@ const desktopBaseDeclarationSlots = `
     deny-installation:
       slot-snap-type:
         - app
+`
+
+// The deny-auto-connection and deny-connection constructs must be placed
+// under plug base declaration because it takes precedence over slot base
+// declaration.
+const desktopBaseDeclarationPlugs = `
+  desktop:
+    allow-installation:
+      plug-attributes:
+        desktop-file-ids: $MISSING
     deny-auto-connection:
       slot-snap-type:
         - app
@@ -90,6 +98,9 @@ owner /run/user/[0-9]*/doc/{,*/} r,
 # the user guided the access and can specify anything DAC allows.
 /run/user/[0-9]*/doc/*/** rw,
 
+# Permission for Wine to execute files that were accessed via the Document Portal.
+/run/user/[0-9]*/doc/*/** ix,
+
 # Allow access to xdg-desktop-portal and xdg-document-portal
 dbus (receive, send)
     bus=session
@@ -100,6 +111,12 @@ dbus (receive, send)
 dbus (receive, send)
     bus=session
     interface=org.freedesktop.DBus.Properties
+    path=/org/freedesktop/portal/{desktop,documents}{,/**}
+    peer=(label=unconfined),
+
+dbus (receive, send)
+    bus=session
+    interface=org.freedesktop.DBus.Introspectable
     path=/org/freedesktop/portal/{desktop,documents}{,/**}
     peer=(label=unconfined),
 
@@ -136,15 +153,136 @@ dbus (send)
     interface="org.gnome.Mutter.IdleMonitor"
     member="GetIdletime"
     peer=(label=###SLOT_SECURITY_TAGS###),
+
+# Allow for color managed applications to communicate with colord
+dbus (receive, send)
+  bus=system
+  interface=org.freedesktop.ColorManager
+  path=/org/freedesktop/ColorManager
+  member=FindDeviceByProperty
+  peer=(label=unconfined),
+dbus (send)
+  bus=system
+  interface=org.freedesktop.DBus.Properties
+  path=/org/freedesktop/ColorManager
+  member="Get{,All}"
+  peer=(label=unconfined),
+dbus (send)
+  bus=system
+  interface=org.freedesktop.DBus.Properties
+  path="/org/freedesktop/ColorManager/{devices,profiles}/*"
+  member="Get{,All}"
+  peer=(label=unconfined),
+
+# Allow access to the ICC profiles in the home directory to
+# be referred to from colord
+owner @{HOME}/.local/share/icc r,
+
+
+# Allow to send updates to the desktop session about ongoing jobs
+# (for progress display in the task list)
+dbus (send)
+    bus=session
+    interface=com.canonical.Unity.LauncherEntry
+    member=Update
+    peer=(label=###SLOT_SECURITY_TAGS###),
+
+# Allow to send updates to the desktop session about ongoing jobs
+# (for KDE Plasma specific details)
+dbus (send)
+    bus=session
+    interface=org.kde.JobViewServer{,V2}
+    path=/JobViewServer
+    member=requestView
+    peer=(label=###SLOT_SECURITY_TAGS###),
+dbus (send)
+    bus=session
+    interface=org.kde.JobView{,V2,V3}
+    path=/org/kde/notificationmanager/jobs/*
+    member={update,terminate}
+    peer=(label=###SLOT_SECURITY_TAGS###),
+
+# Allow to display Status Notifier Items in the KDE Plasma systray
+# (including supporting context menu)
+dbus (send)
+    bus=session
+    path=/org/freedesktop/DBus
+    interface=org.freedesktop.DBus
+    member="{Request,Release}Name"
+    peer=(name=org.freedesktop.DBus, label=unconfined),
+dbus (bind)
+    bus=session
+    name=org.freedesktop.StatusNotifierItem-[0-9]*-[0-9]*,
+dbus (send)
+    bus=session
+    interface=org.kde.StatusNotifierWatcher
+    path=/StatusNotifierWatcher
+    member=RegisterStatusNotifierItem
+    peer=(label=###SLOT_SECURITY_TAGS###),
+dbus (send)
+    bus=session
+    interface=org.freedesktop.DBus.Properties
+    path=/StatusNotifierWatcher
+    member=Get
+    peer=(label=###SLOT_SECURITY_TAGS###),
+dbus (receive)
+    bus=session
+    interface=org.kde.StatusNotifierItem
+    path=/{StatusNotifierItem{,/[0-9]*},org/chromium/StatusNotifierItem/[0-9]*}
+    member={ProvideXdgActivationToken,Activate,ContextMenu,Scroll,SecondaryActivate}
+    peer=(label=###SLOT_SECURITY_TAGS###),
+dbus (receive)
+    bus=session
+    interface=org.freedesktop.StatusNotifierItem
+    path=/{StatusNotifierItem{,/[0-9]*},org/chromium/StatusNotifierItem/[0-9]*}
+    member={Activate,ContextMenu,Scroll,SecondaryActivate}
+    peer=(label=###SLOT_SECURITY_TAGS###),
+dbus (receive)
+    bus=session
+    interface=org.freedesktop.DBus.Properties
+    path=/{StatusNotifierItem{,/[0-9]*},org/chromium/StatusNotifierItem/[0-9]*}
+    member="Get{,All}"
+    peer=(label=###SLOT_SECURITY_TAGS###),
+dbus (send)
+    bus=session
+    interface={org.kde.StatusNotifierItem,org.freedesktop.StatusNotifierItem}
+    path=/{StatusNotifierItem{,/[0-9]*},org/chromium/StatusNotifierItem/[0-9]*}
+    member="New{Icon,IconThemePath,ToolTip}"
+    peer=(label=###SLOT_SECURITY_TAGS###),
+dbus (send)
+    bus=session
+    interface=org.freedesktop.DBus.Properties
+    path=/{StatusNotifierItem{,/[0-9]*},org/chromium/StatusNotifierItem/[0-9]*}
+    member=PropertiesChanged
+    peer=(label=###SLOT_SECURITY_TAGS###),
+dbus (receive)
+    bus=session
+    interface=com.canonical.dbusmenu
+    path=/{MenuBar,org/chromium/DbusMenu{,/[0-9]*}}
+    member={AboutToShow,GetLayout,Event}
+    peer=(label=###SLOT_SECURITY_TAGS###),
 `
 
 const desktopConnectedPlugAppArmorClassic = `
 # subset of gnome abstraction
 /etc/gtk-3.0/settings.ini r,
 owner @{HOME}/.config/gtk-3.0/settings.ini r,
-owner @{HOME}/.config/gtk-3.0/*.css r,
+owner @{HOME}/.config/gtk-3.0/{*.css,**/*.css} r,
+owner @{HOME}/.config/gtk-4.0/settings.ini r,
+owner @{HOME}/.config/gtk-4.0/{*.css,**/*.css} r,
 # Note: this leaks directory names that wouldn't otherwise be known to the snap
 owner @{HOME}/.config/gtk-3.0/bookmarks r,
+owner @{HOME}/.config/gtk-4.0/bookmarks r,
+
+# kde theming support
+owner @{HOME}/.config/kdeglobals r,
+
+# lxqt theming support
+# Note: Subfolders are ignored to avoid providing access to files that involve more than just simple LXQt configurations.
+owner @{HOME}/.config/lxqt/*.conf r,
+
+# kvantum theming support
+owner @{HOME}/.config/Kvantum/** r,
 
 /usr/share/icons/                          r,
 /usr/share/icons/**                        r,
@@ -352,6 +490,82 @@ dbus (send, receive)
       peer=(label=unconfined),
 `
 
+const desktopConnectedSlotAppArmor = `
+# Allow to receive updates from applications to the desktop session about ongoing jobs
+# (for progress display in the task list)
+dbus (receive)
+    bus=session
+    interface=com.canonical.Unity.LauncherEntry
+    member=Update
+    peer=(label=###PLUG_SECURITY_TAGS###),
+
+# Allow to receive updates from applications to the desktop session about ongoing jobs
+# (for KDE Plasma specific details)
+dbus (receive)
+    bus=session
+    interface=org.kde.JobViewServer{,V2}
+    path=/JobViewServer
+    member=requestView
+    peer=(label=###PLUG_SECURITY_TAGS###),
+dbus (receive)
+    bus=session
+    interface=org.kde.JobView{,V2,V3}
+    path=/org/kde/notificationmanager/jobs/*
+    member={update,terminate}
+    peer=(label=###PLUG_SECURITY_TAGS###),
+
+# Allow to display Status Notifier Items in the KDE Plasma systray
+# (including supporting context menu)
+dbus (receive)
+    bus=session
+    interface=org.kde.StatusNotifierWatcher
+    path=/StatusNotifierWatcher
+    member=RegisterStatusNotifierItem
+    peer=(label=###PLUG_SECURITY_TAGS###),
+dbus (receive)
+    bus=session
+    interface=org.freedesktop.DBus.Properties
+    path=/StatusNotifierWatcher
+    member=Get
+    peer=(label=###PLUG_SECURITY_TAGS###),
+dbus (send)
+    bus=session
+    interface=org.kde.StatusNotifierItem
+    path=/{StatusNotifierItem{,/[0-9]*},org/chromium/StatusNotifierItem/[0-9]*}
+    member={ProvideXdgActivationToken,Activate,ContextMenu,Scroll,SecondaryActivate}
+    peer=(label=###PLUG_SECURITY_TAGS###),
+dbus (send)
+    bus=session
+    interface=org.freedesktop.StatusNotifierItem
+    path=/{StatusNotifierItem{,/[0-9]*},org/chromium/StatusNotifierItem/[0-9]*}
+    member={Activate,ContextMenu,Scroll,SecondaryActivate}
+    peer=(label=###PLUG_SECURITY_TAGS###),
+dbus (send)
+    bus=session
+    interface=org.freedesktop.DBus.Properties
+    path=/{StatusNotifierItem{,/[0-9]*},org/chromium/StatusNotifierItem/[0-9]*}
+    member="Get{,All}"
+    peer=(label=###PLUG_SECURITY_TAGS###),
+dbus (receive)
+    bus=session
+    interface={org.kde.StatusNotifierItem,org.freedesktop.StatusNotifierItem}
+    path=/{StatusNotifierItem{,/[0-9]*},org/chromium/StatusNotifierItem/[0-9]*}
+    member="New{Icon,IconThemePath,ToolTip}"
+    peer=(label=###PLUG_SECURITY_TAGS###),
+dbus (receive)
+    bus=session
+    interface=org.freedesktop.DBus.Properties
+    path=/{StatusNotifierItem{,/[0-9]*},org/chromium/StatusNotifierItem/[0-9]*}
+    member=PropertiesChanged
+    peer=(label=###PLUG_SECURITY_TAGS###),
+dbus (send)
+    bus=session
+    interface=com.canonical.dbusmenu
+    path=/{MenuBar,org/chromium/DbusMenu{,/[0-9]*}}
+    member={AboutToShow,GetLayout,Event}
+    peer=(label=###PLUG_SECURITY_TAGS###),
+`
+
 const desktopPermanentSlotAppArmor = `
 # Description: Can provide various desktop services
 
@@ -439,11 +653,21 @@ dbus (receive, send)
     interface=org.freedesktop.DBus.Properties
     peer=(label=unconfined),
 
-# Allow access to the regular xdg-desktop-portal APIs
-dbus (send)
+# Allow access to the regular xdg-desktop-portal and xdg-document-portal APIs
+dbus (receive, send)
     bus=session
     interface=org.freedesktop.portal.*
-    path=/org/freedesktop/portal/desktop{,/**}
+    path=/org/freedesktop/portal/{desktop,documents}{,/**}
+    peer=(label=unconfined),
+dbus (receive, send)
+    bus=session
+    interface=org.freedesktop.DBus.Properties
+    path=/org/freedesktop/portal/{desktop,documents}{,/**}
+    peer=(label=unconfined),
+dbus (receive, send)
+    bus=session
+    interface=org.freedesktop.DBus.Introspectable
+    path=/org/freedesktop/portal/{desktop,documents}{,/**}
     peer=(label=unconfined),
 
 # Allow access to various paths gnome-session and gnome-shell need.
@@ -456,6 +680,51 @@ dbus (send)
 /etc/xdg/user-dirs.conf r,
 /etc/xdg/user-dirs.defaults r,
 /run/udev/tags/seat{,/**} r,
+
+# KDE Plasma specific extension
+
+# Used by the KCrash handler
+@{PROC}/sys/kernel/core_pattern r,
+
+# So that KSplash disappears when appropriate
+dbus (receive, send)
+    bus=session
+    path=/KSplash
+    interface=org.kde.KSplash
+    member=setStage
+    peer=(label=unconfined),
+dbus (receive, send)
+    bus=session
+    path=/KSplash
+    interface=org.freedesktop.DBus.Introspectable
+    member=Introspect
+    peer=(label=unconfined),
+
+dbus (receive, send)
+    bus=session
+    path=/KSMServer
+    interface=org.kde.KSMServerInterface
+    member=restoreSession
+    peer=(label=unconfined),
+dbus (receive, send)
+    bus=session
+    path=/KSMServer
+    interface=org.freedesktop.DBus.Introspectable
+    member=Introspect
+    peer=(label=unconfined),
+
+dbus (receive, send)
+    bus=session
+    path=/kcminit
+    interface=org.kde.KCMInit
+    member=runPhase1
+    peer=(label=unconfined),
+dbus (receive, send)
+    bus=session
+    path=/kcminit
+    interface=org.freedesktop.DBus.Introspectable
+    member=Introspect
+    peer=(label=unconfined),
 `
 
 type desktopInterface struct {
@@ -500,7 +769,7 @@ func (iface *desktopInterface) AppArmorConnectedPlug(spec *apparmor.Specificatio
 		// provided by the OS snap and so will run unconfined
 		new = "unconfined"
 	} else {
-		new = spec.SnapAppSet().SlotLabelExpression(slot)
+		new = slot.LabelExpression()
 	}
 	snippet := strings.Replace(desktopConnectedPlugAppArmor, old, new, -1)
 	spec.AddSnippet(snippet)
@@ -536,7 +805,7 @@ func (iface *desktopInterface) AppArmorConnectedPlug(spec *apparmor.Specificatio
 }
 
 func (iface *desktopInterface) MountConnectedPlug(spec *mount.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
-	appId := "snap." + plug.Snap().InstanceName()
+	appId := "snap." + plug.Snap().InstanceName().String()
 	spec.AddUserMountEntry(osutil.MountEntry{
 		Name:    "$XDG_RUNTIME_DIR/doc/by-app/" + appId,
 		Dir:     "$XDG_RUNTIME_DIR/doc",
@@ -585,9 +854,62 @@ func (iface *desktopInterface) AppArmorPermanentSlot(spec *apparmor.Specificatio
 	return nil
 }
 
+func (iface *desktopInterface) AppArmorConnectedSlot(spec *apparmor.Specification, plug *interfaces.ConnectedPlug, slot *interfaces.ConnectedSlot) error {
+	// Only apply slot snippet when running as application snap
+	// on classic, slot side can be system or application
+	if !implicitSystemConnectedSlot(slot) {
+		old := "###PLUG_SECURITY_TAGS###"
+		new := plug.LabelExpression()
+		spec.AddSnippet(strings.Replace(desktopConnectedSlotAppArmor, old, new, -1))
+	}
+	return nil
+}
+
+// https://specifications.freedesktop.org/desktop-entry-spec/latest/file-naming.html
+// Desktop file id must be a valid D-Bus name:
+//   - A sequence of non-empty elements separated by dots
+//   - None of which starts with a digit
+//   - Each of which contains only characters from the set [A-Za-z0-9-_]
+//
+// XXX: dashes "-" are not recommended but supported, should they be removed?
+// https://dbus.freedesktop.org/doc/dbus-specification.html#message-protocol-names
+var desktopFileIDRegexp = regexp.MustCompile(`^([A-Za-z_-][\w-]*)(\.[A-Za-z_-][\w-]*)*$`)
+
+func (iface *desktopInterface) validateDesktopFileIDs(attribs interfaces.Attrer) error {
+	attrVal, exists := attribs.Lookup("desktop-file-ids")
+	if !exists {
+		// desktop-file-ids attribute is optional
+		return nil
+	}
+
+	// desktop-file-ids must be a list of strings.
+	desktopFileIDs, ok := attrVal.([]any)
+	if !ok {
+		return fmt.Errorf(`cannot add %s plug: "desktop-file-ids" must be a list of strings`, iface.name)
+	}
+	for _, entry := range desktopFileIDs {
+		desktopFileID, ok := entry.(string)
+		if !ok {
+			return fmt.Errorf(`cannot add %s plug: "desktop-file-ids" must be a list of strings`, iface.name)
+		}
+		if !desktopFileIDRegexp.MatchString(desktopFileID) {
+			return fmt.Errorf("desktop-file-ids entry %q is not a valid D-Bus well-known name", desktopFileID)
+		}
+	}
+
+	return nil
+}
+
 func (iface *desktopInterface) BeforePreparePlug(plug *snap.PlugInfo) error {
-	_, err := iface.shouldMountHostFontCache(plug)
-	return err
+	if _, err := iface.shouldMountHostFontCache(plug); err != nil {
+		return err
+	}
+
+	if err := iface.validateDesktopFileIDs(plug); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func init() {
@@ -597,8 +919,12 @@ func init() {
 			summary:              desktopSummary,
 			implicitOnClassic:    true,
 			baseDeclarationSlots: desktopBaseDeclarationSlots,
+			baseDeclarationPlugs: desktopBaseDeclarationPlugs,
 			// affects the plug snap because of mount backend
 			affectsPlugOnRefresh: true,
+			// desktop slot owns the well-known bus names (org.gtk.Settings, etc.) on the
+			// session bus; only one snap instance can hold it at a time.
+			parallelInstancesSlotErr: errParallelInstancesUniqueResourceOwner,
 		},
 	})
 }

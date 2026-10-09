@@ -22,6 +22,7 @@ package squashfs
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -53,6 +54,14 @@ var (
 
 	// for testing
 	isRootWritableOverlay = osutil.IsRootWritableOverlay
+
+	// Limit unsquashfs memory usage
+	// On low-memory devices unsquashfs can otherwise fail with "Requested memory size too large".
+	// TODO: leverage mem-percent parameter in latest version of unsquashfs
+	baseUnsquashfsOptions = []string{
+		"-data-queue", "16", // 16MB
+		"-frag-queue", "16", // 16MB
+	}
 )
 
 func FileHasSquashfsHeader(path string) bool {
@@ -89,6 +98,79 @@ func New(snapPath string) *Snap {
 var osLink = os.Link
 var snapdtoolCommandFromSystemSnap = snapdtool.CommandFromSystemSnap
 
+type linkFunc = func(string, string) error
+
+var errLinkError = errors.New("linking error")
+
+func tryLinkWithIntegrityData(link linkFunc, snapPath, targetPath string, opts *snap.InstallOptions) (retErr error) {
+	if err := link(snapPath, targetPath); err != nil {
+		// Specifically when link(2) is used, it returns EPERM on filesystems that don't
+		// support hard links (like vfat), so checking the error here doesn't
+		// make sense vs just trying to copy it.
+		//
+		// we use a specific error type here to allow the calling code to detect
+		// generic linking errors and ignore them to allow the code to fall-through
+		// and use a different linking or copying method.
+		return errLinkError
+	}
+
+	defer func() {
+		if retErr != nil {
+			// unlink the snap if something below failed
+			if err := os.Remove(targetPath); err != nil {
+				logger.Noticef("cannot remove %q: %v", targetPath, err)
+			}
+		}
+	}()
+
+	if opts != nil && opts.IntegrityDataParams != nil {
+		srcIntegrityFile, err := opts.IntegrityDataParams.IntegrityFile(snapPath)
+		if err != nil {
+			return err
+		}
+		destIntegrityFile, err := opts.IntegrityDataParams.IntegrityFile(targetPath)
+		if err != nil {
+			return err
+		}
+		if err := link(srcIntegrityFile, destIntegrityFile); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func tryCopyWithIntegrityData(snapPath, targetPath string, opts *snap.InstallOptions) (retErr error) {
+	if err := osutil.CopyFile(snapPath, targetPath, osutil.CopyFlagPreserveAll|osutil.CopyFlagSync); err != nil {
+		return err
+	}
+
+	defer func() {
+		if retErr != nil {
+			// remove the copy of the snap if something below failed
+			if err := os.Remove(targetPath); err != nil {
+				logger.Noticef("cannot remove %q: %v", targetPath, err)
+			}
+		}
+	}()
+
+	if opts != nil && opts.IntegrityDataParams != nil {
+		srcIntegrityFile, err := opts.IntegrityDataParams.IntegrityFile(snapPath)
+		if err != nil {
+			return err
+		}
+		destIntegrityFile, err := opts.IntegrityDataParams.IntegrityFile(targetPath)
+		if err != nil {
+			return err
+		}
+		if err := osutil.CopyFile(srcIntegrityFile, destIntegrityFile, osutil.CopyFlagPreserveAll|osutil.CopyFlagSync); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // Install installs a squashfs snap file through an appropriate method.
 func (s *Snap) Install(targetPath, mountDir string, opts *snap.InstallOptions) (bool, error) {
 
@@ -121,18 +203,19 @@ func (s *Snap) Install(targetPath, mountDir string, opts *snap.InstallOptions) (
 		logger.Noticef("cannot detect root filesystem on overlay: %v", err)
 	}
 	// Hard-linking on overlayfs is identical to a full blown
-	// copy.  When we are operating on a overlayfs based system (e.g. live
+	// copy. When we are operating on a overlayfs based system (e.g. live
 	// installer) use symbolic links.
 	// https://bugs.launchpad.net/snapd/+bug/1867415
 	if overlayRoot == "" {
 		// try to (hard)link the file, but go on to trying to copy it
 		// if it fails for whatever reason
-		//
-		// link(2) returns EPERM on filesystems that don't support
-		// hard links (like vfat), so checking the error here doesn't
-		// make sense vs just trying to copy it.
-		if err := osLink(s.path, targetPath); err == nil {
+		err := tryLinkWithIntegrityData(osLink, s.path, targetPath, opts)
+		if err == nil {
+			// Success, no need to do the copy
 			return false, nil
+		}
+		if !errors.Is(err, errLinkError) {
+			return false, err
 		}
 	}
 
@@ -147,13 +230,18 @@ func (s *Snap) Install(targetPath, mountDir string, opts *snap.InstallOptions) (
 		// so we need to check if it has the prefix of the seed dir
 		cleanSrc := filepath.Clean(s.path)
 		if strings.HasPrefix(cleanSrc, dirs.SnapSeedDir) {
-			if os.Symlink(s.path, targetPath) == nil {
+			err := tryLinkWithIntegrityData(os.Symlink, s.path, targetPath, opts)
+			if err == nil {
+				// Success, no need to do the copy
 				return false, nil
+			}
+			if !errors.Is(err, errLinkError) {
+				return false, err
 			}
 		}
 	}
 
-	return false, osutil.CopyFile(s.path, targetPath, osutil.CopyFlagPreserveAll|osutil.CopyFlagSync)
+	return false, tryCopyWithIntegrityData(s.path, targetPath, opts)
 }
 
 // unsquashfsStderrWriter is a helper that captures errors from
@@ -198,11 +286,28 @@ func (u *unsquashfsStderrWriter) Err() error {
 	}
 }
 
+// Helper to call unsquashfs, appending the default option to limit memory consumption
+func unsquashfsCmd(extraArgs ...string) *exec.Cmd {
+	args := append(baseUnsquashfsOptions, extraArgs...)
+	return exec.Command("unsquashfs", args...)
+}
+
+// Unpack unpacks the snap to the given directory.
+//
+// Extended attributes are not preserved. This affects capabilities granted to specific executables.
 func (s *Snap) Unpack(src, dstDir string) error {
 	usw := newUnsquashfsStderrWriter()
 
 	var output bytes.Buffer
-	cmd := exec.Command("unsquashfs", "-n", "-f", "-d", dstDir, s.path, src)
+	extraArgs := []string{
+		"-no-xattrs",
+		"-no-progress",
+		"-force",
+		"-dest", dstDir,
+		s.path,
+		src,
+	}
+	cmd := unsquashfsCmd(extraArgs...)
 	cmd.Stderr = io.MultiWriter(&output, usw)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("cannot extract %q to %q: %v", src, dstDir, osutil.OutputErr(output.Bytes(), err))
@@ -234,7 +339,16 @@ func (s *Snap) withUnpackedFile(filePath string, f func(p string) error) error {
 	defer os.RemoveAll(tmpdir)
 
 	unpackDir := filepath.Join(tmpdir, "unpack")
-	if output, err := exec.Command("unsquashfs", "-n", "-i", "-d", unpackDir, s.path, filePath).CombinedOutput(); err != nil {
+	extraArgs := []string{
+		"-no-xattrs",
+		"-no-progress",
+		"-dest", unpackDir,
+		s.path,
+		filePath,
+	}
+
+	// TODO: use sqfscat
+	if output, err := unsquashfsCmd(extraArgs...).CombinedOutput(); err != nil {
 		return fmt.Errorf("cannot run unsquashfs: %v", osutil.OutputErr(output, err))
 	}
 
@@ -349,12 +463,18 @@ func (s *Snap) Walk(relative string, walkFn filepath.WalkFunc) error {
 		relative = relative[1:]
 	}
 
-	var cmd *exec.Cmd
-	if relative == "." {
-		cmd = exec.Command("unsquashfs", "-no-progress", "-dest", ".", "-ll", s.path)
-	} else {
-		cmd = exec.Command("unsquashfs", "-no-progress", "-dest", ".", "-ll", s.path, relative)
+	extraArgs := []string{
+		"-no-progress",
+		"-dest", ".",
+		"-lls",
+		s.path,
 	}
+	if relative != "." {
+		extraArgs = append(extraArgs, relative)
+	}
+
+	var cmd *exec.Cmd
+	cmd = unsquashfsCmd(extraArgs...)
 	cmd.Env = []string{"TZ=UTC"}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -418,8 +538,16 @@ func (s *Snap) Walk(relative string, walkFn filepath.WalkFunc) error {
 
 // ListDir returns the content of a single directory inside a squashfs snap.
 func (s *Snap) ListDir(dirPath string) ([]string, error) {
-	output, stderr, err := osutil.RunSplitOutput(
-		"unsquashfs", "-no-progress", "-dest", "_", "-l", s.path, dirPath)
+	args := append(
+		baseUnsquashfsOptions,
+		"-no-progress",
+		"-dest", "_",
+		"-ls",
+		s.path,
+		dirPath,
+	)
+	output, stderr, err := osutil.RunSplitOutput("unsquashfs", args...)
+
 	if err != nil {
 		return nil, osutil.OutputErrCombine(output, stderr, err)
 	}
@@ -470,9 +598,7 @@ func (e *errPathsNotReadable) Error() string {
 
 	b.WriteString("cannot access the following locations in the snap source directory:\n")
 	for _, p := range e.paths {
-		fmt.Fprintf(&b, "- ")
-		fmt.Fprintf(&b, p)
-		fmt.Fprintf(&b, "\n")
+		fmt.Fprintf(&b, "- %s\n", p)
 	}
 	if len(e.paths) == maxErrPaths {
 		fmt.Fprintf(&b, "- too many errors, listing first %v entries\n", maxErrPaths)
@@ -591,7 +717,11 @@ func (s *Snap) Build(sourceDir string, opts *BuildOpts) error {
 		}
 	}
 	snapType := opts.SnapType
-	if snapType != "os" && snapType != "core" && snapType != "base" {
+	switch snapType {
+	case "os", "core", "base", "snapd":
+		// -xattrs is default, but let's be explicit about it
+		cmd.Args = append(cmd.Args, "-xattrs")
+	default:
 		cmd.Args = append(cmd.Args, "-all-root", "-no-xattrs")
 	}
 
@@ -609,27 +739,12 @@ func (s *Snap) Build(sourceDir string, opts *BuildOpts) error {
 
 	// Grow the snap if it is smaller than the minimum snap size. See
 	// MinimumSnapSize for more details.
-	return s.growSnapToMinSize(MinimumSnapSize)
+	return growSnapToMinSize(s.path, MinimumSnapSize)
 }
 
 // BuildDate returns the "Creation or last append time" as reported by unsquashfs.
 func (s *Snap) BuildDate() time.Time {
 	return BuildDate(s.path)
-}
-
-func (s *Snap) growSnapToMinSize(minSize int64) error {
-	size, err := s.Size()
-	if err != nil {
-		return fmt.Errorf("cannot get size of snap: %w", err)
-	}
-	if size >= minSize {
-		return nil
-	}
-	if err := os.Truncate(s.path, minSize); err != nil {
-		return fmt.Errorf("cannot grow snap to minimum size: %w", err)
-	}
-
-	return nil
 }
 
 // BuildDate returns the "Creation or last append time" as reported by unsquashfs.
@@ -642,7 +757,13 @@ func BuildDate(path string) time.Time {
 		N:      1,
 	}
 
-	cmd := exec.Command("unsquashfs", "-n", "-s", path)
+	extraArgs := []string{
+		"-no-progress",
+		"-stat",
+		path,
+	}
+
+	cmd := unsquashfsCmd(extraArgs...)
 	cmd.Env = []string{"TZ=UTC"}
 	cmd.Stdout = m
 	cmd.Stderr = m

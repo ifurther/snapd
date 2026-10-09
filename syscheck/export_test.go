@@ -25,8 +25,14 @@ var (
 	CheckApparmorUsable = checkApparmorUsable
 	CheckWSL            = checkWSL
 	CheckCgroup         = checkCgroup
+	CheckSnapMountDir   = checkSnapMountDir
+	CheckLibExecDir     = checkLibExecDir
 
 	CheckFuse = firstCheckFuse
+
+	DefaultLibExecDirDistros = defaulLibExectDirDistros
+	AltLibExecDirDistros     = altLibExecDirDistros
+	BothLibExecDirDistros    = bothLibExecDirDistros
 )
 
 func Checks() []func() error {

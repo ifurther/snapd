@@ -68,7 +68,7 @@ const lxdSupportConnectedPlugSecComp = `
 @unrestricted
 `
 
-const lxdSupportServiceSnippet = `Delegate=true`
+const lxdSupportServiceSnippet = interfaces.PlugServicesServiceSectionSnippet(`Delegate=true`)
 
 type lxdSupportInterface struct {
 	commonInterface
@@ -121,13 +121,17 @@ func (iface *lxdSupportInterface) SecCompConnectedPlug(spec *seccomp.Specificati
 
 func init() {
 	registerIface(&lxdSupportInterface{commonInterface{
-		name:                    "lxd-support",
-		summary:                 lxdSupportSummary,
-		implicitOnCore:          true,
-		implicitOnClassic:       true,
-		appArmorUnconfinedPlugs: true,
-		baseDeclarationSlots:    lxdSupportBaseDeclarationSlots,
-		baseDeclarationPlugs:    lxdSupportBaseDeclarationPlugs,
-		serviceSnippets:         []string{lxdSupportServiceSnippet}},
+		name:                     "lxd-support",
+		summary:                  lxdSupportSummary,
+		implicitOnCore:           true,
+		implicitOnClassic:        true,
+		appArmorUnconfinedPlugs:  true,
+		controlsDeviceCgroup:     true,
+		baseDeclarationSlots:     lxdSupportBaseDeclarationSlots,
+		baseDeclarationPlugs:     lxdSupportBaseDeclarationPlugs,
+		serviceSnippets:          []interfaces.PlugServicesSnippet{lxdSupportServiceSnippet},
+		parallelInstancesPlugErr: errParallelInstancesSharedResources,
+		parallelInstancesSlotErr: errParallelInstancesSystemSlot,
+	},
 	})
 }

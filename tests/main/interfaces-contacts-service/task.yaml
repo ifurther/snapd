@@ -20,10 +20,8 @@ systems:
     - -arch-linux-*  # test-snapd-eds is incompatible with eds version shipped with the distro
     - -centos-*
     - -debian-*
-    - -fedora-38-*  # test-snapd-eds is incompatible with eds version shipped with the distro
-    - -fedora-39-*  # test-snapd-eds is incompatible with eds version shipped with the distro
-    - -opensuse-15.5-*  # test-snapd-eds is incompatible with eds version shipped with the distro
-    - -opensuse-tumbleweed-*  # test-snapd-eds is incompatible with eds version shipped with the distro
+    - -fedora-44-*  # test-snapd-eds is incompatible with eds version shipped with the distro
+    - -opensuse-*  # test-snapd-eds is incompatible with eds version shipped with the distro
     - -ubuntu-14.04-*  # no tests.session support, eds is too old
     - -ubuntu-2*  # test-snapd-eds is incompatible with eds shipped with the distro
     - -ubuntu-core-*  # EDS is unsupported on core systems
@@ -36,14 +34,7 @@ restore: |
     tests.session -u test restore
 
 execute: |
-    if ! snap install --edge test-snapd-eds ; then
-        if [ "$SPREAD_SYSTEM" = ubuntu-16.04-64 ]; then
-            echo "The test-snapd-eds must be available on ubuntu-16.04-64"
-            exit 1
-        fi
-        echo "SKIP: test-snapd-eds not available"
-        exit 0
-    fi
+    snap install --edge test-snapd-eds 
 
     echo "The interface is initially disconnected"
     snap interfaces -i contacts-service | MATCH -- '- +test-snapd-eds:contacts-service'

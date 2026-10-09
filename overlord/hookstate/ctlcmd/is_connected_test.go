@@ -135,21 +135,22 @@ var isConnectedTests = []struct {
 	exitCode: ctlcmd.ClassicSnapCode,
 }}
 
-func mockInstalledSnap(c *C, st *state.State, snapYaml, cohortKey string) {
+func mockInstalledSnap(c *C, st *state.State, snapYaml, cohortKey string) *snap.Info {
 	info := snaptest.MockSnapCurrent(c, snapYaml, &snap.SideInfo{Revision: snap.R(1)})
-	snapstate.Set(st, info.InstanceName(), &snapstate.SnapState{
+	snapstate.Set(st, info.InstanceName().String(), &snapstate.SnapState{
 		Active: true,
 		Sequence: snapstatetest.NewSequenceFromSnapSideInfos([]*snap.SideInfo{
 			{
-				RealName: info.SnapName(),
+				RealName: info.SnapName().String(),
 				Revision: info.Revision,
-				SnapID:   info.InstanceName() + "-id",
+				SnapID:   info.InstanceName().String() + "-id",
 			},
 		}),
 		Current:         info.Revision,
 		TrackingChannel: "stable",
 		CohortKey:       cohortKey,
 	})
+	return info
 }
 
 func (s *isConnectedSuite) testIsConnected(c *C, context *hookstate.Context) {
@@ -200,20 +201,20 @@ plugs:
 	})
 	defer restore()
 
-	s.st.Set("conns", map[string]interface{}{
-		"snap1:plug1 snap2:slot2": map[string]interface{}{},
-		"snap1:plug2 snap3:slot3": map[string]interface{}{"undesired": true},
-		"snap1:plug3 snap4:slot4": map[string]interface{}{"hotplug-gone": true},
-		"snap3:plug4 snap1:slot1": map[string]interface{}{},
-		"snap3:cc snap1:cc":       map[string]interface{}{},
-		"snap5:cc snap1:cc":       map[string]interface{}{},
+	s.st.Set("conns", map[string]any{
+		"snap1:plug1 snap2:slot2": map[string]any{},
+		"snap1:plug2 snap3:slot3": map[string]any{"undesired": true},
+		"snap1:plug3 snap4:slot4": map[string]any{"hotplug-gone": true},
+		"snap3:plug4 snap1:slot1": map[string]any{},
+		"snap3:cc snap1:cc":       map[string]any{},
+		"snap5:cc snap1:cc":       map[string]any{},
 	})
 
 	s.st.Unlock()
 	defer s.st.Lock()
 
 	for _, test := range isConnectedTests {
-		stdout, stderr, err := ctlcmd.Run(context, test.args, 0)
+		stdout, stderr, _, err := ctlcmd.Run(context, test.args, 0, nil)
 		comment := Commentf("%s", test.args)
 		if test.exitCode > 0 {
 			c.Check(err, DeepEquals, &ctlcmd.UnsuccessfulError{ExitCode: test.exitCode}, comment)
@@ -259,7 +260,7 @@ func (s *isConnectedSuite) TestIsConnectedFromApp(c *C) {
 }
 
 func (s *isConnectedSuite) TestNoContextError(c *C) {
-	stdout, stderr, err := ctlcmd.Run(nil, []string{"is-connected", "foo"}, 0)
+	stdout, stderr, _, err := ctlcmd.Run(nil, []string{"is-connected", "foo"}, 0, nil)
 	c.Check(err, ErrorMatches, `cannot invoke snapctl operation commands \(here "is-connected"\) from outside of a snap`)
 	c.Check(string(stdout), Equals, "")
 	c.Check(string(stderr), Equals, "")
@@ -273,8 +274,8 @@ plugs:
   plug1:
     interface: x11`, "")
 
-	s.st.Set("conns", map[string]interface{}{
-		"snap1:plug1 snap2:slot2": map[string]interface{}{},
+	s.st.Set("conns", map[string]any{
+		"snap1:plug1 snap2:slot2": map[string]any{},
 	})
 
 	setup := &hookstate.HookSetup{Snap: "snap1", Revision: snap.R(1)}
@@ -283,7 +284,7 @@ plugs:
 
 	mockContext, err := hookstate.NewContext(nil, s.st, setup, s.mockHandler, "")
 	c.Assert(err, IsNil)
-	stdout, stderr, err := ctlcmd.Run(mockContext, []string{"is-connected", "plug1"}, 1000)
+	stdout, stderr, _, err := ctlcmd.Run(mockContext, []string{"is-connected", "plug1"}, 1000, nil)
 	c.Check(err, IsNil)
 	c.Check(string(stdout), Equals, "")
 	c.Check(string(stderr), Equals, "")
@@ -334,18 +335,18 @@ slots:
     interface: x11
   slot3b:
     interface: x11`, "")
-	s.st.Set("conns", map[string]interface{}{
-		"snap1:plug1a snap2:slot2a": map[string]interface{}{},
-		"snap2:plug2a snap1:slot1a": map[string]interface{}{},
-		"snap3:plug3a snap1:slot1a": map[string]interface{}{},
-		"snap1:plug1c snap3:slot3a": map[string]interface{}{"undesired": true},
-		"snap1:plug1d snap3:slot3b": map[string]interface{}{"hotplug-gone": true},
+	s.st.Set("conns", map[string]any{
+		"snap1:plug1a snap2:slot2a": map[string]any{},
+		"snap2:plug2a snap1:slot1a": map[string]any{},
+		"snap3:plug3a snap1:slot1a": map[string]any{},
+		"snap1:plug1c snap3:slot3a": map[string]any{"undesired": true},
+		"snap1:plug1d snap3:slot3b": map[string]any{"hotplug-gone": true},
 	})
 
 	s.st.Unlock()
 	defer s.st.Lock()
 
-	stdout, stderr, err := ctlcmd.Run(mockContext, []string{"is-connected", "--list"}, 0)
+	stdout, stderr, _, err := ctlcmd.Run(mockContext, []string{"is-connected", "--list"}, 0, nil)
 	c.Check(err, IsNil)
 
 	c.Check(string(stdout), Equals, "plug1a\nslot1a\n")

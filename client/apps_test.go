@@ -22,13 +22,13 @@ package client_test
 import (
 	"encoding/json"
 	"fmt"
-	"os/user"
 	"strconv"
 	"strings"
 
 	"gopkg.in/check.v1"
 
 	"github.com/snapcore/snapd/client"
+	"github.com/snapcore/snapd/osutil/user"
 )
 
 func mksvc(snap, app string) *client.AppInfo {
@@ -78,6 +78,32 @@ func testClientAppsGlobal(cs *clientSuite, c *check.C) ([]*client.AppInfo, error
 }
 
 var appcheckers = []func(*clientSuite, *check.C) ([]*client.AppInfo, error){testClientApps, testClientAppsService, testClientAppsGlobal}
+
+func (cs *clientSuite) TestClientAppActivatorsMarshalJSON(c *check.C) {
+	appInfo := []*client.AppInfo{
+		{
+			Snap:    "hello-world",
+			Name:    "hello-world",
+			Daemon:  "simple",
+			Active:  true,
+			Enabled: true,
+			Activators: []client.AppActivator{
+				{
+					Name:    "test-activator",
+					Type:    "dbus",
+					Active:  false,
+					Enabled: true,
+				},
+			},
+		},
+	}
+
+	activatorString := `[{"snap":"hello-world","name":"hello-world","daemon":"simple","enabled":true,"active":true,"activators":[{"name":"test-activator","type":"dbus","active":false,"enabled":true,"Name":"test-activator","Type":"dbus","Active":false,"Enabled":true}]}]`
+
+	buf, err := json.Marshal(appInfo)
+	c.Assert(err, check.IsNil)
+	c.Check(activatorString, check.DeepEquals, string(buf))
+}
 
 func (cs *clientSuite) TestClientServiceGetHappy(c *check.C) {
 	expected := []*client.AppInfo{mksvc("foo", "foo"), mksvc("bar", "bar1")}
@@ -230,17 +256,17 @@ func (cs *clientSuite) TestClientLogsNotFound(c *check.C) {
 	c.Check(actual, check.HasLen, 0)
 }
 
-func (cs *clientSuite) checkCommonFields(c *check.C, reqOp map[string]interface{}, names []string, scope client.ScopeSelector, users client.UserSelector, comment check.CommentInterface) {
-	inames := make([]interface{}, len(names))
+func (cs *clientSuite) checkCommonFields(c *check.C, reqOp map[string]any, names []string, scope client.ScopeSelector, users client.UserSelector, comment check.CommentInterface) {
+	inames := make([]any, len(names))
 	for i, name := range names {
-		inames[i] = interface{}(name)
+		inames[i] = any(name)
 	}
 
 	c.Check(reqOp["names"], check.DeepEquals, inames, comment)
 	if len(scope) > 0 {
-		snames := make([]interface{}, len(scope))
+		snames := make([]any, len(scope))
 		for i, scope := range scope {
-			snames[i] = interface{}(scope)
+			snames[i] = any(scope)
 		}
 		c.Check(reqOp["scope"], check.DeepEquals, snames, comment)
 	} else {
@@ -253,9 +279,9 @@ func (cs *clientSuite) checkCommonFields(c *check.C, reqOp map[string]interface{
 		c.Check(reqOp["users"], check.Equals, `all`, comment)
 	case client.UserSelectionList:
 		if len(users.Names) > 0 {
-			unames := make([]interface{}, len(users.Names))
+			unames := make([]any, len(users.Names))
 			for i, u := range users.Names {
-				unames[i] = interface{}(u)
+				unames[i] = any(u)
 			}
 			c.Check(reqOp["users"], check.DeepEquals, unames, comment)
 		} else {
@@ -338,7 +364,7 @@ func (cs *clientSuite) TestClientServiceStart(c *check.C) {
 			c.Check(cs.req.Method, check.Equals, "POST", comment)
 			c.Check(cs.req.URL.Query(), check.HasLen, 0, comment)
 
-			var reqOp map[string]interface{}
+			var reqOp map[string]any
 			c.Assert(json.NewDecoder(cs.req.Body).Decode(&reqOp), check.IsNil, comment)
 			c.Check(reqOp["action"], check.Equals, "start", comment)
 			cs.checkCommonFields(c, reqOp, sc.names, sc.scope, sc.users, comment)
@@ -425,7 +451,7 @@ func (cs *clientSuite) TestClientServiceStop(c *check.C) {
 			c.Check(cs.req.Method, check.Equals, "POST", comment)
 			c.Check(cs.req.URL.Query(), check.HasLen, 0, comment)
 
-			var reqOp map[string]interface{}
+			var reqOp map[string]any
 			c.Assert(json.NewDecoder(cs.req.Body).Decode(&reqOp), check.IsNil, comment)
 			c.Check(reqOp["action"], check.Equals, "stop", comment)
 			cs.checkCommonFields(c, reqOp, sc.names, sc.scope, sc.users, comment)
@@ -512,7 +538,7 @@ func (cs *clientSuite) TestClientServiceRestart(c *check.C) {
 			c.Check(cs.req.Method, check.Equals, "POST", comment)
 			c.Check(cs.req.URL.Query(), check.HasLen, 0, comment)
 
-			var reqOp map[string]interface{}
+			var reqOp map[string]any
 			c.Assert(json.NewDecoder(cs.req.Body).Decode(&reqOp), check.IsNil, comment)
 			cs.checkCommonFields(c, reqOp, sc.names, sc.scope, sc.users, comment)
 			c.Check(reqOp["action"], check.Equals, "restart", comment)

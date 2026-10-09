@@ -31,14 +31,19 @@ import (
 	"github.com/snapcore/snapd/i18n"
 	"github.com/snapcore/snapd/interfaces"
 	"github.com/snapcore/snapd/interfaces/policy"
+	"github.com/snapcore/snapd/logger"
 	"github.com/snapcore/snapd/overlord/assertstate"
 	"github.com/snapcore/snapd/overlord/hookstate"
 	"github.com/snapcore/snapd/overlord/snapstate"
 	"github.com/snapcore/snapd/overlord/state"
+	"github.com/snapcore/snapd/overlord/swfeats"
 	"github.com/snapcore/snapd/snap"
+	"github.com/snapcore/snapd/snap/naming"
 )
 
 var connectRetryTimeout = time.Second * 5
+
+var regenerateSecurityProfilesChangeKind = swfeats.RegisterChangeKind("regenerate-security-profiles")
 
 // ErrAlreadyConnected describes the error that occurs when attempting to connect already connected interface.
 type ErrAlreadyConnected struct {
@@ -72,7 +77,7 @@ func findSymmetricAutoconnectTask(st *state.State, plugSnap, slotSnap string, in
 			}
 			otherSnap := snapsup.InstanceName()
 
-			if (otherSnap == plugSnap && installedSnap == slotSnap) || (otherSnap == slotSnap && installedSnap == plugSnap) {
+			if (otherSnap.String() == plugSnap && installedSnap.String() == slotSnap) || (otherSnap.String() == slotSnap && installedSnap.String() == plugSnap) {
 				return true, nil
 			}
 		}
@@ -93,10 +98,10 @@ func Connect(st *state.State, plugSnap, plugName, slotSnap, slotName string) (*s
 		return nil, err
 	}
 
-	return connect(st, plugSnap, plugName, slotSnap, slotName, connectOpts{})
+	return connect(st, naming.InstanceName(plugSnap), plugName, naming.InstanceName(slotSnap), slotName, connectOpts{})
 }
 
-func connect(st *state.State, plugSnap, plugName, slotSnap, slotName string, flags connectOpts) (*state.TaskSet, error) {
+func connect(st *state.State, plugSnap naming.InstanceName, plugName string, slotSnap naming.InstanceName, slotName string, flags connectOpts) (*state.TaskSet, error) {
 	// TODO: Store the intent-to-connect in the state so that we automatically
 	// try to reconnect on reboot (reconnection can fail or can connect with
 	// different parameters so we cannot store the actual connection details).
@@ -125,10 +130,10 @@ func connect(st *state.State, plugSnap, plugName, slotSnap, slotName string, fla
 	}
 
 	var plugSnapst, slotSnapst snapstate.SnapState
-	if err = snapstate.Get(st, plugSnap, &plugSnapst); err != nil {
+	if err = snapstate.Get(st, plugSnap.String(), &plugSnapst); err != nil {
 		return nil, err
 	}
-	if err = snapstate.Get(st, slotSnap, &slotSnapst); err != nil {
+	if err = snapstate.Get(st, slotSnap.String(), &slotSnapst); err != nil {
 		return nil, err
 	}
 	plugSnapInfo, err := plugSnapst.CurrentInfo()
@@ -140,13 +145,13 @@ func connect(st *state.State, plugSnap, plugName, slotSnap, slotName string, fla
 		return nil, err
 	}
 
-	plugStatic, slotStatic, err := initialConnectAttributes(st, plugSnapInfo, plugSnap, plugName, slotSnapInfo, slotSnap, slotName)
+	plugStatic, slotStatic, err := initialConnectAttributes(st, plugSnapInfo, plugSnap.String(), plugName, slotSnapInfo, slotSnap.String(), slotName)
 	if err != nil {
 		return nil, err
 	}
 
 	connectInterface := st.NewTask("connect", fmt.Sprintf(i18n.G("Connect %s:%s to %s:%s"), plugSnap, plugName, slotSnap, slotName))
-	initialContext := make(map[string]interface{})
+	initialContext := make(map[string]any)
 	initialContext["attrs-task"] = connectInterface.ID()
 
 	tasks := state.NewTaskSet()
@@ -161,13 +166,13 @@ func connect(st *state.State, plugSnap, plugName, slotSnap, slotName string, fla
 	preparePlugHookName := fmt.Sprintf("prepare-plug-%s", plugName)
 	if plugSnapInfo.Hooks[preparePlugHookName] != nil {
 		plugHookSetup := &hookstate.HookSetup{
-			Snap:     plugSnap,
+			Snap:     plugSnap.String(),
 			Hook:     preparePlugHookName,
 			Optional: true,
 		}
 		summary := fmt.Sprintf(i18n.G("Run hook %s of snap %q"), plugHookSetup.Hook, plugHookSetup.Snap)
 		undoPrepPlugHookSetup := &hookstate.HookSetup{
-			Snap:        plugSnap,
+			Snap:        plugSnap.String(),
 			Hook:        "unprepare-plug-" + plugName,
 			Optional:    true,
 			IgnoreError: true,
@@ -180,12 +185,12 @@ func connect(st *state.State, plugSnap, plugName, slotSnap, slotName string, fla
 	prepareSlotHookName := fmt.Sprintf("prepare-slot-%s", slotName)
 	if slotSnapInfo.Hooks[prepareSlotHookName] != nil {
 		slotHookSetup := &hookstate.HookSetup{
-			Snap:     slotSnap,
+			Snap:     slotSnap.String(),
 			Hook:     prepareSlotHookName,
 			Optional: true,
 		}
 		undoPrepSlotHookSetup := &hookstate.HookSetup{
-			Snap:        slotSnap,
+			Snap:        slotSnap.String(),
 			Hook:        "unprepare-slot-" + slotName,
 			Optional:    true,
 			IgnoreError: true,
@@ -211,7 +216,7 @@ func connect(st *state.State, plugSnap, plugName, slotSnap, slotName string, fla
 
 	// Expose a copy of all plug and slot attributes coming from yaml to interface hooks. The hooks will be able
 	// to modify them but all attributes will be checked against assertions after the hooks are run.
-	emptyDynamicAttrs := map[string]interface{}{}
+	emptyDynamicAttrs := map[string]any{}
 	connectInterface.Set("plug-static", plugStatic)
 	connectInterface.Set("slot-static", slotStatic)
 	connectInterface.Set("plug-dynamic", emptyDynamicAttrs)
@@ -231,12 +236,12 @@ func connect(st *state.State, plugSnap, plugName, slotSnap, slotName string, fla
 	connectSlotHookName := fmt.Sprintf("connect-slot-%s", slotName)
 	if slotSnapInfo.Hooks[connectSlotHookName] != nil {
 		connectSlotHookSetup := &hookstate.HookSetup{
-			Snap:     slotSnap,
+			Snap:     slotSnap.String(),
 			Hook:     connectSlotHookName,
 			Optional: true,
 		}
 		undoConnectSlotHookSetup := &hookstate.HookSetup{
-			Snap:        slotSnap,
+			Snap:        slotSnap.String(),
 			Hook:        "disconnect-slot-" + slotName,
 			Optional:    true,
 			IgnoreError: true,
@@ -254,12 +259,12 @@ func connect(st *state.State, plugSnap, plugName, slotSnap, slotName string, fla
 	connectPlugHookName := fmt.Sprintf("connect-plug-%s", plugName)
 	if plugSnapInfo.Hooks[connectPlugHookName] != nil {
 		connectPlugHookSetup := &hookstate.HookSetup{
-			Snap:     plugSnap,
+			Snap:     plugSnap.String(),
 			Hook:     connectPlugHookName,
 			Optional: true,
 		}
 		undoConnectPlugHookSetup := &hookstate.HookSetup{
-			Snap:        plugSnap,
+			Snap:        plugSnap.String(),
 			Hook:        "disconnect-plug-" + plugName,
 			Optional:    true,
 			IgnoreError: true,
@@ -280,10 +285,14 @@ func connect(st *state.State, plugSnap, plugName, slotSnap, slotName string, fla
 	return tasks, nil
 }
 
-func initialConnectAttributes(st *state.State, plugSnapInfo *snap.Info, plugSnap string, plugName string, slotSnapInfo *snap.Info, slotSnap string, slotName string) (plugStatic, slotStatic map[string]interface{}, err error) {
+func initialConnectAttributes(st *state.State, plugSnapInfo *snap.Info, plugSnap string, plugName string, slotSnapInfo *snap.Info, slotSnap string, slotName string) (plugStatic, slotStatic map[string]any, err error) {
 	var plugSnapst snapstate.SnapState
 
 	if err = snapstate.Get(st, plugSnap, &plugSnapst); err != nil {
+		return nil, nil, err
+	}
+
+	if err := addImplicitInterfaces(st, plugSnapInfo); err != nil {
 		return nil, nil, err
 	}
 
@@ -298,7 +307,7 @@ func initialConnectAttributes(st *state.State, plugSnapInfo *snap.Info, plugSnap
 		return nil, nil, err
 	}
 
-	if err := addImplicitSlots(st, slotSnapInfo); err != nil {
+	if err := addImplicitInterfaces(st, slotSnapInfo); err != nil {
 		return nil, nil, err
 	}
 
@@ -314,25 +323,34 @@ func initialConnectAttributes(st *state.State, plugSnapInfo *snap.Info, plugSnap
 func Disconnect(st *state.State, conn *interfaces.Connection) (*state.TaskSet, error) {
 	plugSnap := conn.Plug.Snap().InstanceName()
 	slotSnap := conn.Slot.Snap().InstanceName()
-	if err := snapstate.CheckChangeConflictMany(st, []string{plugSnap, slotSnap}, ""); err != nil {
+	if err := snapstate.CheckChangeConflictMany(st, []string{plugSnap.String(), slotSnap.String()}, ""); err != nil {
 		return nil, err
 	}
 
-	return disconnectTasks(st, conn, disconnectOpts{})
+	return disconnectTasks(st, conn, disconnectOpts{
+		// Explicit disconnect shall not be blocked by failing hooks.
+		IgnoreHookError: true,
+	})
 }
 
-// Forget returs a set of tasks for disconnecting and forgetting an interface.
+// Forget returns a set of tasks for disconnecting and forgetting an interface.
 // If the interface is already disconnected, it will be removed from the state
 // (forgotten).
 func Forget(st *state.State, repo *interfaces.Repository, connRef *interfaces.ConnRef) (*state.TaskSet, error) {
-	if err := snapstate.CheckChangeConflictMany(st, []string{connRef.PlugRef.Snap, connRef.SlotRef.Snap}, ""); err != nil {
+	if err := snapstate.CheckChangeConflictMany(st, []string{connRef.PlugRef.Snap.String(), connRef.SlotRef.Snap.String()}, ""); err != nil {
 		return nil, err
 	}
 
 	if conn, err := repo.Connection(connRef); err == nil {
 		// connection exists - run regular set of disconnect tasks with forget
 		// flag.
-		opts := disconnectOpts{Forget: true}
+		opts := disconnectOpts{
+			// Drop the connection, but do not record it as undesired.
+			Forget: true,
+			// Similarly to explicit Disconnect(), failing hooks shall not
+			// block disconnecting the interface.
+			IgnoreHookError: true,
+		}
 		ts, err := disconnectTasks(st, conn, opts)
 		return ts, err
 	}
@@ -345,9 +363,16 @@ func Forget(st *state.State, repo *interfaces.Repository, connRef *interfaces.Co
 }
 
 type disconnectOpts struct {
+	// AutoDisconnect indicates that disconnect is requested as part of snap
+	// removal.
 	AutoDisconnect bool
-	ByHotplug      bool
-	Forget         bool
+	// ByHotplug is true when disconnect is triggered by hotplug.
+	ByHotplug bool
+	// Forget when true, indicates that the connection state shall be
+	// disconnected without recording its state as undesired.
+	Forget bool
+	// IgnoreHookError when true, errors from disconnect hooks shall be ignored.
+	IgnoreHookError bool
 }
 
 // forgetTasks creates a set of tasks for forgetting an inactive connection
@@ -370,10 +395,10 @@ func disconnectTasks(st *state.State, conn *interfaces.Connection, flags disconn
 	slotName := conn.Slot.Name()
 
 	var plugSnapst, slotSnapst snapstate.SnapState
-	if err := snapstate.Get(st, slotSnap, &slotSnapst); err != nil {
+	if err := snapstate.Get(st, slotSnap.String(), &slotSnapst); err != nil {
 		return nil, err
 	}
-	if err := snapstate.Get(st, plugSnap, &plugSnapst); err != nil {
+	if err := snapstate.Get(st, plugSnap.String(), &plugSnapst); err != nil {
 		return nil, err
 	}
 
@@ -408,7 +433,7 @@ func disconnectTasks(st *state.State, conn *interfaces.Connection, flags disconn
 		prev = t
 	}
 
-	initialContext := make(map[string]interface{})
+	initialContext := make(map[string]any)
 	initialContext["attrs-task"] = disconnectTask.ID()
 
 	plugSnapInfo, err := plugSnapst.CurrentInfo()
@@ -425,16 +450,16 @@ func disconnectTasks(st *state.State, conn *interfaces.Connection, flags disconn
 		hookName := fmt.Sprintf("disconnect-slot-%s", slotName)
 		if slotSnapInfo.Hooks[hookName] != nil {
 			disconnectSlotHookSetup := &hookstate.HookSetup{
-				Snap:        slotSnap,
+				Snap:        slotSnap.String(),
 				Hook:        hookName,
 				Optional:    true,
-				IgnoreError: flags.AutoDisconnect,
+				IgnoreError: flags.IgnoreHookError,
 			}
 			undoDisconnectSlotHookSetup := &hookstate.HookSetup{
-				Snap:        slotSnap,
+				Snap:        slotSnap.String(),
 				Hook:        "connect-slot-" + slotName,
 				Optional:    true,
-				IgnoreError: flags.AutoDisconnect,
+				IgnoreError: flags.IgnoreHookError,
 			}
 
 			summary := fmt.Sprintf(i18n.G("Run hook %s of snap %q"), disconnectSlotHookSetup.Hook, disconnectSlotHookSetup.Snap)
@@ -449,16 +474,16 @@ func disconnectTasks(st *state.State, conn *interfaces.Connection, flags disconn
 		hookName := fmt.Sprintf("disconnect-plug-%s", plugName)
 		if plugSnapInfo.Hooks[hookName] != nil {
 			disconnectPlugHookSetup := &hookstate.HookSetup{
-				Snap:        plugSnap,
+				Snap:        plugSnap.String(),
 				Hook:        hookName,
 				Optional:    true,
-				IgnoreError: flags.AutoDisconnect,
+				IgnoreError: flags.IgnoreHookError,
 			}
 			undoDisconnectPlugHookSetup := &hookstate.HookSetup{
-				Snap:        plugSnap,
+				Snap:        plugSnap.String(),
 				Hook:        "connect-plug-" + plugName,
 				Optional:    true,
-				IgnoreError: flags.AutoDisconnect,
+				IgnoreError: flags.IgnoreHookError,
 			}
 
 			summary := fmt.Sprintf(i18n.G("Run hook %s of snap %q"), disconnectPlugHookSetup.Hook, disconnectPlugHookSetup.Snap)
@@ -475,7 +500,7 @@ func disconnectTasks(st *state.State, conn *interfaces.Connection, flags disconn
 // CheckInterfaces checks whether plugs and slots of snap are allowed for installation.
 func CheckInterfaces(st *state.State, snapInfo *snap.Info, deviceCtx snapstate.DeviceContext) error {
 	// XXX: addImplicitSlots is really a brittle interface
-	if err := addImplicitSlots(st, snapInfo); err != nil {
+	if err := addImplicitInterfaces(st, snapInfo); err != nil {
 		return err
 	}
 
@@ -538,6 +563,8 @@ func delayedCrossMgrInit() {
 
 		// hook into snap linking/unlinking and activation state changes
 		snapstate.AddLinkSnapParticipant(snapstate.LinkSnapParticipantFunc(OnSnapLinkageChanged))
+
+		snapstate.ProcessDelayedSecurityBackendEffects = ProcessDelayedSecurityBackendEffects
 	})
 }
 
@@ -555,7 +582,7 @@ func OnSnapLinkageChanged(st *state.State, snapsup *snapstate.SnapSetup) error {
 	instanceName := snapsup.InstanceName()
 
 	var snapst snapstate.SnapState
-	if err := snapstate.Get(st, instanceName, &snapst); err != nil && !errors.Is(err, state.ErrNoState) {
+	if err := snapstate.Get(st, instanceName.String(), &snapst); err != nil && !errors.Is(err, state.ErrNoState) {
 		return err
 	}
 	if !snapst.IsInstalled() {
@@ -570,9 +597,119 @@ func OnSnapLinkageChanged(st *state.State, snapsup *snapstate.SnapSetup) error {
 		// track the revision that was just unlinked that has
 		// still profiles
 		snapst.PendingSecurity = &snapstate.PendingSecurityState{
-			SideInfo: snapst.CurrentSideInfo(),
+			SideInfo:   snapst.CurrentSideInfo(),
+			Components: snapst.CurrentComponentSideInfos(),
 		}
 	}
-	snapstate.Set(st, instanceName, &snapst)
+	snapstate.Set(st, instanceName.String(), &snapst)
 	return nil
+}
+
+// InterfacesRequestsControlHandlerServices returns the list of all apps which
+// are defined as "handler-service" for a snap which has a connected plug for
+// the "snap-interfaces-requests-control" interface.
+//
+// The caller must ensure that the given state is locked.
+func InterfacesRequestsControlHandlerServices(st *state.State) ([]*snap.AppInfo, error) {
+	conns, err := ConnectionStates(st)
+	if err != nil {
+		return nil, fmt.Errorf("internal error: cannot get connections: %w", err)
+	}
+
+	var handlers []*snap.AppInfo
+
+	for connId, connState := range conns {
+		if connState.Interface != "snap-interfaces-requests-control" || !connState.Active() {
+			continue
+		}
+
+		connRef, err := interfaces.ParseConnRef(connId)
+		if err != nil {
+			return nil, err
+		}
+
+		handler, ok := connState.StaticPlugAttrs["handler-service"].(string)
+		if !ok {
+			// does not have a handler service
+			continue
+		}
+
+		sn := connRef.PlugRef.Snap
+		si, err := snapstate.CurrentInfo(st, sn.String())
+		if err != nil {
+			return nil, err
+		}
+
+		// this should not fail as the plug's BeforePrepare should have validated that such an app exists
+		app := si.Apps[handler]
+		if app == nil {
+			return nil, fmt.Errorf("internal error: cannot find app %q in snap %q", app, sn)
+		}
+
+		handlers = append(handlers, app)
+	}
+
+	return handlers, nil
+}
+
+// AdviseReportedSystemKeyMismatch inspects the system key, which is reportedly
+// in a mismatch with the recoded one, and decides to either create a state
+// change for regenerating security profiles, thus returning a change, or do
+// nothing, in which case no change is returned.
+func AdviseReportedSystemKeyMismatch(st *state.State, systemKey any) (*state.Change, error) {
+	var seeded bool
+	err := st.Get("seeded", &seeded)
+	if err != nil && !errors.Is(err, state.ErrNoState) {
+		return nil, err
+	}
+
+	if !seeded {
+		// System not ready yet for checking system-key, bubble up the error to
+		// clients. They can either wait or proceed at their own peril.
+		return nil, errors.New("system not yet seeded")
+	}
+
+	for _, chg := range st.Changes() {
+		// if we have a change that isn't ready, return it instead
+		if chg.Kind() == regenerateSecurityProfilesChangeKind && !chg.IsReady() {
+			return chg, nil
+		}
+	}
+
+	action, err := interfaces.SystemKeyMismatchAdvice(systemKey)
+	if err != nil {
+		return nil, err
+	}
+
+	logger.Debugf("reported system key mismatch action: %v", action)
+
+	if action == interfaces.SystemKeyMismatchActionNone {
+		// nothing to do
+		return nil, nil
+	}
+
+	chg := st.NewChange(regenerateSecurityProfilesChangeKind, "Regenerate security profiles")
+	t := st.NewTask(regenerateSecurityProfilesChangeKind, "Regenerate security profiles")
+	chg.AddTask(t)
+
+	return chg, nil
+}
+
+// ProcessDelayedSecurityBackendEffects creates a task set for processing
+// delayed effects from security backend setup calls.
+//
+// The task for processing delayed effects is free standing and has no direct
+// dependencies on other tasks. However, any delayed effects are applied only
+// when the snaps that triggered them have been processed (installed, refreshed,
+// or removed) successfully. The monitorLanes parameter carries a list of lanes
+// that should be monitored for tasks related to snap processing. The
+// applyInLane parameter, if non 0, identifies the lane which tasks for applying
+// delayed effects should join (such as when using all-snaps transaction).
+func ProcessDelayedSecurityBackendEffects(st *state.State, monitorLanes []int, applyInLane int) (ts *state.TaskSet) {
+	delayedCoordinationTask := st.NewTask("process-delayed-security-backend-effects",
+		"Process delayed security backend side effects for affected snaps")
+	delayedCoordinationTask.Set("monitored-lanes", monitorLanes)
+	delayedCoordinationTask.Set("apply-in-lane", applyInLane)
+	ts = state.NewTaskSet(delayedCoordinationTask)
+	return ts
 }

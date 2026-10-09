@@ -24,7 +24,12 @@ import (
 	"os"
 
 	"github.com/snapcore/snapd/dirs"
+	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/snap"
+)
+
+var (
+	osutilSaveMountProfile = osutil.SaveMountProfile
 )
 
 // SystemProfileUpdateContext contains information about update to system-wide mount namespace.
@@ -86,10 +91,26 @@ func (upCtx *SystemProfileUpdateContext) Assumptions() *Assumptions {
 	// permission only matters if the plug-side app constructs its mount
 	// namespace before the slot-side app is launched.
 	as.AddModeHint("/var/lib/snapd/hostfs/tmp/snap-private-tmp/snap.*/tmp/.X11-unix", 0777|os.ModeSticky)
+	// This is to ensure the mount target directory /tmp/.X11-unix inside the
+	// mount namespace is created with the same permissions as a typical host
+	// /tmp/.X11-unix. When x11 interface is connected, the target path is
+	// shadowed by a bind mount from the host, so the actual mode is only
+	// visible when said interface is disconnected after being connected earlier
+	// with the mount namespace being preserved.
+	as.AddModeHint("/tmp/.X11-unix", 0777|os.ModeSticky)
 	// This is to ensure private shared-memory directories have
 	// the right permissions.
 	as.AddModeHint("/dev/shm/snap.*", 0777|os.ModeSticky)
 	return as
+}
+
+// SaveCurrentProfile saves the current mount profile to a file owned by the
+// root user.
+func (upCtx *SystemProfileUpdateContext) SaveCurrentProfile(profile *osutil.MountProfile) error {
+	if err := osutilSaveMountProfile(profile, upCtx.currentProfilePath, 0, 0); err != nil {
+		return fmt.Errorf("cannot save current mount profile of snap %q: %s", upCtx.instanceName, err)
+	}
+	return nil
 }
 
 // desiredSystemProfilePath returns the path of the fstab-like file with the desired, system-wide mount profile for a snap.

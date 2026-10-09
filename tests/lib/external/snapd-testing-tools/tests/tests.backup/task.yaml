@@ -1,6 +1,10 @@
 summary: tests for the tests.backup tool
 
-backends: [google]
+details: |
+    Check the tests.backup tool properly backs up and
+    restores a specific directory.
+
+backends: [openstack*]
 
 execute: |
     # Without any arguments a help message is printed.

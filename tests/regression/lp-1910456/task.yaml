@@ -8,6 +8,10 @@ details: |
 # ubuntu-14.04: Docker is not supported anymore in ubuntu 14.04
 systems: [-ubuntu-14.04-64]
 
+environment:
+  IMAGE_URL_X86: https://storage.googleapis.com/snapd-spread-tests/images/docker/ubuntu-24.04.tar
+  IMAGE_URL_ARM: https://storage.googleapis.com/snapd-spread-tests/images/docker/ubuntu-24.04-arm64.tar
+
 prepare: |
     # build and install the strict test snap
     snap pack container-mgr-snap
@@ -24,15 +28,20 @@ prepare: |
             classic-container-mgr-snap/meta/snap.yaml
         echo "confinement: classic" >> classic-container-mgr-snap/meta/snap.yaml
 
-        if os.query is-arch-linux || os.query is-fedora || os.query is-centos; then
-            # need to enable /snap symlink to install classic snaps
-            ln -s /var/lib/snapd/snap /snap
-            # remove it when we are done
-            tests.cleanup defer rm -rf /snap
+        SNAP_MOUNT_DIR="$(os.paths snap-mount-dir)"
+        if [ "$SNAP_MOUNT_DIR" = "/var/lib/snapd/snap" ] && [ ! -L /snap ]; then
+            # set up classic execution support
+            ln -sfn "$SNAP_MOUNT_DIR" /snap
+            tests.cleanup defer rm -f /snap
         fi
 
         snap pack classic-container-mgr-snap
         snap install --dangerous --classic test-snapd-classic-container-mgrs*.snap
+    fi
+    if os.query is-xenial || os.query is-bionic; then
+        # Old kernels do not clean up snap cgroup dirs on snap removal.
+        # Must run after snap remove --purge docker (LIFO).
+        tests.cleanup defer find /sys/fs/cgroup/ -type d -name snap.\* -prune -exec rmdir '{}' '+' '||' true
     fi
 
 execute: |
@@ -124,17 +133,29 @@ execute: |
     fi
 
     CHANNEL=latest/stable
-    if os.query is-pc-i386; then
-        # on i386 only the "base: core18" version is available
-        CHANNEL=core18/stable
-    fi
     snap install --channel="$CHANNEL" docker
-    tests.cleanup defer snap remove docker
+    tests.cleanup defer snap remove --purge docker
+
+    if [ "${SNAPD_USE_PROXY:-}" = true ]; then
+        if ! command -v curl; then
+            snap install --devmode --edge test-snapd-curl
+            snap alias test-snapd-curl.curl curl
+        fi  
+        if os.query is-arm; then
+            IMAGE_URL=$IMAGE_URL_ARM
+        else
+            IMAGE_URL=$IMAGE_URL_X86
+        fi  
+        # Save to the home directory to get around apparmor denials
+        curl -sL "$IMAGE_URL" -o "$HOME"/ubuntu-24.04.tar
+        mv "$HOME"/ubuntu-24.04.tar .
+        retry -n 30 --wait 1 docker load -i ubuntu-24.04.tar
+    fi
 
     echo "Test that docker container cgroups on ubuntu are not moved when systemctl daemon-reload is executed"
 
     # start a docker container - need to wait until dockerd comes alive
-    retry -n10 --wait 1 sh -c 'docker run -d --name test ubuntu:18.04 sleep infinity'
+    retry -n10 --wait 1 sh -c 'docker run -d --name test ubuntu:24.04 sleep infinity'
     tests.cleanup defer docker kill test
 
     # make sure that docker top can see the process
